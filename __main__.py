@@ -1,27 +1,3 @@
-"""
-KELT-20b Atmospheric Retrieval - Command Line Interface
-========================================================
-
-Run atmospheric retrieval from command line.
-
-Usage:
-    python -m uhj_atmo_retrieval [options]
-    python __main__.py [options]
-
-Examples:
-    # Transmission retrieval with default config
-    python -m uhj_atmo_retrieval --mode transmission
-
-    # Emission retrieval with custom config
-    python -m uhj_atmo_retrieval --mode emission --config my_config.py
-
-    # Quick test with fewer samples
-    python -m uhj_atmo_retrieval --mode transmission --quick
-
-    # Override specific parameters
-    python -m uhj_atmo_retrieval --mode transmission --svi-steps 500 --mcmc-samples 1000
-"""
-
 import argparse
 import sys
 import os
@@ -32,70 +8,23 @@ def create_parser():
     """Create argument parser for CLI."""
 
     parser = argparse.ArgumentParser(
-        description="KELT-20b Ultra-Hot Jupiter Atmospheric Retrieval",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Run transmission retrieval
-  %(prog)s --mode transmission
-
-  # Quick test run (fewer samples)
-  %(prog)s --mode transmission --quick
-
-  # Custom configuration file
-  %(prog)s --mode emission --config custom_config.py
-
-  # Override SVI/MCMC parameters
-  %(prog)s --mode transmission --svi-steps 2000 --mcmc-samples 3000
-
-  # Specify output directory
-  %(prog)s --mode transmission --output results_run1
-
-  # Verbose output
-  %(prog)s --mode transmission --verbose
-
-For more information, see README.md
-        """
-    )
+        )
 
     # Required arguments
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["transmission", "emission", "combined"],
-        default="transmission",
-        help="Retrieval mode: transmission, emission, or combined (default: transmission)"
-    )
+    # TODO: add reflection?
+    parser.add_argument("--mode", type=str, choices=["transmission", "emission"])
 
     # Configuration
     config_group = parser.add_argument_group("Configuration")
-    config_group.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="Path to custom config file (default: use config.py)"
-    )
-    config_group.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Output directory (default: from config.DIR_SAVE)"
-    )
+    config_group.add_argument("--config", type=str, default=None,help="Path to custom config file (default: use config.py)")
+    config_group.add_argument("--output", type=str, default=None, help="Output directory (default: from config.DIR_SAVE)")
 
     # Data options
     data_group = parser.add_argument_group("Data")
-    data_group.add_argument(
-        "--data-dir",
-        type=str,
-        default=None,
-        help="Override data directory path"
-    )
-    data_group.add_argument(
-        "--wavelength-range",
-        type=str,
-        default=None,
-        help="Wavelength range mode: blue, green, red, full (default: from config)"
-    )
+    data_group.add_argument("--data-dir", type=str, default=None, help="Override data directory path")
+    #TODO: these wavelength ranges dont make sense, need to have it include red or blue or red/blue -- or maybe based on cross-dispersers. will depend on dataset. see if this can be extracted from fits rather than gathered explicitly
+    data_group.add_argument("--wavelength-range", type=str, default=None, help="Wavelength range mode: blue, green, red, full (default: from config)")
 
     # Inference parameters
     inference_group = parser.add_argument_group("Inference Parameters")

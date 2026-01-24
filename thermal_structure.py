@@ -11,6 +11,8 @@ import numpyro
 import numpyro.distributions as dist
 
 
+# TODO: probably all of these parameters are needed but may be useful
+
 def isothermal_profile(art, T0):
     """
     Isothermal temperature profile.

@@ -1,11 +1,3 @@
-"""
-Opacity Setup Module
-====================
-
-Load and build collision-induced absorption (CIA) and line opacities.
-Supports molecules (HITEMP/ExoMol) and atoms (Kurucz/VALD).
-"""
-
 import jax.numpy as jnp
 from exojax.database.contdb import CdbCIA
 from exojax.opacity.opacont import OpaCIA
@@ -14,27 +6,17 @@ from exojax.opacity.premodit.api import OpaPremodit
 from exojax.opacity import saveopa
 
 
-def setup_cia_opacities(cia_paths, nu_grid):
-    """
-    Load collision-induced absorption opacities.
-
-    Parameters
-    ----------
-    cia_paths : dict
-        Dictionary mapping CIA names to file paths
-    nu_grid : np.ndarray
-        Wavenumber grid [cm^-1]
-
-    Returns
-    -------
-    opa_cias : dict
-        Dictionary of OpaCIA objects
-    """
+def setup_cia_opacities(cia_paths:dict, nu_grid:np.ndarray) -> dict:
     opa_cias = {}
     for name, path in cia_paths.items():
         cdb = CdbCIA(path, nurange=nu_grid)
         opa_cias[name] = OpaCIA(cdb, nu_grid=nu_grid)
     return opa_cias
+
+
+
+
+# TODO: with this function and all the following functions and for that matter, all of the functions in the codebase, specify a paramater's type and output type using type hints, not docstrings can keep the little comments for now but that's it
 
 
 def build_premodit_from_snapshot(snapshot, molmass, mol, nu_grid, ndiv, diffmode, Tlow, Thigh):

@@ -24,6 +24,7 @@ dependencies:
       - corner
       - emcee
       - dynesty
+      - uncertainties
       # Apple Silicon GPU (Metal). Keep jax == jaxlib per jax-metal table.
       - jax==0.4.34
       - jaxlib==0.4.34

@@ -24,5 +24,6 @@ dependencies:
       - corner
       - emcee
       - dynesty
+      - uncertainties
       # NVIDIA CUDA 12.x (Linux)
       - "jax[cuda12]"
