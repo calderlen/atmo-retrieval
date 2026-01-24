@@ -77,9 +77,7 @@ data/**/*.dat
 *.jpeg
 *.svg
 
-# But keep example/reference plots
-!docs/**/*.png
-!docs/**/*.pdf
+# But keep paper figures if present
 !paper_figures/*.png
 
 # ============================================================================
@@ -241,6 +239,20 @@ slurm-*.err
 *.sbatch.log
 
 # ============================================================================
+# DOCUMENTATION (PRIVATE)
+# ============================================================================
+
+# Private/internal documentation
+docs/
+docs/**/*
+
+# Guide/reference files (private - not for public repo)
+CLI_GUIDE.md
+CLI_QUICKREF.md
+MODULE_SUMMARY.md
+GIT_GUIDE.md
+
+# ============================================================================
 # KEEP THESE (Override previous ignores)
 # ============================================================================
 
@@ -251,9 +263,8 @@ slurm-*.err
 # Keep small example data files
 !data/example/*.npy
 
-# Keep documentation
-!docs/
-!*.md
+# Keep ONLY README.md public
+!README.md
 !LICENSE
 
 # Keep requirements
@@ -281,3 +292,5 @@ playground/
 NOTES.md
 TODO.md
 notes/
+
+./docs/*

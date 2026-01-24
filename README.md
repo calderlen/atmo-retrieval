@@ -1,6 +1,19 @@
 Modular atmospheric retrieval pipeline for ultra-hot Jupiters using ExoJAX and NumPyro. This codebase performs Bayesian atmospheric retrieval on transmission and/or emission spectra of ultra-hot Jupiters, specifically designed for KELT-20b observations with PEPSI/LBT.
 
-## modules
+## Quick Start
+
+```bash
+# Run transmission retrieval
+python __main__.py --mode transmission
+
+# Quick test (100 samples)
+python __main__.py --quick
+
+# See all options
+python __main__.py --help
+```
+
+## Modules
 
 ```
 ├── config.py              # Configuration and system parameters
@@ -13,7 +26,8 @@ Modular atmospheric retrieval pipeline for ultra-hot Jupiters using ExoJAX and N
 ├── telluric_model.py      # Telluric absorption (ground-based)
 ├── inference.py           # SVI and HMC-NUTS
 ├── plotting.py            # Visualization
-└── main.py                # Main orchestration script
+├── retrieval.py           # Retrieval pipeline functions
+└── __main__.py            # CLI entry point
 ```
 
 ## Dependencies
