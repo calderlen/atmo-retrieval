@@ -1,10 +1,6 @@
-"""
-Emission Spectrum Forward Model
-================================
+"""NumPyro model for emission spectrum retrieval (dayside/nightside)."""
 
-NumPyro model for emission spectrum retrieval (dayside/nightside).
-"""
-
+from typing import Callable
 import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
@@ -12,95 +8,40 @@ import numpyro.distributions as dist
 from exojax.database import molinfo
 from exojax.utils.astrofunc import gravity_jupiter
 from exojax.utils.constants import RJ, Rs, MJ
+from exojax.postproc.specop import SopRotation, SopInstProfile
+from exojax.opacity.premodit.api import OpaPremodit
+from exojax.opacity.opacont import OpaCIA
 
 
 def create_emission_model(
-    art,
-    opa_mols,
-    opa_cias,
-    molmass_arr,
-    nu_grid,
-    sop_rot,
-    sop_inst,
-    beta_inst,
-    inst_nus,
-    period_day,
-    Mp_mean,
-    Mp_std,
-    Rstar_mean,
-    Rstar_std,
-    Tstar,
-    Tlow,
-    Thigh,
-    pressure_top,
-    pressure_btm,
-    nlayer,
-    cloud_width,
-    cloud_integrated_tau,
-    temperature_profile="madhu_seager",
-    opa_atoms=None,
-):
-    """
-    Create NumPyro emission spectrum model.
+    art: object,
+    opa_mols: dict[str, OpaPremodit],
+    opa_cias: dict[str, OpaCIA],
+    molmass_arr: jnp.ndarray,
+    nu_grid: jnp.ndarray,
+    sop_rot: SopRotation,
+    sop_inst: SopInstProfile,
+    beta_inst: float,
+    inst_nus: jnp.ndarray,
+    period_day: float,
+    Mp_mean: float,
+    Mp_std: float,
+    Rstar_mean: float,
+    Rstar_std: float,
+    Tstar: float,
+    Tlow: float,
+    Thigh: float,
+    pressure_top: float,
+    pressure_btm: float,
+    nlayer: int,
+    cloud_width: float,
+    cloud_integrated_tau: float,
+    temperature_profile: str = "madhu_seager",
+    opa_atoms: dict | None = None,
+) -> Callable:
+    """Create NumPyro emission spectrum model."""
 
-    Parameters
-    ----------
-    art : ArtEmisPure
-        Atmospheric emission RT object
-    opa_mols : dict
-        Molecular opacities
-    opa_cias : dict
-        CIA opacities
-    molmass_arr : jnp.ndarray
-        Molecular masses
-    nu_grid : jnp.ndarray
-        Wavenumber grid
-    sop_rot : SopRotation
-        Rotation operator
-    sop_inst : SopInstProfile
-        Instrumental profile operator
-    beta_inst : float
-        Instrumental Gaussian width
-    inst_nus : jnp.ndarray
-        Instrument wavenumber grid
-    period_day : float
-        Orbital period [days]
-    Mp_mean : float
-        Planet mass prior mean [M_J]
-    Mp_std : float
-        Planet mass prior std [M_J]
-    Rstar_mean : float
-        Stellar radius prior mean [R_Sun]
-    Rstar_std : float
-        Stellar radius prior std [R_Sun]
-    Tstar : float
-        Stellar effective temperature [K]
-    Tlow : float
-        Low temperature [K]
-    Thigh : float
-        High temperature [K]
-    pressure_top : float
-        Top pressure [bar]
-    pressure_btm : float
-        Bottom pressure [bar]
-    nlayer : int
-        Number of atmospheric layers
-    cloud_width : float
-        Cloud width in log10(P)
-    cloud_integrated_tau : float
-        Integrated cloud optical depth
-    temperature_profile : str
-        Type of temperature profile: "isothermal", "gradient", "madhu_seager", "free"
-    opa_atoms : dict, optional
-        Atomic opacities
-
-    Returns
-    -------
-    model : callable
-        NumPyro model function
-    """
-
-    def model_c(fp_mean, fp_std):
+    def model_c(fp_mean: jnp.ndarray, fp_std: jnp.ndarray) -> None:
         """NumPyro emission model."""
 
         # Planet/star parameters
@@ -206,8 +147,6 @@ def create_emission_model(
         Fp_sample = sop_inst.sampling(Frot_inst, RV, inst_nus)
 
         # Planet-to-star flux ratio (Fp/Fs)
-        # Need stellar spectrum at same wavelengths
-        # For simplicity, use blackbody approximation
         from exojax.spec.planck import piBarr
         Fs_star = piBarr(nu_grid, Tstar)  # Stellar flux
         Fs_sample = sop_inst.sampling(Fs_star, RV, inst_nus)

@@ -1,11 +1,4 @@
-"""
-KELT-20b Ultra-Hot Jupiter Retrieval - Main Script
-===================================================
-
-Orchestrates transmission/emission retrieval pipeline.
-
-Can be run directly or via CLI (__main__.py).
-"""
+"""Orchestrates transmission/emission retrieval pipeline."""
 
 import jax
 from jax import random
@@ -13,10 +6,8 @@ import jax.numpy as jnp
 import numpy as np
 from numpyro.infer import Predictive
 
-# ExoJAX imports
 from exojax.rt import ArtTransPure, ArtEmisPure
 
-# Local modules
 import config
 from data_loader import load_observed_spectrum, ResolutionInterpolator
 from grid_setup import setup_wavenumber_grid, setup_spectral_operators
@@ -28,28 +19,13 @@ from plotting import create_transmission_plots
 
 
 def run_transmission_retrieval(
-    skip_svi=False,
-    svi_only=False,
-    no_plots=False,
-    temperature_profile="isothermal",
-    seed=42,
-):
-    """
-    Run transmission spectrum retrieval.
-
-    Parameters
-    ----------
-    skip_svi : bool
-        Skip SVI warm-up
-    svi_only : bool
-        Run only SVI, skip MCMC
-    no_plots : bool
-        Skip plotting
-    temperature_profile : str
-        Temperature profile type
-    seed : int
-        Random seed
-    """
+    skip_svi: bool = False,
+    svi_only: bool = False,
+    no_plots: bool = False,
+    temperature_profile: str = "isothermal",
+    seed: int = 42,
+) -> None:
+    """Run transmission spectrum retrieval."""
 
     print("="*70)
     print("KELT-20b Transmission Spectrum Retrieval")
@@ -68,7 +44,7 @@ def run_transmission_retrieval(
 
     # Setup instrumental resolution
     print("\n[2/8] Setting up instrumental resolution...")
-    res_interp = ResolutionInterpolator(constant_R=config.PEPSI_RESOLUTION)
+    res_interp = ResolutionInterpolator(constant_R=config.RESOLUTION)
     Rinst = res_interp(np.mean(wav_obs))
     print(f"  PEPSI resolving power: R = {Rinst:.0f}")
 
@@ -101,11 +77,9 @@ def run_transmission_retrieval(
     # Load opacities
     print("\n[5/8] Loading opacities...")
 
-    # CIA
     opa_cias = setup_cia_opacities(config.CIA_PATHS, nu_grid)
     print(f"  Loaded {len(opa_cias)} CIA sources")
 
-    # Molecules
     opa_mols, molmass_arr = load_molecular_opacities(
         config.MOLPATH_HITEMP,
         config.MOLPATH_EXOMOL,
@@ -117,6 +91,14 @@ def run_transmission_retrieval(
         config.THIGH,
     )
     print(f"  Loaded {len(opa_mols)} molecular species: {list(opa_mols.keys())}")
+
+    # Get planet parameters
+    params = config.get_params()
+    period_day = params["period"].nominal_value
+    Mp_mean = params["M_p"].nominal_value
+    Mp_std = params["M_p"].std_dev
+    Rstar_mean = params["R_star"].nominal_value
+    Rstar_std = params["R_star"].std_dev
 
     # Build forward model
     print(f"\n[6/8] Building transmission forward model ({temperature_profile})...")
@@ -130,11 +112,11 @@ def run_transmission_retrieval(
         sop_inst=sop_inst,
         beta_inst=beta_inst,
         inst_nus=inst_nus,
-        period_day=config.PERIOD_DAY,
-        Mp_mean=config.MP_MEAN,
-        Mp_std=config.MP_STD,
-        Rstar_mean=config.RSTAR_MEAN,
-        Rstar_std=config.RSTAR_STD,
+        period_day=period_day,
+        Mp_mean=Mp_mean,
+        Mp_std=Mp_std,
+        Rstar_mean=Rstar_mean,
+        Rstar_std=Rstar_std,
         Tlow=config.TLOW,
         Thigh=config.THIGH,
         pressure_top=config.PRESSURE_TOP,
@@ -149,7 +131,6 @@ def run_transmission_retrieval(
     # Run inference
     rng_key = random.PRNGKey(seed)
 
-    # SVI
     svi_params = None
     svi_median = None
     svi_guide = None
@@ -166,10 +147,10 @@ def run_transmission_retrieval(
             rng_key=rng_key_,
             rp_mean=rp_mean,
             rp_std=rp_std,
-            Mp_mean=config.MP_MEAN,
-            Mp_std=config.MP_STD,
-            Rstar_mean=config.RSTAR_MEAN,
-            Rstar_std=config.RSTAR_STD,
+            Mp_mean=Mp_mean,
+            Mp_std=Mp_std,
+            Rstar_mean=Rstar_mean,
+            Rstar_std=Rstar_std,
             output_dir=config.DIR_SAVE,
             num_steps=config.SVI_NUM_STEPS,
             lr=config.SVI_LEARNING_RATE,
@@ -181,7 +162,6 @@ def run_transmission_retrieval(
         print(f"\n  Results saved to: {config.DIR_SAVE}/")
         return
 
-    # HMC-NUTS
     print("\n  Running HMC-NUTS sampling...")
     print(f"  Warmup: {config.MCMC_NUM_WARMUP}, Samples: {config.MCMC_NUM_SAMPLES}")
     print(f"  Chains: {config.MCMC_NUM_CHAINS}")
@@ -200,18 +180,15 @@ def run_transmission_retrieval(
         num_chains=config.MCMC_NUM_CHAINS,
     )
 
-    # Predictions
     print("\n  Generating predictive spectrum...")
     rng_key, rng_key_ = random.split(rng_key)
     predictions = generate_predictions(
         model_c, rng_key_, posterior_sample, rp_std, config.DIR_SAVE
     )
 
-    # Plotting
     if not no_plots:
         print("\n[8/8] Creating diagnostic plots...")
 
-        # SVI prediction
         if svi_median is not None:
             rng_key, rng_plot = random.split(rng_key)
             svi_pred = Predictive(
@@ -221,11 +198,7 @@ def run_transmission_retrieval(
 
             rng_key, rng_svi = random.split(rng_key)
             svi_samples = svi_guide[-1].sample_posterior(
-                rng_svi,
-                svi_params,
-                rp_mean=rp_mean,
-                rp_std=rp_std,
-                sample_shape=(1000,),
+                rng_svi, svi_params, rp_mean=rp_mean, rp_std=rp_std, sample_shape=(1000,),
             )
         else:
             svi_mu = None
@@ -254,39 +227,21 @@ def run_transmission_retrieval(
 
 
 def run_emission_retrieval(
-    skip_svi=False,
-    svi_only=False,
-    no_plots=False,
-    temperature_profile="madhu_seager",
-    seed=42,
-):
-    """
-    Run emission spectrum retrieval.
-
-    Parameters
-    ----------
-    skip_svi : bool
-        Skip SVI warm-up
-    svi_only : bool
-        Run only SVI, skip MCMC
-    no_plots : bool
-        Skip plotting
-    temperature_profile : str
-        Temperature profile type
-    seed : int
-        Random seed
-    """
+    skip_svi: bool = False,
+    svi_only: bool = False,
+    no_plots: bool = False,
+    temperature_profile: str = "madhu_seager",
+    seed: int = 42,
+) -> None:
+    """Run emission spectrum retrieval."""
     print("Emission retrieval not yet implemented.")
     print("Please use transmission mode for now.")
-    # TODO: Implement similar to transmission but with ArtEmisPure
 
 
 if __name__ == "__main__":
-    # If run directly (not via CLI), use default settings
     print("Running with default settings.")
-    print("For more options, use: python -m uhj_atmo_retrieval --help\n")
+    print("For more options, use: python __main__.py --help\n")
 
-    # Select retrieval mode
     if config.RETRIEVAL_MODE == "transmission":
         run_transmission_retrieval()
     elif config.RETRIEVAL_MODE == "emission":

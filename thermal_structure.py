@@ -1,94 +1,36 @@
-"""
-Thermal Structure Module
-=========================
-
-Temperature-pressure profiles for ultra-hot Jupiters.
-Includes isothermal, gradient, Guillot, and free temperature profiles.
-"""
+"""Temperature-pressure profiles for ultra-hot Jupiters."""
 
 import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 
 
-# TODO: probably all of these parameters are needed but may be useful
-
-def isothermal_profile(art, T0):
-    """
-    Isothermal temperature profile.
-
-    Parameters
-    ----------
-    art : ArtEmisPure or ArtTransPure
-        Atmospheric RT object
-    T0 : float
-        Constant temperature [K]
-
-    Returns
-    -------
-    Tarr : jnp.ndarray
-        Temperature array [K]
-    """
+def isothermal_profile(art: object, T0: float) -> jnp.ndarray:
+    """Isothermal temperature profile."""
     return T0 * jnp.ones_like(art.pressure)
 
 
-def gradient_profile(art, T_btm, T_top):
-    """
-    Linear temperature gradient in log(P) space.
-
-    Parameters
-    ----------
-    art : ArtEmisPure or ArtTransPure
-        Atmospheric RT object
-    T_btm : float
-        Temperature at bottom pressure [K]
-    T_top : float
-        Temperature at top pressure [K]
-
-    Returns
-    -------
-    Tarr : jnp.ndarray
-        Temperature array [K]
-    """
+def gradient_profile(art: object, T_btm: float, T_top: float) -> jnp.ndarray:
+    """Linear temperature gradient in log(P) space."""
     log_p = jnp.log10(art.pressure)
     log_p_btm = jnp.log10(art.pressure[-1])
     log_p_top = jnp.log10(art.pressure[0])
 
-    # Linear interpolation in log(P) space
     Tarr = T_top + (T_btm - T_top) * (log_p - log_p_top) / (log_p_btm - log_p_top)
     return Tarr
 
 
-def guillot_profile(art, T_irr, T_int, kappa_ir, gamma):
-    """
-    Guillot (2010) temperature profile with thermal inversion.
-
-    Parameters
-    ----------
-    art : ArtEmisPure or ArtTransPure
-        Atmospheric RT object
-    T_irr : float
-        Irradiation temperature [K]
-    T_int : float
-        Internal temperature [K]
-    kappa_ir : float
-        IR opacity [cm^2/g]
-    gamma : float
-        Ratio of visible to IR opacity
-
-    Returns
-    -------
-    Tarr : jnp.ndarray
-        Temperature array [K]
-    """
-    # Simplified Guillot profile
-    # tau is optical depth (needs to be computed from pressure)
-    # This is a placeholder - full implementation requires integration
-
+def guillot_profile(
+    art: object,
+    T_irr: float,
+    T_int: float,
+    kappa_ir: float,
+    gamma: float,
+) -> jnp.ndarray:
+    """Guillot (2010) temperature profile with thermal inversion."""
     # Approximation using pressure as proxy for optical depth
-    tau = art.pressure / 1e-3  # Rough approximation
+    tau = art.pressure / 1e-3
 
-    # Guillot formula (simplified)
     T4_eff = T_int**4 + T_irr**4 * (
         2.0 / 3.0 + 2.0 / 3.0 / gamma * (1.0 + gamma * tau / 2.0 - gamma * tau)
     )
@@ -97,34 +39,17 @@ def guillot_profile(art, T_irr, T_int, kappa_ir, gamma):
     return Tarr
 
 
-def madhu_seager_profile(art, T_deep, T_high, P_trans, delta_P):
-    """
-    Madhusudhan & Seager (2009) smoothly-varying profile.
-
-    Allows for thermal inversions.
-
-    Parameters
-    ----------
-    art : ArtEmisPure or ArtTransPure
-        Atmospheric RT object
-    T_deep : float
-        Temperature at deep atmosphere [K]
-    T_high : float
-        Temperature at upper atmosphere [K]
-    P_trans : float
-        Transition pressure [bar]
-    delta_P : float
-        Width of transition in log(P)
-
-    Returns
-    -------
-    Tarr : jnp.ndarray
-        Temperature array [K]
-    """
+def madhu_seager_profile(
+    art: object,
+    T_deep: float,
+    T_high: float,
+    P_trans: float,
+    delta_P: float,
+) -> jnp.ndarray:
+    """Madhusudhan & Seager (2009) smoothly-varying profile with inversions."""
     log_p = jnp.log10(art.pressure)
     log_p_trans = jnp.log10(P_trans)
 
-    # Sigmoid transition
     alpha = (log_p - log_p_trans) / delta_P
     f_transition = 0.5 * (1.0 + jnp.tanh(alpha))
 
@@ -132,29 +57,13 @@ def madhu_seager_profile(art, T_deep, T_high, P_trans, delta_P):
     return Tarr
 
 
-def free_temperature_profile(art, n_layers=5, Tlow=1000, Thigh=4000):
-    """
-    Free temperature profile with piecewise linear interpolation.
-
-    Parameters
-    ----------
-    art : ArtEmisPure or ArtTransPure
-        Atmospheric RT object
-    n_layers : int
-        Number of free temperature nodes
-    Tlow : float
-        Minimum allowed temperature [K]
-    Thigh : float
-        Maximum allowed temperature [K]
-
-    Returns
-    -------
-    Tarr : jnp.ndarray
-        Temperature array [K]
-    T_nodes : jnp.ndarray
-        Temperature node values
-    """
-    # Sample temperatures at fixed pressure levels
+def free_temperature_profile(
+    art: object,
+    n_layers: int = 5,
+    Tlow: float = 1000,
+    Thigh: float = 4000,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Free temperature profile with piecewise linear interpolation."""
     log_p = jnp.log10(art.pressure)
     log_p_nodes = jnp.linspace(log_p.min(), log_p.max(), n_layers)
 
@@ -164,75 +73,25 @@ def free_temperature_profile(art, n_layers=5, Tlow=1000, Thigh=4000):
         T_nodes.append(T_i)
     T_nodes = jnp.array(T_nodes)
 
-    # Interpolate between nodes
     Tarr = jnp.interp(log_p, log_p_nodes, T_nodes)
-
     return Tarr, T_nodes
 
 
-def numpyro_isothermal(art, Tlow, Thigh):
-    """
-    Isothermal profile with NumPyro sampling.
-
-    Parameters
-    ----------
-    art : ArtEmisPure or ArtTransPure
-        Atmospheric RT object
-    Tlow : float
-        Lower temperature bound [K]
-    Thigh : float
-        Upper temperature bound [K]
-
-    Returns
-    -------
-    Tarr : jnp.ndarray
-        Temperature array [K]
-    """
+def numpyro_isothermal(art: object, Tlow: float, Thigh: float) -> jnp.ndarray:
+    """Isothermal profile with NumPyro sampling."""
     T0 = numpyro.sample("T0", dist.Uniform(Tlow, Thigh))
     return isothermal_profile(art, T0)
 
 
-def numpyro_gradient(art, Tlow, Thigh):
-    """
-    Gradient profile with NumPyro sampling.
-
-    Parameters
-    ----------
-    art : ArtEmisPure or ArtTransPure
-        Atmospheric RT object
-    Tlow : float
-        Lower temperature bound [K]
-    Thigh : float
-        Upper temperature bound [K]
-
-    Returns
-    -------
-    Tarr : jnp.ndarray
-        Temperature array [K]
-    """
+def numpyro_gradient(art: object, Tlow: float, Thigh: float) -> jnp.ndarray:
+    """Gradient profile with NumPyro sampling."""
     T_btm = numpyro.sample("T_btm", dist.Uniform(Tlow, Thigh))
     T_top = numpyro.sample("T_top", dist.Uniform(Tlow, Thigh))
     return gradient_profile(art, T_btm, T_top)
 
 
-def numpyro_madhu_seager(art, Tlow, Thigh):
-    """
-    Madhusudhan-Seager profile with NumPyro sampling.
-
-    Parameters
-    ----------
-    art : ArtEmisPure or ArtTransPure
-        Atmospheric RT object
-    Tlow : float
-        Lower temperature bound [K]
-    Thigh : float
-        Upper temperature bound [K]
-
-    Returns
-    -------
-    Tarr : jnp.ndarray
-        Temperature array [K]
-    """
+def numpyro_madhu_seager(art: object, Tlow: float, Thigh: float) -> jnp.ndarray:
+    """Madhusudhan-Seager profile with NumPyro sampling."""
     T_deep = numpyro.sample("T_deep", dist.Uniform(Tlow, Thigh))
     T_high = numpyro.sample("T_high", dist.Uniform(Tlow, Thigh))
     log_P_trans = numpyro.sample("log_P_trans", dist.Uniform(-8, 2))
@@ -242,24 +101,11 @@ def numpyro_madhu_seager(art, Tlow, Thigh):
     return madhu_seager_profile(art, T_deep, T_high, P_trans, delta_P)
 
 
-def numpyro_free_temperature(art, n_layers=5, Tlow=1000, Thigh=4000):
-    """
-    Free temperature profile with NumPyro sampling.
-
-    Parameters
-    ----------
-    art : ArtEmisPure or ArtTransPure
-        Atmospheric RT object
-    n_layers : int
-        Number of temperature nodes
-    Tlow : float
-        Lower temperature bound [K]
-    Thigh : float
-        Upper temperature bound [K]
-
-    Returns
-    -------
-    Tarr : jnp.ndarray
-        Temperature array [K]
-    """
+def numpyro_free_temperature(
+    art: object,
+    n_layers: int = 5,
+    Tlow: float = 1000,
+    Thigh: float = 4000,
+) -> jnp.ndarray:
+    """Free temperature profile with NumPyro sampling."""
     return free_temperature_profile(art, n_layers, Tlow, Thigh)[0]

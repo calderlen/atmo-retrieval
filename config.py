@@ -223,7 +223,7 @@ PLANETS = {
 }
 
 
-def get_params(planet=None, ephemeris=None):
+def get_params(planet: str | None = None, ephemeris: str | None = None) -> dict:
     """Get planet parameters for the specified planet and ephemeris."""
     planet = planet or PLANET
     ephemeris = ephemeris or EPHEMERIS
@@ -238,12 +238,12 @@ def get_params(planet=None, ephemeris=None):
     return PLANETS[planet][ephemeris]
 
 
-def list_planets():
+def list_planets() -> list[str]:
     """List all available planets."""
     return list(PLANETS.keys())
 
 
-def list_ephemerides(planet=None):
+def list_ephemerides(planet: str | None = None) -> list[str]:
     """List available ephemerides for a planet."""
     planet = planet or PLANET
     if planet not in PLANETS:
@@ -366,13 +366,13 @@ TELLURIC_AIRMASS = 1.2  # Typical airmass
 # DATA PATHS
 # ==============================================================================
 
-def get_data_dir(planet=None):
+def get_data_dir(planet: str | None = None) -> str:
     """Get data directory for a planet."""
     planet = planet or PLANET
     return os.path.join(INPUT_DIR, "spectra", planet.lower().replace("-", ""))
 
 
-def get_transmission_paths(planet=None):
+def get_transmission_paths(planet: str | None = None) -> dict[str, str]:
     """Get paths to transmission data files."""
     data_dir = get_data_dir(planet)
     return {
@@ -382,7 +382,7 @@ def get_transmission_paths(planet=None):
     }
 
 
-def get_emission_paths(planet=None):
+def get_emission_paths(planet: str | None = None) -> dict[str, str]:
     """Get paths to emission data files."""
     data_dir = get_data_dir(planet)
     return {
@@ -407,7 +407,11 @@ RETRIEVAL_MODE = "transmission"  # Options: "transmission", "emission"
 # OUTPUT CONFIGURATION
 # ==============================================================================
 
-def get_output_dir(planet=None, ephemeris=None, mode=None):
+def get_output_dir(
+    planet: str | None = None,
+    ephemeris: str | None = None,
+    mode: str | None = None,
+) -> str:
     """Get output directory: output/{planet}/{ephemeris}/{mode}/"""
     planet = planet or PLANET
     ephemeris = ephemeris or EPHEMERIS
