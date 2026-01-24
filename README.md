@@ -1,4 +1,4 @@
-Modular atmospheric retrieval pipeline for ultra-hot Jupiters using ExoJAX and NumPyro. This codebase performs Bayesian atmospheric retrieval on transmission and/or emission spectra of ultra-hot Jupiters, specifically designed for KELT-20b observations with PEPSI/LBT.
+This codebase performs Bayesian atmospheric retrieval on transmission and/or emission spectra of ultra-hot Jupiters, specifically designed for KELT-20b observations with PEPSI/LBT.
 
 ## Quick Start
 
