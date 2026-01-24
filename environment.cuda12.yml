@@ -1,0 +1,28 @@
+name: exojax-retrieval
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # Core modeling
+      - exojax
+      - jaxopt
+      - optax
+      # Scientific stack
+      - numpy
+      - scipy
+      - pandas
+      - matplotlib
+      - astropy
+      - h5py
+      - xarray
+      - tqdm
+      # Retrieval + diagnostics
+      - numpyro
+      - arviz
+      - corner
+      - emcee
+      - dynesty
+      # NVIDIA CUDA 12.x (Linux)
+      - "jax[cuda12]"

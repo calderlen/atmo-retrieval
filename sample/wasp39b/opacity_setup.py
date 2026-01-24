@@ -1,0 +1,184 @@
+"""
+Opacity Setup Module
+====================
+
+Load and build collision-induced absorption (CIA) and line opacities.
+"""
+
+import jax.numpy as jnp
+from exojax.database.contdb import CdbCIA
+from exojax.opacity.opacont import OpaCIA
+from exojax.database.api import MdbHitemp, MdbExomol
+from exojax.opacity.premodit.api import OpaPremodit
+from exojax.opacity import saveopa
+
+
+def setup_cia_opacities(cia_paths, nu_grid):
+    """
+    Load collision-induced absorption opacities.
+
+    Parameters
+    ----------
+    cia_paths : dict
+        Dictionary mapping CIA names to file paths
+    nu_grid : np.ndarray
+        Wavenumber grid [cm^-1]
+
+    Returns
+    -------
+    opa_cias : dict
+        Dictionary of OpaCIA objects
+    """
+    opa_cias = {}
+    for name, path in cia_paths.items():
+        cdb = CdbCIA(path, nurange=nu_grid)
+        opa_cias[name] = OpaCIA(cdb, nu_grid=nu_grid)
+    return opa_cias
+
+
+def build_premodit_from_snapshot(snapshot, molmass, mol, nu_grid, ndiv, diffmode, Tlow, Thigh):
+    """
+    Create preMODIT opacity from database snapshot and save it.
+
+    Parameters
+    ----------
+    snapshot : object
+        Molecular database snapshot
+    molmass : float
+        Molecular mass
+    mol : str
+        Molecule name
+    nu_grid : np.ndarray
+        Wavenumber grid
+    ndiv : int
+        Number of stitch blocks
+    diffmode : int
+        Diffmode parameter
+    Tlow : float
+        Low temperature bound [K]
+    Thigh : float
+        High temperature bound [K]
+
+    Returns
+    -------
+    opa : OpaPremodit
+        Opacity object
+    """
+    opa = OpaPremodit.from_snapshot(
+        snapshot,
+        nu_grid,
+        nstitch=ndiv,
+        diffmode=diffmode,
+        auto_trange=[Tlow, Thigh],
+        dit_grid_resolution=1,
+        allow_32bit=True,
+        cutwing=1 / (2 * ndiv),
+    )
+    saveopa(opa, f"opa_{mol}.zarr", format="zarr", aux={"molmass": molmass})
+    return opa
+
+
+def load_or_build_opacity(mol, path, mdb_factory, opa_load, nu_grid, ndiv, diffmode, Tlow, Thigh):
+    """
+    Load saved opacity or build from database snapshot.
+
+    Parameters
+    ----------
+    mol : str
+        Molecule name
+    path : str
+        Path to molecular database
+    mdb_factory : callable
+        Factory function to create MDB object
+    opa_load : bool
+        If True, attempt to load saved opacity
+    nu_grid : np.ndarray
+        Wavenumber grid
+    ndiv : int
+        Number of stitch blocks
+    diffmode : int
+        Diffmode parameter
+    Tlow : float
+        Low temperature [K]
+    Thigh : float
+        High temperature [K]
+
+    Returns
+    -------
+    opa : OpaPremodit
+        Opacity object
+    molmass : float
+        Molecular mass
+    """
+    if opa_load:
+        try:
+            opa = OpaPremodit.from_saved_opa(f"opa_{mol}.zarr", strict=False)
+            return opa, opa.aux["molmass"]
+        except:
+            print(f"  Warning: Could not load saved opacity for {mol}, building from database...")
+
+    mdb = mdb_factory(path)
+    molmass = mdb.molmass
+    opa = build_premodit_from_snapshot(
+        mdb.to_snapshot(), molmass, mol, nu_grid, ndiv, diffmode, Tlow, Thigh
+    )
+    del mdb
+    return opa, molmass
+
+
+def load_molecular_opacities(molpath_hitemp, molpath_exomol, nu_grid, opa_load, ndiv, diffmode, Tlow, Thigh):
+    """
+    Load or create all molecular opacities for HITEMP and ExoMol.
+
+    Parameters
+    ----------
+    molpath_hitemp : dict
+        HITEMP molecule paths
+    molpath_exomol : dict
+        ExoMol molecule paths
+    nu_grid : np.ndarray
+        Wavenumber grid
+    opa_load : bool
+        Load saved opacities if True
+    ndiv : int
+        preMODIT stitch blocks
+    diffmode : int
+        Diffmode parameter
+    Tlow : float
+        Low temperature [K]
+    Thigh : float
+        High temperature [K]
+
+    Returns
+    -------
+    opa_mols : dict
+        Dictionary of molecular opacities
+    molmass_arr : jnp.ndarray
+        Array of molecular masses
+    """
+    opa_mols = {}
+    molmass_list = []
+
+    print("Loading HITEMP/ExoMol databases...")
+
+    # HITEMP molecules
+    for mol, path in molpath_hitemp.items():
+        print(f"  * {mol} (HITEMP)")
+        mdb_factory = lambda p: MdbHitemp(p, nu_grid, gpu_transfer=False, isotope=1)
+        opa, molmass = load_or_build_opacity(
+            mol, path, mdb_factory, opa_load, nu_grid, ndiv, diffmode, Tlow, Thigh
+        )
+        opa_mols[mol] = opa
+        molmass_list.append(molmass)
+
+    # ExoMol molecules
+    for mol, path in molpath_exomol.items():
+        print(f"  * {mol} (ExoMol)")
+        mdb_factory = lambda p: MdbExomol(p, nu_grid, gpu_transfer=False)
+        opa, molmass = load_or_build_opacity(
+            mol, path, mdb_factory, opa_load, nu_grid, ndiv, diffmode, Tlow, Thigh
+        )
+        opa_mols[mol] = opa
+        molmass_list.append(molmass)
+
+    return opa_mols, jnp.array(molmass_list)

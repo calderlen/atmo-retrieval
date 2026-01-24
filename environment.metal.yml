@@ -1,0 +1,30 @@
+name: exojax-retrieval
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # Core modeling
+      - exojax
+      - jaxopt
+      - optax
+      # Scientific stack
+      - numpy
+      - scipy
+      - pandas
+      - matplotlib
+      - astropy
+      - h5py
+      - xarray
+      - tqdm
+      # Retrieval + diagnostics
+      - numpyro
+      - arviz
+      - corner
+      - emcee
+      - dynesty
+      # Apple Silicon GPU (Metal). Keep jax == jaxlib per jax-metal table.
+      - jax==0.4.34
+      - jaxlib==0.4.34
+      - jax-metal==0.1.1
