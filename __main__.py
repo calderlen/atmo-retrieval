@@ -11,20 +11,43 @@ def create_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         )
 
-    # Required arguments
-    # TODO: add reflection?
+    # Target selection
+    target_group = parser.add_argument_group("Target")
+    target_group.add_argument(
+        "--planet",
+        type=str,
+        default=None,
+        help="Target planet (default: KELT-20b). Use --list-planets to see options"
+    )
+    target_group.add_argument(
+        "--ephemeris",
+        type=str,
+        default=None,
+        help="Ephemeris source (default: Duck24). Use --list-ephemerides to see options"
+    )
+    target_group.add_argument(
+        "--list-planets",
+        action="store_true",
+        help="List available planets and exit"
+    )
+    target_group.add_argument(
+        "--list-ephemerides",
+        action="store_true",
+        help="List available ephemerides for the selected planet and exit"
+    )
+
+    # Retrieval mode
     parser.add_argument("--mode", type=str, choices=["transmission", "emission"])
 
     # Configuration
     config_group = parser.add_argument_group("Configuration")
-    config_group.add_argument("--config", type=str, default=None,help="Path to custom config file (default: use config.py)")
-    config_group.add_argument("--output", type=str, default=None, help="Output directory (default: from config.DIR_SAVE)")
+    config_group.add_argument("--config", type=str, default=None, help="Path to custom config file (default: use config.py)")
+    config_group.add_argument("--output", type=str, default=None, help="Output directory (default: output/{planet}/{ephemeris}/{mode})")
 
     # Data options
     data_group = parser.add_argument_group("Data")
     data_group.add_argument("--data-dir", type=str, default=None, help="Override data directory path")
-    #TODO: these wavelength ranges dont make sense, need to have it include red or blue or red/blue -- or maybe based on cross-dispersers. will depend on dataset. see if this can be extracted from fits rather than gathered explicitly
-    data_group.add_argument("--wavelength-range", type=str, default=None, help="Wavelength range mode: blue, green, red, full (default: from config)")
+    data_group.add_argument("--wavelength-range", type=str, choices=["blue", "green", "red", "full"], default=None, help="Wavelength range mode (default: from config)")
 
     # Inference parameters
     inference_group = parser.add_argument_group("Inference Parameters")
@@ -168,14 +191,33 @@ def apply_cli_overrides(args):
     """Apply command-line argument overrides to config."""
     import config
 
-    # Output directory
+    # Planet and ephemeris selection
+    if args.planet:
+        config.PLANET = args.planet
+    if args.ephemeris:
+        config.EPHEMERIS = args.ephemeris
+
+    # Validate planet/ephemeris combination
+    params = config.get_params()  # Will raise if invalid
+
+    # Retrieval mode
+    if args.mode:
+        config.RETRIEVAL_MODE = args.mode
+
+    # Output directory (auto-set based on planet/ephemeris/mode)
     if args.output:
         config.DIR_SAVE = args.output
-        os.makedirs(config.DIR_SAVE, exist_ok=True)
+    else:
+        config.DIR_SAVE = config.get_output_dir()
+    os.makedirs(config.DIR_SAVE, exist_ok=True)
 
     # Data directory
     if args.data_dir:
         config.DATA_DIR = args.data_dir
+    else:
+        config.DATA_DIR = config.get_data_dir()
+        config.TRANSMISSION_DATA = config.get_transmission_paths()
+        config.EMISSION_DATA = config.get_emission_paths()
 
     # Wavelength range
     if args.wavelength_range:
@@ -214,9 +256,6 @@ def apply_cli_overrides(args):
         config.ENABLE_TELLURICS = True
     elif args.disable_tellurics:
         config.ENABLE_TELLURICS = False
-
-    # Retrieval mode
-    config.RETRIEVAL_MODE = args.mode
 
     return config
 
@@ -261,15 +300,22 @@ def print_banner():
 
 def print_config_summary(config, args):
     """Print configuration summary."""
+    params = config.get_params()
+    
     print("\n" + "="*70)
     print("CONFIGURATION SUMMARY")
     print("="*70)
+
+    print(f"\nTarget: {config.PLANET} ({config.EPHEMERIS})")
+    print(f"  Period: {params['period']} days")
+    print(f"  R_p: {params['R_p']} R_J")
+    print(f"  T_star: {params['T_star']} K")
 
     print(f"\nMode: {config.RETRIEVAL_MODE.upper()}")
     print(f"Output directory: {config.DIR_SAVE}")
     print(f"\nObserving mode: {config.OBSERVING_MODE}")
     print(f"Wavelength range: {config.WAV_MIN}-{config.WAV_MAX} nm")
-    print(f"Resolution: R = {config.PEPSI_RESOLUTION:,}")
+    print(f"Resolution: R = {config.RESOLUTION:,}")
 
     print(f"\nInference:")
     print(f"  SVI steps: {config.SVI_NUM_STEPS:,}")
@@ -297,6 +343,23 @@ def main():
     """Main CLI entry point."""
     parser = create_parser()
     args = parser.parse_args()
+
+    # Handle info commands first (before loading full config)
+    if args.list_planets:
+        import config
+        print("\nAvailable planets:")
+        for planet in config.list_planets():
+            ephems = config.list_ephemerides(planet)
+            print(f"  {planet}: {', '.join(ephems)}")
+        return 0
+
+    if args.list_ephemerides:
+        import config
+        planet = args.planet or config.PLANET
+        print(f"\nAvailable ephemerides for {planet}:")
+        for ephem in config.list_ephemerides(planet):
+            print(f"  {ephem}")
+        return 0
 
     # Setup logging
     logger = setup_logging(args)

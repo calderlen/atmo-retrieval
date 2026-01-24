@@ -1,26 +1,23 @@
-# Large database files (opacity sources)
-.db_HITEMP/
-.db_ExoMol/
-.db_CIA/
-.db_kurucz/
-.db_VALD/
+# Input directory (databases and spectra)
+input/.db_HITEMP/
+input/.db_ExoMol/
+input/.db_CIA/
+input/.db_kurucz/
+input/.db_VALD/
+input/spectra/**/*.npy
+input/spectra/**/*.npz
+input/spectra/**/*.fits
 
 # Opacity cache (zarr format)
 opa_*.zarr/
 opa_*.zarr.zip
 
 # Output directories
-output_*/
-results_*/
+output/
 
 # MCMC/SVI results
 *.npz
 *_pred.npy
-
-# Data files
-data/**/*.npy
-data/**/*.npz
-data/**/*.fits
 
 # Plots (regenerable)
 *.png
