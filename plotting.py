@@ -240,5 +240,3 @@ def create_transmission_plots(
         hmc_samples=posterior_sample, svi_samples=svi_samples, variables=corner_vars,
         save_path=os.path.join(output_dir, "corner_plot_overlay.png")
     )
-
-    print("All plots generated successfully.")

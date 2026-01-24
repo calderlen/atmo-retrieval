@@ -1,4 +1,4 @@
-name: exojax-retrieval
+name: retrieval
 channels:
   - conda-forge
 dependencies:

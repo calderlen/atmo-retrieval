@@ -12,8 +12,7 @@ import config
 from data_loader import load_observed_spectrum, ResolutionInterpolator
 from grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from opacity_setup import setup_cia_opacities, load_molecular_opacities
-from transmission_model import create_transmission_model
-from emission_model import create_emission_model
+from atmospheric_model import create_transmission_model, create_emission_model
 from inference import run_svi, run_mcmc, generate_predictions
 from plotting import create_transmission_plots
 
@@ -32,6 +31,21 @@ def run_transmission_retrieval(
     print("PEPSI/LBT")
     print("="*70)
 
+    # Create timestamped output directory
+    base_dir = config.DIR_SAVE or config.get_output_dir()
+    output_dir = config.create_timestamped_dir(base_dir)
+    print(f"\nOutput directory: {output_dir}")
+
+    # Save run configuration
+    config.save_run_config(
+        output_dir=output_dir,
+        mode="transmission",
+        temperature_profile=temperature_profile,
+        skip_svi=skip_svi,
+        svi_only=svi_only,
+        seed=seed,
+    )
+
     # Load observed data
     print("\n[1/8] Loading observed transmission spectrum...")
     wav_obs, rp_mean, rp_std, inst_nus = load_observed_spectrum(
@@ -40,7 +54,7 @@ def run_transmission_retrieval(
         config.TRANSMISSION_DATA["uncertainty"],
     )
     print(f"  Loaded {len(wav_obs)} spectral points")
-    print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} nm")
+    print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
 
     # Setup instrumental resolution
     print("\n[2/8] Setting up instrumental resolution...")
@@ -54,7 +68,7 @@ def run_transmission_retrieval(
         config.WAV_MIN - config.WAV_MIN_OFFSET,
         config.WAV_MAX + config.WAV_MAX_OFFSET,
         config.N_SPECTRAL_POINTS,
-        unit="nm",
+        unit="AA",
     )
 
     sop_rot, sop_inst, beta_inst = setup_spectral_operators(
@@ -151,7 +165,7 @@ def run_transmission_retrieval(
             Mp_std=Mp_std,
             Rstar_mean=Rstar_mean,
             Rstar_std=Rstar_std,
-            output_dir=config.DIR_SAVE,
+            output_dir=output_dir,
             num_steps=config.SVI_NUM_STEPS,
             lr=config.SVI_LEARNING_RATE,
         )
@@ -159,7 +173,7 @@ def run_transmission_retrieval(
 
     if svi_only:
         print("\n  SVI-only mode: skipping MCMC")
-        print(f"\n  Results saved to: {config.DIR_SAVE}/")
+        print(f"\n  Results saved to: {output_dir}/")
         return
 
     print("\n  Running HMC-NUTS sampling...")
@@ -173,7 +187,7 @@ def run_transmission_retrieval(
         rp_mean=rp_mean,
         rp_std=rp_std,
         init_strategy=init_strategy,
-        output_dir=config.DIR_SAVE,
+        output_dir=output_dir,
         num_warmup=config.MCMC_NUM_WARMUP,
         num_samples=config.MCMC_NUM_SAMPLES,
         max_tree_depth=config.MCMC_MAX_TREE_DEPTH,
@@ -183,7 +197,7 @@ def run_transmission_retrieval(
     print("\n  Generating predictive spectrum...")
     rng_key, rng_key_ = random.split(rng_key)
     predictions = generate_predictions(
-        model_c, rng_key_, posterior_sample, rp_std, config.DIR_SAVE
+        model_c, rng_key_, posterior_sample, rp_std, output_dir
     )
 
     if not no_plots:
@@ -215,14 +229,14 @@ def run_transmission_retrieval(
             svi_samples=svi_samples,
             opa_mols=opa_mols,
             art=art,
-            output_dir=config.DIR_SAVE,
+            output_dir=output_dir,
         )
     else:
         print("\n[8/8] Skipping plots (--no-plots)")
 
     print("\n" + "="*70)
     print("RETRIEVAL COMPLETE")
-    print(f"Results saved to: {config.DIR_SAVE}/")
+    print(f"Results saved to: {output_dir}/")
     print("="*70)
 
 
@@ -234,8 +248,25 @@ def run_emission_retrieval(
     seed: int = 42,
 ) -> None:
     """Run emission spectrum retrieval."""
+
+    # Create timestamped output directory
+    base_dir = config.DIR_SAVE or config.get_output_dir()
+    output_dir = config.create_timestamped_dir(base_dir)
+    print(f"\nOutput directory: {output_dir}")
+
+    # Save run configuration
+    config.save_run_config(
+        output_dir=output_dir,
+        mode="emission",
+        temperature_profile=temperature_profile,
+        skip_svi=skip_svi,
+        svi_only=svi_only,
+        seed=seed,
+    )
+
     print("Emission retrieval not yet implemented.")
     print("Please use transmission mode for now.")
+    print(f"\nConfiguration saved to: {output_dir}/")
 
 
 if __name__ == "__main__":

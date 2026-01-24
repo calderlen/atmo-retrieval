@@ -30,7 +30,8 @@ def load_observed_spectrum(
     else:
         raise ValueError(f"Unknown format: {format}")
 
-    inst_nus = wav2nu(wav_obs, "nm")
+    # Wavelength in Angstroms, convert to wavenumber
+    inst_nus = wav2nu(wav_obs, "AA")
     return wav_obs, spectrum, uncertainty, inst_nus
 
 

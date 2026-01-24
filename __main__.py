@@ -412,12 +412,6 @@ def main():
             logger.error("Combined retrieval not yet implemented")
             sys.exit(1)
 
-        if not args.quiet:
-            print("\n" + "="*70)
-            print("✅ RETRIEVAL COMPLETE")
-            print(f"Results saved to: {config.DIR_SAVE}/")
-            print("="*70)
-
         return 0
 
     except KeyboardInterrupt:

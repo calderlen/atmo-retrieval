@@ -258,10 +258,10 @@ def list_ephemerides(planet: str | None = None) -> list[str]:
 OBSERVING_MODE = "red"  # Options: "blue", "green", "red", "full"
 
 WAVELENGTH_RANGES = {
-    "blue": (383, 476),    # nm, CD1+CD2
-    "green": (476, 657),   # nm, CD3+CD4
-    "red": (650, 907),     # nm, CD5+CD6
-    "full": (383, 907),    # nm, all cross-dispersers
+    "blue": (4752, 5425),    # Angstroms, PEPSI blue arm
+    "green": (4760, 6570),   # Angstroms, CD3+CD4 (approximate)
+    "red": (6231, 7427),     # Angstroms, PEPSI red arm
+    "full": (4752, 7427),    # Angstroms, both arms combined
 }
 
 WAV_MIN, WAV_MAX = WAVELENGTH_RANGES[OBSERVING_MODE]
@@ -288,8 +288,8 @@ THIGH = 4500.0  # Very hot dayside with thermal inversion
 # ==============================================================================
 
 N_SPECTRAL_POINTS = 100000  # Higher resolution for PEPSI
-WAV_MIN_OFFSET = 10  # nm
-WAV_MAX_OFFSET = 10  # nm
+WAV_MIN_OFFSET = 100  # Angstroms
+WAV_MAX_OFFSET = 100  # Angstroms
 
 # preMODIT parameters
 NDIV = 8  # More divisions for higher resolution
@@ -366,15 +366,16 @@ TELLURIC_AIRMASS = 1.2  # Typical airmass
 # DATA PATHS
 # ==============================================================================
 
-def get_data_dir(planet: str | None = None) -> str:
-    """Get data directory for a planet."""
+def get_data_dir(planet: str | None = None, arm: str | None = None) -> str:
+    """Get data directory for a planet and arm."""
     planet = planet or PLANET
-    return os.path.join(INPUT_DIR, "spectra", planet.lower().replace("-", ""))
+    arm = arm or OBSERVING_MODE
+    return os.path.join(INPUT_DIR, "spectra", planet.lower().replace("-", ""), arm)
 
 
-def get_transmission_paths(planet: str | None = None) -> dict[str, str]:
+def get_transmission_paths(planet: str | None = None, arm: str | None = None) -> dict[str, str]:
     """Get paths to transmission data files."""
-    data_dir = get_data_dir(planet)
+    data_dir = get_data_dir(planet, arm=arm)
     return {
         "wavelength": os.path.join(data_dir, "wavelength_transmission.npy"),
         "spectrum": os.path.join(data_dir, "spectrum_transmission.npy"),
@@ -382,9 +383,9 @@ def get_transmission_paths(planet: str | None = None) -> dict[str, str]:
     }
 
 
-def get_emission_paths(planet: str | None = None) -> dict[str, str]:
+def get_emission_paths(planet: str | None = None, arm: str | None = None) -> dict[str, str]:
     """Get paths to emission data files."""
-    data_dir = get_data_dir(planet)
+    data_dir = get_data_dir(planet, arm=arm)
     return {
         "wavelength": os.path.join(data_dir, "wavelength_emission.npy"),
         "spectrum": os.path.join(data_dir, "spectrum_emission.npy"),
@@ -416,9 +417,145 @@ def get_output_dir(
     planet = planet or PLANET
     ephemeris = ephemeris or EPHEMERIS
     mode = mode or RETRIEVAL_MODE
-    
+
     base = os.path.join(os.path.dirname(__file__), "output")
     return os.path.join(base, planet.lower().replace("-", ""), ephemeris, mode)
+
+
+def create_timestamped_dir(base_dir: str) -> str:
+    """Create timestamped subdirectory within base directory.
+
+    Args:
+        base_dir: Base output directory (e.g., output/kelt20b/jpl/transmission/)
+
+    Returns:
+        Path to timestamped directory (e.g., output/.../2026-01-24_14-30-45/)
+    """
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    timestamped_dir = os.path.join(base_dir, timestamp)
+    os.makedirs(timestamped_dir, exist_ok=True)
+
+    return timestamped_dir
+
+
+def save_run_config(
+    output_dir: str,
+    mode: str,
+    temperature_profile: str,
+    skip_svi: bool,
+    svi_only: bool,
+    seed: int,
+) -> None:
+    """Save run configuration to log file.
+
+    Args:
+        output_dir: Directory to save config log
+        mode: Retrieval mode (transmission/emission)
+        temperature_profile: Temperature profile type
+        skip_svi: Whether SVI was skipped
+        svi_only: Whether only SVI was run
+        seed: Random seed
+    """
+    from datetime import datetime
+    import platform
+    import jax
+
+    log_path = os.path.join(output_dir, "run_config.log")
+
+    params = get_params()
+
+    with open(log_path, "w") as f:
+        f.write("="*70 + "\n")
+        f.write("RETRIEVAL RUN CONFIGURATION\n")
+        f.write("="*70 + "\n\n")
+
+        # Timestamp
+        f.write(f"Run started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Random seed: {seed}\n\n")
+
+        # System info
+        f.write("SYSTEM INFORMATION\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Platform: {platform.platform()}\n")
+        f.write(f"Python: {platform.python_version()}\n")
+        f.write(f"JAX version: {jax.__version__}\n")
+        f.write(f"JAX backend: {jax.default_backend()}\n")
+        f.write(f"JAX devices: {jax.devices()}\n\n")
+
+        # Target info
+        f.write("TARGET\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Planet: {PLANET}\n")
+        f.write(f"Ephemeris: {EPHEMERIS}\n")
+        f.write(f"Period: {params['period']}\n")
+        f.write(f"R_p: {params['R_p']}\n")
+        f.write(f"M_p: {params['M_p']}\n")
+        f.write(f"R_star: {params['R_star']}\n")
+        f.write(f"T_star: {params['T_star']}\n\n")
+
+        # Retrieval mode
+        f.write("RETRIEVAL CONFIGURATION\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Mode: {mode}\n")
+        f.write(f"Temperature profile: {temperature_profile}\n")
+        f.write(f"Output directory: {output_dir}\n\n")
+
+        # Wavelength/spectral setup
+        f.write("SPECTRAL SETUP\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Observing mode: {OBSERVING_MODE}\n")
+        f.write(f"Wavelength range: {WAV_MIN} - {WAV_MAX} Angstroms\n")
+        f.write(f"Spectral points: {N_SPECTRAL_POINTS}\n")
+        f.write(f"Resolution: R = {RESOLUTION:,}\n\n")
+
+        # Atmospheric setup
+        f.write("ATMOSPHERIC SETUP\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Layers: {NLAYER}\n")
+        f.write(f"Pressure range: {PRESSURE_TOP:.2e} - {PRESSURE_BTM:.2e} bar\n")
+        f.write(f"Temperature range: {TLOW} - {THIGH} K\n")
+        f.write(f"Cloud width: {CLOUD_WIDTH}\n")
+        f.write(f"Cloud integrated tau: {CLOUD_INTEGRATED_TAU}\n\n")
+
+        # Molecules
+        f.write("OPACITY SOURCES\n")
+        f.write("-" * 70 + "\n")
+        f.write("Molecules (HITEMP):\n")
+        for mol in MOLPATH_HITEMP.keys():
+            f.write(f"  - {mol}\n")
+        f.write("Molecules (ExoMol):\n")
+        for mol in MOLPATH_EXOMOL.keys():
+            f.write(f"  - {mol}\n")
+        f.write(f"\nCIA sources: H2-H2, H2-He\n")
+        f.write(f"Opacity loading: {OPA_LOAD}\n")
+        f.write(f"Opacity saving: {OPA_SAVE}\n\n")
+
+        # Inference parameters
+        f.write("INFERENCE PARAMETERS\n")
+        f.write("-" * 70 + "\n")
+        if not skip_svi:
+            f.write(f"SVI steps: {SVI_NUM_STEPS:,}\n")
+            f.write(f"SVI learning rate: {SVI_LEARNING_RATE}\n")
+        else:
+            f.write("SVI: SKIPPED\n")
+
+        if not svi_only:
+            f.write(f"\nMCMC warmup: {MCMC_NUM_WARMUP:,}\n")
+            f.write(f"MCMC samples: {MCMC_NUM_SAMPLES:,}\n")
+            f.write(f"MCMC chains: {MCMC_NUM_CHAINS}\n")
+            f.write(f"MCMC max tree depth: {MCMC_MAX_TREE_DEPTH}\n")
+        else:
+            f.write("\nMCMC: SKIPPED (SVI only)\n")
+
+        # Tellurics
+        if ENABLE_TELLURICS:
+            f.write(f"\nTelluric correction: ENABLED\n")
+
+        f.write("\n" + "="*70 + "\n")
+
+    print(f"Run configuration saved to {log_path}")
 
 
 # Default output directory (lazy - will be set by CLI or on first use)
