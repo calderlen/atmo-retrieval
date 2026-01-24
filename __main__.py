@@ -100,6 +100,21 @@ def create_parser():
         help="Save computed opacities for future use"
     )
 
+    # HITRAN credentials (for HITEMP downloads)
+    hitran_group = parser.add_argument_group("HITRAN")
+    hitran_group.add_argument(
+        "--hitran-username",
+        type=str,
+        default=None,
+        help="HITRAN username/email (or set HITRAN_USERNAME)"
+    )
+    hitran_group.add_argument(
+        "--hitran-password",
+        type=str,
+        default=None,
+        help="HITRAN password (or set HITRAN_PASSWORD)"
+    )
+
     # Model options
     model_group = parser.add_argument_group("Model Options")
     model_group.add_argument(
@@ -210,6 +225,12 @@ def apply_cli_overrides(args):
     else:
         config.DIR_SAVE = config.get_output_dir()
     os.makedirs(config.DIR_SAVE, exist_ok=True)
+
+    # HITRAN credentials (for HITEMP downloads)
+    if args.hitran_username:
+        os.environ["HITRAN_USERNAME"] = args.hitran_username
+    if args.hitran_password:
+        os.environ["HITRAN_PASSWORD"] = args.hitran_password
 
     # Data directory
     if args.data_dir:

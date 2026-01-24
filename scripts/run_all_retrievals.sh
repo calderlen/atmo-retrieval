@@ -79,6 +79,12 @@ PY
   out_dir="output/${planet_dir}/${ephem}/${MODE}/${epoch}/${arm}"
 
   cmd=(python __main__.py --mode "$MODE" --planet "$planet" --ephemeris "$ephem" --data-dir "$data_dir" --wavelength-range "$arm" --output "$out_dir")
+  if [[ -n "${HITRAN_USERNAME:-}" ]]; then
+    cmd+=(--hitran-username "$HITRAN_USERNAME")
+  fi
+  if [[ -n "${HITRAN_PASSWORD:-}" ]]; then
+    cmd+=(--hitran-password "$HITRAN_PASSWORD")
+  fi
   if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
     cmd+=("${EXTRA_ARGS[@]}")
   fi

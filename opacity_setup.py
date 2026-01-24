@@ -38,6 +38,135 @@ _patch_path_contains()
 _patch_radis_dbmanager()
 
 
+def _patch_radis_download():
+    try:
+        from radis.api import dbmanager as radis_dbmanager
+    except Exception:
+        return
+    orig = getattr(radis_dbmanager.DatabaseManager, "download_and_parse", None)
+    if orig is None or getattr(orig, "_no_head_patched", False):
+        return
+
+    def download_and_parse(self, urlnames, local_files, N_files_total=None):
+        import re
+        import requests
+        from time import time
+
+        if N_files_total is None:
+            all_local_files, _ = self.get_filenames()
+            N_files_total = len(all_local_files)
+
+        verbose = self.verbose
+        molecule = self.molecule
+        parallel = self.parallel
+
+        t0 = time()
+        pbar_Ntot_estimate_factor = None
+        if len(urlnames) != N_files_total:
+            pbar_Ntot_estimate_factor = len(urlnames) / N_files_total
+
+        Nlines_total = 0
+        Ntotal_downloads = len(local_files)
+
+        def download_and_parse_one_file(urlname, local_file, Ndownload):
+            if verbose:
+                inputf = urlname.split("/")[-1]
+                print(
+                    f"Downloading {inputf} for {molecule} ({Ndownload}/{Ntotal_downloads})."
+                )
+
+            db_path = str(self.local_databases).lower()
+            if "hitemp" in db_path:
+                from radis.api.hitempapi import login_to_hitran
+                session = login_to_hitran(verbose=verbose)
+            else:
+                session = requests.Session()
+
+            headers = {
+                "Accept": "application/zip, application/octet-stream",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            }
+
+            try:
+                response = session.get(
+                    urlname, headers=headers, stream=True, allow_redirects=True
+                )
+                response.raise_for_status()
+
+                content_type = response.headers.get("content-type", "").lower()
+                if "text/html" in content_type:
+                    raise requests.HTTPError(
+                        f"Received HTML instead of a data file for {urlname}. "
+                        "HITRAN login is likely required. Set HITRAN_USERNAME and HITRAN_PASSWORD."
+                    )
+
+                temp_file_path = urlname.split("/")[-1]
+                temp_file_path = re.sub(r'[<>:\"/\\\\|?*&=]', "_", temp_file_path)
+
+                with open(temp_file_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+
+                opener = radis_dbmanager.RequestsFileOpener(temp_file_path)
+
+                Nlines = self.parse_to_local_file(
+                    opener,
+                    urlname,
+                    local_file,
+                    pbar_active=(not parallel),
+                    pbar_t0=time() - t0,
+                    pbar_Ntot_estimate_factor=pbar_Ntot_estimate_factor,
+                    pbar_Nlines_already=Nlines_total,
+                    pbar_last=(Ndownload == Ntotal_downloads),
+                )
+
+            except requests.RequestException as err:
+                raise type(err)(
+                    f"Problem downloading: {urlname}. Error: {str(err)}"
+                ).with_traceback(err.__traceback__)
+            except Exception as err:
+                raise type(err)(
+                    f"Problem parsing downloaded file from {urlname}. "
+                    "Check the error above. It may arise if the file wasn't properly downloaded.\n\n"
+                    f"Error: {str(err)}"
+                ).with_traceback(err.__traceback__)
+
+            return Nlines
+
+        if parallel and len(local_files) > self.minimum_nfiles:
+            nJobs = self.nJobs
+            batch_size = self.batch_size
+            if self.verbose:
+                print(
+                    f"Downloading and parsing {urlnames} to {local_files} "
+                    + f"({len(local_files)}) files), in parallel ({nJobs} jobs)"
+                )
+            Nlines_total = sum(
+                radis_dbmanager.Parallel(
+                    n_jobs=nJobs, batch_size=batch_size, verbose=self.verbose
+                )(
+                    radis_dbmanager.delayed(download_and_parse_one_file)(
+                        urlname, local_file, Ndownload
+                    )
+                    for urlname, local_file, Ndownload in zip(
+                        urlnames, local_files, range(1, len(local_files) + 1)
+                    )
+                )
+            )
+        else:
+            for urlname, local_file, Ndownload in zip(
+                urlnames, local_files, range(1, len(local_files) + 1)
+            ):
+                download_and_parse_one_file(urlname, local_file, Ndownload)
+
+    download_and_parse._no_head_patched = True
+    radis_dbmanager.DatabaseManager.download_and_parse = download_and_parse
+
+
+_patch_radis_download()
+
+
 def setup_cia_opacities(cia_paths: dict[str, str], nu_grid: np.ndarray) -> dict[str, OpaCIA]:
     """Setup CIA opacities for H2-H2 and H2-He."""
     opa_cias = {}
