@@ -214,6 +214,16 @@ def apply_cli_overrides(args):
     # Data directory
     if args.data_dir:
         config.DATA_DIR = args.data_dir
+        config.TRANSMISSION_DATA = {
+            "wavelength": os.path.join(config.DATA_DIR, "wavelength_transmission.npy"),
+            "spectrum": os.path.join(config.DATA_DIR, "spectrum_transmission.npy"),
+            "uncertainty": os.path.join(config.DATA_DIR, "uncertainty_transmission.npy"),
+        }
+        config.EMISSION_DATA = {
+            "wavelength": os.path.join(config.DATA_DIR, "wavelength_emission.npy"),
+            "spectrum": os.path.join(config.DATA_DIR, "spectrum_emission.npy"),
+            "uncertainty": os.path.join(config.DATA_DIR, "uncertainty_emission.npy"),
+        }
     else:
         config.DATA_DIR = config.get_data_dir()
         config.TRANSMISSION_DATA = config.get_transmission_paths()
@@ -285,19 +295,6 @@ def setup_logging(args):
     return logging.getLogger(__name__)
 
 
-def print_banner():
-    """Print welcome banner."""
-    banner = """
-╔══════════════════════════════════════════════════════════════════╗
-║                                                                  ║
-║      KELT-20b Ultra-Hot Jupiter Atmospheric Retrieval            ║
-║                   ExoJAX + NumPyro                               ║
-║                                                                  ║
-╚══════════════════════════════════════════════════════════════════╝
-"""
-    print(banner)
-
-
 def print_config_summary(config, args):
     """Print configuration summary."""
     params = config.get_params()
@@ -363,10 +360,6 @@ def main():
 
     # Setup logging
     logger = setup_logging(args)
-
-    # Print banner
-    if not args.quiet:
-        print_banner()
 
     # Load config
     if args.config:

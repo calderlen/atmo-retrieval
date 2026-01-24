@@ -26,11 +26,6 @@ def run_transmission_retrieval(
 ) -> None:
     """Run transmission spectrum retrieval."""
 
-    print("="*70)
-    print("KELT-20b Transmission Spectrum Retrieval")
-    print("PEPSI/LBT")
-    print("="*70)
-
     # Create timestamped output directory
     base_dir = config.DIR_SAVE or config.get_output_dir()
     output_dir = config.create_timestamped_dir(base_dir)

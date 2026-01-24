@@ -3,11 +3,39 @@
 from typing import Callable
 import numpy as np
 import jax.numpy as jnp
+import pathlib
 from exojax.database.contdb import CdbCIA
 from exojax.opacity.opacont import OpaCIA
 from exojax.database.api import MdbHitemp, MdbExomol
 from exojax.opacity.premodit.api import OpaPremodit
 from exojax.opacity import saveopa
+
+
+def _patch_path_contains():
+    if not hasattr(pathlib.Path, "__contains__"):
+        def _contains(self, item):
+            return str(item) in str(self)
+        pathlib.Path.__contains__ = _contains
+
+
+def _patch_radis_dbmanager():
+    try:
+        from radis.api import dbmanager as radis_dbmanager
+    except Exception:
+        return
+    orig_init = getattr(radis_dbmanager.DatabaseManager, "__init__", None)
+    if orig_init is None or getattr(orig_init, "_path_patched", False):
+        return
+
+    def _init(self, name, molecule, local_databases, *args, **kwargs):
+        return orig_init(self, name, molecule, str(local_databases), *args, **kwargs)
+
+    _init._path_patched = True
+    radis_dbmanager.DatabaseManager.__init__ = _init
+
+
+_patch_path_contains()
+_patch_radis_dbmanager()
 
 
 def setup_cia_opacities(cia_paths: dict[str, str], nu_grid: np.ndarray) -> dict[str, OpaCIA]:
@@ -56,6 +84,7 @@ def load_or_build_opacity(
     Thigh: float,
 ) -> tuple[OpaPremodit, float]:
     """Load saved opacity or build from database snapshot."""
+    path = str(path)
     if opa_load:
         try:
             opa = OpaPremodit.from_saved_opa(f"opa_{mol}.zarr", strict=False)
