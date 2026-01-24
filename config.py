@@ -308,11 +308,11 @@ CLOUD_INTEGRATED_TAU = 30.0  # Lower than WASP-39b (UHJs have minimal clouds on 
 INPUT_DIR = os.path.join(os.path.dirname(__file__), "input")
 os.makedirs(INPUT_DIR, exist_ok=True)
 
-# Molecular databases
-DB_HITEMP = os.path.join(INPUT_DIR, ".db_HITEMP/")
-DB_EXOMOL = os.path.join(INPUT_DIR, ".db_ExoMol/")
-DB_KURUCZ = os.path.join(INPUT_DIR, ".db_kurucz/")
-DB_CIA = os.path.join(INPUT_DIR, ".db_CIA/")
+# Molecular databases (override with env vars if set)
+DB_HITEMP = os.environ.get("HITEMP_DIR") or os.path.join(INPUT_DIR, ".db_HITEMP/")
+DB_EXOMOL = os.environ.get("EXOMOL_DIR") or os.path.join(INPUT_DIR, ".db_ExoMol/")
+DB_KURUCZ = os.environ.get("KURUCZ_DIR") or os.path.join(INPUT_DIR, ".db_kurucz/")
+DB_CIA = os.environ.get("CIA_DIR") or os.path.join(INPUT_DIR, ".db_CIA/")
 
 # CIA paths
 CIA_PATHS = {
@@ -332,7 +332,7 @@ MOLPATH_EXOMOL = {
     "TiO": os.path.join(DB_EXOMOL, "TiO/48Ti-16O/Toto/"),
     "VO": os.path.join(DB_EXOMOL, "VO/51V-16O/VOMYT/"),
     "FeH": os.path.join(DB_EXOMOL, "FeH/56Fe-1H/MoLLIST/"),
-    "CaH": os.path.join(DB_EXOMOL, "CaH/40Ca-1H/MoLLIST/"),
+    "CaH": os.path.join(DB_EXOMOL, "CaH/40Ca-1H/XAB/"),
     "CrH": os.path.join(DB_EXOMOL, "CrH/52Cr-1H/MoLLIST/"),
     "AlO": os.path.join(DB_EXOMOL, "AlO/27Al-16O/ATP/"),
 }
