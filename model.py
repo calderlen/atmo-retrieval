@@ -35,6 +35,19 @@ _TWO_PI = 2.0 * jnp.pi
 _C_KMS = 299792.458  # Speed of light in km/s
 
 
+def _element_from_species(species_name: str) -> str:
+    """Extract element name from species notation.
+
+    Examples:
+        "Fe I" -> "Fe"
+        "Fe II" -> "Fe"
+        "Ca II" -> "Ca"
+        "Na" -> "Na"
+    """
+    # Split on space and take first part (the element)
+    return species_name.split()[0]
+
+
 def planet_rv_kms(
     phase: jnp.ndarray,
     Kp_kms: float, 
@@ -340,7 +353,8 @@ def reconstruct_mmw_and_h2he(
     """
     # Compute molecular masses
     mol_masses = {m: molinfo.molmass_isotope(m) for m in mol_names}
-    atom_masses = {a: molinfo.molmass_isotope(a) for a in atom_names}
+    # For atoms, extract element name from species notation (e.g., "Fe I" -> "Fe")
+    atom_masses = {a: molinfo.molmass_isotope(_element_from_species(a)) for a in atom_names}
     
     # Sum VMRs
     sum_mols = sum(vmr_mols.values()) if vmr_mols else 0.0
@@ -561,7 +575,7 @@ def create_retrieval_model(
     mol_masses = jnp.array([molinfo.molmass_isotope(m) for m in mol_names])
     # Handle case where opa_atoms is {}
     if len(atom_names) > 0:
-        atom_masses = jnp.array([molinfo.molmass_isotope(a) for a in atom_names])
+        atom_masses = jnp.array([molinfo.molmass_isotope(_element_from_species(a)) for a in atom_names])
     else:
         atom_masses = jnp.zeros((0,))
 

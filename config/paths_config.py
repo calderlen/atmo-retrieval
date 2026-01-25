@@ -51,13 +51,60 @@ MOLPATH_EXOMOL = {
 }
 
 # Atomic line lists (Kurucz/VALD)
+# Format: "Element_I" for neutral, "Element_II" for singly ionized
+# Key names match spectroscopic notation (e.g., "Fe I", "Fe II")
 ATOMIC_SPECIES = {
-    "Na": {"element": "Na", "ionization": 0},  # Na I
-    "K": {"element": "K", "ionization": 0},    # K I
-    "Ca": {"element": "Ca", "ionization": 1},  # Ca II
-    "Fe": {"element": "Fe", "ionization": 0},  # Fe I
-    "Ti": {"element": "Ti", "ionization": 0},  # Ti I
-    "V": {"element": "V", "ionization": 0},    # V I
+    # Neutral atoms (ionization = 0)
+    "Al I": {"element": "Al", "ionization": 0},
+    "B I": {"element": "B", "ionization": 0},
+    "Ba I": {"element": "Ba", "ionization": 0},
+    "Be I": {"element": "Be", "ionization": 0},
+    "Ca I": {"element": "Ca", "ionization": 0},
+    "Co I": {"element": "Co", "ionization": 0},
+    "Cr I": {"element": "Cr", "ionization": 0},
+    "Cs I": {"element": "Cs", "ionization": 0},
+    "Cu I": {"element": "Cu", "ionization": 0},
+    "Fe I": {"element": "Fe", "ionization": 0},
+    "Ga I": {"element": "Ga", "ionization": 0},
+    "Ge I": {"element": "Ge", "ionization": 0},
+    "Hf I": {"element": "Hf", "ionization": 0},
+    "In I": {"element": "In", "ionization": 0},
+    "Ir I": {"element": "Ir", "ionization": 0},
+    "K I": {"element": "K", "ionization": 0},
+    "Li I": {"element": "Li", "ionization": 0},
+    "Mg I": {"element": "Mg", "ionization": 0},
+    "Mn I": {"element": "Mn", "ionization": 0},
+    "Mo I": {"element": "Mo", "ionization": 0},
+    "Na I": {"element": "Na", "ionization": 0},
+    "Nb I": {"element": "Nb", "ionization": 0},
+    "Ni I": {"element": "Ni", "ionization": 0},
+    "Os I": {"element": "Os", "ionization": 0},
+    "Pb I": {"element": "Pb", "ionization": 0},
+    "Pd I": {"element": "Pd", "ionization": 0},
+    "Rb I": {"element": "Rb", "ionization": 0},
+    "Rh I": {"element": "Rh", "ionization": 0},
+    "Ru I": {"element": "Ru", "ionization": 0},
+    "Sc I": {"element": "Sc", "ionization": 0},
+    "Si I": {"element": "Si", "ionization": 0},
+    "Sn I": {"element": "Sn", "ionization": 0},
+    "Sr I": {"element": "Sr", "ionization": 0},
+    "Ti I": {"element": "Ti", "ionization": 0},
+    "Tl I": {"element": "Tl", "ionization": 0},
+    "V I": {"element": "V", "ionization": 0},
+    "W I": {"element": "W", "ionization": 0},
+    "Y I": {"element": "Y", "ionization": 0},
+    "Zn I": {"element": "Zn", "ionization": 0},
+    "Zr I": {"element": "Zr", "ionization": 0},
+    # Singly ionized atoms (ionization = 1)
+    "Ba II": {"element": "Ba", "ionization": 1},
+    "Ca II": {"element": "Ca", "ionization": 1},
+    "Cr II": {"element": "Cr", "ionization": 1},
+    "Fe II": {"element": "Fe", "ionization": 1},
+    "Mg II": {"element": "Mg", "ionization": 1},
+    "Sc II": {"element": "Sc", "ionization": 1},
+    "Sr II": {"element": "Sr", "ionization": 1},
+    "Ti II": {"element": "Ti", "ionization": 1},
+    "Y II": {"element": "Y", "ionization": 1},
 }
 
 # ==============================================================================

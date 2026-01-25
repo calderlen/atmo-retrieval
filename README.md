@@ -33,7 +33,7 @@ flowchart TB
     end
 
     subgraph Opacity["Opacity Setup"]
-        opa_setup["opacity_setup.py"]
+        opa_setup["opacity.py"]
         cia["CIA<br/><i>H₂-H₂, H₂-He</i>"]
         hitemp["HITEMP<br/><i>H₂O, CO, OH</i>"]
         exomol["ExoMol<br/><i>TiO, VO, FeH...</i>"]
@@ -136,7 +136,7 @@ python __main__.py --help
 ├── preprocess.py          # PEPSI data preprocessing
 ├── tellurics.py           # Telluric fitting and correction (HITRAN H2O)
 ├── grid_setup.py          # Wavenumber grid and spectral operators
-├── opacity_setup.py       # CIA, molecular, atomic opacities
+├── opacity.py       # CIA, molecular, atomic opacities
 ├── model.py               # NumPyro atmospheric model
 ├── pt.py                  # Temperature-pressure profiles
 ├── inference.py           # SVI and HMC-NUTS

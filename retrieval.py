@@ -10,7 +10,7 @@ from exojax.rt import ArtTransPure, ArtEmisPure
 import config
 from load import load_observed_spectrum, ResolutionInterpolator
 from grid_setup import setup_wavenumber_grid, setup_spectral_operators
-from opacity_setup import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
+from opacity import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
 from model import create_retrieval_model, PhaseMode, compute_atmospheric_state_from_posterior
 from inference import run_svi, run_mcmc, generate_predictions
 from plot import (

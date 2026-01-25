@@ -332,57 +332,137 @@ def load_atomic_opacities(
     
     # Atomic mass lookup (most common isotopes)
     ATOMIC_MASSES = {
-        "Na": 22.99,   # 23Na
-        "K": 39.10,    # 39K  
-        "Ca": 40.08,   # 40Ca
-        "Fe": 55.85,   # 56Fe
-        "Ti": 47.87,   # 48Ti
-        "V": 50.94,    # 51V
-        "Cr": 52.00,   # 52Cr
-        "Mg": 24.31,   # 24Mg
-        "Li": 6.94,    # 7Li
+        "Al": 26.98,   # 27Al
+        "B": 10.81,    # 11B
         "Ba": 137.33,  # 138Ba
+        "Be": 9.01,    # 9Be
+        "Ca": 40.08,   # 40Ca
+        "Co": 58.93,   # 59Co
+        "Cr": 52.00,   # 52Cr
+        "Cs": 132.91,  # 133Cs
+        "Cu": 63.55,   # 63Cu
+        "Fe": 55.85,   # 56Fe
+        "Ga": 69.72,   # 69Ga
+        "Ge": 72.63,   # 74Ge
+        "Hf": 178.49,  # 180Hf
+        "In": 114.82,  # 115In
+        "Ir": 192.22,  # 193Ir
+        "K": 39.10,    # 39K
+        "Li": 6.94,    # 7Li
+        "Mg": 24.31,   # 24Mg
+        "Mn": 54.94,   # 55Mn
+        "Mo": 95.95,   # 98Mo
+        "Na": 22.99,   # 23Na
+        "Nb": 92.91,   # 93Nb
+        "Ni": 58.69,   # 58Ni
+        "Os": 190.23,  # 192Os
+        "Pb": 207.2,   # 208Pb
+        "Pd": 106.42,  # 106Pd
+        "Rb": 85.47,   # 85Rb
+        "Rh": 102.91,  # 103Rh
+        "Ru": 101.07,  # 102Ru
+        "Sc": 44.96,   # 45Sc
+        "Si": 28.09,   # 28Si
+        "Sn": 118.71,  # 120Sn
+        "Sr": 87.62,   # 88Sr
+        "Ti": 47.87,   # 48Ti
+        "Tl": 204.38,  # 205Tl
+        "V": 50.94,    # 51V
+        "W": 183.84,   # 184W
+        "Y": 88.91,    # 89Y
+        "Zn": 65.38,   # 64Zn
+        "Zr": 91.22,   # 90Zr
     }
-    
-    # ExoAtom naming conventions
+
+    # ExoAtom naming conventions: element -> path
+    # Format: {element}/{mass}{element}/Kurucz
+    # For ions, append "_I" or "_II" suffix when loading
     EXOATOM_PATHS = {
-        "Na": "Na/23Na/Kurucz",
-        "K": "K/39K/Kurucz", 
+        "Al": "Al/27Al/Kurucz",
+        "B": "B/11B/Kurucz",
+        "Ba": "Ba/138Ba/Kurucz",
+        "Be": "Be/9Be/Kurucz",
         "Ca": "Ca/40Ca/Kurucz",
-        "Fe": "Fe/56Fe/Kurucz",
-        "Ti": "Ti/48Ti/Kurucz",
-        "V": "V/51V/Kurucz",
+        "Co": "Co/59Co/Kurucz",
         "Cr": "Cr/52Cr/Kurucz",
+        "Cs": "Cs/133Cs/Kurucz",
+        "Cu": "Cu/63Cu/Kurucz",
+        "Fe": "Fe/56Fe/Kurucz",
+        "Ga": "Ga/69Ga/Kurucz",
+        "Ge": "Ge/74Ge/Kurucz",
+        "Hf": "Hf/180Hf/Kurucz",
+        "In": "In/115In/Kurucz",
+        "Ir": "Ir/193Ir/Kurucz",
+        "K": "K/39K/Kurucz",
+        "Li": "Li/7Li/Kurucz",
         "Mg": "Mg/24Mg/Kurucz",
+        "Mn": "Mn/55Mn/Kurucz",
+        "Mo": "Mo/98Mo/Kurucz",
+        "Na": "Na/23Na/Kurucz",
+        "Nb": "Nb/93Nb/Kurucz",
+        "Ni": "Ni/58Ni/Kurucz",
+        "Os": "Os/192Os/Kurucz",
+        "Pb": "Pb/208Pb/Kurucz",
+        "Pd": "Pd/106Pd/Kurucz",
+        "Rb": "Rb/85Rb/Kurucz",
+        "Rh": "Rh/103Rh/Kurucz",
+        "Ru": "Ru/102Ru/Kurucz",
+        "Sc": "Sc/45Sc/Kurucz",
+        "Si": "Si/28Si/Kurucz",
+        "Sn": "Sn/120Sn/Kurucz",
+        "Sr": "Sr/88Sr/Kurucz",
+        "Ti": "Ti/48Ti/Kurucz",
+        "Tl": "Tl/205Tl/Kurucz",
+        "V": "V/51V/Kurucz",
+        "W": "W/184W/Kurucz",
+        "Y": "Y/89Y/Kurucz",
+        "Zn": "Zn/64Zn/Kurucz",
+        "Zr": "Zr/90Zr/Kurucz",
     }
     
     for atom, atom_config in atomic_species.items():
         element = atom_config.get("element", atom)
         ionization = atom_config.get("ionization", 0)
-        
-        # Skip ions for now (ExoAtom neutral atoms only initially)
-        if ionization > 0:
-            print(f"  * {atom} (ion, skipping - not yet supported)")
-            continue
-            
+
         if element not in EXOATOM_PATHS:
             print(f"  * {atom} (not in ExoAtom database, skipping)")
             continue
-            
-        exoatom_path = pathlib.Path(db_exoatom) / EXOATOM_PATHS[element]
-        
-        if not exoatom_path.exists():
-            print(f"  * {atom} (ExoAtom data not found at {exoatom_path}, skipping)")
+
+        # Build path - for ions, try ionization-specific subdirectory first
+        base_path = EXOATOM_PATHS[element]
+        if ionization > 0:
+            # Try ion-specific path: e.g., Fe/56Fe/Kurucz_II or Fe/56Fe_II/Kurucz
+            ion_suffix = "I" * (ionization + 1)  # I for neutral, II for +1, III for +2
+            ion_paths_to_try = [
+                f"{base_path}_{ion_suffix}",  # Fe/56Fe/Kurucz_II
+                base_path.replace("/Kurucz", f"_{ion_suffix}/Kurucz"),  # Fe/56Fe_II/Kurucz
+                base_path,  # Fall back to neutral path (some databases combine all ions)
+            ]
+        else:
+            ion_paths_to_try = [base_path]
+
+        exoatom_path = None
+        for try_path in ion_paths_to_try:
+            candidate = pathlib.Path(db_exoatom) / try_path
+            if candidate.exists():
+                exoatom_path = candidate
+                break
+
+        if exoatom_path is None:
+            print(f"  * {atom} (ExoAtom data not found, skipping)")
+            print(f"    Tried paths: {[str(pathlib.Path(db_exoatom) / p) for p in ion_paths_to_try]}")
             print(f"    Download from: https://exomol.com/data/atoms/{element}/")
             continue
-        
+
         print(f"  * {atom} (ExoAtom)")
-        
+
         try:
             # ExoAtom uses ExoMol format, so we can use MdbExomol
             mdb_factory = lambda p: MdbExomol(str(p), nu_grid, gpu_transfer=False)
+            # Use sanitized name for cache (replace space with underscore)
+            cache_name = f"atom_{atom.replace(' ', '_')}"
             opa, molmass = load_or_build_opacity(
-                f"atom_{atom}",
+                cache_name,
                 str(exoatom_path),
                 mdb_factory,
                 opa_load,
