@@ -9,6 +9,9 @@ flowchart TB
         spectra["spectra/<br/><i>Processed .npy</i>"]
         db_hitemp[".db_HITEMP/<br/><i>HITEMP line lists</i>"]
         db_exomol[".db_ExoMol/<br/><i>ExoMol line lists</i>"]
+        db_exoatom[".db_ExoAtom/<br/><i>ExoAtom atomic line lists</i>"]
+        db_kurucz[".db_kurucz/<br/><i>Kurucz gfall</i>"]
+        db_vald[".db_VALD/<br/><i>VALD3 extract</i>"]
         db_cia[".db_CIA/<br/><i>CIA databases</i>"]
         opa_cache[".opa_cache/<br/><i>Cached opacities</i>"]
     end
@@ -18,30 +21,30 @@ flowchart TB
     end
 
     subgraph Config["Configuration (config/)"]
-        planets["planets.py<br/><i>System parameters</i>"]
-        instrument["instrument.py<br/><i>PEPSI settings</i>"]
-        model_cfg["model.py<br/><i>RT parameters</i>"]
-        paths["paths.py<br/><i>Database paths</i>"]
-        inf_cfg["inference.py<br/><i>Sampling params</i>"]
+        planets["planets_config.py<br/><i>System parameters</i>"]
+        instrument["instrument_config.py<br/><i>PEPSI settings</i>"]
+        model_cfg["model_config.py<br/><i>RT parameters</i>"]
+        paths["paths_config.py<br/><i>Database paths</i>"]
+        inf_cfg["inference_config.py<br/><i>Sampling params</i>"]
     end
 
     subgraph DataPrep["Data Preparation"]
-        load["load.py<br/><i>Load spectra</i>"]
-        preprocess["preprocess.py<br/><i>PEPSI reduction</i>"]
-        tellurics["tellurics.py<br/><i>Telluric correction</i>"]
-        grid["grid_setup.py<br/><i>Wavenumber grid</i>"]
+        load["dataio/load.py<br/><i>Load spectra</i>"]
+        preprocess["dataio/preprocess.py<br/><i>PEPSI reduction</i>"]
+        tellurics["dataio/tellurics.py<br/><i>Telluric correction</i>"]
+        grid["physics/grid_setup.py<br/><i>Wavenumber grid</i>"]
     end
 
     subgraph Opacity["Opacity Setup"]
-        opa_setup["opacity.py"]
+        opa_setup["databases/opacity.py"]
         cia["CIA<br/><i>H₂-H₂, H₂-He</i>"]
         hitemp["HITEMP<br/><i>H₂O, CO, OH</i>"]
         exomol["ExoMol<br/><i>TiO, VO, FeH...</i>"]
     end
 
     subgraph Forward["Forward Model"]
-        model["model.py<br/><i>NumPyro model</i>"]
-        pt["pt.py<br/><i>T-P profiles</i>"]
+        model["physics/model.py<br/><i>NumPyro model</i>"]
+        pt["physics/pt.py<br/><i>T-P profiles</i>"]
     end
 
     subgraph Inference["Bayesian Inference"]
@@ -52,7 +55,7 @@ flowchart TB
 
     subgraph Output["Results (output/)"]
         posterior["Posterior Samples<br/><i>.npz files</i>"]
-        plots["plot.py<br/><i>Diagnostics</i>"]
+        plots["plotting/plot.py<br/><i>Diagnostics</i>"]
     end
 
     %% Data flow
@@ -62,11 +65,14 @@ flowchart TB
 
     db_hitemp --> opa_setup
     db_exomol --> opa_setup
+    db_exoatom --> opa_setup
+    db_kurucz --> opa_setup
+    db_vald --> opa_setup
     db_cia --> opa_setup
     opa_setup --> opa_cache
 
     %% Main flow
-    main --> retrieval["retrieval.py<br/><i>Pipeline orchestrator</i>"]
+    main --> retrieval["pipeline/retrieval.py<br/><i>Pipeline orchestrator</i>"]
     Config --> retrieval
 
     retrieval --> load
@@ -100,7 +106,7 @@ flowchart TB
     classDef inference fill:#e8eaf6,stroke:#3f51b5
     classDef output fill:#efebe9,stroke:#5d4037
 
-    class raw,spectra,db_hitemp,db_exomol,db_cia,opa_cache input
+    class raw,spectra,db_hitemp,db_exomol,db_exoatom,db_kurucz,db_vald,db_cia,opa_cache input
     class main,retrieval entry
     class planets,instrument,model_cfg,paths,inf_cfg config
     class load,preprocess,tellurics,grid data
@@ -127,21 +133,30 @@ python __main__.py --help
 
 ```
 ├── config/                # Configuration package
-│   ├── planets.py         #   Planet/system parameters from literature
-│   ├── instrument.py      #   Spectrograph settings (PEPSI/LBT)
-│   ├── model.py           #   RT and spectral grid parameters
-│   ├── paths.py           #   Database paths and output directories
-│   └── inference.py       #   SVI and MCMC sampling parameters
-├── load.py                # Data loading
-├── preprocess.py          # PEPSI data preprocessing
-├── tellurics.py           # Telluric fitting and correction (HITRAN H2O)
-├── grid_setup.py          # Wavenumber grid and spectral operators
-├── opacity.py       # CIA, molecular, atomic opacities
-├── model.py               # NumPyro atmospheric model
-├── pt.py                  # Temperature-pressure profiles
-├── inference.py           # SVI and HMC-NUTS
-├── plot.py                # Visualization
-├── retrieval.py           # Retrieval pipeline orchestrator
+│   ├── planets_config.py  #   Planet/system parameters from literature
+│   ├── instrument_config.py # Spectrograph settings (PEPSI/LBT)
+│   ├── model_config.py    #   RT and spectral grid parameters
+│   ├── paths_config.py    #   Database paths and output directories
+│   └── inference_config.py #  SVI and MCMC sampling parameters
+├── databases/             # Line lists and opacities
+│   ├── atomic.py          #   Atomic DB helpers (Kurucz/VALD/ExoAtom)
+│   └── opacity.py         #   CIA, molecular, atomic opacities
+├── dataio/                # Data loading and preprocessing
+│   ├── load.py            #   Data loading
+│   ├── preprocess.py      #   PEPSI data preprocessing
+│   ├── tellurics.py       #   Telluric fitting and correction (HITRAN H2O)
+│   └── horus.py           #   Doppler shadow removal
+├── physics/               # Forward-model physics
+│   ├── grid_setup.py      #   Wavenumber grid and spectral operators
+│   ├── model.py           #   NumPyro atmospheric model
+│   └── pt.py              #   Temperature-pressure profiles
+├── pipeline/              # Retrieval orchestration
+│   ├── inference.py       #   SVI and HMC-NUTS
+│   ├── retrieval.py       #   Retrieval pipeline orchestrator
+│   └── retrieval_binned.py #  Phase-binned retrievals
+├── plotting/              # Diagnostics and figures
+│   ├── plot.py            #   Visualization
+│   └── aliasing.py        #   Species aliasing diagnostics
 └── __main__.py            # CLI entry point
 ```
 
@@ -153,7 +168,9 @@ input/
 ├── spectra/               # Processed .npy files by planet/epoch/arm
 ├── .db_HITEMP/            # HITEMP line lists (H2O, CO, OH)
 ├── .db_ExoMol/            # ExoMol line lists (TiO, VO, FeH, etc.)
-├── .db_ExoAtom/           # Atomic line lists (Na, K, Fe, etc.)
+├── .db_ExoAtom/           # ExoAtom atomic line lists (auto-download)
+├── .db_kurucz/            # Kurucz gfall atomic line lists (auto-download)
+├── .db_VALD/              # VALD3 extract file (manual download)
 ├── .db_CIA/               # CIA databases (H2-H2, H2-He)
 └── .opa_cache/            # Cached preMODIT opacities (.zarr)
 ```
@@ -162,24 +179,24 @@ input/
 
 Configuration is split into logical modules under `config/`:
 
-- **planets.py**: Planet parameters from published literature with ephemeris source tracking
+- **planets_config.py**: Planet parameters from published literature with ephemeris source tracking
   - `PLANET` and `EPHEMERIS` select the active target
   - `get_params()` returns parameters for the current planet/ephemeris
   - Supports multiple ephemeris sources per planet (e.g., "Duck24", "Talens18")
 
-- **instrument.py**: Spectrograph and observatory settings
+- **instrument_config.py**: Spectrograph and observatory settings
   - `RESOLUTION`, `OBSERVING_MODE`, wavelength ranges
   - FITS header key mappings and file patterns
 
-- **model.py**: Radiative transfer parameters
+- **model_config.py**: Radiative transfer parameters
   - Pressure/temperature ranges, atmospheric layers
   - Spectral grid resolution, cloud parameters
 
-- **paths.py**: Database and output paths
+- **paths_config.py**: Database and output paths
   - HITEMP, ExoMol, Kurucz database locations
   - Input/output directory structure
 
-- **inference.py**: Sampling parameters
+- **inference_config.py**: Sampling parameters
   - SVI steps and learning rate
   - MCMC warmup, samples, chains
 

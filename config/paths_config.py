@@ -24,7 +24,9 @@ INPUT_DIR.mkdir(exist_ok=True)
 # Molecular databases (override with env vars if set)
 DB_HITEMP = Path(os.environ.get("HITEMP_DIR") or INPUT_DIR / ".db_HITEMP")
 DB_EXOMOL = Path(os.environ.get("EXOMOL_DIR") or INPUT_DIR / ".db_ExoMol")
+DB_EXOATOM = Path(os.environ.get("EXOATOM_DIR") or INPUT_DIR / ".db_ExoAtom")
 DB_KURUCZ = Path(os.environ.get("KURUCZ_DIR") or INPUT_DIR / ".db_kurucz")
+DB_VALD = Path(os.environ.get("VALD_DIR") or INPUT_DIR / ".db_VALD")
 DB_CIA = Path(os.environ.get("CIA_DIR") or INPUT_DIR / ".db_CIA")
 
 # CIA paths

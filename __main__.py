@@ -435,7 +435,7 @@ def main():
     try:
         # Handle phase-binned retrieval
         if args.all_phase_bins:
-            from retrieval_binned import run_phase_binned_retrieval
+            from pipeline.retrieval_binned import run_phase_binned_retrieval
             
             logger.info("Starting phase-binned retrieval (all bins)...")
             run_phase_binned_retrieval(
@@ -450,7 +450,7 @@ def main():
             )
         
         elif args.phase_bin:
-            from retrieval_binned import run_phase_binned_retrieval
+            from pipeline.retrieval_binned import run_phase_binned_retrieval
             
             logger.info(f"Starting retrieval for phase bin: {args.phase_bin}...")
             run_phase_binned_retrieval(
@@ -465,7 +465,7 @@ def main():
             )
         
         elif args.mode == "transmission":
-            from retrieval import run_retrieval
+            from pipeline.retrieval import run_retrieval
 
             logger.info("Starting transmission retrieval...")
             run_retrieval(
@@ -480,7 +480,7 @@ def main():
             )
 
         elif args.mode == "emission":
-            from retrieval import run_retrieval
+            from pipeline.retrieval import run_retrieval
 
             logger.info("Starting emission retrieval...")
             run_retrieval(
