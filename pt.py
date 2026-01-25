@@ -15,6 +15,22 @@ def numpyro_isothermal(art: object, Tlow: float, Thigh: float) -> jnp.ndarray:
     return isothermal_profile(art, T0)
 
 
+def gradient_profile(art: object, T_bottom: float, T_top: float) -> jnp.ndarray:
+    """Linear temperature gradient from bottom to top of atmosphere."""
+    log_p = jnp.log10(art.pressure)
+    log_p_min, log_p_max = log_p.min(), log_p.max()
+    # Linear interpolation in log-pressure
+    frac = (log_p - log_p_min) / (log_p_max - log_p_min)
+    return T_bottom + (T_top - T_bottom) * frac
+
+
+def numpyro_gradient(art: object, Tlow: float, Thigh: float) -> jnp.ndarray:
+    """Linear gradient profile with NumPyro sampling."""
+    T_bottom = numpyro.sample("T_bottom", dist.Uniform(Tlow, Thigh))
+    T_top = numpyro.sample("T_top", dist.Uniform(Tlow, Thigh))
+    return gradient_profile(art, T_bottom, T_top)
+
+
 def guillot_profile(
     pressure_bar: jnp.ndarray,
     g_cgs: float,

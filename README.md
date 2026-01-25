@@ -4,6 +4,15 @@ This codebase performs Bayesian atmospheric retrieval on transmission and/or emi
 
 ```mermaid
 flowchart TB
+    subgraph Input["Input Data (input/)"]
+        raw["raw/<br/><i>FITS observations</i>"]
+        spectra["spectra/<br/><i>Processed .npy</i>"]
+        db_hitemp[".db_HITEMP/<br/><i>HITEMP line lists</i>"]
+        db_exomol[".db_ExoMol/<br/><i>ExoMol line lists</i>"]
+        db_cia[".db_CIA/<br/><i>CIA databases</i>"]
+        opa_cache[".opa_cache/<br/><i>Cached opacities</i>"]
+    end
+
     subgraph CLI["Entry Point"]
         main["__main__.py<br/><i>CLI parser</i>"]
     end
@@ -31,7 +40,7 @@ flowchart TB
     end
 
     subgraph Forward["Forward Model"]
-        model["model.py<br/><i>NumPyro model</i>"]
+        model["model.py<br/><i>NumPyro HRCCS</i>"]
         pt["pt.py<br/><i>T-P profiles</i>"]
     end
 
@@ -41,17 +50,26 @@ flowchart TB
         pred["Predictive<br/><i>Model spectra</i>"]
     end
 
-    subgraph Output["Results"]
+    subgraph Output["Results (output/)"]
         posterior["Posterior Samples<br/><i>.npz files</i>"]
         plots["plot.py<br/><i>Diagnostics</i>"]
     end
+
+    %% Data flow
+    raw --> preprocess
+    preprocess --> spectra
+    spectra --> load
+
+    db_hitemp --> opa_setup
+    db_exomol --> opa_setup
+    db_cia --> opa_setup
+    opa_setup --> opa_cache
 
     %% Main flow
     main --> retrieval["retrieval.py<br/><i>Pipeline orchestrator</i>"]
     Config --> retrieval
 
     retrieval --> load
-    preprocess --> load
     retrieval --> grid
     retrieval --> opa_setup
 
@@ -73,6 +91,7 @@ flowchart TB
     posterior --> plots
 
     %% Styling
+    classDef input fill:#fff9c4,stroke:#f57f17
     classDef entry fill:#e1f5fe,stroke:#01579b
     classDef config fill:#fff3e0,stroke:#e65100
     classDef data fill:#e8f5e9,stroke:#2e7d32
@@ -81,6 +100,7 @@ flowchart TB
     classDef inference fill:#e8eaf6,stroke:#3f51b5
     classDef output fill:#efebe9,stroke:#5d4037
 
+    class raw,spectra,db_hitemp,db_exomol,db_cia,opa_cache input
     class main,retrieval entry
     class planets,instrument,model_cfg,paths,inf_cfg config
     class load,preprocess,tellurics,grid data
@@ -89,15 +109,6 @@ flowchart TB
     class svi,mcmc,pred inference
     class posterior,plots output
 ```
-
-### Data Flow Summary
-
-1. **Configuration** → Load planet parameters, instrument settings, and sampling hyperparameters
-2. **Data Preparation** → Load observed spectrum, build high-resolution wavenumber grid
-3. **Opacity Setup** → Load/compute CIA and molecular cross-sections (cached as `.zarr`)
-4. **Forward Model** → NumPyro probabilistic model: T-P profile → opacities → radiative transfer → spectrum
-5. **Inference** → SVI warm-up finds good initialization, then HMC-NUTS samples the posterior
-6. **Output** → Posterior samples, predictive spectra, and diagnostic plots
 
 ## Quick Start
 
@@ -121,17 +132,30 @@ python __main__.py --help
 │   ├── model.py           #   RT and spectral grid parameters
 │   ├── paths.py           #   Database paths and output directories
 │   └── inference.py       #   SVI and MCMC sampling parameters
-├── load.py                # Data loading (PEPSI, JWST formats)
+├── load.py                # Data loading
 ├── preprocess.py          # PEPSI data preprocessing
 ├── tellurics.py           # Telluric fitting and correction (HITRAN H2O)
 ├── grid_setup.py          # Wavenumber grid and spectral operators
 ├── opacity_setup.py       # CIA, molecular, atomic opacities
-├── model.py               # NumPyro model for HRCCS time-series retrieval
-├── old/forward_model.py   # Legacy disk-integrated models
+├── model.py               # NumPyro model for HRCCS retrieval
+├── pt.py                  # Temperature-pressure profiles
 ├── inference.py           # SVI and HMC-NUTS
 ├── plot.py                # Visualization
-├── retrieval.py           # Retrieval pipeline functions
+├── retrieval.py           # Retrieval pipeline orchestrator
 └── __main__.py            # CLI entry point
+```
+
+## Input Directory Structure
+
+```
+input/
+├── raw/                   # Raw FITS observations (YYYYMMDD_PLANET/)
+├── spectra/               # Processed .npy files by planet/epoch/arm
+├── .db_HITEMP/            # HITEMP line lists (H2O, CO, OH)
+├── .db_ExoMol/            # ExoMol line lists (TiO, VO, FeH, etc.)
+├── .db_ExoAtom/           # Atomic line lists (Na, K, Fe, etc.)
+├── .db_CIA/               # CIA databases (H2-H2, H2-He)
+└── .opa_cache/            # Cached preMODIT opacities (.zarr)
 ```
 
 ## Configuration
