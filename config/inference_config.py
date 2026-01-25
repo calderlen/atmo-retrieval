@@ -17,5 +17,5 @@ MCMC_NUM_WARMUP = 2000
 MCMC_NUM_SAMPLES = 2000
 MCMC_MAX_TREE_DEPTH = 6
 
-# Parallel chains for better convergence
-MCMC_NUM_CHAINS = 4
+# Parallel chains
+MCMC_NUM_CHAINS = 1

@@ -1,9 +1,14 @@
 """Opacity setup for molecular and atomic species."""
 
 from typing import Callable
+import os
 import numpy as np
 import jax.numpy as jnp
 import pathlib
+
+# RADIS uses numba cache=True in some environments where caching is unsupported.
+os.environ.setdefault("NUMBA_DISABLE_CACHE", "1")
+
 from exojax.database.contdb import CdbCIA
 from exojax.opacity.opacont import OpaCIA
 from exojax.database.api import MdbHitemp, MdbExomol
@@ -60,52 +65,6 @@ ATOMIC_MASSES = {
     "Zn": 65.38,   # 64Zn
     "Zr": 91.22,   # 90Zr
 }
-
-# ExoAtom naming conventions: element -> path
-# Format: {element}/{mass}{element}/Kurucz
-EXOATOM_PATHS = {
-    "Al": "Al/27Al/Kurucz",
-    "B": "B/11B/Kurucz",
-    "Ba": "Ba/138Ba/Kurucz",
-    "Be": "Be/9Be/Kurucz",
-    "Ca": "Ca/40Ca/Kurucz",
-    "Co": "Co/59Co/Kurucz",
-    "Cr": "Cr/52Cr/Kurucz",
-    "Cs": "Cs/133Cs/Kurucz",
-    "Cu": "Cu/63Cu/Kurucz",
-    "Fe": "Fe/56Fe/Kurucz",
-    "Ga": "Ga/69Ga/Kurucz",
-    "Ge": "Ge/74Ge/Kurucz",
-    "Hf": "Hf/180Hf/Kurucz",
-    "In": "In/115In/Kurucz",
-    "Ir": "Ir/193Ir/Kurucz",
-    "K": "K/39K/Kurucz",
-    "Li": "Li/7Li/Kurucz",
-    "Mg": "Mg/24Mg/Kurucz",
-    "Mn": "Mn/55Mn/Kurucz",
-    "Mo": "Mo/98Mo/Kurucz",
-    "Na": "Na/23Na/Kurucz",
-    "Nb": "Nb/93Nb/Kurucz",
-    "Ni": "Ni/58Ni/Kurucz",
-    "Os": "Os/192Os/Kurucz",
-    "Pb": "Pb/208Pb/Kurucz",
-    "Pd": "Pd/106Pd/Kurucz",
-    "Rb": "Rb/85Rb/Kurucz",
-    "Rh": "Rh/103Rh/Kurucz",
-    "Ru": "Ru/102Ru/Kurucz",
-    "Sc": "Sc/45Sc/Kurucz",
-    "Si": "Si/28Si/Kurucz",
-    "Sn": "Sn/120Sn/Kurucz",
-    "Sr": "Sr/88Sr/Kurucz",
-    "Ti": "Ti/48Ti/Kurucz",
-    "Tl": "Tl/205Tl/Kurucz",
-    "V": "V/51V/Kurucz",
-    "W": "W/184W/Kurucz",
-    "Y": "Y/89Y/Kurucz",
-    "Zn": "Zn/64Zn/Kurucz",
-    "Zr": "Zr/90Zr/Kurucz",
-}
-
 
 def _patch_path_contains():
     if not hasattr(pathlib.Path, "__contains__"):
@@ -268,10 +227,45 @@ _patch_radis_download()
 def setup_cia_opacities(cia_paths: dict[str, str], nu_grid: np.ndarray) -> dict[str, OpaCIA]:
     """Setup CIA opacities for H2-H2 and H2-He."""
     opa_cias = {}
+
+    class _ZeroCIA:
+        """Fallback CIA that returns zero opacity (log10 = -inf)."""
+
+        def __init__(self, nu_size: int) -> None:
+            self._nu_size = int(nu_size)
+            self._is_dummy = True
+
+        def logacia_matrix(self, temperatures):
+            nlayer = len(temperatures)
+            return jnp.full((nlayer, self._nu_size), -jnp.inf)
+
     for name, path in cia_paths.items():
-        cdb = CdbCIA(str(path), nurange=nu_grid)
+        try:
+            cdb = CdbCIA(str(path), nurange=nu_grid)
+        except Exception as exc:
+            print(f"  Warning: Could not load CIA {name} ({exc})")
+            opa_cias[name] = _ZeroCIA(np.asarray(nu_grid).size)
+            continue
+        if np.asarray(cdb.nucia).size == 0:
+            print(f"  Warning: CIA {name} has no overlap with nu_grid; skipping.")
+            opa_cias[name] = _ZeroCIA(np.asarray(nu_grid).size)
+            continue
         opa_cias[name] = OpaCIA(cdb, nu_grid=nu_grid)
     return opa_cias
+
+
+def _opa_grid_matches(opa: OpaPremodit, nu_grid: np.ndarray) -> bool:
+    """Check whether a cached opacity matches the current wavenumber grid."""
+    try:
+        opa_grid = np.asarray(opa.nu_grid)
+    except Exception:
+        return False
+    nu_grid = np.asarray(nu_grid)
+    if opa_grid.shape != nu_grid.shape:
+        return False
+    if opa_grid.size == 0:
+        return False
+    return np.isclose(opa_grid[0], nu_grid[0]) and np.isclose(opa_grid[-1], nu_grid[-1])
 
 
 def build_premodit_from_snapshot(
@@ -317,6 +311,8 @@ def load_or_build_opacity(
         try:
             opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
             opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
+            if not _opa_grid_matches(opa, nu_grid):
+                raise ValueError("Cached opacity grid mismatch.")
             return opa, opa.aux["molmass"]
         except Exception:
             print(f"  Warning: Could not load saved opacity for {mol}, building from database...")
@@ -377,23 +373,19 @@ def load_atomic_opacities(
     diffmode: int,
     Tlow: float,
     Thigh: float,
-    db_exoatom: str | None = None,
     db_kurucz: str | None = None,
     db_vald: str | None = None,
     auto_download: bool = True,
-    use_kurucz_vald: bool = False,
 ) -> tuple[dict[str, OpaPremodit], jnp.ndarray]:
-    """Load atomic opacities.
+    """Load atomic opacities from Kurucz or VALD databases.
 
-    Default behavior uses ExoAtom (ExoMol format via MdbExomol).
-    Kurucz/VALD support is kept for later, but is disabled unless
-    use_kurucz_vald=True.
+    Kurucz line lists are auto-downloaded from kurucz.harvard.edu.
+    VALD requires manual download from vald.astro.uu.se.
 
     Source priority:
         1. Cached .zarr opacity (if opa_load=True)
-        2. Kurucz gfall (optional; if use_kurucz_vald=True)
-        3. VALD3 extract file (optional; if use_kurucz_vald=True)
-        4. ExoAtom via MdbExomol auto-download (official ExoJAX)
+        2. Kurucz gfall (auto-download enabled)
+        3. VALD3 extract file (if available)
     """
     opa_atoms = {}
     atommass_list = []
@@ -401,46 +393,40 @@ def load_atomic_opacities(
     if not atomic_species:
         return opa_atoms, jnp.array(atommass_list)
 
-    from config.paths_config import DB_EXOATOM
-    if db_exoatom is None:
-        db_exoatom = DB_EXOATOM
+    # Import Kurucz/VALD helpers
+    try:
+        from databases.atomic import (
+            load_kurucz_atomic,
+            load_vald_atomic,
+            create_atomic_snapshot,
+            resolve_vald_file,
+            parse_species,
+            ATOMIC_MASSES,
+        )
+    except ImportError as exc:
+        print(f"  Warning: Kurucz/VALD disabled ({exc})")
+        return opa_atoms, jnp.array(atommass_list)
 
-    db_exoatom = pathlib.Path(db_exoatom) if db_exoatom is not None else None
+    from config.paths_config import DB_KURUCZ, DB_VALD
+    if db_kurucz is None:
+        db_kurucz = DB_KURUCZ
+    if db_vald is None:
+        db_vald = DB_VALD
+    db_kurucz = pathlib.Path(db_kurucz)
+    db_vald = pathlib.Path(db_vald) if db_vald is not None else None
+    vald_file = resolve_vald_file(db_vald) if db_vald is not None else None
 
-    # Optional Kurucz/VALD setup (kept for later use)
-    if use_kurucz_vald:
-        try:
-            from databases.atomic import (
-                load_kurucz_atomic,
-                load_vald_atomic,
-                create_atomic_snapshot,
-                resolve_vald_file,
-                parse_species,
-                ATOMIC_MASSES,
-            )
-        except ImportError as exc:
-            print(f"  Warning: Kurucz/VALD disabled ({exc})")
-            use_kurucz_vald = False
+    print("Loading atomic line databases (Kurucz)...")
 
-    if use_kurucz_vald:
-        from config.paths_config import DB_KURUCZ, DB_VALD
-        if db_kurucz is None:
-            db_kurucz = DB_KURUCZ
-        if db_vald is None:
-            db_vald = DB_VALD
-        db_kurucz = pathlib.Path(db_kurucz)
-        db_vald = pathlib.Path(db_vald) if db_vald is not None else None
-        vald_file = resolve_vald_file(db_vald) if db_vald is not None else None
-
-    print("Loading atomic line databases (ExoAtom)...")
-
-    for atom in atomic_species.keys():
+    for atom, atom_meta in atomic_species.items():
         cache_name = f"atom_{atom.replace(' ', '_')}"
 
         if opa_load:
             try:
                 opa_path = OPA_CACHE_DIR / f"opa_{cache_name}.zarr"
                 opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
+                if not _opa_grid_matches(opa, nu_grid):
+                    raise ValueError("Cached opacity grid mismatch.")
                 molmass = opa.aux.get("molmass", None)
                 if molmass is None:
                     raise KeyError("Missing molmass in cached opacity.")
@@ -456,71 +442,29 @@ def load_atomic_opacities(
         source = None
         reasons = []
 
-        if use_kurucz_vald:
+        # Try Kurucz first
+        try:
+            adb, mask = load_kurucz_atomic(atom, nu_grid, db_kurucz, auto_download=auto_download)
+            snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
+            source = "Kurucz"
+        except Exception as exc:
+            reasons.append(f"Kurucz: {exc}")
+
+        # Fall back to VALD if available
+        if snapshot is None and vald_file is not None:
             try:
-                adb, mask = load_kurucz_atomic(atom, nu_grid, db_kurucz, auto_download=auto_download)
+                adb, mask = load_vald_atomic(atom, nu_grid, vald_file)
                 snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
-                source = "Kurucz"
+                source = "VALD"
             except Exception as exc:
-                reasons.append(f"Kurucz: {exc}")
+                reasons.append(f"VALD: {exc}")
+        elif snapshot is None and vald_file is None:
+            reasons.append("VALD: no extract file found")
 
-            if snapshot is None and vald_file is not None:
-                try:
-                    adb, mask = load_vald_atomic(atom, nu_grid, vald_file)
-                    snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
-                    source = "VALD"
-                except Exception as exc:
-                    reasons.append(f"VALD: {exc}")
-            elif snapshot is None and vald_file is None:
-                reasons.append("VALD: no extract file found")
-
-            if snapshot is not None and (molmass is None or (isinstance(molmass, float) and np.isnan(molmass))):
-                element, _ = parse_species(atom)
-                molmass = ATOMIC_MASSES.get(element, molmass)
-
-        if snapshot is None:
-            try:
-                parts = atom.split()
-                element = parts[0] if parts else atom
-                ionization = parts[1] if len(parts) > 1 else None
-                if element not in EXOATOM_PATHS:
-                    reasons.append("ExoAtom: no path mapping for element")
-                elif db_exoatom is None:
-                    reasons.append("ExoAtom: DB_EXOATOM not set")
-                else:
-                    base_path = EXOATOM_PATHS[element]
-                    if ionization is not None and ionization != "I":
-                        # Try ion-specific suffixes if present in local database
-                        ion_suffix = ionization
-                        ion_paths_to_try = [
-                            f"{base_path}_{ion_suffix}",
-                            base_path.replace("/Kurucz", f"_{ion_suffix}/Kurucz"),
-                        ]
-                    else:
-                        ion_paths_to_try = [base_path]
-
-                    exoatom_path = None
-                    for try_path in ion_paths_to_try:
-                        candidate = pathlib.Path(db_exoatom) / try_path
-                        if candidate.exists():
-                            exoatom_path = candidate
-                            break
-
-                    if exoatom_path is None:
-                        reasons.append(
-                            f"ExoAtom: data not found (tried {ion_paths_to_try})"
-                        )
-                    else:
-                        mdb = MdbExomol(
-                            str(exoatom_path),
-                            nu_grid,
-                            gpu_transfer=False,
-                        )
-                        snapshot = mdb.to_snapshot()
-                        molmass = mdb.molmass
-                        source = "ExoAtom"
-            except Exception as exc:
-                reasons.append(f"ExoAtom: {exc}")
+        # Fix missing molmass
+        if snapshot is not None and (molmass is None or (isinstance(molmass, float) and np.isnan(molmass))):
+            element, _ = parse_species(atom)
+            molmass = ATOMIC_MASSES.get(element, molmass)
 
         if snapshot is None:
             print(f"  * {atom} (skipping - {'; '.join(reasons)})")

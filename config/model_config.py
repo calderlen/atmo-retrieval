@@ -29,7 +29,7 @@ THIGH = 4500.0
 # SPECTRAL GRID PARAMETERS
 # ==============================================================================
 
-N_SPECTRAL_POINTS = 100000
+N_SPECTRAL_POINTS = 250000
 WAV_MIN_OFFSET = 100  # Angstroms
 WAV_MAX_OFFSET = 100  # Angstroms
 

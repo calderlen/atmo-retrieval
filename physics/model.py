@@ -382,9 +382,11 @@ def reconstruct_mmw_and_h2he(
         Tuple of (mmw, vmrH2, vmrHe) arrays
     """
     # Compute molecular masses
-    mol_masses = {m: molinfo.molmass_isotope(m) for m in mol_names}
+    mol_masses = {m: molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names}
     # For atoms, extract element name from species notation (e.g., "Fe I" -> "Fe")
-    atom_masses = {a: molinfo.molmass_isotope(_element_from_species(a)) for a in atom_names}
+    atom_masses = {
+        a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names
+    }
     
     # Sum VMRs
     sum_mols = sum(vmr_mols.values()) if vmr_mols else 0.0
@@ -606,7 +608,9 @@ def create_retrieval_model(
     mol_masses = jnp.array([molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names])
     # Handle case where opa_atoms is {}
     if len(atom_names) > 0:
-        atom_masses = jnp.array([molinfo.molmass_isotope(_element_from_species(a)) for a in atom_names])
+        atom_masses = jnp.array(
+            [molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names]
+        )
     else:
         atom_masses = jnp.zeros((0,))
 
@@ -762,7 +766,10 @@ def create_retrieval_model(
 
         # CIA
         for molA, molB in [("H2", "H2"), ("H2", "He")]:
-            logacia_matrix = opa_cias[molA + molB].logacia_matrix(Tarr)
+            key = molA + molB
+            if key not in opa_cias:
+                continue
+            logacia_matrix = opa_cias[key].logacia_matrix(Tarr)
             vmrX, vmrY = (vmrH2, vmrH2) if molB == "H2" else (vmrH2, vmrHe)
             dtau = dtau + art.opacity_profile_cia(
                 logacia_matrix, Tarr, vmrX, vmrY, mmw[:, None], g

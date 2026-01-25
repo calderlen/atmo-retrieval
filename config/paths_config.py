@@ -194,5 +194,5 @@ OPA_LOAD = True
 OPA_SAVE = False
 
 # Atomic database preferences
-# Default keeps Kurucz/VALD disabled due to upstream ExoJAX import bug.
-USE_KURUCZ_VALD = False
+# Kurucz line lists are auto-downloaded from kurucz.harvard.edu
+USE_KURUCZ_VALD = True

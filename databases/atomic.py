@@ -161,12 +161,23 @@ def ionization_to_iion(ionization: int) -> int:
     return ionization + 1
 
 
-def download_kurucz_gfall(element: str, output_dir: Path, timeout: int = 60) -> Path:
-    """Download Kurucz gfall line list for element."""
+def _kurucz_filename(code: int, ionization: int) -> str:
+    if ionization < 0 or ionization > 99:
+        raise ValueError(f"Unsupported ionization state: {ionization}")
+    return f"gf{code:02d}{ionization:02d}.all"
+
+
+def download_kurucz_gfall(
+    element: str,
+    ionization: int,
+    output_dir: Path,
+    timeout: int = 60,
+) -> Path:
+    """Download Kurucz gfall line list for element/ionization."""
     code = element_to_atomic_number(element)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"gf{code:02d}00.all"
+    filename = _kurucz_filename(code, ionization)
     dest = output_dir / filename
     if dest.exists():
         return dest
@@ -200,9 +211,10 @@ def load_kurucz_atomic(
     code = element_to_atomic_number(element)
 
     db_kurucz = Path(db_kurucz)
-    filepath = db_kurucz / f"gf{code:02d}00.all"
+    filename = _kurucz_filename(code, ionization)
+    filepath = db_kurucz / filename
     if auto_download and not filepath.exists():
-        filepath = download_kurucz_gfall(element, db_kurucz)
+        filepath = download_kurucz_gfall(element, ionization, db_kurucz)
     if not filepath.exists():
         raise FileNotFoundError(f"Kurucz gfall file not found: {filepath}")
 
@@ -256,9 +268,9 @@ def create_atomic_snapshot(
     Tref: float = 296.0,
 ) -> Tuple[MDBSnapshot, float]:
     """Convert AdbKurucz/AdbVald to a snapshot for OpaPremodit."""
-    nu_lines = _maybe_mask(getattr(adb, "nu_lines"), mask)
-    elower = _maybe_mask(getattr(adb, "elower"), mask)
-    Sij0 = _maybe_mask(getattr(adb, "Sij0"), mask)
+    nu_lines = _maybe_mask(_get_adb_attr(adb, "nu_lines"), mask)
+    elower = _maybe_mask(_get_adb_attr(adb, "elower"), mask)
+    Sij0 = _maybe_mask(_get_adb_attr(adb, "Sij0"), mask)
 
     molmass = _extract_molmass(adb, mask)
 
@@ -278,8 +290,8 @@ def create_atomic_snapshot(
     )
 
     nlines = len(nu_lines)
-    n_Texp = _maybe_mask(getattr(adb, "n_Texp", None), mask)
-    alpha_ref = _maybe_mask(getattr(adb, "alpha_ref", None), mask)
+    n_Texp = _maybe_mask(_get_adb_attr(adb, "n_Texp"), mask)
+    alpha_ref = _maybe_mask(_get_adb_attr(adb, "alpha_ref"), mask)
     if n_Texp is None:
         n_Texp = np.full(nlines, 0.5)
     if alpha_ref is None:
@@ -298,14 +310,30 @@ def _maybe_mask(arr: Iterable | None, mask: np.ndarray | None) -> np.ndarray | N
     return arr_np[mask]
 
 
+def _get_adb_attr(adb: object, name: str, default=None):
+    """Get attribute from AdbKurucz/AdbVald, checking underscore prefix fallback.
+
+    ExoJAX uses underscore-prefixed names (e.g., _elower) when gpu_transfer=False,
+    and non-prefixed names (e.g., elower) when gpu_transfer=True.
+    """
+    if hasattr(adb, name):
+        return getattr(adb, name)
+    underscore_name = f"_{name}"
+    if hasattr(adb, underscore_name):
+        return getattr(adb, underscore_name)
+    return default
+
+
 def _extract_molmass(adb: object, mask: np.ndarray | None) -> float:
-    if hasattr(adb, "atomicmass"):
-        amass = _maybe_mask(getattr(adb, "atomicmass"), mask)
+    amass = _get_adb_attr(adb, "atomicmass")
+    if amass is not None:
+        amass = _maybe_mask(amass, mask)
         if amass is not None and len(amass) > 0:
             return float(np.asarray(amass)[0])
     # Fallback to periodic table lookup by element label if available
-    if hasattr(adb, "ielem"):
-        ielem = _maybe_mask(getattr(adb, "ielem"), mask)
+    ielem = _get_adb_attr(adb, "ielem")
+    if ielem is not None:
+        ielem = _maybe_mask(ielem, mask)
         if ielem is not None and len(ielem) > 0:
             element = _element_from_atomic_number(int(np.asarray(ielem)[0]))
             return float(ATOMIC_MASSES.get(element, np.nan))
@@ -314,13 +342,15 @@ def _extract_molmass(adb: object, mask: np.ndarray | None) -> float:
 
 def _extract_partition(adb: object, mask: np.ndarray | None, Tref: float) -> Tuple[np.ndarray, np.ndarray]:
     # Prefer the 284-species partition function grid if available.
-    if hasattr(adb, "gQT_284species") and hasattr(adb, "T_gQT") and hasattr(adb, "QTmask"):
-        qtmask = _maybe_mask(getattr(adb, "QTmask"), mask)
+    gQT_284 = _get_adb_attr(adb, "gQT_284species")
+    T_gQT = _get_adb_attr(adb, "T_gQT")
+    qtmask_arr = _get_adb_attr(adb, "QTmask")
+    if gQT_284 is not None and T_gQT is not None and qtmask_arr is not None:
+        qtmask = _maybe_mask(qtmask_arr, mask)
         if qtmask is not None and len(qtmask) > 0:
             qt_idx = int(np.asarray(qtmask)[0])
-            gQT = np.asarray(getattr(adb, "gQT_284species"))[qt_idx]
-            T_gQT = np.asarray(getattr(adb, "T_gQT"))
-            return T_gQT, gQT
+            gQT = np.asarray(gQT_284)[qt_idx]
+            return np.asarray(T_gQT), gQT
 
     # Fallback: flat partition function
     return np.array([Tref], dtype=float), np.array([1.0], dtype=float)
@@ -328,13 +358,18 @@ def _extract_partition(adb: object, mask: np.ndarray | None, Tref: float) -> Tup
 
 def _species_mask(adb: object, element: str, iion: int, ielem: int | None = None) -> np.ndarray | None:
     mask = None
-    if hasattr(adb, "iion"):
-        iion_arr = np.asarray(getattr(adb, "iion"))
+    # Check for iion or _iion (ExoJAX uses _iion when gpu_transfer=False)
+    iion_attr = "iion" if hasattr(adb, "iion") else "_iion" if hasattr(adb, "_iion") else None
+    if iion_attr:
+        iion_arr = np.asarray(getattr(adb, iion_attr))
         mask = (iion_arr == iion) if mask is None else (mask & (iion_arr == iion))
-    if hasattr(adb, "ielem"):
+
+    # Check for ielem or _ielem (ExoJAX uses _ielem when gpu_transfer=False)
+    ielem_attr = "ielem" if hasattr(adb, "ielem") else "_ielem" if hasattr(adb, "_ielem") else None
+    if ielem_attr:
         if ielem is None:
             ielem = element_to_atomic_number(element)
-        ielem_arr = np.asarray(getattr(adb, "ielem"))
+        ielem_arr = np.asarray(getattr(adb, ielem_attr))
         mask = (ielem_arr == ielem) if mask is None else (mask & (ielem_arr == ielem))
 
     if mask is not None and not np.any(mask):

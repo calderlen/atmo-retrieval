@@ -44,6 +44,167 @@ def load_timeseries_data(data_dir: str) -> tuple[np.ndarray, np.ndarray, np.ndar
     return wavelength, data, sigma, phase
 
 
+def _format_range(arr: np.ndarray) -> str:
+    if arr is None:
+        return "None"
+    arr = np.asarray(arr)
+    if arr.size == 0:
+        return "empty"
+    return f"{np.nanmin(arr):.4g} .. {np.nanmax(arr):.4g}"
+
+
+def _preflight_spectrum_checks(
+    wav_obs: np.ndarray,
+    data: np.ndarray,
+    sigma: np.ndarray,
+    phase: np.ndarray,
+    inst_nus: np.ndarray,
+) -> None:
+    """Validate inputs before building the forward model."""
+    errors = []
+
+    wav_obs = np.asarray(wav_obs)
+    data = np.asarray(data)
+    sigma = np.asarray(sigma)
+    phase = np.asarray(phase)
+    inst_nus = np.asarray(inst_nus)
+
+    if wav_obs.size == 0:
+        errors.append("wavelength array is empty")
+    if inst_nus.size == 0:
+        errors.append("instrument wavenumber array is empty")
+    if data.ndim not in (1, 2):
+        errors.append(f"data has invalid ndim={data.ndim} (expected 1 or 2)")
+    if sigma.shape != data.shape:
+        errors.append(f"sigma shape {sigma.shape} does not match data shape {data.shape}")
+
+    if data.ndim == 1:
+        if data.size != wav_obs.size:
+            errors.append(f"data length {data.size} != wavelength length {wav_obs.size}")
+        expected_exposures = 1
+    elif data.ndim == 2:
+        if data.shape[1] != wav_obs.size:
+            errors.append(
+                f"data spectral axis {data.shape[1]} != wavelength length {wav_obs.size}"
+            )
+        expected_exposures = data.shape[0]
+    else:
+        expected_exposures = None
+
+    if phase.ndim != 1:
+        errors.append(f"phase has invalid ndim={phase.ndim} (expected 1)")
+    elif expected_exposures is not None and phase.size != expected_exposures:
+        errors.append(
+            f"phase length {phase.size} != number of exposures {expected_exposures}"
+        )
+
+    if not np.all(np.isfinite(wav_obs)):
+        errors.append("wavelength array contains non-finite values")
+    if not np.all(np.isfinite(inst_nus)):
+        errors.append("instrument wavenumber array contains non-finite values")
+    if not np.all(np.isfinite(data)):
+        errors.append("data array contains non-finite values")
+    if not np.all(np.isfinite(sigma)):
+        errors.append("sigma array contains non-finite values")
+
+    if errors:
+        print("\nPreflight check failed:")
+        for err in errors:
+            print(f"  - {err}")
+        print("Diagnostics:")
+        print(f"  wav_obs: shape={wav_obs.shape}, range={_format_range(wav_obs)}")
+        print(f"  inst_nus: shape={inst_nus.shape}, range={_format_range(inst_nus)}")
+        print(f"  data: shape={data.shape}")
+        print(f"  sigma: shape={sigma.shape}")
+        print(f"  phase: shape={phase.shape}, range={_format_range(phase)}")
+        raise ValueError("Preflight check failed; see diagnostics above.")
+
+
+def _preflight_grid_checks(inst_nus: np.ndarray, nu_grid: np.ndarray) -> None:
+    """Validate that the model grid covers the instrument grid."""
+    inst_nus = np.asarray(inst_nus)
+    nu_grid = np.asarray(nu_grid)
+
+    if nu_grid.size == 0:
+        raise ValueError("Preflight check failed: nu_grid is empty.")
+
+    inst_min = np.nanmin(inst_nus) if inst_nus.size > 0 else np.nan
+    inst_max = np.nanmax(inst_nus) if inst_nus.size > 0 else np.nan
+    nu_min = np.nanmin(nu_grid)
+    nu_max = np.nanmax(nu_grid)
+
+    if inst_nus.size == 0:
+        raise ValueError("Preflight check failed: inst_nus is empty.")
+
+    if inst_min < nu_min or inst_max > nu_max:
+        msg = (
+            "Preflight check failed: instrument wavenumber grid is outside model grid.\n"
+            f"  inst_nus range: {inst_min:.4g} .. {inst_max:.4g}\n"
+            f"  nu_grid range: {nu_min:.4g} .. {nu_max:.4g}\n"
+            "  Check wavelength range / offsets or data wavelength files."
+        )
+        raise ValueError(msg)
+
+
+def _cia_header_range(path: str) -> tuple[float, float] | None:
+    """Read CIA wavenumber min/max from header line if possible."""
+    try:
+        with open(path, "r") as f:
+            header = f.readline().strip().split()
+        if len(header) < 3:
+            return None
+        nu_min = float(header[1])
+        nu_max = float(header[2])
+        return nu_min, nu_max
+    except Exception:
+        return None
+
+
+def _format_um(nu_cm: float) -> float:
+    """Convert wavenumber (cm^-1) to wavelength (um)."""
+    if nu_cm <= 0:
+        return float("nan")
+    return 1.0e4 / nu_cm
+
+
+def _report_cia_coverage(cia_paths: dict[str, str], nu_grid: np.ndarray) -> None:
+    """Print CIA coverage and overlap with the model grid."""
+    nu_grid = np.asarray(nu_grid)
+    if nu_grid.size == 0:
+        return
+    grid_min = float(np.nanmin(nu_grid))
+    grid_max = float(np.nanmax(nu_grid))
+    grid_um_min = _format_um(grid_max)
+    grid_um_max = _format_um(grid_min)
+    print(
+        f"  CIA coverage check: model nu_grid {grid_min:.0f}-{grid_max:.0f} cm^-1 "
+        f"({grid_um_min:.3f}-{grid_um_max:.3f} um)"
+    )
+    for name, path in cia_paths.items():
+        rng = _cia_header_range(str(path))
+        if rng is None:
+            print(f"    {name}: could not read header for {path}")
+            continue
+        cia_min, cia_max = rng
+        cia_um_min = _format_um(cia_max)
+        cia_um_max = _format_um(cia_min)
+        ov_min = max(cia_min, grid_min)
+        ov_max = min(cia_max, grid_max)
+        if ov_min >= ov_max:
+            overlap = "none"
+        else:
+            ov_um_min = _format_um(ov_max)
+            ov_um_max = _format_um(ov_min)
+            overlap = (
+                f"{ov_min:.0f}-{ov_max:.0f} cm^-1 "
+                f"({ov_um_min:.3f}-{ov_um_max:.3f} um)"
+            )
+        print(
+            f"    {name}: {cia_min:.0f}-{cia_max:.0f} cm^-1 "
+            f"({cia_um_min:.3f}-{cia_um_max:.3f} um), overlap: {overlap}"
+        )
+
+
 def run_retrieval(
     mode: str = "transmission",
     skip_svi: bool = False,
@@ -130,6 +291,8 @@ def run_retrieval(
             data = data[sort_idx]
             sigma = sigma[sort_idx]
 
+    _preflight_spectrum_checks(wav_obs, data, sigma, phase, inst_nus)
+
     # Setup instrumental resolution
     print("\n[2/7] Setting up instrumental resolution...")
     Rinst = config.get_resolution()
@@ -144,6 +307,7 @@ def run_retrieval(
         config.N_SPECTRAL_POINTS,
         unit="AA",
     )
+    _preflight_grid_checks(inst_nus, nu_grid)
 
     sop_rot, sop_inst, _ = setup_spectral_operators(
         nu_grid, Rinst, vsini_max=150.0, vrmax=500.0
@@ -171,9 +335,14 @@ def run_retrieval(
 
     # Load opacities
     print("\n[5/7] Loading opacities...")
+    _report_cia_coverage(config.CIA_PATHS, nu_grid)
 
     opa_cias = setup_cia_opacities(config.CIA_PATHS, nu_grid)
-    print(f"  Loaded {len(opa_cias)} CIA sources")
+    n_cia = sum(1 for cia in opa_cias.values() if not getattr(cia, "_is_dummy", False))
+    if n_cia == 0:
+        print("  Loaded 0 CIA sources (no overlap with nu_grid)")
+    else:
+        print(f"  Loaded {n_cia} CIA sources")
 
     opa_mols, molmass_arr = load_molecular_opacities(
         config.MOLPATH_HITEMP,
@@ -187,7 +356,7 @@ def run_retrieval(
     )
     print(f"  Loaded {len(opa_mols)} molecular species: {list(opa_mols.keys())}")
 
-    # Load atomic opacities (optional)
+    # Load atomic opacities (optional, uses Kurucz with auto-download)
     opa_atoms, atommass_arr = load_atomic_opacities(
         config.ATOMIC_SPECIES,
         nu_grid,
@@ -196,7 +365,6 @@ def run_retrieval(
         config.DIFFMODE,
         config.TLOW,
         config.THIGH,
-        use_kurucz_vald=config.USE_KURUCZ_VALD,
     )
     if opa_atoms:
         print(f"  Loaded {len(opa_atoms)} atomic species: {list(opa_atoms.keys())}")
