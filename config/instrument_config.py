@@ -19,7 +19,7 @@ from typing import Callable
 
 OBSERVATORY = "lbt"
 INSTRUMENT = "PEPSI"
-OBSERVING_MODE = "red"
+OBSERVING_MODE = "full"
 
 
 # ==============================================================================

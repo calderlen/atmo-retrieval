@@ -192,3 +192,7 @@ DIR_SAVE = None  # Set by CLI via get_output_dir()
 # Opacity loading/saving
 OPA_LOAD = True
 OPA_SAVE = False
+
+# Atomic database preferences
+# Default keeps Kurucz/VALD disabled due to upstream ExoJAX import bug.
+USE_KURUCZ_VALD = False

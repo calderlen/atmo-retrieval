@@ -187,6 +187,7 @@ Configuration is split into logical modules under `config/`:
 - **instrument_config.py**: Spectrograph and observatory settings
   - `RESOLUTION`, `OBSERVING_MODE`, wavelength ranges
   - FITS header key mappings and file patterns
+  - Default `OBSERVING_MODE` is `full` (combined red+blue via `dataio.preprocess --arm full`)
 
 - **model_config.py**: Radiative transfer parameters
   - Pressure/temperature ranges, atmospheric layers
@@ -195,6 +196,7 @@ Configuration is split into logical modules under `config/`:
 - **paths_config.py**: Database and output paths
   - HITEMP, ExoMol, Kurucz database locations
   - Input/output directory structure
+  - `USE_KURUCZ_VALD` toggles Kurucz/VALD atomic loading (off by default)
 
 - **inference_config.py**: Sampling parameters
   - SVI steps and learning rate

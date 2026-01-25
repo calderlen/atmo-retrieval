@@ -9,11 +9,15 @@ import urllib.request
 import numpy as np
 
 try:
-    # ExoJAX >= 2.2 moved adb classes to subpackages.
+    # Official ExoJAX atomic database APIs (Kurucz/VALD).
     from exojax.database.kurucz.api import AdbKurucz
     from exojax.database.vald.api import AdbVald
-except Exception:  # pragma: no cover - fallback for older ExoJAX
-    from exojax.database.moldb import AdbKurucz, AdbVald
+except Exception as exc:  # pragma: no cover
+    raise ImportError(
+        "ExoJAX Kurucz/VALD APIs are not available. "
+        "Install/upgrade ExoJAX so `exojax.database.kurucz.api` and "
+        "`exojax.database.vald.api` are present."
+    ) from exc
 
 try:
     from exojax.database.contracts import MDBMeta, Lines, MDBSnapshot

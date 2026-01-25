@@ -83,6 +83,7 @@ from .paths_config import (
     DIR_SAVE,
     OPA_LOAD,
     OPA_SAVE,
+    USE_KURUCZ_VALD,
 )
 
 from .inference_config import (

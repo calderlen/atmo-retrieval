@@ -8,7 +8,7 @@ This script:
 4. Saves wavelength, spectrum, and uncertainty as .npy files
 
 Usage:
-    python preprocess.py --epoch 20250601 --planet KELT-20b --arm red
+    python -m dataio.preprocess --epoch 20250601 --planet KELT-20b --arm full
 """
 
 import argparse
@@ -701,6 +701,61 @@ def get_pepsi_data(
     return result
 
 
+def _align_exposures_by_jd(jd_a: np.ndarray, jd_b: np.ndarray, tol: float = 1.0e-4) -> tuple[np.ndarray, np.ndarray]:
+    """Match exposures by JD within a tolerance (days). Arrays must be sorted."""
+    ia = []
+    ib = []
+    j = 0
+    for i in range(len(jd_a)):
+        while j < len(jd_b) and jd_b[j] < jd_a[i] - tol:
+            j += 1
+        if j < len(jd_b) and abs(jd_b[j] - jd_a[i]) <= tol:
+            ia.append(i)
+            ib.append(j)
+    return np.array(ia, dtype=int), np.array(ib, dtype=int)
+
+
+def combine_full_arms(
+    red: tuple[np.ndarray, ...],
+    blue: tuple[np.ndarray, ...],
+    jd_tol: float = 1.0e-4,
+) -> tuple[np.ndarray, ...]:
+    """Combine red+blue arms into a single 'full' spectrum set."""
+    wave_r, flux_r, err_r, jd_r, snr_r, exptime_r, airmass_r, _, _ = red
+    wave_b, flux_b, err_b, jd_b, snr_b, exptime_b, airmass_b, _, _ = blue
+
+    ia, ib = _align_exposures_by_jd(jd_r, jd_b, tol=jd_tol)
+    if len(ia) == 0:
+        raise ValueError("No matching exposures between red and blue arms (check timestamps).")
+    if len(ia) != len(jd_r) or len(ib) != len(jd_b):
+        print(f"Warning: matched {len(ia)} exposures between red ({len(jd_r)}) and blue ({len(jd_b)}) arms.")
+
+    wave_r = wave_r[ia]
+    flux_r = flux_r[ia]
+    err_r = err_r[ia]
+    wave_b = wave_b[ib]
+    flux_b = flux_b[ib]
+    err_b = err_b[ib]
+
+    jd = jd_r[ia]
+    snr = 0.5 * (snr_r[ia] + snr_b[ib])
+    exptime = 0.5 * (exptime_r[ia] + exptime_b[ib])
+    airmass = 0.5 * (airmass_r[ia] + airmass_b[ib])
+
+    wave = np.concatenate([wave_b, wave_r], axis=1)
+    flux = np.concatenate([flux_b, flux_r], axis=1)
+    err = np.concatenate([err_b, err_r], axis=1)
+
+    sort_idx = np.argsort(wave, axis=1)
+    wave = np.take_along_axis(wave, sort_idx, axis=1)
+    flux = np.take_along_axis(flux, sort_idx, axis=1)
+    err = np.take_along_axis(err, sort_idx, axis=1)
+
+    n_spectra = wave.shape[0]
+    npix = wave.shape[1]
+    return wave, flux, err, jd, snr, exptime, airmass, n_spectra, npix
+
+
 def get_orbital_phase(
     jd: np.ndarray, epoch: float, period: float, RA: str, Dec: str
 ) -> np.ndarray:
@@ -796,7 +851,7 @@ def main():
     parser = argparse.ArgumentParser(description='Prepare PEPSI data for retrieval')
     parser.add_argument('--epoch', type=str, required=True, help='Observation epoch (YYYYMMDD)')
     parser.add_argument('--planet', type=str, default='KELT-20b', help='Planet name')
-    parser.add_argument('--arm', type=str, choices=['red', 'blue'], default='red', help='Spectrograph arm')
+    parser.add_argument('--arm', type=str, choices=['red', 'blue', 'full'], default='full', help='Spectrograph arm')
     parser.add_argument('--molecfit', action='store_true', default=True, help='Use molecfit-corrected data')
     parser.add_argument('--no-molecfit', action='store_false', dest='molecfit', help='Use uncorrected data')
     parser.add_argument('--data-dir', type=str, default='input/raw', help='Raw data directory')
@@ -820,16 +875,39 @@ def main():
 
     args = parser.parse_args()
 
+    def _load_arm(arm: str, prefer_molecfit: bool = True):
+        result = get_pepsi_data(
+            arm,
+            args.epoch,
+            args.planet,
+            prefer_molecfit,
+            args.data_dir,
+            barycentric_correction=args.barycorr,
+            apply_introduced_shift=args.introduced_shift if prefer_molecfit else False,
+        )
+        if result is None and prefer_molecfit:
+            print(f"  No molecfit files for {arm} arm; retrying with raw files...")
+            result = get_pepsi_data(
+                arm,
+                args.epoch,
+                args.planet,
+                False,
+                args.data_dir,
+                barycentric_correction=args.barycorr,
+                apply_introduced_shift=False,
+            )
+        return result
+
     print(f"\nLoading PEPSI {args.arm} arm data for {args.planet} ({args.epoch})...")
-    result = get_pepsi_data(
-        args.arm,
-        args.epoch,
-        args.planet,
-        args.molecfit,
-        args.data_dir,
-        barycentric_correction=args.barycorr,
-        apply_introduced_shift=args.introduced_shift,
-    )
+    if args.arm == "full":
+        red = _load_arm("red", prefer_molecfit=True)
+        blue = _load_arm("blue", prefer_molecfit=False)
+        if red is None or blue is None:
+            print("Failed to load data for full arm (red/blue).")
+            return 1
+        result = combine_full_arms(red, blue)
+    else:
+        result = _load_arm(args.arm, prefer_molecfit=args.molecfit)
 
     if result is None:
         print("Failed to load data!")

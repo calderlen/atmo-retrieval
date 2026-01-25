@@ -17,7 +17,6 @@ from exojax.database import molinfo
 from exojax.opacity.opacont import OpaCIA
 from exojax.opacity.premodit.api import OpaPremodit
 from exojax.postproc.specop import SopInstProfile, SopRotation
-from exojax.spec.planck import piBarr
 from exojax.utils.astrofunc import gravity_jupiter
 from exojax.utils.constants import MJ, RJ, Rs
 
@@ -33,6 +32,37 @@ from physics.pt import (
 _EPS = 1.0e-30
 _TWO_PI = 2.0 * jnp.pi
 _C_KMS = 299792.458  # Speed of light in km/s
+
+
+def _get_piBarr():
+    """Locate ExoJAX's piBarr without hard-coding a single module path."""
+    import importlib
+
+    candidates = (
+        "exojax.spec.planck",
+        "exojax.rt.planck",
+        "exojax.special.planck",
+    )
+    for modname in candidates:
+        try:
+            mod = importlib.import_module(modname)
+            fn = getattr(mod, "piBarr", None)
+            if fn is not None:
+                return fn
+        except Exception:
+            continue
+
+    try:
+        spec = importlib.import_module("exojax.spec")
+        planck = getattr(spec, "planck", None)
+        if planck is not None and hasattr(planck, "piBarr"):
+            return planck.piBarr
+    except Exception:
+        pass
+
+    raise ImportError(
+        "Could not import ExoJAX piBarr. Update ExoJAX or adjust the import path."
+    )
 
 
 def _element_from_species(species_name: str) -> str:
@@ -572,7 +602,8 @@ def create_retrieval_model(
     atom_names = tuple(opa_atoms.keys())  # Mandatory argument, checking keys is safe
 
     # Pre-compute masses
-    mol_masses = jnp.array([molinfo.molmass_isotope(m) for m in mol_names])
+    # Avoid HITRAN-only checks for non-HITRAN species (silences warnings)
+    mol_masses = jnp.array([molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names])
     # Handle case where opa_atoms is {}
     if len(atom_names) > 0:
         atom_masses = jnp.array([molinfo.molmass_isotope(_element_from_species(a)) for a in atom_names])
@@ -773,11 +804,21 @@ def create_retrieval_model(
         if mode == "transmission":
             model_ts = jnp.sqrt(planet_ts) * (Rp / Rstar)
         else:
+            piBarr = _get_piBarr()
             Fs = piBarr(nu_grid, Tstar)
             Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
             model_ts = planet_ts / jnp.clip(Fs_ts, _EPS, None) * (Rp / Rstar) ** 2
 
         # 9. Pipeline Corrections
+        # Ensure 2D shapes before any per-exposure operations
+        if model_ts.ndim == 1:
+            model_ts = model_ts[None, :]
+        if data.ndim == 1:
+            data = data[None, :]
+            sigma = sigma[None, :]
+        if model_ts.shape[1] == 0:
+            raise ValueError("model_ts has zero spectral points; check inst_nus/nu_grid")
+
         if subtract_per_exposure_mean:
             model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
 

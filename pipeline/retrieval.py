@@ -118,6 +118,17 @@ def run_retrieval(
     # Convert to wavenumber
     from exojax.utils.grids import wav2nu
     inst_nus = wav2nu(wav_obs, "AA")
+    # Ensure wavenumber grid and data are in ascending order
+    if inst_nus.size > 1 and np.any(np.diff(inst_nus) <= 0):
+        sort_idx = np.argsort(inst_nus)
+        inst_nus = inst_nus[sort_idx]
+        wav_obs = wav_obs[sort_idx]
+        if data.ndim == 2:
+            data = data[:, sort_idx]
+            sigma = sigma[:, sort_idx]
+        else:
+            data = data[sort_idx]
+            sigma = sigma[sort_idx]
 
     # Setup instrumental resolution
     print("\n[2/7] Setting up instrumental resolution...")
@@ -185,6 +196,7 @@ def run_retrieval(
         config.DIFFMODE,
         config.TLOW,
         config.THIGH,
+        use_kurucz_vald=config.USE_KURUCZ_VALD,
     )
     if opa_atoms:
         print(f"  Loaded {len(opa_atoms)} atomic species: {list(opa_atoms.keys())}")
