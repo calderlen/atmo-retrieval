@@ -8,7 +8,7 @@ This script:
 4. Saves wavelength, spectrum, and uncertainty as .npy files
 
 Usage:
-    python prepare_pepsi_data.py --epoch 20250601 --planet KELT-20b --arm red
+    python preprocess.py --epoch 20250601 --planet KELT-20b --arm red
 """
 
 import argparse
@@ -20,6 +20,8 @@ from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation
 import astropy.units as u
 
+
+#TODO: figure out what these are and why they are here
 
 _INTRODUCED_SHIFTS_MPS = {
     "20210501": 6000.0,
@@ -49,13 +51,10 @@ _INTRODUCED_SHIFTS_MPS = {
 }
 
 
-def _get_barycentric_velocity_mps(header, velocity_keys=("RADVEL", "OBSVEL", "SSBVEL")):
-    if not hasattr(header, "__contains__"):
-        raise TypeError("header must support key lookup")
-    if not isinstance(velocity_keys, (tuple, list)):
-        raise TypeError("velocity_keys must be a tuple or list of strings")
-    if not all(isinstance(key, str) for key in velocity_keys):
-        raise TypeError("velocity_keys must be a tuple or list of strings")
+def _get_barycentric_velocity_mps(
+    header, velocity_keys: tuple[str, ...] = ("RADVEL", "OBSVEL", "SSBVEL")
+) -> tuple[float, list[str]]:
+    """Extract barycentric velocity from FITS header."""
     total_velocity = 0.0
     used_keys = []
     for key in velocity_keys:
@@ -68,36 +67,22 @@ def _get_barycentric_velocity_mps(header, velocity_keys=("RADVEL", "OBSVEL", "SS
     return total_velocity, used_keys
 
 
-def _get_introduced_shift_mps(observation_epoch):
-    if not isinstance(observation_epoch, str):
-        raise TypeError("observation_epoch must be a string")
+
+def _get_introduced_shift_mps(observation_epoch: str) -> float:
+    """Get epoch-specific wavelength shift correction."""
     return _INTRODUCED_SHIFTS_MPS.get(observation_epoch, 0.0)
 
 
 def get_pepsi_data(
-    arm,
-    observation_epoch,
-    planet_name,
-    do_molecfit=True,
-    data_dir='input',
-    barycentric_correction=False,
-    apply_introduced_shift=True,
-):
+    arm: str,
+    observation_epoch: str,
+    planet_name: str,
+    do_molecfit: bool = True,
+    data_dir: str = "input",
+    barycentric_correction: bool = False,
+    apply_introduced_shift: bool = True,
+) -> tuple[np.ndarray, ...] | None:
     """Load PEPSI spectroscopic data."""
-    if not isinstance(arm, str):
-        raise TypeError("arm must be a string")
-    if not isinstance(observation_epoch, str):
-        raise TypeError("observation_epoch must be a string")
-    if not isinstance(planet_name, str):
-        raise TypeError("planet_name must be a string")
-    if not isinstance(do_molecfit, bool):
-        raise TypeError("do_molecfit must be a bool")
-    if not isinstance(data_dir, str):
-        raise TypeError("data_dir must be a string")
-    if not isinstance(barycentric_correction, bool):
-        raise TypeError("barycentric_correction must be a bool")
-    if not isinstance(apply_introduced_shift, bool):
-        raise TypeError("apply_introduced_shift must be a bool")
     ckms = 2.9979e5
 
     # Get data
@@ -235,17 +220,10 @@ def get_pepsi_data(
     return wave, fluxin, errorin, jd, snr_spectra, exptime, airmass, n_spectra, npix
 
 
-def get_orbital_phase(jd, epoch, period, RA, Dec):
-    if not isinstance(jd, np.ndarray):
-        raise TypeError("jd must be a numpy array")
-    if not isinstance(epoch, (int, float, np.floating)):
-        raise TypeError("epoch must be a number")
-    if not isinstance(period, (int, float, np.floating)):
-        raise TypeError("period must be a number")
-    if not isinstance(RA, str):
-        raise TypeError("RA must be a string")
-    if not isinstance(Dec, str):
-        raise TypeError("Dec must be a string")
+def get_orbital_phase(
+    jd: np.ndarray, epoch: float, period: float, RA: str, Dec: str
+) -> np.ndarray:
+    """Calculate orbital phase with light travel time correction."""
     lbt_coordinates = EarthLocation.of_site('lbt')
 
     observed_times = Time(jd, format='jd', location=lbt_coordinates)
@@ -262,23 +240,16 @@ def get_orbital_phase(jd, epoch, period, RA, Dec):
     return orbital_phase
 
 
-def calculate_transmission_spectrum(wave, flux, error, jd, transit_params, RA, Dec):
-    if not isinstance(wave, np.ndarray):
-        raise TypeError("wave must be a numpy array")
-    if not isinstance(flux, np.ndarray):
-        raise TypeError("flux must be a numpy array")
-    if not isinstance(error, np.ndarray):
-        raise TypeError("error must be a numpy array")
-    if not isinstance(jd, np.ndarray):
-        raise TypeError("jd must be a numpy array")
-    if not isinstance(transit_params, dict):
-        raise TypeError("transit_params must be a dict")
-    if not all(key in transit_params for key in ("T0", "period", "duration")):
-        raise TypeError("transit_params must contain T0, period, and duration")
-    if not isinstance(RA, str):
-        raise TypeError("RA must be a string")
-    if not isinstance(Dec, str):
-        raise TypeError("Dec must be a string")
+def calculate_transmission_spectrum(
+    wave: np.ndarray,
+    flux: np.ndarray,
+    error: np.ndarray,
+    jd: np.ndarray,
+    transit_params: dict,
+    RA: str,
+    Dec: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Calculate transmission spectrum from in-transit and out-of-transit exposures."""
     # Calculate orbital phase with light travel time correction
     orbital_phase = get_orbital_phase(
         jd,
@@ -320,15 +291,10 @@ def calculate_transmission_spectrum(wave, flux, error, jd, transit_params, RA, D
     return wave_grid, transmission, transmission_err, orbital_phase, in_transit, out_transit
 
 
-def bin_spectrum(wave, flux, error, bin_size=50):
-    if not isinstance(wave, np.ndarray):
-        raise TypeError("wave must be a numpy array")
-    if not isinstance(flux, np.ndarray):
-        raise TypeError("flux must be a numpy array")
-    if not isinstance(error, np.ndarray):
-        raise TypeError("error must be a numpy array")
-    if not isinstance(bin_size, int):
-        raise TypeError("bin_size must be an int")
+def bin_spectrum(
+    wave: np.ndarray, flux: np.ndarray, error: np.ndarray, bin_size: int = 50
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bin spectrum to lower resolution."""
     npix = len(wave)
     n_bins = npix // bin_size
 

@@ -1,0 +1,38 @@
+- TODO: need to subtract off the stellar spectrum and stuff, so look how atmo-analysis does it
+- TODO: parse the FITS files for the labels of various information
+- TODO: order the spectra if get_pepsi_data doest do that
+- TODO: refine wavelength range that you're going to use
+- TODO: refine pressure range that you're going to use
+- TODO: reduce the resolution of the simulation -- make it match the resolution of the instrument (?)
+- TODO: profile the GPU memory requirements of the test model and various model complexities
+- TODO: i guess molecfit was already run on the tellurics so you don't need to model them out? check the do_molecfit logic in old code
+- TODO: determine what sort of atmospheric chemistry model you're going to use
+    - free chemistry: sample log Xi directly as parameters and run NUTS/HCM/nested sampling
+        - obtain species-specific constraints
+        - don't assume equilibrium; cases against equilibrium include UHJ ionization, day/night chemistry, vertical mixing
+        - minimal assumptions
+    - equilibrium chemistry retrieval inside JAX
+        - ExoGibbs to recover elemental ratios in a physically-coupled way
+        - FastChem2/3 to be used as a comparator or to precompute a grid interpolated in JAX
+- TODO: model core retrieval parameters
+    - kinematics
+        - Kp
+        - V_sys
+        - v_wind/delta V
+        - vsin i? probably not just use discovery
+    - line-strength parameters for detected species -- (relative (line-to-continuum)) abundances
+        - log VMRs
+    - T-P structure parameter
+        - isothermal or full Guillot. you decide
+    - contiuum/reference level nuisance parameters?
+        - Rp(lambda) baseline /reference radius at a reference pressure
+        - log P_0
+        - gray opacity/haze amplitude
+- TODO: model secondary retrieval parameters
+    - ionization partiiton, retrieving the ions and neutral species separately OR ionization fraciton OR retrieve them separately, moving this up to core retrieval parameters
+    - MMW/metallicity/(C/O)?
+- TODO: what not to try to retrieve, make sure to avoid this
+     - free T-P profile
+     - log g?
+
+- TODO: In order to maximize the signal strength, we adopt the methodology presented in E. F. Spring & J. L. Birkby (2025, in preparation) to stop SYSREM once the removal of successive systematic fails to improve to residuals by more than 1 part in 10.4 The number of systematics removed is low, ranging from 0 to 2 per night and per arm.

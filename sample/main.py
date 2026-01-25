@@ -16,10 +16,10 @@ from exojax.rt import ArtTransPure, ArtEmisPure
 
 # Local modules
 import config
-from data_loader import load_observed_spectrum, ResolutionInterpolator
+from load import load_observed_spectrum, ResolutionInterpolator
 from grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from opacity_setup import setup_cia_opacities, load_molecular_opacities
-from atmospheric_model import create_transmission_model, create_emission_model
+from atmo_model_old import create_transmission_model, create_emission_model
 from inference import run_svi, run_mcmc, generate_predictions
 from plotting import create_transmission_plots
 

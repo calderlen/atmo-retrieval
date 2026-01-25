@@ -76,7 +76,7 @@ for dir in "$DATA_DIR"/????????_*; do
   planet=${base#*_}
 
   for arm in "${arms_list[@]}"; do
-    cmd=(python prepare_pepsi_data.py --epoch "$epoch" --planet "$planet" --arm "$arm" --data-dir "$DATA_DIR" --bin-size "$BIN_SIZE")
+    cmd=(python preprocess.py --epoch "$epoch" --planet "$planet" --arm "$arm" --data-dir "$DATA_DIR" --bin-size "$BIN_SIZE")
 
     if [[ "$BARYCORR" -eq 1 ]]; then
       cmd+=(--barycorr)

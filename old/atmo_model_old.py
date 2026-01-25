@@ -101,13 +101,13 @@ def _create_atmospheric_model_core(
             T0 = numpyro.sample("T0", dist.Uniform(Tlow, Thigh))
             Tarr = T0 * jnp.ones_like(art.pressure)
         elif temperature_profile == "gradient":
-            from thermal_structure import numpyro_gradient
+            from tp_profiles import numpyro_gradient
             Tarr = numpyro_gradient(art, Tlow, Thigh)
         elif temperature_profile == "madhu_seager":
-            from thermal_structure import numpyro_madhu_seager
+            from tp_profiles import numpyro_madhu_seager
             Tarr = numpyro_madhu_seager(art, Tlow, Thigh)
         elif temperature_profile == "free":
-            from thermal_structure import numpyro_free_temperature
+            from tp_profiles import numpyro_free_temperature
             Tarr = numpyro_free_temperature(art, n_layers=5, Tlow=Tlow, Thigh=Thigh)
         else:
             raise ValueError(f"Unknown temperature profile: {temperature_profile}")

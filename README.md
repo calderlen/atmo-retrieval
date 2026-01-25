@@ -17,7 +17,7 @@ python __main__.py --help
 
 ```
 ├── config.py              # Configuration and system parameters
-├── data_loader.py         # Data loading (PEPSI, JWST formats)
+├── load.py                # Data loading (PEPSI, JWST formats)
 ├── grid_setup.py          # Wavenumber grid and spectral operators
 ├── opacity_setup.py       # CIA, molecular, atomic opacities
 ├── thermal_structure.py   # Temperature-pressure profiles

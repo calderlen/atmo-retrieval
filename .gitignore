@@ -1,4 +1,3 @@
-# Input directory (databases and spectra)
 input/.db_HITEMP/
 input/.db_ExoMol/
 input/.db_CIA/
@@ -8,53 +7,38 @@ input/spectra/**/*.npy
 input/spectra/**/*.npz
 input/spectra/**/*.fits
 
-# Opacity cache (zarr format)
-opa_*.zarr/
 opa_*.zarr.zip
 
-# Output directories
 output/
 
-# MCMC/SVI results
 *.npz
 *_pred.npy
 
-# Plots (regenerable)
 *.png
 *.pdf
 
-# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 
-# Jupyter
 .ipynb_checkpoints/
 
-# JAX cache
 .jax_cache/
 __jaxcache__/
 
-# Environments
 venv/
 .venv/
 
-# IDE
 .vscode/
 .idea/
 
-# macOS
 .DS_Store
 
-# Logs
 *.log
 
-# Private docs
 docs/
 CLI_GUIDE.md
 CLI_QUICKREF.md
 MODULE_SUMMARY.md
 GIT_GUIDE.md
 
-# Claude settings
-.claude/

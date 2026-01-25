@@ -1,0 +1,355 @@
+"""NumPyro atmospheric model for HRCCS (time-series) retrieval.
+
+Updates:
+1) opa_atoms is mandatory (pass {} for empty).
+2) Automated Instrument Profile: Pass 'instrument_resolution' (R) instead of beta.
+3) Grid Validation: Checks if nu_grid is fine enough for the given R.
+4) Default T-P profile is 'guillot'.
+"""
+
+from __future__ import annotations
+
+import warnings
+from typing import Callable, Literal
+
+import jax
+import jax.numpy as jnp
+import numpyro
+import numpyro.distributions as dist
+
+from exojax.database import molinfo
+from exojax.opacity.opacont import OpaCIA
+from exojax.opacity.premodit.api import OpaPremodit
+from exojax.postproc.specop import SopInstProfile, SopRotation
+from exojax.spec.planck import piBarr
+from exojax.utils.astrofunc import gravity_jupiter
+from exojax.utils.constants import MJ, RJ, Rs
+
+# Import your TP profiles (ensure these exist in your local tp_profiles.py)
+from tp_profiles import (
+    guillot_profile,
+    numpyro_free_temperature,
+    numpyro_gradient,
+    numpyro_madhu_seager,
+)
+
+
+_EPS = 1.0e-30
+_TWO_PI = 2.0 * jnp.pi
+_C_KMS = 299792.458  # Speed of light in km/s
+
+
+def planet_rv_kms(
+    phase: jnp.ndarray,
+    Kp_kms: float, 
+    Vsys_kms: float, 
+    dRV_kms: 
+    float = 0.0
+) -> jnp.ndarray:
+ 
+    return Kp_kms * jnp.sin(_TWO_PI * phase) + Vsys_kms + dRV_kms
+
+
+def sysrem_filter_model(
+    model_matrix: 
+    jnp.ndarray, 
+    U: jnp.ndarray, 
+    invvar_spec: 
+    jnp.ndarray
+) -> jnp.ndarray:
+ 
+    """Apply the SYSREM linear filter: (I - U (UᵀΛU)⁻¹ UᵀΛ) M."""
+ 
+    UTW = U.T * invvar_spec[None, :]  # (K, Nspec)
+    U_dag = jnp.linalg.solve(UTW @ U, UTW)  # (K, Nspec)  = (UᵀΛU)⁻¹ UᵀΛ
+ 
+    return model_matrix - U @ (U_dag @ model_matrix)
+
+
+def check_grid_resolution(nu_grid: jnp.ndarray, 
+                          R: float, 
+                          min_samples: 
+                          float = 4.0):
+    """
+    Validates that the physics grid (nu_grid) is fine enough to resolve 
+    the Instrument Profile defined by R.
+    
+    Rule of thumb: FWHM should be sampled by at least ~4-5 pixels.
+    """
+    # Estimate grid resolution R_grid = nu / dnu
+    # We take the median spacing to avoid edge effects
+    dnu = jnp.abs(jnp.diff(nu_grid))
+    nu_mid = nu_grid[:-1]
+    R_grid_local = nu_mid / dnu
+    R_grid = jnp.median(R_grid_local)
+
+    # Resolution required to sample the FWHM 'min_samples' times:
+    # FWHM_dnu = nu / R
+    # We need dnu < FWHM_dnu / min_samples
+    # => nu/R_grid < (nu/R) / min_samples
+    # => R_grid > R * min_samples
+    
+    required_R_grid = R * min_samples
+
+    if R_grid < required_R_grid:
+        warnings.warn(
+            f"\n[WARNING] Grid Under-sampling Detected!\n"
+            f"  Instrument Resolution (R): {R}\n"
+            f"  Physics Grid Resolution (R_grid): ~{R_grid:.0f}\n"
+            f"  Ratio (Grid/Inst): {R_grid/R:.2f} pixels per FWHM.\n"
+            f"  Recommended: > {min_samples} pixels per FWHM.\n"
+            f"  Your dtau/opacity calculation might be aliased. Regenerate 'nu_grid' with higher resolution.",
+            UserWarning
+        )
+    else:
+        print(f"[INFO] Grid check passed: {R_grid/R:.1f} pixels per FWHM (Target R={R}).")
+
+
+def create_hrccs_model(
+    *,
+    mode: Literal["transmission", "emission"],
+    art: object,
+    opa_mols: dict[str, OpaPremodit],
+    opa_atoms: dict[str, OpaPremodit],  # Mandatory: pass {} if empty
+    opa_cias: dict[str, OpaCIA],
+    nu_grid: jnp.ndarray,
+    sop_rot: SopRotation,
+    sop_inst: SopInstProfile,
+    instrument_resolution: float,  # Replaced beta_inst. Provide R (e.g. 130000)
+    inst_nus: jnp.ndarray,
+    period_day: float,
+    # system priors
+    Kp_mean: float,
+    Kp_std: float,
+    Vsys_mean: float,
+    Vsys_std: float,
+    Rp_mean: float,
+    Rp_std: float,
+    Mp_mean: float,
+    Mp_std: float,
+    Rstar_mean: float,
+    Rstar_std: float,
+    Tstar: float | None,
+    # temperature (Default: Guillot)
+    temperature_profile: Literal[
+        "isothermal", "gradient", "madhu_seager", "free", "guillot"
+    ] = "guillot",
+    Tlow: float = 400.0,
+    Thigh: float = 3000.0,
+    Tirr_mean: float | None = None,
+    Tirr_std: float | None = None,
+    Tint_fixed: float = 100.0,
+    log_kappa_ir_bounds: tuple[float, float] = (-4.0, 0.0),
+    log_gamma_bounds: tuple[float, float] = (-2.0, 2.0),
+    # Pipeline options
+    subtract_per_exposure_mean: bool = True,
+    apply_sysrem: bool = False,
+) -> Callable:
+
+    # --- 0. Validation & Setup ---
+    check_grid_resolution(nu_grid, instrument_resolution)
+
+    # Calculate beta_inst (IP Gaussian Sigma) from Resolution (R)
+    # FWHM = nu / R
+    # Sigma = FWHM / (2 * sqrt(2 * ln(2))) approx FWHM / 2.35482
+    # For ESLOG (log-wavenumber) grids, beta is dimensionless ~ 1/R_eff
+    beta_inst = 1.0 / (instrument_resolution * 2.3548200450309493)
+
+    mol_names = tuple(opa_mols.keys())
+    atom_names = tuple(opa_atoms.keys())  # Mandatory argument, checking keys is safe
+
+    # Pre-compute masses
+    mol_masses = jnp.array([molinfo.molmass_isotope(m) for m in mol_names])
+    # Handle case where opa_atoms is {}
+    if len(atom_names) > 0:
+        atom_masses = jnp.array([molinfo.molmass_isotope(a) for a in atom_names])
+    else:
+        atom_masses = jnp.zeros((0,))
+
+    if (mode == "emission") and (Tstar is None):
+        raise ValueError("Tstar is required for emission mode.")
+
+    # --- The NumPyro Model ---
+    def model(
+        data: jnp.ndarray,
+        sigma: jnp.ndarray,
+        phase: jnp.ndarray,
+        U: jnp.ndarray | None = None,
+        invvar_spec: jnp.ndarray | None = None,
+    ) -> None:
+
+        # 1. System Parameters
+        Kp = numpyro.sample("Kp", dist.TruncatedNormal(Kp_mean, Kp_std, low=0.0))
+        Vsys = numpyro.sample("Vsys", dist.Normal(Vsys_mean, Vsys_std))
+        dRV = numpyro.sample("dRV", dist.Normal(0.0, 10.0))
+
+        Mp = numpyro.sample("Mp", dist.TruncatedNormal(Mp_mean, Mp_std, low=0.0)) * MJ
+        Rstar = numpyro.sample("Rstar", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0)) * Rs
+        Rp = numpyro.sample("Rp", dist.TruncatedNormal(Rp_mean, Rp_std, low=0.0)) * RJ
+
+        # 2. Composition
+        vmr_mols_list = []
+        for mol in mol_names:
+            logVMR = numpyro.sample(f"logVMR_{mol}", dist.Uniform(-15.0, 0.0))
+            vmr_mols_list.append(art.constant_mmr_profile(jnp.power(10.0, logVMR)))
+        
+        # Handle shape if no molecules (edge case)
+        if len(mol_names) > 0:
+            vmr_mols = jnp.array(vmr_mols_list)
+        else:
+            vmr_mols = jnp.zeros((0, art.pressure.size))
+
+        vmr_atoms_list = []
+        for atom in atom_names:
+            logVMR = numpyro.sample(f"logVMR_{atom}", dist.Uniform(-15.0, 0.0))
+            vmr_atoms_list.append(art.constant_mmr_profile(jnp.power(10.0, logVMR)))
+        
+        if len(atom_names) > 0:
+            vmr_atoms = jnp.array(vmr_atoms_list)
+            sum_atoms = jnp.sum(vmr_atoms, axis=0)
+            dot_atoms = jnp.dot(atom_masses, vmr_atoms)
+        else:
+            vmr_atoms = jnp.zeros((0, art.pressure.size))
+            sum_atoms = 0.0
+            dot_atoms = 0.0
+
+        if len(mol_names) > 0:
+            sum_mols = jnp.sum(vmr_mols, axis=0)
+            dot_mols = jnp.dot(mol_masses, vmr_mols)
+        else:
+            sum_mols = 0.0
+            dot_mols = 0.0
+
+        vmr_tot = jnp.clip(sum_mols + sum_atoms, 0.0, 1.0)
+        vmrH2 = (1.0 - vmr_tot) * (6.0 / 7.0)
+        vmrHe = (1.0 - vmr_tot) * (1.0 / 7.0)
+
+        mmw = (
+            molinfo.molmass_isotope("H2") * vmrH2
+            + molinfo.molmass_isotope("He", db_HIT=False) * vmrHe
+            + dot_mols
+            + dot_atoms
+        )
+
+        # 3. Temperature & Gravity
+        g_btm = gravity_jupiter(Rp / RJ, Mp / MJ)
+
+        if temperature_profile == "guillot":
+            if (Tirr_mean is not None) and (Tirr_std is not None):
+                Tirr = numpyro.sample(
+                    "Tirr", dist.TruncatedNormal(Tirr_mean, Tirr_std, low=0.0)
+                )
+            else:
+                Tirr = numpyro.sample("Tirr", dist.Uniform(Tlow, Thigh))
+
+            log_kappa_ir = numpyro.sample(
+                "log_kappa_ir", dist.Uniform(*log_kappa_ir_bounds)
+            )
+            log_gamma = numpyro.sample("log_gamma", dist.Uniform(*log_gamma_bounds))
+
+            Tarr = guillot_profile(
+                pressure_bar=art.pressure,
+                g_cgs=g_btm,
+                Tirr=Tirr,
+                Tint=Tint_fixed,
+                kappa_ir_cgs=jnp.power(10.0, log_kappa_ir),
+                gamma=jnp.power(10.0, log_gamma),
+            )
+
+        elif temperature_profile == "isothermal":
+            T0 = numpyro.sample("T0", dist.Uniform(Tlow, Thigh))
+            Tarr = T0 * jnp.ones_like(art.pressure)
+        elif temperature_profile == "gradient":
+            Tarr = numpyro_gradient(art, Tlow, Thigh)
+        elif temperature_profile == "madhu_seager":
+            Tarr = numpyro_madhu_seager(art, Tlow, Thigh)
+        elif temperature_profile == "free":
+            Tarr = numpyro_free_temperature(art, n_layers=5, Tlow=Tlow, Thigh=Thigh)
+        else:
+            raise ValueError(f"Unknown temperature profile: {temperature_profile}")
+
+        g = art.gravity_profile(Tarr, mmw, Rp, g_btm)
+
+        # 4. Opacity Calculation (CIA + Mols + Atoms)
+        dtau = jnp.zeros((art.pressure.size, nu_grid.size))
+
+        # CIA
+        for molA, molB in [("H2", "H2"), ("H2", "He")]:
+            logacia_matrix = opa_cias[molA + molB].logacia_matrix(Tarr)
+            vmrX, vmrY = (vmrH2, vmrH2) if molB == "H2" else (vmrH2, vmrHe)
+            dtau = dtau + art.opacity_profile_cia(
+                logacia_matrix, Tarr, vmrX, vmrY, mmw[:, None], g
+            )
+
+        # Molecules
+        for i, mol in enumerate(mol_names):
+            xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
+            dtau = dtau + art.opacity_profile_xs(
+                xsmatrix, vmr_mols[i], mmw[:, None], g
+            )
+
+        # Atoms
+        for i, atom in enumerate(atom_names):
+            xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
+            dtau = dtau + art.opacity_profile_xs(
+                xsmatrix, vmr_atoms[i], mmw[:, None], g
+            )
+
+        # 5. Radiative Transfer
+        rt = art.run(dtau, Tarr, mmw, Rp, g_btm)
+
+        # 6. Rotation & Instrument Broadening
+        # Tidal locking: Spin period = Orbital period
+        vsini = (
+            2.0 * jnp.pi * Rp / (period_day * 86400.0) / 1.0e5
+        )  # cm/s -> km/s
+        
+        rt = sop_rot.rigid_rotation(rt, vsini, 0.0, 0.0)
+        
+        # Apply Instrument Profile (Calculated from R above)
+        rt = sop_inst.ipgauss(rt, beta_inst)
+
+        # 7. Time-Series Sampling (Doppler shift)
+        rv = planet_rv_kms(phase, Kp, Vsys, dRV)
+        planet_ts = jax.vmap(lambda v: sop_inst.sampling(rt, v, inst_nus))(rv)
+
+        # 8. Contrast / Flux Ratio
+        if mode == "transmission":
+            model_ts = jnp.sqrt(planet_ts) * (Rp / Rstar)
+        else:
+            Fs = piBarr(nu_grid, Tstar)
+            Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
+            model_ts = planet_ts / jnp.clip(Fs_ts, _EPS, None) * (Rp / Rstar) ** 2
+
+        # 9. Pipeline Corrections
+        if subtract_per_exposure_mean:
+            model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
+
+        if apply_sysrem:
+            if (U is None) or (invvar_spec is None):
+                # This should be caught by caller, but safe to check
+                pass 
+            model_ts = sysrem_filter_model(model_ts, U, invvar_spec)
+
+        # 10. Log-Likelihood (CCF-equivalent Matched Filter)
+        w = 1.0 / jnp.clip(sigma, _EPS, None) ** 2
+
+        def _lnL_one(f: jnp.ndarray, m: jnp.ndarray, w_: jnp.ndarray) -> jnp.ndarray:
+            s_mm = jnp.sum((m * m) * w_)
+            s_fm = jnp.sum((f * m) * w_)
+            alpha = s_fm / (s_mm + _EPS)
+            r = f - alpha * m
+            chi2 = jnp.sum((r * r) * w_)
+            norm = jnp.sum(jnp.log(_TWO_PI / w_))
+            return -0.5 * (chi2 + norm)
+
+        lnL = jnp.sum(jax.vmap(_lnL_one)(data, model_ts, w))
+        numpyro.factor("logL", lnL)
+
+        # Deterministics for tracking
+        numpyro.deterministic("Kp_kms", Kp)
+        numpyro.deterministic("Vsys_kms", Vsys)
+        numpyro.deterministic("dRV_kms", dRV)
+        numpyro.deterministic("vsini_kms", vsini)
+
+    return model
