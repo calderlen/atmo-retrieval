@@ -11,31 +11,36 @@ Configuration is split into logical modules:
 """
 
 # Re-export everything for convenience
-from .planets import (
+from .planets_config import (
     PLANET,
     EPHEMERIS,
     PLANETS,
+    PHASE_BINS,
     get_params,
     list_planets,
     list_ephemerides,
 )
 
-from .instrument import (
+from .instrument_config import (
+    # Global state (can be modified at runtime)
     INSTRUMENT,
     OBSERVATORY,
-    RESOLUTION,
-    ARMS,
     OBSERVING_MODE,
+    # Main config database
+    INSTRUMENTS,
+    TELLURIC_REGIONS,
+    # Helper functions (use global state by default)
+    get_instrument_config,
+    get_mode_config,
+    get_resolution,
     get_wavelength_range,
     get_file_prefix,
-    WAV_MIN,
-    WAV_MAX,
-    HEADER_KEYS,
+    get_header_keys,
+    get_fits_columns,
     get_data_patterns,
-    FITS_COLUMNS,
 )
 
-from .model import (
+from .model_config import (
     RETRIEVAL_MODE,
     DIFFMODE,
     NLAYER,
@@ -54,7 +59,7 @@ from .model import (
     TELLURIC_AIRMASS,
 )
 
-from .paths import (
+from .paths_config import (
     PROJECT_ROOT,
     INPUT_DIR,
     DB_HITEMP,
@@ -78,7 +83,7 @@ from .paths import (
     OPA_SAVE,
 )
 
-from .inference import (
+from .inference_config import (
     SVI_NUM_STEPS,
     SVI_LEARNING_RATE,
     MCMC_NUM_WARMUP,
@@ -154,10 +159,13 @@ def save_run_config(
         # Wavelength/spectral setup
         f.write("SPECTRAL SETUP\n")
         f.write("-" * 70 + "\n")
+        f.write(f"Observatory: {OBSERVATORY}\n")
+        f.write(f"Instrument: {INSTRUMENT}\n")
         f.write(f"Observing mode: {OBSERVING_MODE}\n")
-        f.write(f"Wavelength range: {WAV_MIN} - {WAV_MAX} Angstroms\n")
+        wav_min, wav_max = get_wavelength_range()
+        f.write(f"Wavelength range: {wav_min} - {wav_max} Angstroms\n")
         f.write(f"Spectral points: {N_SPECTRAL_POINTS}\n")
-        f.write(f"Resolution: R = {RESOLUTION:,}\n\n")
+        f.write(f"Resolution: R = {get_resolution():,}\n\n")
 
         # Atmospheric setup
         f.write("ATMOSPHERIC SETUP\n")

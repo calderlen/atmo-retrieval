@@ -11,7 +11,7 @@ from exojax.opacity.premodit.api import OpaPremodit
 from exojax.opacity import saveopa
 
 # Opacity cache directory (relative to project root)
-from config.paths import PROJECT_ROOT
+from config.paths_config import PROJECT_ROOT
 OPA_CACHE_DIR = PROJECT_ROOT / "input" / ".opa_cache"
 OPA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -325,7 +325,7 @@ def load_atomic_opacities(
     
     # Default ExoAtom path
     if db_exoatom is None:
-        from config.paths import PROJECT_ROOT
+        from config.paths_config import PROJECT_ROOT
         db_exoatom = PROJECT_ROOT / "input" / ".db_ExoAtom"
     
     print("Loading atomic line databases (ExoAtom)...")

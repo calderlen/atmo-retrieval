@@ -40,7 +40,7 @@ flowchart TB
     end
 
     subgraph Forward["Forward Model"]
-        model["model.py<br/><i>NumPyro HRCCS</i>"]
+        model["model.py<br/><i>NumPyro model</i>"]
         pt["pt.py<br/><i>T-P profiles</i>"]
     end
 
@@ -137,7 +137,7 @@ python __main__.py --help
 ├── tellurics.py           # Telluric fitting and correction (HITRAN H2O)
 ├── grid_setup.py          # Wavenumber grid and spectral operators
 ├── opacity_setup.py       # CIA, molecular, atomic opacities
-├── model.py               # NumPyro model for HRCCS retrieval
+├── model.py               # NumPyro atmospheric model
 ├── pt.py                  # Temperature-pressure profiles
 ├── inference.py           # SVI and HMC-NUTS
 ├── plot.py                # Visualization

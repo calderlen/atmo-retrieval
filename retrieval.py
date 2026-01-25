@@ -1,4 +1,4 @@
-"""Orchestrates HRCCS (High-Resolution Cross-Correlation Spectroscopy) retrieval pipeline."""
+"""Orchestrates high-resolution spectroscopic retrieval pipeline."""
 
 import jax
 from jax import random
@@ -11,14 +11,19 @@ import config
 from load import load_observed_spectrum, ResolutionInterpolator
 from grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from opacity_setup import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
-from model import create_hrccs_model
+from model import create_retrieval_model, PhaseMode, compute_atmospheric_state_from_posterior
 from inference import run_svi, run_mcmc, generate_predictions
-from plot import create_transmission_plots
+from plot import (
+    create_transmission_plots,
+    plot_contribution_function,
+    plot_contribution_per_species,
+    plot_contribution_combined,
+)
 
 
-def load_hrccs_data(data_dir: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load HRCCS time-series data.
-    
+def load_timeseries_data(data_dir: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load time-series spectroscopic data.
+
     Expected files in data_dir:
         - wavelength.npy: (n_wavelengths,) wavelength array in Angstroms
         - data.npy: (n_exposures, n_wavelengths) flux time-series
@@ -39,15 +44,18 @@ def load_hrccs_data(data_dir: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, 
     return wavelength, data, sigma, phase
 
 
-def run_hrccs_retrieval(
+def run_retrieval(
     mode: str = "transmission",
     skip_svi: bool = False,
     svi_only: bool = False,
     no_plots: bool = False,
     temperature_profile: str = "guillot",
+    phase_mode: PhaseMode = "shared",
+    check_aliasing: bool = False,
+    compute_contribution: bool = True,
     seed: int = 42,
 ) -> None:
-    """Run HRCCS atmospheric retrieval.
+    """Run atmospheric retrieval.
     
     Args:
         mode: "transmission" or "emission"
@@ -55,6 +63,14 @@ def run_hrccs_retrieval(
         svi_only: Run only SVI, skip MCMC
         no_plots: Skip diagnostic plots
         temperature_profile: T-P profile type (guillot, isothermal, madhu_seager, free)
+        phase_mode: How to model phase-dependent velocity offset:
+            - "shared": Single dRV for all exposures (default)
+            - "per_exposure": Independent dRV for each exposure
+            - "hierarchical": dRV[i] ~ Normal(dRV_mean, dRV_scatter)
+            - "linear": dRV = dRV_0 + dRV_slope * phase
+            - "quadratic": dRV = a + b*phase + c*phase^2
+        check_aliasing: Run species aliasing diagnostics before retrieval
+        compute_contribution: Compute and plot contribution function after MCMC
         seed: Random seed
     """
     # Create timestamped output directory
@@ -76,20 +92,16 @@ def run_hrccs_retrieval(
     params = config.get_params()
     print(f"\nTarget: {config.PLANET} ({config.EPHEMERIS})")
     
-    # Load observed HRCCS data
-    print("\n[1/7] Loading HRCCS time-series data...")
+    print("\n[1/7] Loading time-series data...")
     data_paths = config.TRANSMISSION_DATA if mode == "transmission" else config.EMISSION_DATA
-    
-    # For HRCCS, we need time-series data
-    # Try loading from expected HRCCS format first
+
     try:
         data_dir = config.get_data_dir()
-        wav_obs, data, sigma, phase = load_hrccs_data(data_dir)
+        wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
         print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
         print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
     except FileNotFoundError:
-        # Fallback: load single spectrum (for testing)
-        print("  Warning: HRCCS time-series not found, loading single spectrum...")
+        print("  Warning: time-series not found, loading single spectrum...")
         wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
             data_paths["wavelength"],
             data_paths["spectrum"],
@@ -99,7 +111,7 @@ def run_hrccs_retrieval(
         data = spectrum[np.newaxis, :]
         sigma = uncertainty[np.newaxis, :]
         phase = np.array([0.5])
-        print(f"  Loaded single spectrum with {len(wav_obs)} points (mock HRCCS)")
+        print(f"  Loaded single spectrum with {len(wav_obs)} points")
     
     print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
 
@@ -109,14 +121,15 @@ def run_hrccs_retrieval(
 
     # Setup instrumental resolution
     print("\n[2/7] Setting up instrumental resolution...")
-    Rinst = config.RESOLUTION
-    print(f"  PEPSI resolving power: R = {Rinst:.0f}")
+    Rinst = config.get_resolution()
+    print(f"  Instrument resolving power: R = {Rinst:.0f}")
 
     # Setup wavenumber grid
     print("\n[3/7] Building wavenumber grid...")
+    wav_min, wav_max = config.get_wavelength_range()
     nu_grid, wav_grid, res_high = setup_wavenumber_grid(
-        config.WAV_MIN - config.WAV_MIN_OFFSET,
-        config.WAV_MAX + config.WAV_MAX_OFFSET,
+        wav_min - config.WAV_MIN_OFFSET,
+        wav_max + config.WAV_MAX_OFFSET,
         config.N_SPECTRAL_POINTS,
         unit="AA",
     )
@@ -176,10 +189,26 @@ def run_hrccs_retrieval(
     if opa_atoms:
         print(f"  Loaded {len(opa_atoms)} atomic species: {list(opa_atoms.keys())}")
 
-    # Build HRCCS forward model
-    print(f"\n[6/7] Building HRCCS {mode} model ({temperature_profile} T-P)...")
+    # Run aliasing diagnostics if requested
+    if check_aliasing:
+        print("\n  Running species aliasing diagnostics...")
+        from aliasing import check_aliasing_with_fe, generate_aliasing_report
+        import os
+        
+        # Build templates from opacity objects
+        # For now, just print a warning - full implementation would generate 
+        # model spectra for each species
+        aliasing_dir = os.path.join(output_dir, "aliasing")
+        os.makedirs(aliasing_dir, exist_ok=True)
+        
+        all_species = list(opa_mols.keys()) + list(opa_atoms.keys())
+        print(f"  Species to check: {', '.join(all_species)}")
+        print(f"  (Full aliasing analysis requires template generation - see aliasing.py)")
+        print(f"  Aliasing directory: {aliasing_dir}")
+
+    print(f"\n[6/7] Building {mode} forward model ({temperature_profile} T-P)...")
     
-    # Convert params to format expected by create_hrccs_model
+    # Convert params to format expected by create_retrieval_model
     model_params = {
         "Kp": params.get("Kp", 150.0),
         "Kp_err": params.get("Kp_err", 20.0),
@@ -196,7 +225,7 @@ def run_hrccs_retrieval(
         "period": params["period"].nominal_value if hasattr(params["period"], "nominal_value") else params["period"],
     }
     
-    model_c = create_hrccs_model(
+    model_c = create_retrieval_model(
         mode=mode,
         params=model_params,
         art=art,
@@ -211,8 +240,9 @@ def run_hrccs_retrieval(
         temperature_profile=temperature_profile,
         Tlow=config.TLOW,
         Thigh=config.THIGH,
+        phase_mode=phase_mode,
     )
-    print("  HRCCS model created")
+    print(f"  Model created (phase_mode={phase_mode})")
 
     # Convert data to JAX arrays
     data_jnp = jnp.array(data)
@@ -225,12 +255,10 @@ def run_hrccs_retrieval(
 
     if not skip_svi:
         print(f"  SVI warm-up: {config.SVI_NUM_STEPS} steps, LR={config.SVI_LEARNING_RATE}")
-        # Note: inference.py needs to be updated to handle HRCCS model signature
-        # For now, we go straight to MCMC
-        print("  (SVI for HRCCS not yet implemented, skipping to MCMC)")
-    
+        print("  (SVI not yet implemented, skipping to MCMC)")
+
     if svi_only:
-        print("\n  SVI-only mode requested but not implemented for HRCCS")
+        print("\n  SVI-only mode not yet implemented")
         print(f"  Configuration saved to: {output_dir}/")
         return
 
@@ -265,30 +293,99 @@ def run_hrccs_retrieval(
     posterior_sample = mcmc.get_samples()
     jnp.savez(os.path.join(output_dir, "posterior_sample"), **posterior_sample)
     
+    # Compute contribution function from posterior
+    if compute_contribution:
+        print("\n  Computing contribution function from posterior...")
+        
+        try:
+            # Convert posterior samples from JAX to numpy
+            posterior_np = {k: np.array(v) for k, v in posterior_sample.items()}
+            
+            atmo_state = compute_atmospheric_state_from_posterior(
+                posterior_samples=posterior_np,
+                art=art,
+                opa_mols=opa_mols,
+                opa_atoms=opa_atoms,
+                opa_cias=opa_cias,
+                nu_grid=nu_grid,
+                temperature_profile=temperature_profile,
+                use_median=True,
+            )
+            
+            # Save atmospheric state
+            np.savez(
+                os.path.join(output_dir, "atmospheric_state.npz"),
+                dtau=np.array(atmo_state['dtau']),
+                Tarr=np.array(atmo_state['Tarr']),
+                pressure=np.array(atmo_state['pressure']),
+                dParr=np.array(atmo_state['dParr']),
+                mmw=np.array(atmo_state['mmw']),
+                vmrH2=np.array(atmo_state['vmrH2']),
+                vmrHe=np.array(atmo_state['vmrHe']),
+            )
+            
+            # Plot contribution function
+            if not no_plots:
+                print("  Plotting contribution function...")
+                
+                # Total contribution function
+                cf = plot_contribution_function(
+                    nu_grid=np.array(nu_grid),
+                    dtau=np.array(atmo_state['dtau']),
+                    Tarr=np.array(atmo_state['Tarr']),
+                    pressure=np.array(atmo_state['pressure']),
+                    dParr=np.array(atmo_state['dParr']),
+                    save_path=os.path.join(output_dir, "contribution_function.pdf"),
+                    wavelength_unit="AA",
+                    title=f"{config.PLANET} Contribution Function ({mode})",
+                )
+                
+                # Per-species contribution functions (if available)
+                if atmo_state['dtau_per_species']:
+                    dtau_per_species_np = {
+                        k: np.array(v) for k, v in atmo_state['dtau_per_species'].items()
+                    }
+                    
+                    plot_contribution_per_species(
+                        nu_grid=np.array(nu_grid),
+                        dtau_per_species=dtau_per_species_np,
+                        Tarr=np.array(atmo_state['Tarr']),
+                        pressure=np.array(atmo_state['pressure']),
+                        dParr=np.array(atmo_state['dParr']),
+                        save_path=os.path.join(output_dir, "contribution_per_species.pdf"),
+                        wavelength_unit="AA",
+                    )
+                    
+                    # Combined plot
+                    plot_contribution_combined(
+                        nu_grid=np.array(nu_grid),
+                        dtau=np.array(atmo_state['dtau']),
+                        dtau_per_species=dtau_per_species_np,
+                        Tarr=np.array(atmo_state['Tarr']),
+                        pressure=np.array(atmo_state['pressure']),
+                        dParr=np.array(atmo_state['dParr']),
+                        save_path=os.path.join(output_dir, "contribution_combined.pdf"),
+                        wavelength_unit="AA",
+                    )
+                
+                print(f"  Contribution function plots saved to {output_dir}/")
+            
+        except Exception as e:
+            print(f"  Warning: Could not compute contribution function: {e}")
+            import traceback
+            traceback.print_exc()
+    
     print("\n" + "="*70)
-    print("HRCCS RETRIEVAL COMPLETE")
+    print("RETRIEVAL COMPLETE")
     print(f"Results saved to: {output_dir}/")
     print("="*70)
-
-
-# Aliases for backward compatibility
-def run_transmission_retrieval(**kwargs):
-    """Run HRCCS transmission retrieval."""
-    return run_hrccs_retrieval(mode="transmission", **kwargs)
-
-
-def run_emission_retrieval(**kwargs):
-    """Run HRCCS emission retrieval."""
-    return run_hrccs_retrieval(mode="emission", **kwargs)
 
 
 if __name__ == "__main__":
     print("Running with default settings.")
     print("For more options, use: python __main__.py --help\n")
 
-    if config.RETRIEVAL_MODE == "transmission":
-        run_transmission_retrieval()
-    elif config.RETRIEVAL_MODE == "emission":
-        run_emission_retrieval()
+    if config.RETRIEVAL_MODE in ("transmission", "emission"):
+        run_retrieval(mode=config.RETRIEVAL_MODE)
     else:
         raise ValueError(f"Unknown retrieval mode: {config.RETRIEVAL_MODE}")

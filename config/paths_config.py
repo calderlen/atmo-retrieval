@@ -5,7 +5,7 @@ Database paths, data paths, and output configuration.
 import os
 from pathlib import Path
 
-from .planets import PLANET, EPHEMERIS
+from .planets_config import PLANET, EPHEMERIS
 
 # ==============================================================================
 # BASE DIRECTORIES
@@ -65,8 +65,8 @@ ATOMIC_SPECIES = {
 # ==============================================================================
 
 # Import here to avoid circular import at module level
-from .instrument import OBSERVING_MODE
-from .model import RETRIEVAL_MODE
+from .instrument_config import OBSERVING_MODE
+from .model_config import RETRIEVAL_MODE
 
 
 def get_data_dir(planet: str | None = None, arm: str | None = None) -> Path:
@@ -96,7 +96,6 @@ def get_emission_paths(planet: str | None = None, arm: str | None = None) -> dic
     }
 
 
-# Legacy compatibility
 DATA_DIR = get_data_dir()
 TRANSMISSION_DATA = get_transmission_paths()
 EMISSION_DATA = get_emission_paths()

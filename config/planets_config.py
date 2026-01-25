@@ -8,6 +8,22 @@ from math import nan
 PLANET = "KELT-20b"
 EPHEMERIS = "Duck24"
 
+# ==============================================================================
+# Phase Bin Definitions
+# ==============================================================================
+
+# Standard transit contact points:
+# T1 = first contact (start of ingress)
+# T2 = second contact (end of ingress, start of full transit)
+# T3 = third contact (end of full transit, start of egress)
+# T4 = fourth contact (end of egress)
+
+PHASE_BINS = {
+    "T12": "ingress",       # T1 to T2 (first to second contact)
+    "T23": "full_transit",  # T2 to T3 (second to third contact)
+    "T34": "egress",        # T3 to T4 (third to fourth contact)
+}
+
 # Planet parameters dictionary
 # Format: PLANETS[planet_name][ephemeris_source]
 PLANETS = {
@@ -18,8 +34,10 @@ PLANETS = {
             "period_err": 0.00000012,
             "epoch": 2459757.811176,     # BJD_TDB
             "epoch_err": 0.000019,
-            "duration": 0.147565,        # days
+            "duration": 0.147565,        # days (T14)
             "duration_err": 0.000092,
+            "tau": 0.02007,              # days (ingress/egress duration)
+            "tau_err": 0.00011,
             # Orbital parameters
             "inclination": 86.12,        # degrees
             "inclination_err": 0.28,
@@ -36,6 +54,20 @@ PLANETS = {
             "Fe_H": -0.29,               # metallicity
             "v_sini_star": 117.4,        # km/s
             "v_sini_star_err": 2.9,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": 0.0,         # deg (spin-orbit angle, ~aligned)
+            "lambda_angle_err": 5.0,     # deg (estimated)
+            # Limb darkening coefficients (quadratic law, ATLAS models for Teff=8720K, logg=4.3)
+            # Computed for PEPSI bandpass using PyLDTk or similar
+            "gamma1": 0.35,              # linear limb darkening coeff
+            "gamma2": 0.25,              # quadratic limb darkening coeff
+            # Derived transit geometry (for Doppler shadow model)
+            # a_rs = a[AU] * 215.03 / R_star[R_Sun] = 0.0542 * 215.03 / 1.565 = 7.45
+            "a_rs": 7.45,                # semi-major axis in stellar radii
+            # b = a_rs * cos(i) = 7.45 * cos(86.12°) = 0.50
+            "b": 0.50,                   # impact parameter
+            # rp_rs from Lund+17: tau = 0.02007 days, gives Rp/Rs ~ 0.11
+            "rp_rs": 0.111,              # planet-to-star radius ratio
             # Planetary parameters
             "M_p": 3.382,                # M_J (upper limit)
             "M_p_err": 0.13,
@@ -65,6 +97,8 @@ PLANETS = {
             "epoch_err": 0.000024,
             "duration": 0.1475,
             "duration_err": nan,
+            "tau": float('nan'),  # TODO: look up from literature
+            "tau_err": float('nan'),  # TODO: look up from literature
             # Orbital parameters
             "inclination": 86.03,
             "inclination_err": 0.05,
@@ -81,6 +115,16 @@ PLANETS = {
             "Fe_H": nan,
             "v_sini_star": nan,
             "v_sini_star_err": nan,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": float('nan'),  # TODO: look up from literature
+            "lambda_angle_err": float('nan'),  # TODO: look up from literature
+            # Limb darkening coefficients
+            "gamma1": float('nan'),  # TODO: look up from literature
+            "gamma2": float('nan'),  # TODO: look up from literature
+            # Transit geometry
+            "a_rs": float('nan'),  # TODO: look up from literature
+            "b": float('nan'),  # TODO: look up from literature
+            "rp_rs": float('nan'),  # TODO: look up from literature
             # Planetary parameters
             "M_p": 3.382,
             "M_p_err": 0.13,
@@ -110,6 +154,8 @@ PLANETS = {
             "epoch_err": 0.000190,
             "duration": 0.14898,
             "duration_err": nan,
+            "tau": float('nan'),  # TODO: look up from literature
+            "tau_err": float('nan'),  # TODO: look up from literature
             # Orbital parameters
             "inclination": 86.12,
             "inclination_err": 0.28,
@@ -126,6 +172,16 @@ PLANETS = {
             "Fe_H": nan,
             "v_sini_star": nan,
             "v_sini_star_err": nan,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": float('nan'),  # TODO: look up from literature
+            "lambda_angle_err": float('nan'),  # TODO: look up from literature
+            # Limb darkening coefficients
+            "gamma1": float('nan'),  # TODO: look up from literature
+            "gamma2": float('nan'),  # TODO: look up from literature
+            # Transit geometry
+            "a_rs": float('nan'),  # TODO: look up from literature
+            "b": float('nan'),  # TODO: look up from literature
+            "rp_rs": float('nan'),  # TODO: look up from literature
             # Planetary parameters
             "M_p": 3.382,
             "M_p_err": 0.13,
@@ -157,6 +213,8 @@ PLANETS = {
             "epoch_err": 0.00034,
             "duration": 3.694 / 24.0,
             "duration_err": nan,
+            "tau": float('nan'),  # TODO: look up from literature
+            "tau_err": float('nan'),  # TODO: look up from literature
             # Orbital parameters
             "inclination": 88.0,
             "inclination_err": 1.6,
@@ -173,6 +231,16 @@ PLANETS = {
             "Fe_H": nan,
             "v_sini_star": nan,
             "v_sini_star_err": nan,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": float('nan'),  # TODO: look up from literature
+            "lambda_angle_err": float('nan'),  # TODO: look up from literature
+            # Limb darkening coefficients
+            "gamma1": float('nan'),  # TODO: look up from literature
+            "gamma2": float('nan'),  # TODO: look up from literature
+            # Transit geometry
+            "a_rs": float('nan'),  # TODO: look up from literature
+            "b": float('nan'),  # TODO: look up from literature
+            "rp_rs": float('nan'),  # TODO: look up from literature
             # Planetary parameters
             "M_p": 0.92,
             "M_p_err": 0.03,
@@ -204,6 +272,8 @@ PLANETS = {
             "epoch_err": 0.00014,
             "duration": 3.9158 / 24.0,
             "duration_err": nan,
+            "tau": float('nan'),  # TODO: look up from literature
+            "tau_err": float('nan'),  # TODO: look up from literature
             # Orbital parameters
             "inclination": 86.79,
             "inclination_err": 0.25,
@@ -220,6 +290,16 @@ PLANETS = {
             "Fe_H": nan,
             "v_sini_star": nan,
             "v_sini_star_err": nan,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": float('nan'),  # TODO: look up from literature
+            "lambda_angle_err": float('nan'),  # TODO: look up from literature
+            # Limb darkening coefficients
+            "gamma1": float('nan'),  # TODO: look up from literature
+            "gamma2": float('nan'),  # TODO: look up from literature
+            # Transit geometry
+            "a_rs": float('nan'),  # TODO: look up from literature
+            "b": float('nan'),  # TODO: look up from literature
+            "rp_rs": float('nan'),  # TODO: look up from literature
             # Planetary parameters
             "M_p": 2.17,
             "M_p_err": 0.56,
@@ -251,6 +331,8 @@ PLANETS = {
             "epoch_err": 7e-05,
             "duration": 3.0408 / 24.0,
             "duration_err": nan,
+            "tau": float('nan'),  # TODO: look up from literature
+            "tau_err": float('nan'),  # TODO: look up from literature
             # Orbital parameters
             "inclination": 83.3,
             "inclination_err": 1.1,
@@ -267,6 +349,16 @@ PLANETS = {
             "Fe_H": nan,
             "v_sini_star": nan,
             "v_sini_star_err": nan,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": float('nan'),  # TODO: look up from literature
+            "lambda_angle_err": float('nan'),  # TODO: look up from literature
+            # Limb darkening coefficients
+            "gamma1": float('nan'),  # TODO: look up from literature
+            "gamma2": float('nan'),  # TODO: look up from literature
+            # Transit geometry
+            "a_rs": float('nan'),  # TODO: look up from literature
+            "b": float('nan'),  # TODO: look up from literature
+            "rp_rs": float('nan'),  # TODO: look up from literature
             # Planetary parameters
             "M_p": 1.39,
             "M_p_err": 0.12,
@@ -298,6 +390,8 @@ PLANETS = {
             "epoch_err": 0.00022,
             "duration": 2.854 / 24.0,
             "duration_err": nan,
+            "tau": float('nan'),  # TODO: look up from literature
+            "tau_err": float('nan'),  # TODO: look up from literature
             # Orbital parameters
             "inclination": 86.63,
             "inclination_err": 0.03,
@@ -314,6 +408,16 @@ PLANETS = {
             "Fe_H": nan,
             "v_sini_star": nan,
             "v_sini_star_err": nan,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": float('nan'),  # TODO: look up from literature
+            "lambda_angle_err": float('nan'),  # TODO: look up from literature
+            # Limb darkening coefficients
+            "gamma1": float('nan'),  # TODO: look up from literature
+            "gamma2": float('nan'),  # TODO: look up from literature
+            # Transit geometry
+            "a_rs": float('nan'),  # TODO: look up from literature
+            "b": float('nan'),  # TODO: look up from literature
+            "rp_rs": float('nan'),  # TODO: look up from literature
             # Planetary parameters
             "M_p": 2.093,
             "M_p_err": 0.139,
@@ -345,6 +449,8 @@ PLANETS = {
             "epoch_err": 0.00019,
             "duration": 2.21 / 24.0,
             "duration_err": nan,
+            "tau": float('nan'),  # TODO: look up from literature
+            "tau_err": float('nan'),  # TODO: look up from literature
             # Orbital parameters
             "inclination": 83.5,
             "inclination_err": 2.0,
@@ -361,6 +467,16 @@ PLANETS = {
             "Fe_H": nan,
             "v_sini_star": nan,
             "v_sini_star_err": nan,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": float('nan'),  # TODO: look up from literature
+            "lambda_angle_err": float('nan'),  # TODO: look up from literature
+            # Limb darkening coefficients
+            "gamma1": float('nan'),  # TODO: look up from literature
+            "gamma2": float('nan'),  # TODO: look up from literature
+            # Transit geometry
+            "a_rs": float('nan'),  # TODO: look up from literature
+            "b": float('nan'),  # TODO: look up from literature
+            "rp_rs": float('nan'),  # TODO: look up from literature
             # Planetary parameters
             "M_p": 10.20,
             "M_p_err": 0.35,
@@ -392,6 +508,8 @@ PLANETS = {
             "epoch_err": 0.0000650,
             "duration": 4.3336 / 24.0,
             "duration_err": nan,
+            "tau": float('nan'),  # TODO: look up from literature
+            "tau_err": float('nan'),  # TODO: look up from literature
             # Orbital parameters
             "inclination": 84.03,
             "inclination_err": 0.14,
@@ -408,6 +526,16 @@ PLANETS = {
             "Fe_H": nan,
             "v_sini_star": nan,
             "v_sini_star_err": nan,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": float('nan'),  # TODO: look up from literature
+            "lambda_angle_err": float('nan'),  # TODO: look up from literature
+            # Limb darkening coefficients
+            "gamma1": float('nan'),  # TODO: look up from literature
+            "gamma2": float('nan'),  # TODO: look up from literature
+            # Transit geometry
+            "a_rs": float('nan'),  # TODO: look up from literature
+            "b": float('nan'),  # TODO: look up from literature
+            "rp_rs": float('nan'),  # TODO: look up from literature
             # Planetary parameters
             "M_p": 1.99,
             "M_p_err": 0.16,
@@ -439,6 +567,8 @@ PLANETS = {
             "epoch_err": 0.000092,
             "duration": 4.226 / 24.0,
             "duration_err": nan,
+            "tau": float('nan'),  # TODO: look up from literature
+            "tau_err": float('nan'),  # TODO: look up from literature
             # Orbital parameters
             "inclination": 88.45,
             "inclination_err": 0.17,
@@ -455,6 +585,16 @@ PLANETS = {
             "Fe_H": nan,
             "v_sini_star": nan,
             "v_sini_star_err": nan,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": float('nan'),  # TODO: look up from literature
+            "lambda_angle_err": float('nan'),  # TODO: look up from literature
+            # Limb darkening coefficients
+            "gamma1": float('nan'),  # TODO: look up from literature
+            "gamma2": float('nan'),  # TODO: look up from literature
+            # Transit geometry
+            "a_rs": float('nan'),  # TODO: look up from literature
+            "b": float('nan'),  # TODO: look up from literature
+            "rp_rs": float('nan'),  # TODO: look up from literature
             # Planetary parameters
             "M_p": 3.7,
             "M_p_err": 0.9,
@@ -486,6 +626,8 @@ PLANETS = {
             "epoch_err": 0.00007,
             "duration": 2.489 / 24.0,
             "duration_err": nan,
+            "tau": float('nan'),  # TODO: look up from literature
+            "tau_err": float('nan'),  # TODO: look up from literature
             # Orbital parameters
             "inclination": 80.13,
             "inclination_err": 0.13,
@@ -502,6 +644,16 @@ PLANETS = {
             "Fe_H": nan,
             "v_sini_star": nan,
             "v_sini_star_err": nan,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": float('nan'),  # TODO: look up from literature
+            "lambda_angle_err": float('nan'),  # TODO: look up from literature
+            # Limb darkening coefficients
+            "gamma1": float('nan'),  # TODO: look up from literature
+            "gamma2": float('nan'),  # TODO: look up from literature
+            # Transit geometry
+            "a_rs": float('nan'),  # TODO: look up from literature
+            "b": float('nan'),  # TODO: look up from literature
+            "rp_rs": float('nan'),  # TODO: look up from literature
             # Planetary parameters
             "M_p": 3.12,
             "M_p_err": 0.18,
@@ -534,6 +686,8 @@ PLANETS = {
             "epoch_err": 0.000094,
             "duration": 2.365 / 24.0,
             "duration_err": nan,
+            "tau": float('nan'),  # TODO: look up from literature
+            "tau_err": float('nan'),  # TODO: look up from literature
             # Orbital parameters
             "inclination": 77.84,
             "inclination_err": 0.26,
@@ -550,6 +704,16 @@ PLANETS = {
             "Fe_H": nan,
             "v_sini_star": nan,
             "v_sini_star_err": nan,
+            # Spin-orbit alignment (Doppler shadow)
+            "lambda_angle": float('nan'),  # TODO: look up from literature
+            "lambda_angle_err": float('nan'),  # TODO: look up from literature
+            # Limb darkening coefficients
+            "gamma1": float('nan'),  # TODO: look up from literature
+            "gamma2": float('nan'),  # TODO: look up from literature
+            # Transit geometry
+            "a_rs": float('nan'),  # TODO: look up from literature
+            "b": float('nan'),  # TODO: look up from literature
+            "rp_rs": float('nan'),  # TODO: look up from literature
             # Planetary parameters
             "M_p": 2.3,
             "M_p_err": 2.3,

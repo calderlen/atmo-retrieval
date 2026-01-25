@@ -1,11 +1,4 @@
-"""NumPyro atmospheric model for HRCCS (time-series) retrieval.
-
-Updates:
-1) opa_atoms is mandatory (pass {} for empty).
-2) Automated Instrument Profile: Pass 'instrument_resolution' (R) instead of beta.
-3) Grid Validation: Checks if nu_grid is fine enough for the given R.
-4) Default T-P profile is 'guillot'.
-"""
+"""NumPyro atmospheric model for high-resolution spectroscopic retrieval."""
 
 from __future__ import annotations
 
@@ -16,6 +9,9 @@ import jax
 import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
+
+# Phase mode type for type hints
+PhaseMode = Literal["shared", "per_exposure", "hierarchical", "linear", "quadratic"]
 
 from exojax.database import molinfo
 from exojax.opacity.opacont import OpaCIA
@@ -105,7 +101,368 @@ def check_grid_resolution(nu_grid: jnp.ndarray,
         print(f"[INFO] Grid check passed: {R_grid/R:.1f} pixels per FWHM (Target R={R}).")
 
 
-def create_hrccs_model(
+# ==============================================================================
+# Contribution Function Utilities
+# ==============================================================================
+
+def compute_dtau(
+    art: object,
+    opa_mols: dict[str, OpaPremodit],
+    opa_atoms: dict[str, OpaPremodit],
+    opa_cias: dict[str, OpaCIA],
+    nu_grid: jnp.ndarray,
+    Tarr: jnp.ndarray,
+    vmr_mols: dict[str, jnp.ndarray],
+    vmr_atoms: dict[str, jnp.ndarray],
+    vmrH2: jnp.ndarray,
+    vmrHe: jnp.ndarray,
+    mmw: jnp.ndarray,
+    g: jnp.ndarray,
+) -> jnp.ndarray:
+    """Compute optical depth matrix dtau for given atmospheric state.
+    
+    This is a standalone function that extracts the dtau computation logic
+    from the NumPyro model, allowing computation of contribution functions
+    from posterior samples.
+    
+    Args:
+        art: ExoJAX atmospheric radiative transfer object
+        opa_mols: Dictionary of molecular opacity objects
+        opa_atoms: Dictionary of atomic opacity objects (pass {} if none)
+        opa_cias: Dictionary of CIA opacity objects
+        nu_grid: Wavenumber grid
+        Tarr: Temperature array per layer
+        vmr_mols: Dict mapping molecule name -> VMR profile array
+        vmr_atoms: Dict mapping atom name -> VMR profile array
+        vmrH2: H2 volume mixing ratio profile
+        vmrHe: He volume mixing ratio profile
+        mmw: Mean molecular weight profile
+        g: Gravity profile
+        
+    Returns:
+        dtau: Optical depth matrix, shape (n_layers, n_wavenumber)
+    """
+    dtau = jnp.zeros((art.pressure.size, nu_grid.size))
+    
+    # CIA contributions
+    for molA, molB in [("H2", "H2"), ("H2", "He")]:
+        key = molA + molB
+        if key in opa_cias:
+            logacia_matrix = opa_cias[key].logacia_matrix(Tarr)
+            vmrX, vmrY = (vmrH2, vmrH2) if molB == "H2" else (vmrH2, vmrHe)
+            dtau = dtau + art.opacity_profile_cia(
+                logacia_matrix, Tarr, vmrX, vmrY, mmw[:, None], g
+            )
+    
+    # Molecular contributions
+    for mol, vmr in vmr_mols.items():
+        if mol in opa_mols:
+            xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
+            dtau = dtau + art.opacity_profile_xs(
+                xsmatrix, vmr, mmw[:, None], g
+            )
+    
+    # Atomic contributions
+    for atom, vmr in vmr_atoms.items():
+        if atom in opa_atoms:
+            xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
+            dtau = dtau + art.opacity_profile_xs(
+                xsmatrix, vmr, mmw[:, None], g
+            )
+    
+    return dtau
+
+
+def compute_dtau_per_species(
+    art: object,
+    opa_mols: dict[str, OpaPremodit],
+    opa_atoms: dict[str, OpaPremodit],
+    opa_cias: dict[str, OpaCIA],
+    nu_grid: jnp.ndarray,
+    Tarr: jnp.ndarray,
+    vmr_mols: dict[str, jnp.ndarray],
+    vmr_atoms: dict[str, jnp.ndarray],
+    vmrH2: jnp.ndarray,
+    vmrHe: jnp.ndarray,
+    mmw: jnp.ndarray,
+    g: jnp.ndarray,
+) -> dict[str, jnp.ndarray]:
+    """Compute optical depth matrix dtau for each species separately.
+    
+    Useful for understanding the contribution of individual species
+    to the total opacity at each wavelength and pressure level.
+    
+    Args:
+        Same as compute_dtau()
+        
+    Returns:
+        Dict mapping species name -> dtau array, shape (n_layers, n_wavenumber)
+    """
+    dtau_dict = {}
+    
+    # CIA contributions
+    for molA, molB in [("H2", "H2"), ("H2", "He")]:
+        key = molA + molB
+        if key in opa_cias:
+            logacia_matrix = opa_cias[key].logacia_matrix(Tarr)
+            vmrX, vmrY = (vmrH2, vmrH2) if molB == "H2" else (vmrH2, vmrHe)
+            dtau_dict[f"CIA_{key}"] = art.opacity_profile_cia(
+                logacia_matrix, Tarr, vmrX, vmrY, mmw[:, None], g
+            )
+    
+    # Molecular contributions
+    for mol, vmr in vmr_mols.items():
+        if mol in opa_mols:
+            xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
+            dtau_dict[mol] = art.opacity_profile_xs(
+                xsmatrix, vmr, mmw[:, None], g
+            )
+    
+    # Atomic contributions
+    for atom, vmr in vmr_atoms.items():
+        if atom in opa_atoms:
+            xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
+            dtau_dict[atom] = art.opacity_profile_xs(
+                xsmatrix, vmr, mmw[:, None], g
+            )
+    
+    return dtau_dict
+
+
+def reconstruct_temperature_profile(
+    posterior_params: dict,
+    art: object,
+    temperature_profile: str = "guillot",
+    Tint_fixed: float = 100.0,
+) -> jnp.ndarray:
+    """Reconstruct temperature profile from posterior parameter values.
+    
+    Args:
+        posterior_params: Dict of parameter values (e.g., median of posterior)
+        art: ExoJAX art object (provides pressure grid)
+        temperature_profile: Type of T-P profile ("guillot", "isothermal", etc.)
+        Tint_fixed: Fixed internal temperature for Guillot profile
+        
+    Returns:
+        Tarr: Temperature array per layer
+    """
+    if temperature_profile == "guillot":
+        Tirr = posterior_params.get("Tirr", 2500.0)
+        log_kappa_ir = posterior_params.get("log_kappa_ir", -2.0)
+        log_gamma = posterior_params.get("log_gamma", 0.0)
+        
+        # Need gravity for Guillot profile
+        Rp = posterior_params.get("Rp", 1.5)  # R_J
+        Mp = posterior_params.get("Mp", 1.0)  # M_J
+        g_btm = gravity_jupiter(Rp, Mp)
+        
+        Tarr = guillot_profile(
+            pressure_bar=art.pressure,
+            g_cgs=g_btm,
+            Tirr=Tirr,
+            Tint=Tint_fixed,
+            kappa_ir_cgs=jnp.power(10.0, log_kappa_ir),
+            gamma=jnp.power(10.0, log_gamma),
+        )
+        
+    elif temperature_profile == "isothermal":
+        T0 = posterior_params.get("T0", 2500.0)
+        Tarr = T0 * jnp.ones_like(art.pressure)
+        
+    elif temperature_profile == "gradient":
+        # Linear gradient in log-pressure
+        T_btm = posterior_params.get("T_btm", 3000.0)
+        T_top = posterior_params.get("T_top", 1500.0)
+        log_p = jnp.log10(art.pressure)
+        log_p_btm = jnp.log10(art.pressure[-1])
+        log_p_top = jnp.log10(art.pressure[0])
+        Tarr = T_top + (T_btm - T_top) * (log_p - log_p_top) / (log_p_btm - log_p_top)
+        
+    else:
+        raise ValueError(f"Unsupported temperature profile for reconstruction: {temperature_profile}")
+    
+    return Tarr
+
+
+def reconstruct_vmrs(
+    posterior_params: dict,
+    art: object,
+    mol_names: list[str],
+    atom_names: list[str],
+) -> tuple[dict[str, jnp.ndarray], dict[str, jnp.ndarray]]:
+    """Reconstruct VMR profiles from posterior parameter values.
+    
+    Args:
+        posterior_params: Dict of parameter values (e.g., median of posterior)
+        art: ExoJAX art object (provides pressure grid for profile shape)
+        mol_names: List of molecule names to reconstruct
+        atom_names: List of atom names to reconstruct
+        
+    Returns:
+        Tuple of (vmr_mols, vmr_atoms) where each is a dict mapping
+        species name -> constant VMR profile array
+    """
+    vmr_mols = {}
+    for mol in mol_names:
+        key = f"logVMR_{mol}"
+        if key in posterior_params:
+            logVMR = posterior_params[key]
+            vmr_mols[mol] = art.constant_mmr_profile(jnp.power(10.0, logVMR))
+    
+    vmr_atoms = {}
+    for atom in atom_names:
+        key = f"logVMR_{atom}"
+        if key in posterior_params:
+            logVMR = posterior_params[key]
+            vmr_atoms[atom] = art.constant_mmr_profile(jnp.power(10.0, logVMR))
+    
+    return vmr_mols, vmr_atoms
+
+
+def reconstruct_mmw_and_h2he(
+    vmr_mols: dict[str, jnp.ndarray],
+    vmr_atoms: dict[str, jnp.ndarray],
+    mol_names: list[str],
+    atom_names: list[str],
+    art: object,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Compute mean molecular weight and H2/He VMRs from species VMRs.
+    
+    Args:
+        vmr_mols: Dict mapping molecule name -> VMR profile
+        vmr_atoms: Dict mapping atom name -> VMR profile
+        mol_names: List of molecule names (for mass lookup)
+        atom_names: List of atom names (for mass lookup)
+        art: ExoJAX art object
+        
+    Returns:
+        Tuple of (mmw, vmrH2, vmrHe) arrays
+    """
+    # Compute molecular masses
+    mol_masses = {m: molinfo.molmass_isotope(m) for m in mol_names}
+    atom_masses = {a: molinfo.molmass_isotope(a) for a in atom_names}
+    
+    # Sum VMRs
+    sum_mols = sum(vmr_mols.values()) if vmr_mols else 0.0
+    sum_atoms = sum(vmr_atoms.values()) if vmr_atoms else 0.0
+    vmr_tot = jnp.clip(sum_mols + sum_atoms, 0.0, 1.0)
+    
+    # H2/He fill (solar ratio 6:1)
+    vmrH2 = (1.0 - vmr_tot) * (6.0 / 7.0)
+    vmrHe = (1.0 - vmr_tot) * (1.0 / 7.0)
+    
+    # Mean molecular weight
+    dot_mols = sum(mol_masses[m] * vmr for m, vmr in vmr_mols.items()) if vmr_mols else 0.0
+    dot_atoms = sum(atom_masses[a] * vmr for a, vmr in vmr_atoms.items()) if vmr_atoms else 0.0
+    
+    mmw = (
+        molinfo.molmass_isotope("H2") * vmrH2
+        + molinfo.molmass_isotope("He", db_HIT=False) * vmrHe
+        + dot_mols
+        + dot_atoms
+    )
+    
+    return mmw, vmrH2, vmrHe
+
+
+def compute_atmospheric_state_from_posterior(
+    posterior_samples: dict,
+    art: object,
+    opa_mols: dict[str, OpaPremodit],
+    opa_atoms: dict[str, OpaPremodit],
+    opa_cias: dict[str, OpaCIA],
+    nu_grid: jnp.ndarray,
+    temperature_profile: str = "guillot",
+    use_median: bool = True,
+) -> dict:
+    """Compute full atmospheric state from posterior samples.
+    
+    This is the main entry point for computing contribution functions
+    from retrieval results.
+    
+    Args:
+        posterior_samples: Dict of posterior samples from MCMC
+        art: ExoJAX art object
+        opa_mols: Molecular opacity objects
+        opa_atoms: Atomic opacity objects
+        opa_cias: CIA opacity objects
+        nu_grid: Wavenumber grid
+        temperature_profile: T-P profile type
+        use_median: If True, use median; else use mean
+        
+    Returns:
+        Dict with keys:
+            - 'dtau': Total optical depth matrix
+            - 'dtau_per_species': Dict of per-species dtau
+            - 'Tarr': Temperature profile
+            - 'pressure': Pressure grid
+            - 'dParr': Pressure differentials
+            - 'mmw': Mean molecular weight
+            - 'vmrH2': H2 VMR profile
+            - 'vmrHe': He VMR profile
+            - 'vmr_mols': Molecular VMR profiles
+            - 'vmr_atoms': Atomic VMR profiles
+            - 'params': Point estimates used
+    """
+    import numpy as np
+    
+    # Extract point estimates
+    if use_median:
+        params = {k: float(np.median(v)) for k, v in posterior_samples.items() 
+                  if not k.startswith("_")}
+    else:
+        params = {k: float(np.mean(v)) for k, v in posterior_samples.items()
+                  if not k.startswith("_")}
+    
+    # Get species lists from opacity objects
+    mol_names = list(opa_mols.keys())
+    atom_names = list(opa_atoms.keys())
+    
+    # Reconstruct temperature profile
+    Tarr = reconstruct_temperature_profile(params, art, temperature_profile)
+    
+    # Reconstruct VMRs
+    vmr_mols, vmr_atoms = reconstruct_vmrs(params, art, mol_names, atom_names)
+    
+    # Compute mean molecular weight and H2/He
+    mmw, vmrH2, vmrHe = reconstruct_mmw_and_h2he(
+        vmr_mols, vmr_atoms, mol_names, atom_names, art
+    )
+    
+    # Compute gravity profile
+    Rp = params.get("Rp", 1.5) * RJ
+    Mp = params.get("Mp", 1.0) * MJ
+    g_btm = gravity_jupiter(Rp / RJ, Mp / MJ)
+    g = art.gravity_profile(Tarr, mmw, Rp, g_btm)
+    
+    # Compute total dtau
+    dtau = compute_dtau(
+        art, opa_mols, opa_atoms, opa_cias, nu_grid,
+        Tarr, vmr_mols, vmr_atoms, vmrH2, vmrHe, mmw, g
+    )
+    
+    # Compute per-species dtau
+    dtau_per_species = compute_dtau_per_species(
+        art, opa_mols, opa_atoms, opa_cias, nu_grid,
+        Tarr, vmr_mols, vmr_atoms, vmrH2, vmrHe, mmw, g
+    )
+    
+    return {
+        'dtau': dtau,
+        'dtau_per_species': dtau_per_species,
+        'Tarr': Tarr,
+        'pressure': art.pressure,
+        'dParr': art.dParr,
+        'mmw': mmw,
+        'vmrH2': vmrH2,
+        'vmrHe': vmrHe,
+        'vmr_mols': vmr_mols,
+        'vmr_atoms': vmr_atoms,
+        'params': params,
+    }
+
+
+def create_retrieval_model(
     *,
     mode: Literal["transmission", "emission"],
     params: dict,  # from config.get_params()
@@ -128,11 +485,13 @@ def create_hrccs_model(
     Tint_fixed: float = 100.0,
     log_kappa_ir_bounds: tuple[float, float] = (-4.0, 0.0),
     log_gamma_bounds: tuple[float, float] = (-2.0, 2.0),
+    # Phase-dependent velocity modeling
+    phase_mode: PhaseMode = "shared",
     # Pipeline options
     subtract_per_exposure_mean: bool = True,
     apply_sysrem: bool = False,
 ) -> Callable:
-    """Create HRCCS NumPyro model for atmospheric retrieval.
+    """Create NumPyro model for atmospheric retrieval.
 
     Args:
         mode: "transmission" or "emission"
@@ -160,6 +519,12 @@ def create_hrccs_model(
         Tint_fixed: Internal temperature (K)
         log_kappa_ir_bounds: Prior bounds on log10(kappa_IR)
         log_gamma_bounds: Prior bounds on log10(gamma)
+        phase_mode: How to model phase-dependent velocity offset dRV:
+            - "shared": Single dRV for all exposures (default)
+            - "per_exposure": Independent dRV[i] for each exposure
+            - "hierarchical": dRV[i] ~ Normal(dRV_mean, dRV_scatter)
+            - "linear": dRV = dRV_0 + dRV_slope * phase
+            - "quadratic": dRV = dRV_a + dRV_b * phase + dRV_c * phase^2
         subtract_per_exposure_mean: Subtract per-exposure mean
         apply_sysrem: Apply SYSREM filter
 
@@ -215,7 +580,50 @@ def create_hrccs_model(
         # 1. System Parameters
         Kp = numpyro.sample("Kp", dist.TruncatedNormal(Kp_mean, Kp_std, low=0.0))
         Vsys = numpyro.sample("Vsys", dist.Normal(Vsys_mean, Vsys_std))
-        dRV = numpyro.sample("dRV", dist.Normal(0.0, 10.0))
+        
+        # Phase-dependent velocity offset (dRV) sampling based on phase_mode
+        n_exp = phase.shape[0]
+        
+        if phase_mode == "shared":
+            # Single dRV for all exposures (original behavior)
+            dRV = numpyro.sample("dRV", dist.Normal(0.0, 10.0))
+            
+        elif phase_mode == "per_exposure":
+            # Independent dRV for each exposure
+            with numpyro.plate("exposures", n_exp):
+                dRV = numpyro.sample("dRV", dist.Normal(0.0, 10.0))
+            # Track mean and std as deterministics
+            numpyro.deterministic("dRV_mean", jnp.mean(dRV))
+            numpyro.deterministic("dRV_std", jnp.std(dRV))
+            
+        elif phase_mode == "hierarchical":
+            # Hierarchical: dRV[i] ~ Normal(dRV_mean, dRV_scatter)
+            dRV_mean = numpyro.sample("dRV_mean", dist.Normal(0.0, 10.0))
+            dRV_scatter = numpyro.sample("dRV_scatter", dist.HalfNormal(5.0))
+            with numpyro.plate("exposures", n_exp):
+                dRV = numpyro.sample("dRV", dist.Normal(dRV_mean, dRV_scatter))
+            
+        elif phase_mode == "linear":
+            # Linear trend: dRV = dRV_0 + dRV_slope * phase
+            dRV_0 = numpyro.sample("dRV_0", dist.Normal(0.0, 10.0))
+            dRV_slope = numpyro.sample("dRV_slope", dist.Normal(0.0, 50.0))  # km/s per phase
+            dRV = dRV_0 + dRV_slope * phase
+            # Track values at ingress/egress for interpretation
+            numpyro.deterministic("dRV_at_ingress", dRV_0 + dRV_slope * jnp.min(phase))
+            numpyro.deterministic("dRV_at_egress", dRV_0 + dRV_slope * jnp.max(phase))
+            
+        elif phase_mode == "quadratic":
+            # Quadratic: dRV = a + b*phase + c*phase^2
+            dRV_a = numpyro.sample("dRV_a", dist.Normal(0.0, 10.0))
+            dRV_b = numpyro.sample("dRV_b", dist.Normal(0.0, 50.0))
+            dRV_c = numpyro.sample("dRV_c", dist.Normal(0.0, 100.0))
+            dRV = dRV_a + dRV_b * phase + dRV_c * phase**2
+            # Track values at key phases
+            numpyro.deterministic("dRV_at_midtransit", dRV_a)
+            numpyro.deterministic("dRV_at_ingress", dRV_a + dRV_b * jnp.min(phase) + dRV_c * jnp.min(phase)**2)
+            numpyro.deterministic("dRV_at_egress", dRV_a + dRV_b * jnp.max(phase) + dRV_c * jnp.max(phase)**2)
+        else:
+            raise ValueError(f"Unknown phase_mode: {phase_mode}")
 
         Mp = numpyro.sample("Mp", dist.TruncatedNormal(Mp_mean, Mp_std, low=0.0)) * MJ
         Rstar = numpyro.sample("Rstar", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0)) * Rs

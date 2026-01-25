@@ -136,6 +136,36 @@ def create_parser():
         help="Disable telluric modeling"
     )
 
+    # Phase analysis options
+    phase_group = parser.add_argument_group("Phase Analysis")
+    phase_group.add_argument(
+        "--phase-mode",
+        type=str,
+        choices=["shared", "per_exposure", "hierarchical", "linear", "quadratic"],
+        default="shared",
+        help="How to model phase-dependent velocity offset dRV (default: shared)"
+    )
+    phase_group.add_argument(
+        "--phase-bin",
+        type=str,
+        choices=["T12", "T23", "T34"],
+        default=None,
+        help="Run retrieval on specific phase bin only"
+    )
+    phase_group.add_argument(
+        "--all-phase-bins",
+        action="store_true",
+        help="Run separate retrievals for all phase bins (T12, T23, T34)"
+    )
+
+    # Diagnostics
+    diag_group = parser.add_argument_group("Diagnostics")
+    diag_group.add_argument(
+        "--check-aliasing",
+        action="store_true",
+        help="Compute species template cross-correlations before retrieval"
+    )
+
     # Execution options
     exec_group = parser.add_argument_group("Execution")
     exec_group.add_argument(
@@ -250,10 +280,9 @@ def apply_cli_overrides(args):
         config.TRANSMISSION_DATA = config.get_transmission_paths()
         config.EMISSION_DATA = config.get_emission_paths()
 
-    # Wavelength range
+    # Wavelength range / observing mode
     if args.wavelength_range:
         config.OBSERVING_MODE = args.wavelength_range
-        config.WAV_MIN, config.WAV_MAX = config.WAVELENGTH_RANGES[args.wavelength_range]
 
     # Quick mode
     if args.quick:
@@ -330,10 +359,16 @@ def print_config_summary(config, args):
     print(f"  T_star: {params['T_star']} K")
 
     print(f"\nMode: {config.RETRIEVAL_MODE.upper()}")
+    print(f"Phase mode: {args.phase_mode if hasattr(args, 'phase_mode') else 'shared'}")
+    if hasattr(args, 'phase_bin') and args.phase_bin:
+        print(f"Phase bin: {args.phase_bin}")
+    if hasattr(args, 'all_phase_bins') and args.all_phase_bins:
+        print(f"Phase bins: T12, T23, T34 (all)")
     print(f"Output directory: {config.DIR_SAVE}")
     print(f"\nObserving mode: {config.OBSERVING_MODE}")
-    print(f"Wavelength range: {config.WAV_MIN}-{config.WAV_MAX} nm")
-    print(f"Resolution: R = {config.RESOLUTION:,}")
+    wav_min, wav_max = config.get_wavelength_range()
+    print(f"Wavelength range: {wav_min}-{wav_max} Angstroms")
+    print(f"Resolution: R = {config.get_resolution():,}")
 
     print(f"\nInference:")
     print(f"  SVI steps: {config.SVI_NUM_STEPS:,}")
@@ -398,27 +433,64 @@ def main():
 
     # Run retrieval
     try:
-        if args.mode == "transmission":
-            from retrieval import run_transmission_retrieval
-
-            logger.info("Starting transmission retrieval...")
-            run_transmission_retrieval(
+        # Handle phase-binned retrieval
+        if args.all_phase_bins:
+            from retrieval_binned import run_phase_binned_retrieval
+            
+            logger.info("Starting phase-binned retrieval (all bins)...")
+            run_phase_binned_retrieval(
+                phase_bins=["T12", "T23", "T34"],
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
                 temperature_profile=args.temperature_profile or "isothermal",
+                phase_mode=args.phase_mode,
+                check_aliasing=args.check_aliasing,
+                seed=args.seed,
+            )
+        
+        elif args.phase_bin:
+            from retrieval_binned import run_phase_binned_retrieval
+            
+            logger.info(f"Starting retrieval for phase bin: {args.phase_bin}...")
+            run_phase_binned_retrieval(
+                phase_bins=[args.phase_bin],
+                skip_svi=args.skip_svi,
+                svi_only=args.svi_only,
+                no_plots=args.no_plots,
+                temperature_profile=args.temperature_profile or "isothermal",
+                phase_mode=args.phase_mode,
+                check_aliasing=args.check_aliasing,
+                seed=args.seed,
+            )
+        
+        elif args.mode == "transmission":
+            from retrieval import run_retrieval
+
+            logger.info("Starting transmission retrieval...")
+            run_retrieval(
+                mode="transmission",
+                skip_svi=args.skip_svi,
+                svi_only=args.svi_only,
+                no_plots=args.no_plots,
+                temperature_profile=args.temperature_profile or "isothermal",
+                phase_mode=args.phase_mode,
+                check_aliasing=args.check_aliasing,
                 seed=args.seed,
             )
 
         elif args.mode == "emission":
-            from retrieval import run_emission_retrieval
+            from retrieval import run_retrieval
 
             logger.info("Starting emission retrieval...")
-            run_emission_retrieval(
+            run_retrieval(
+                mode="emission",
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
                 temperature_profile=args.temperature_profile or "madhu_seager",
+                phase_mode=args.phase_mode,
+                check_aliasing=args.check_aliasing,
                 seed=args.seed,
             )
 
