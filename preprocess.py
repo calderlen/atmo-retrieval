@@ -86,7 +86,7 @@ def get_pepsi_data(
     observation_epoch: str,
     planet_name: str,
     do_molecfit: bool = True,
-    data_dir: str = "input",
+    data_dir: str = "input/raw",
     barycentric_correction: bool = False,
     apply_introduced_shift: bool = True,
 ) -> tuple[np.ndarray, ...] | None:
@@ -300,7 +300,7 @@ def main():
     parser.add_argument('--arm', type=str, choices=['red', 'blue'], default='red', help='Spectrograph arm')
     parser.add_argument('--molecfit', action='store_true', default=True, help='Use molecfit-corrected data')
     parser.add_argument('--no-molecfit', action='store_false', dest='molecfit', help='Use uncorrected data')
-    parser.add_argument('--data-dir', type=str, default='input', help='Data directory')
+    parser.add_argument('--data-dir', type=str, default='input/raw', help='Raw data directory')
     parser.add_argument('--barycorr', action='store_true', default=False,
                         help='Apply barycentric correction to wavelength grid')
     parser.add_argument('--no-barycorr', action='store_false', dest='barycorr',

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DATA_DIR="input"
+DATA_DIR="input/raw"
 ARMS="red"
 BARYCORR=0
 INTRODUCED_SHIFT=1
@@ -13,7 +13,7 @@ usage() {
 Usage: scripts/prepare_all.sh [options]
 
 Options:
-  --data-dir DIR           Input data directory (default: input)
+  --data-dir DIR           Raw data directory (default: input/raw)
   --arms LIST              Comma-separated arms (default: red)
   --barycorr               Enable barycentric correction
   --no-barycorr            Disable barycentric correction (default)

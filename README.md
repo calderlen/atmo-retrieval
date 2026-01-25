@@ -43,7 +43,7 @@ flowchart TB
 
     subgraph Output["Results"]
         posterior["Posterior Samples<br/><i>.npz files</i>"]
-        plots["plotting.py<br/><i>Diagnostics</i>"]
+        plots["plot.py<br/><i>Diagnostics</i>"]
     end
 
     %% Main flow
@@ -131,7 +131,7 @@ python __main__.py --help
 ├── emission_model.py      # Emission forward model
 ├── telluric_model.py      # Telluric absorption (ground-based)
 ├── inference.py           # SVI and HMC-NUTS
-├── plotting.py            # Visualization
+├── plot.py                # Visualization
 ├── retrieval.py           # Retrieval pipeline functions
 └── __main__.py            # CLI entry point
 ```

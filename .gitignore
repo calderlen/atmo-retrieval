@@ -3,11 +3,20 @@ input/.db_ExoMol/
 input/.db_CIA/
 input/.db_kurucz/
 input/.db_VALD/
+input/.opa_cache/
+input/raw/
 input/spectra/**/*.npy
 input/spectra/**/*.npz
 input/spectra/**/*.fits
 
+# Opacity caches (old location - root)
+opa_*.zarr/
 opa_*.zarr.zip
+
+# HITEMP/HITRAN downloads (should go to .db_HITEMP, but catch stray ones)
+*.par
+*.par.bz2
+*.zip
 
 output/
 
@@ -41,4 +50,7 @@ CLI_GUIDE.md
 CLI_QUICKREF.md
 MODULE_SUMMARY.md
 GIT_GUIDE.md
+
+# Sample/example code (not part of main package)
+sample/
 

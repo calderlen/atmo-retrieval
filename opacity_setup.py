@@ -10,6 +10,11 @@ from exojax.database.api import MdbHitemp, MdbExomol
 from exojax.opacity.premodit.api import OpaPremodit
 from exojax.opacity import saveopa
 
+# Opacity cache directory (relative to project root)
+from config.paths import PROJECT_ROOT
+OPA_CACHE_DIR = PROJECT_ROOT / "input" / ".opa_cache"
+OPA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def _patch_path_contains():
     if not hasattr(pathlib.Path, "__contains__"):
@@ -100,8 +105,10 @@ def _patch_radis_download():
                         "HITRAN login is likely required. Set HITRAN_USERNAME and HITRAN_PASSWORD."
                     )
 
-                temp_file_path = urlname.split("/")[-1]
-                temp_file_path = re.sub(r'[<>:\"/\\\\|?*&=]', "_", temp_file_path)
+                temp_file_name = urlname.split("/")[-1]
+                temp_file_name = re.sub(r'[<>:\"/\\\\|?*&=]', "_", temp_file_name)
+                # Save downloads to the database directory, not project root
+                temp_file_path = str(self.local_databases / temp_file_name)
 
                 with open(temp_file_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
@@ -197,7 +204,8 @@ def build_premodit_from_snapshot(
         allow_32bit=True,
         cutwing=1 / (2 * ndiv),
     )
-    saveopa(opa, f"opa_{mol}.zarr", format="zarr", aux={"molmass": molmass})
+    opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
+    saveopa(opa, str(opa_path), format="zarr", aux={"molmass": molmass})
     return opa
 
 
@@ -216,7 +224,8 @@ def load_or_build_opacity(
     path = str(path)
     if opa_load:
         try:
-            opa = OpaPremodit.from_saved_opa(f"opa_{mol}.zarr", strict=False)
+            opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
+            opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
             return opa, opa.aux["molmass"]
         except Exception:
             print(f"  Warning: Could not load saved opacity for {mol}, building from database...")
