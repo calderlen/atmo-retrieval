@@ -25,8 +25,8 @@ from exojax.spec.planck import piBarr
 from exojax.utils.astrofunc import gravity_jupiter
 from exojax.utils.constants import MJ, RJ, Rs
 
-# Import your TP profiles (ensure these exist in your local tp_profiles.py)
-from tp_profiles import (
+# Import your TP profiles (ensure these exist in your local pt.py)
+from pt import (
     guillot_profile,
     numpyro_free_temperature,
     numpyro_gradient,
@@ -108,6 +108,7 @@ def check_grid_resolution(nu_grid: jnp.ndarray,
 def create_hrccs_model(
     *,
     mode: Literal["transmission", "emission"],
+    params: dict,  # from config.get_params()
     art: object,
     opa_mols: dict[str, OpaPremodit],
     opa_atoms: dict[str, OpaPremodit],  # Mandatory: pass {} if empty
@@ -117,27 +118,13 @@ def create_hrccs_model(
     sop_inst: SopInstProfile,
     instrument_resolution: float,  # Replaced beta_inst. Provide R (e.g. 130000)
     inst_nus: jnp.ndarray,
-    period_day: float,
-    # system priors
-    Kp_mean: float,
-    Kp_std: float,
-    Vsys_mean: float,
-    Vsys_std: float,
-    Rp_mean: float,
-    Rp_std: float,
-    Mp_mean: float,
-    Mp_std: float,
-    Rstar_mean: float,
-    Rstar_std: float,
-    Tstar: float | None,
     # temperature (Default: Guillot)
     temperature_profile: Literal[
         "isothermal", "gradient", "madhu_seager", "free", "guillot"
     ] = "guillot",
     Tlow: float = 400.0,
     Thigh: float = 3000.0,
-    Tirr_mean: float | None = None,
-    Tirr_std: float | None = None,
+    Tirr_std: float | None = None,  # If None, uses uniform prior on Tirr
     Tint_fixed: float = 100.0,
     log_kappa_ir_bounds: tuple[float, float] = (-4.0, 0.0),
     log_gamma_bounds: tuple[float, float] = (-2.0, 2.0),
@@ -145,8 +132,55 @@ def create_hrccs_model(
     subtract_per_exposure_mean: bool = True,
     apply_sysrem: bool = False,
 ) -> Callable:
+    """Create HRCCS NumPyro model for atmospheric retrieval.
 
-    # --- 0. Validation & Setup ---
+    Args:
+        mode: "transmission" or "emission"
+        params: Planet parameters dict from config.get_params(), containing:
+            - Kp, Kp_err: Planet RV semi-amplitude (km/s)
+            - RV_abs, RV_abs_err: Systemic velocity (km/s)
+            - R_p, R_p_err: Planet radius (R_J)
+            - M_p, M_p_err: Planet mass (M_J)
+            - R_star, R_star_err: Stellar radius (R_Sun)
+            - T_star: Stellar temperature (K)
+            - T_eq: Equilibrium temperature (K), optional
+            - period: Orbital period (days)
+        art: ExoJAX art object
+        opa_mols: Molecular opacity dict
+        opa_atoms: Atomic opacity dict (pass {} if none)
+        opa_cias: CIA opacity dict
+        nu_grid: Wavenumber grid
+        sop_rot: Rotation operator
+        sop_inst: Instrument profile operator
+        instrument_resolution: Spectral resolution R
+        inst_nus: Instrument wavenumber grid
+        temperature_profile: TP profile type
+        Tlow, Thigh: Temperature bounds (K)
+        Tirr_std: If provided, use normal prior on Tirr with T_eq as mean
+        Tint_fixed: Internal temperature (K)
+        log_kappa_ir_bounds: Prior bounds on log10(kappa_IR)
+        log_gamma_bounds: Prior bounds on log10(gamma)
+        subtract_per_exposure_mean: Subtract per-exposure mean
+        apply_sysrem: Apply SYSREM filter
+
+    Returns:
+        NumPyro model function
+    """
+    # --- 0. Extract parameters from config ---
+    Kp_mean, Kp_std = params["Kp"], params["Kp_err"]
+    Vsys_mean, Vsys_std = params["RV_abs"], params["RV_abs_err"]
+    Rp_mean, Rp_std = params["R_p"], params["R_p_err"]
+    Mp_mean, Mp_std = params["M_p"], params["M_p_err"]
+    Rstar_mean, Rstar_std = params["R_star"], params["R_star_err"]
+    Tstar = params["T_star"]
+    Tirr_mean = params.get("T_eq")  # May be None or nan
+    period_day = params["period"]
+
+    # Handle nan values in Tirr_mean
+    if Tirr_mean is not None and (Tirr_mean != Tirr_mean):  # nan check
+        Tirr_mean = None
+
+    # --- 1. Validation & Setup ---
     check_grid_resolution(nu_grid, instrument_resolution)
 
     # Calculate beta_inst (IP Gaussian Sigma) from Resolution (R)

@@ -4,8 +4,9 @@ Ultra-Hot Jupiter Atmospheric Retrieval Configuration
 
 Configuration is split into logical modules:
 - planets: System parameters from published literature
+- instrument: Spectrograph and observatory settings
+- model: RT parameters, spectral grid settings
 - paths: Database paths, data paths, output configuration
-- model: RT parameters, spectral grid, observation settings
 - inference: SVI and MCMC sampling parameters
 """
 
@@ -19,12 +20,22 @@ from .planets import (
     list_ephemerides,
 )
 
-from .model import (
+from .instrument import (
+    INSTRUMENT,
+    OBSERVATORY,
+    RESOLUTION,
+    ARMS,
     OBSERVING_MODE,
-    WAVELENGTH_RANGES,
+    get_wavelength_range,
+    get_file_prefix,
     WAV_MIN,
     WAV_MAX,
-    RESOLUTION,
+    HEADER_KEYS,
+    get_data_patterns,
+    FITS_COLUMNS,
+)
+
+from .model import (
     RETRIEVAL_MODE,
     DIFFMODE,
     NLAYER,

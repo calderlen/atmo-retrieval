@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Prepare PEPSI transmission spectrum data for retrieval.
+"""Prepare spectroscopic data for retrieval.
 
 This script:
-1. Loads raw PEPSI FITS files
+1. Loads raw FITS files from the configured instrument
 2. Calculates transmission spectrum (in-transit / out-of-transit)
 3. Bins to desired resolution
 4. Saves wavelength, spectrum, and uncertainty as .npy files
@@ -19,6 +19,14 @@ from astropy.io import fits
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation
 import astropy.units as u
+
+from config.instrument import (
+    OBSERVATORY,
+    HEADER_KEYS,
+    FITS_COLUMNS,
+    get_data_patterns,
+    get_file_prefix,
+)
 
 
 #TODO: figure out what these are and why they are here
@@ -82,39 +90,13 @@ def get_pepsi_data(
     barycentric_correction: bool = False,
     apply_introduced_shift: bool = True,
 ) -> tuple[np.ndarray, ...] | None:
-    """Load PEPSI spectroscopic data."""
+    """Load spectroscopic data from configured instrument."""
     ckms = 2.9979e5
 
-    # Get data
-    if arm == 'blue':
-        arm_file = 'pepsib'
-    elif arm == 'red':
-        arm_file = 'pepsir'
-    else:
-        raise ValueError(f"arm must be 'blue' or 'red', got {arm}")
-
-    year = float(observation_epoch[0:4])
-    pepsi_exts = ["nor", "avr"]
-    if year >= 2024:
-        pepsi_exts.insert(0, "bwl")
-
-    patterns = []
-    if do_molecfit:
-        for ext in pepsi_exts:
-            patterns.append(
-                f'{data_dir}/{observation_epoch}_{planet_name}/molecfit_weak/SCIENCE_TELLURIC_CORR_{arm_file}*.dxt.{ext}.fits'
-            )
-            patterns.append(
-                f'{data_dir}/{observation_epoch}_{planet_name}/**/SCIENCE_TELLURIC_CORR_{arm_file}*.dxt.{ext}.fits'
-            )
-    else:
-        for ext in pepsi_exts:
-            patterns.append(
-                f'{data_dir}/{observation_epoch}_{planet_name}/{arm_file}*.dxt.{ext}'
-            )
-            patterns.append(
-                f'{data_dir}/{observation_epoch}_{planet_name}/**/{arm_file}*.dxt.{ext}'
-            )
+    # Get file patterns from instrument config
+    patterns = get_data_patterns(
+        observation_epoch, planet_name, arm, do_molecfit, data_dir
+    )
 
     spectra_files = []
     for pattern in patterns:
@@ -137,10 +119,9 @@ def get_pepsi_data(
         hdu = fits.open(spectrum)
         data, header = hdu[1].data, hdu[0].header
 
-        if do_molecfit:
-            wave_tag, flux_tag, error_tag = 'lambda', 'flux', 'error'
-        else:
-            wave_tag, flux_tag, error_tag = 'Arg', 'Fun', 'Var'
+        # Get column names from instrument config
+        col_cfg = FITS_COLUMNS["molecfit" if do_molecfit else "raw"]
+        wave_tag, flux_tag, error_tag = col_cfg["wave"], col_cfg["flux"], col_cfg["error"]
 
         if i == 0:
             npix = len(data[wave_tag])
@@ -159,12 +140,13 @@ def get_pepsi_data(
             fluxin[i, 0:npixhere] = data[flux_tag]
             errorin[i, 0:npixhere] = data[error_tag]
 
-        # Molecfit utilities already handle variance->uncertainty
-        if not do_molecfit:
+        # Raw files have variance, need sqrt for uncertainty
+        if col_cfg.get("error") == "Var":
             errorin[i, :] = np.sqrt(errorin[i, :])
 
-        if do_molecfit:
-            wave[i, :] *= 10000.  # microns -> Angstroms
+        # Convert wavelength units if needed
+        if col_cfg["wave_unit"] == "micron":
+            wave[i, :] *= 10000.0  # microns -> Angstroms
 
         introduced_shift = 0.0
         if do_molecfit and apply_introduced_shift:
@@ -191,19 +173,19 @@ def get_pepsi_data(
         elif barycentric_correction and i == 0:
             print("Velocity correction: no RADVEL/OBSVEL/SSBVEL found; skipping")
 
-        jd[i] = header['JD-OBS']  # mid-exposure time
+        jd[i] = header[HEADER_KEYS["jd"]]  # mid-exposure time
         try:
-            snr_spectra[i] = header['SNR']
+            snr_spectra[i] = header[HEADER_KEYS["snr"]]
         except KeyError:
             snr_spectra[i] = np.percentile(fluxin[i, :] / errorin[i, :], 90)
 
-        exptime_val = header['EXPTIME']
+        exptime_val = header[HEADER_KEYS["exptime"]]
         if isinstance(exptime_val, str):
             exptime_strings = exptime_val.split(':')
             exptime[i] = float(exptime_strings[0]) * 3600. + float(exptime_strings[1]) * 60. + float(exptime_strings[2])
         else:
             exptime[i] = float(exptime_val)
-        airmass[i] = header['AIRMASS']
+        airmass[i] = header[HEADER_KEYS["airmass"]]
         hdu.close()
         i += 1
 
@@ -224,7 +206,7 @@ def get_orbital_phase(
     jd: np.ndarray, epoch: float, period: float, RA: str, Dec: str
 ) -> np.ndarray:
     """Calculate orbital phase with light travel time correction."""
-    lbt_coordinates = EarthLocation.of_site('lbt')
+    observatory_location = EarthLocation.of_site(OBSERVATORY)
 
     observed_times = Time(jd, format='jd', location=lbt_coordinates)
 

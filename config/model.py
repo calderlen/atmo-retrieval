@@ -1,23 +1,8 @@
 """
-Radiative transfer model parameters, spectral grid, and observation settings.
+Radiative transfer model parameters and spectral grid settings.
+
+Instrument-specific settings (resolution, wavelength ranges) are in instrument.py.
 """
-
-# ==============================================================================
-# OBSERVATION PARAMETERS - PEPSI/LBT
-# ==============================================================================
-
-OBSERVING_MODE = "red"  # Options: "blue", "green", "red", "full"
-
-WAVELENGTH_RANGES = {
-    "blue": (4752, 5425),    # Angstroms, PEPSI blue arm
-    "green": (4760, 6570),   # Angstroms, CD3+CD4 (approximate)
-    "red": (6231, 7427),     # Angstroms, PEPSI red arm
-    "full": (4752, 7427),    # Angstroms, both arms combined
-}
-
-WAV_MIN, WAV_MAX = WAVELENGTH_RANGES[OBSERVING_MODE]
-
-RESOLUTION = 120000  # PEPSI high-resolution mode
 
 # ==============================================================================
 # RETRIEVAL MODE

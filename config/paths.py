@@ -65,7 +65,8 @@ ATOMIC_SPECIES = {
 # ==============================================================================
 
 # Import here to avoid circular import at module level
-from .model import OBSERVING_MODE, RETRIEVAL_MODE
+from .instrument import OBSERVING_MODE
+from .model import RETRIEVAL_MODE
 
 
 def get_data_dir(planet: str | None = None, arm: str | None = None) -> Path:
