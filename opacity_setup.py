@@ -286,20 +286,119 @@ def load_atomic_opacities(
     diffmode: int,
     Tlow: float,
     Thigh: float,
-) -> tuple[dict[str, object], jnp.ndarray]:
-    """Load atomic line opacities (e.g., Na, K, Ca)."""
+    db_exoatom: str | None = None,
+) -> tuple[dict[str, OpaPremodit], jnp.ndarray]:
+    """Load atomic LINE LISTS and compute opacities using preMODIT.
+    
+    Workflow:
+        1. Load atomic line lists from ExoAtom (ExoMol format)
+        2. Compute cross-sections using preMODIT
+        3. Cache computed opacities to .zarr for fast reloading
+    
+    ExoAtom provides atomic line lists (Na, K, Fe, etc.) in ExoMol format.
+    See: https://exomol.com/data/atoms/
+    
+    Args:
+        atomic_species: Dict mapping atom names to config, e.g.:
+            {"Na": {"element": "Na", "ionization": 0}}  # Na I (neutral)
+            {"Fe": {"element": "Fe", "ionization": 0}}  # Fe I
+        nu_grid: Wavenumber grid
+        opa_load: Try loading cached .zarr opacity first
+        ndiv: Number of DIT divisions for preMODIT
+        diffmode: DIT diff mode
+        Tlow, Thigh: Temperature range [K]
+        db_exoatom: Path to ExoAtom line list directory
+        
+    Returns:
+        (opa_atoms dict, atomic_masses array)
+        
+    Note:
+        Download atomic LINE LISTS from https://exomol.com/data/atoms/
+        Directory structure: {db_exoatom}/{element}/{isotope}/{linelist}/
+        Example: input/.db_ExoAtom/Na/23Na/Kurucz/
+    """
     opa_atoms = {}
     atommass_list = []
-
-    print("Loading atomic line databases...")
-
-    # Note: Atomic line handling depends on the database format
-    # This is a placeholder - actual implementation depends on your atomic line source
-    # ExoJAX can use Kurucz/VALD format
-
-    for atom, config in atomic_species.items():
-        print(f"  * {atom}")
-        # Placeholder for atomic line loading
-        pass
-
+    
+    if not atomic_species:
+        return opa_atoms, jnp.array(atommass_list)
+    
+    # Default ExoAtom path
+    if db_exoatom is None:
+        from config.paths import PROJECT_ROOT
+        db_exoatom = PROJECT_ROOT / "input" / ".db_ExoAtom"
+    
+    print("Loading atomic line databases (ExoAtom)...")
+    
+    # Atomic mass lookup (most common isotopes)
+    ATOMIC_MASSES = {
+        "Na": 22.99,   # 23Na
+        "K": 39.10,    # 39K  
+        "Ca": 40.08,   # 40Ca
+        "Fe": 55.85,   # 56Fe
+        "Ti": 47.87,   # 48Ti
+        "V": 50.94,    # 51V
+        "Cr": 52.00,   # 52Cr
+        "Mg": 24.31,   # 24Mg
+        "Li": 6.94,    # 7Li
+        "Ba": 137.33,  # 138Ba
+    }
+    
+    # ExoAtom naming conventions
+    EXOATOM_PATHS = {
+        "Na": "Na/23Na/Kurucz",
+        "K": "K/39K/Kurucz", 
+        "Ca": "Ca/40Ca/Kurucz",
+        "Fe": "Fe/56Fe/Kurucz",
+        "Ti": "Ti/48Ti/Kurucz",
+        "V": "V/51V/Kurucz",
+        "Cr": "Cr/52Cr/Kurucz",
+        "Mg": "Mg/24Mg/Kurucz",
+    }
+    
+    for atom, atom_config in atomic_species.items():
+        element = atom_config.get("element", atom)
+        ionization = atom_config.get("ionization", 0)
+        
+        # Skip ions for now (ExoAtom neutral atoms only initially)
+        if ionization > 0:
+            print(f"  * {atom} (ion, skipping - not yet supported)")
+            continue
+            
+        if element not in EXOATOM_PATHS:
+            print(f"  * {atom} (not in ExoAtom database, skipping)")
+            continue
+            
+        exoatom_path = pathlib.Path(db_exoatom) / EXOATOM_PATHS[element]
+        
+        if not exoatom_path.exists():
+            print(f"  * {atom} (ExoAtom data not found at {exoatom_path}, skipping)")
+            print(f"    Download from: https://exomol.com/data/atoms/{element}/")
+            continue
+        
+        print(f"  * {atom} (ExoAtom)")
+        
+        try:
+            # ExoAtom uses ExoMol format, so we can use MdbExomol
+            mdb_factory = lambda p: MdbExomol(str(p), nu_grid, gpu_transfer=False)
+            opa, molmass = load_or_build_opacity(
+                f"atom_{atom}",
+                str(exoatom_path),
+                mdb_factory,
+                opa_load,
+                nu_grid,
+                ndiv,
+                diffmode,
+                Tlow,
+                Thigh,
+            )
+            opa_atoms[atom] = opa
+            atommass_list.append(ATOMIC_MASSES.get(element, molmass))
+        except Exception as e:
+            print(f"    Warning: Failed to load {atom}: {e}")
+            continue
+    
+    if not opa_atoms:
+        print("  No atomic opacities loaded (data not available or download required)")
+    
     return opa_atoms, jnp.array(atommass_list)

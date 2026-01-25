@@ -9,67 +9,15 @@ def load_observed_spectrum(
     wav_path: str,
     spectrum_path: str,
     uncertainty_path: str,
-    format: str = "npy",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load observed spectrum (transmission or emission)."""
-    if format == "npy":
-        wav_obs = np.load(wav_path)
-        spectrum = np.load(spectrum_path)
-        uncertainty = np.load(uncertainty_path)
-    elif format == "fits":
-        with fits.open(wav_path) as hdul:
-            wav_obs = hdul[0].data
-        with fits.open(spectrum_path) as hdul:
-            spectrum = hdul[0].data
-        with fits.open(uncertainty_path) as hdul:
-            uncertainty = hdul[0].data
-    elif format == "ascii":
-        wav_obs = np.loadtxt(wav_path)
-        spectrum = np.loadtxt(spectrum_path)
-        uncertainty = np.loadtxt(uncertainty_path)
-    else:
-        raise ValueError(f"Unknown format: {format}")
+
+    wav_obs = np.load(wav_path)
+    spectrum = np.load(spectrum_path)
+    uncertainty = np.load(uncertainty_path)
 
     # Wavelength in Angstroms, convert to wavenumber
     inst_nus = wav2nu(wav_obs, "AA")
     return wav_obs, spectrum, uncertainty, inst_nus
-
-
-def load_pepsi_spectrum(
-    data_dict: dict[str, str],
-    barycentric_correction: bool = True,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load PEPSI spectrum with optional barycentric correction."""
-    wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
-        data_dict["wavelength"],
-        data_dict["spectrum"],
-        data_dict["uncertainty"],
-    )
-
-    if barycentric_correction:
-        print("Note: Barycentric correction should be applied during data reduction")
-
-    return wav_obs, spectrum, uncertainty, inst_nus
-
-
-def load_transmission_emission_pair(
-    trans_dict: dict[str, str],
-    emis_dict: dict[str, str],
-) -> tuple[tuple, tuple]:
-    """Load both transmission and emission spectra for joint retrieval."""
-    trans_data = load_observed_spectrum(
-        trans_dict["wavelength"],
-        trans_dict["spectrum"],
-        trans_dict["uncertainty"],
-    )
-
-    emis_data = load_observed_spectrum(
-        emis_dict["wavelength"],
-        emis_dict["spectrum"],
-        emis_dict["uncertainty"],
-    )
-
-    return trans_data, emis_data
 
 
 def load_resolution_curve(fits_path: str) -> np.ndarray:

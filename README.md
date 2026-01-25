@@ -19,6 +19,7 @@ flowchart TB
     subgraph DataPrep["Data Preparation"]
         load["load.py<br/><i>Load spectra</i>"]
         preprocess["preprocess.py<br/><i>PEPSI reduction</i>"]
+        tellurics["tellurics.py<br/><i>Telluric correction</i>"]
         grid["grid_setup.py<br/><i>Wavenumber grid</i>"]
     end
 
@@ -32,7 +33,6 @@ flowchart TB
     subgraph Forward["Forward Model"]
         model["model.py<br/><i>NumPyro model</i>"]
         pt["pt.py<br/><i>T-P profiles</i>"]
-        telluric["telluric_model.py<br/><i>Ground-based correction</i>"]
     end
 
     subgraph Inference["Bayesian Inference"]
@@ -63,7 +63,6 @@ flowchart TB
     grid --> model
     opa_setup --> model
     pt --> model
-    telluric -.-> model
 
     model --> svi
     svi -->|"init strategy"| mcmc
@@ -84,9 +83,9 @@ flowchart TB
 
     class main,retrieval entry
     class planets,instrument,model_cfg,paths,inf_cfg config
-    class load,preprocess,grid data
+    class load,preprocess,tellurics,grid data
     class opa_setup,cia,hitemp,exomol opacity
-    class model,pt,telluric forward
+    class model,pt forward
     class svi,mcmc,pred inference
     class posterior,plots output
 ```
@@ -124,12 +123,11 @@ python __main__.py --help
 │   └── inference.py       #   SVI and MCMC sampling parameters
 ├── load.py                # Data loading (PEPSI, JWST formats)
 ├── preprocess.py          # PEPSI data preprocessing
+├── tellurics.py           # Telluric fitting and correction (HITRAN H2O)
 ├── grid_setup.py          # Wavenumber grid and spectral operators
 ├── opacity_setup.py       # CIA, molecular, atomic opacities
-├── model.py               # NumPyro model for HRCCS retrieval
-├── transmission_model.py  # Transmission forward model
-├── emission_model.py      # Emission forward model
-├── telluric_model.py      # Telluric absorption (ground-based)
+├── model.py               # NumPyro model for HRCCS time-series retrieval
+├── old/forward_model.py   # Legacy disk-integrated models
 ├── inference.py           # SVI and HMC-NUTS
 ├── plot.py                # Visualization
 ├── retrieval.py           # Retrieval pipeline functions

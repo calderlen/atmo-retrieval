@@ -12,7 +12,7 @@ import config
 from load import load_observed_spectrum, ResolutionInterpolator
 from grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from opacity_setup import setup_cia_opacities, load_molecular_opacities
-from atmo_model_old import create_transmission_model, create_emission_model
+from old.forward_model import create_transmission_model, create_emission_model
 from inference import run_svi, run_mcmc, generate_predictions
 from plot import create_transmission_plots
 
@@ -272,7 +272,5 @@ if __name__ == "__main__":
         run_transmission_retrieval()
     elif config.RETRIEVAL_MODE == "emission":
         run_emission_retrieval()
-    elif config.RETRIEVAL_MODE == "combined":
-        print("Combined retrieval not yet implemented.")
     else:
         raise ValueError(f"Unknown retrieval mode: {config.RETRIEVAL_MODE}")

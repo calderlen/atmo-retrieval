@@ -422,10 +422,6 @@ def main():
                 seed=args.seed,
             )
 
-        elif args.mode == "combined":
-            logger.error("Combined retrieval not yet implemented")
-            sys.exit(1)
-
         return 0
 
     except KeyboardInterrupt:

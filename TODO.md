@@ -36,3 +36,4 @@
      - log g?
 
 - TODO: In order to maximize the signal strength, we adopt the methodology presented in E. F. Spring & J. L. Birkby (2025, in preparation) to stop SYSREM once the removal of successive systematic fails to improve to residuals by more than 1 part in 10.4 The number of systematics removed is low, ranging from 0 to 2 per night and per arm.
+- TODO: add joint retreival?
