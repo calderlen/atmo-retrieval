@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import warnings
 from typing import Callable, Literal
+import inspect
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import numpyro
 import numpyro.distributions as dist
 
@@ -32,6 +34,156 @@ from physics.pt import (
 _EPS = 1.0e-30
 _TWO_PI = 2.0 * jnp.pi
 _C_KMS = 299792.458  # Speed of light in km/s
+
+
+def _closest_divisor(n: int, target: int) -> int:
+    """Return the divisor of n closest to target (ties -> smaller)."""
+    if n <= 0:
+        return 1
+    target = max(1, int(target))
+    best = 1
+    best_delta = abs(target - 1)
+    limit = int(np.sqrt(n))
+    for d in range(1, limit + 1):
+        if n % d != 0:
+            continue
+        for cand in (d, n // d):
+            delta = abs(cand - target)
+            if delta < best_delta or (delta == best_delta and cand < best):
+                best = cand
+                best_delta = delta
+    return best
+
+
+def _estimate_guard_points(
+    nu_grid: np.ndarray,
+    instrument_resolution: float,
+    params: dict,
+    period_day: float,
+    guard_kms: float | None,
+    min_guard_points: int,
+) -> int:
+    """Estimate guard size in grid points from velocity-scale effects."""
+    nu_grid = np.asarray(nu_grid)
+    if nu_grid.size < 2:
+        return int(min_guard_points)
+    dnu = float(np.median(np.abs(np.diff(nu_grid))))
+    nu_ref = float(np.nanmax(nu_grid))
+
+    # Instrument sigma in km/s (approx)
+    sigma_v = _C_KMS / (instrument_resolution * 2.3548200450309493)
+
+    # Planet rotation broadening (km/s) using mean Rp
+    Rp_mean = float(params.get("R_p", 1.0))
+    vsini = (2.0 * np.pi * (Rp_mean * RJ) / (period_day * 86400.0) / 1.0e5)
+
+    # RV guard from priors (3-sigma) + dRV prior
+    kp = float(params.get("Kp", 0.0))
+    kp_err = float(params.get("Kp_err", 0.0))
+    vsys = float(params.get("RV_abs", 0.0))
+    vsys_err = float(params.get("RV_abs_err", 0.0))
+    rv_guard = abs(vsys) + 3.0 * vsys_err + kp + 3.0 * kp_err + 30.0
+
+    v_guard = rv_guard + max(vsini, 5.0 * sigma_v)
+    if guard_kms is not None:
+        v_guard = max(float(guard_kms), v_guard)
+
+    guard_points = int(np.ceil((nu_ref * v_guard / _C_KMS) / dnu))
+    return max(int(min_guard_points), guard_points)
+
+
+def _build_chunk_plan(
+    nu_grid: np.ndarray,
+    inst_nus: np.ndarray,
+    guard_points: int,
+    *,
+    chunk_points: int | None = None,
+    n_chunks: int | None = None,
+) -> list[tuple[int, int, int, int, int, int]]:
+    """Plan equal-sized chunks with guard bands.
+
+    Returns list of tuples:
+      (chunk_start, chunk_end, core_start, core_end, inst_start, inst_end)
+    """
+    nu_grid = np.asarray(nu_grid)
+    inst_nus = np.asarray(inst_nus)
+
+    if guard_points < 0:
+        raise ValueError("guard_points must be >= 0.")
+    if nu_grid.size <= 2 * guard_points:
+        raise ValueError("guard_points too large for nu_grid size.")
+
+    core_len = int(nu_grid.size - 2 * guard_points)
+    if core_len <= 0:
+        raise ValueError("Core length is non-positive; reduce guard_points.")
+
+    if n_chunks is None:
+        target = int(chunk_points) if chunk_points is not None else core_len
+        target = max(1, target)
+        n_chunks = max(1, int(round(core_len / target)))
+
+    n_chunks = _closest_divisor(core_len, int(n_chunks))
+    core_size = core_len // n_chunks
+    chunk_size = core_size + 2 * guard_points
+
+    # Ensure inst_nus are inside the core-safe region
+    nu_min_safe = nu_grid[guard_points]
+    nu_max_safe = nu_grid[-guard_points - 1]
+    if inst_nus.size == 0:
+        raise ValueError("inst_nus is empty.")
+    if inst_nus.min() < nu_min_safe or inst_nus.max() > nu_max_safe:
+        raise ValueError(
+            "Instrument grid extends into guard region. Increase WAV offsets or reduce guard."
+        )
+
+    chunks: list[tuple[int, int, int, int, int, int]] = []
+    for i in range(n_chunks):
+        core_start = guard_points + i * core_size
+        core_end = core_start + core_size
+        chunk_start = core_start - guard_points
+        chunk_end = core_end + guard_points
+
+        nu_core_min = nu_grid[core_start]
+        nu_core_max = nu_grid[core_end - 1]
+        inst_start = int(np.searchsorted(inst_nus, nu_core_min, side="left"))
+        inst_end = int(np.searchsorted(inst_nus, nu_core_max, side="right"))
+        if inst_end <= inst_start:
+            raise ValueError("Chunk has no instrument points; adjust chunk/guard.")
+
+        chunks.append((chunk_start, chunk_end, core_start, core_end, inst_start, inst_end))
+
+    # Sanity: chunk sizes are uniform
+    for chunk_start, chunk_end, *_ in chunks:
+        if (chunk_end - chunk_start) != chunk_size:
+            raise ValueError("Non-uniform chunk sizes detected; check chunk plan.")
+
+    return chunks
+
+
+def _slice_spectral_matrix(
+    matrix: jnp.ndarray,
+    start: int,
+    end: int,
+    n_nu: int,
+) -> jnp.ndarray:
+    """Slice spectral matrices along the wavenumber axis."""
+    if matrix.shape[-1] == n_nu:
+        return matrix[..., start:end]
+    if matrix.shape[0] == n_nu:
+        return matrix[start:end, ...]
+    raise ValueError("Unexpected spectral matrix shape; cannot slice.")
+
+
+def _resolve_spectral_arg(fn: Callable) -> str | None:
+    """Return parameter name for passing a custom spectral grid, if supported."""
+    try:
+        sig = inspect.signature(fn)
+    except Exception:
+        return None
+    for name in ("nus", "nu_grid"):
+        if name in sig.parameters:
+            return name
+    return None
 
 
 def _get_piBarr():
@@ -536,6 +688,13 @@ def create_retrieval_model(
     # Pipeline options
     subtract_per_exposure_mean: bool = True,
     apply_sysrem: bool = False,
+    # Inference grid stitching (optional)
+    stitch_inference: bool = False,
+    stitch_chunk_points: int | None = None,
+    stitch_n_chunks: int | None = None,
+    stitch_guard_kms: float | None = None,
+    stitch_guard_points: int | None = None,
+    stitch_min_guard_points: int = 128,
 ) -> Callable:
     """Create NumPyro model for atmospheric retrieval.
 
@@ -573,6 +732,12 @@ def create_retrieval_model(
             - "quadratic": dRV = dRV_a + dRV_b * phase + dRV_c * phase^2
         subtract_per_exposure_mean: Subtract per-exposure mean
         apply_sysrem: Apply SYSREM filter
+        stitch_inference: Enable chunked forward model across the grid
+        stitch_chunk_points: Target number of grid points per chunk core
+        stitch_n_chunks: Explicit number of chunks (overrides stitch_chunk_points)
+        stitch_guard_kms: Guard size in km/s for edge effects
+        stitch_guard_points: Explicit guard size in grid points
+        stitch_min_guard_points: Minimum guard size in grid points
 
     Returns:
         NumPyro model function
@@ -616,6 +781,59 @@ def create_retrieval_model(
 
     if (mode == "emission") and (Tstar is None):
         raise ValueError("Tstar is required for emission mode.")
+
+    xs_arg = None
+    cia_arg = None
+    if opa_mols:
+        xs_arg = _resolve_spectral_arg(next(iter(opa_mols.values())).xsmatrix)
+    if opa_cias:
+        cia_arg = _resolve_spectral_arg(next(iter(opa_cias.values())).logacia_matrix)
+
+    # --- Optional: build chunk plan for inference stitching ---
+    stitch_plan = None
+    stitch_sops: list[tuple[SopRotation, SopInstProfile]] | None = None
+    if stitch_inference:
+        if apply_sysrem:
+            raise ValueError("SYSREM is not supported with inference stitching.")
+
+        guard_points = (
+            int(stitch_guard_points)
+            if stitch_guard_points is not None
+            else _estimate_guard_points(
+                np.asarray(nu_grid),
+                instrument_resolution,
+                params,
+                period_day,
+                stitch_guard_kms,
+                stitch_min_guard_points,
+            )
+        )
+
+        stitch_plan = _build_chunk_plan(
+            np.asarray(nu_grid),
+            np.asarray(inst_nus),
+            guard_points,
+            chunk_points=stitch_chunk_points,
+            n_chunks=stitch_n_chunks,
+        )
+
+        vsini_max = float(getattr(sop_rot, "vsini_max", 150.0))
+        vrmax = float(getattr(sop_inst, "vrmax", 500.0))
+        stitch_sops = []
+        for chunk_start, chunk_end, *_ in stitch_plan:
+            nu_chunk = jnp.array(nu_grid[chunk_start:chunk_end])
+            stitch_sops.append(
+                (
+                    SopRotation(nu_chunk, vsini_max=vsini_max),
+                    SopInstProfile(nu_chunk, vrmax=vrmax),
+                )
+            )
+        chunk_size = stitch_plan[0][1] - stitch_plan[0][0]
+        core_size = chunk_size - 2 * guard_points
+        print(
+            f"[INFO] Inference stitching enabled: "
+            f"{len(stitch_plan)} chunks, core={core_size}, guard={guard_points}."
+        )
 
     # --- The NumPyro Model ---
     def model(
@@ -761,94 +979,205 @@ def create_retrieval_model(
 
         g = art.gravity_profile(Tarr, mmw, Rp, g_btm)
 
-        # 4. Opacity Calculation (CIA + Mols + Atoms)
-        dtau = jnp.zeros((art.pressure.size, nu_grid.size))
+        # 4. Opacity Calculation + Forward Model (full grid or stitched)
+        # Ensure 2D shapes for downstream operations
+        if data.ndim == 1:
+            data = data[None, :]
+            sigma = sigma[None, :]
 
-        # CIA
-        for molA, molB in [("H2", "H2"), ("H2", "He")]:
-            key = molA + molB
-            if key not in opa_cias:
-                continue
-            logacia_matrix = opa_cias[key].logacia_matrix(Tarr)
-            vmrX, vmrY = (vmrH2, vmrH2) if molB == "H2" else (vmrH2, vmrHe)
-            dtau = dtau + art.opacity_profile_cia(
-                logacia_matrix, Tarr, vmrX, vmrY, mmw[:, None], g
-            )
-
-        # Molecules
-        for i, mol in enumerate(mol_names):
-            xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
-            dtau = dtau + art.opacity_profile_xs(
-                xsmatrix, vmr_mols[i], mmw[:, None], g
-            )
-
-        # Atoms
-        for i, atom in enumerate(atom_names):
-            xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
-            dtau = dtau + art.opacity_profile_xs(
-                xsmatrix, vmr_atoms[i], mmw[:, None], g
-            )
-
-        # 5. Radiative Transfer
-        rt = art.run(dtau, Tarr, mmw, Rp, g_btm)
-
-        # 6. Rotation & Instrument Broadening
         # Tidal locking: Spin period = Orbital period
         vsini = (
             2.0 * jnp.pi * Rp / (period_day * 86400.0) / 1.0e5
         )  # cm/s -> km/s
-        
-        rt = sop_rot.rigid_rotation(rt, vsini, 0.0, 0.0)
-        
-        # Apply Instrument Profile (Calculated from R above)
-        rt = sop_inst.ipgauss(rt, beta_inst)
 
-        # 7. Time-Series Sampling (Doppler shift)
-        rv = planet_rv_kms(phase, Kp, Vsys, dRV)
-        planet_ts = jax.vmap(lambda v: sop_inst.sampling(rt, v, inst_nus))(rv)
+        if stitch_plan is None:
+            dtau = jnp.zeros((art.pressure.size, nu_grid.size))
 
-        # 8. Contrast / Flux Ratio
-        if mode == "transmission":
-            model_ts = jnp.sqrt(planet_ts) * (Rp / Rstar)
+            # CIA
+            for molA, molB in [("H2", "H2"), ("H2", "He")]:
+                key = molA + molB
+                if key not in opa_cias:
+                    continue
+                logacia_matrix = opa_cias[key].logacia_matrix(Tarr)
+                vmrX, vmrY = (vmrH2, vmrH2) if molB == "H2" else (vmrH2, vmrHe)
+                dtau = dtau + art.opacity_profile_cia(
+                    logacia_matrix, Tarr, vmrX, vmrY, mmw[:, None], g
+                )
+
+            # Molecules
+            for i, mol in enumerate(mol_names):
+                xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
+                dtau = dtau + art.opacity_profile_xs(
+                    xsmatrix, vmr_mols[i], mmw[:, None], g
+                )
+
+            # Atoms
+            for i, atom in enumerate(atom_names):
+                xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
+                dtau = dtau + art.opacity_profile_xs(
+                    xsmatrix, vmr_atoms[i], mmw[:, None], g
+                )
+
+            # 5. Radiative Transfer
+            rt = art.run(dtau, Tarr, mmw, Rp, g_btm)
+
+            # 6. Rotation & Instrument Broadening
+            rt = sop_rot.rigid_rotation(rt, vsini, 0.0, 0.0)
+            rt = sop_inst.ipgauss(rt, beta_inst)
+
+            # 7. Time-Series Sampling (Doppler shift)
+            rv = planet_rv_kms(phase, Kp, Vsys, dRV)
+            planet_ts = jax.vmap(lambda v: sop_inst.sampling(rt, v, inst_nus))(rv)
+
+            # 8. Contrast / Flux Ratio
+            if mode == "transmission":
+                model_ts = jnp.sqrt(planet_ts) * (Rp / Rstar)
+            else:
+                piBarr = _get_piBarr()
+                Fs = piBarr(nu_grid, Tstar)
+                Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
+                model_ts = planet_ts / jnp.clip(Fs_ts, _EPS, None) * (Rp / Rstar) ** 2
+
+            # 9. Pipeline Corrections
+            if model_ts.ndim == 1:
+                model_ts = model_ts[None, :]
+            if model_ts.shape[1] == 0:
+                raise ValueError("model_ts has zero spectral points; check inst_nus/nu_grid")
+
+            if subtract_per_exposure_mean:
+                model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
+
+            if apply_sysrem:
+                if (U is None) or (invvar_spec is None):
+                    # This should be caught by caller, but safe to check
+                    pass
+                model_ts = sysrem_filter_model(model_ts, U, invvar_spec)
+
+            # 10. Log-Likelihood (CCF-equivalent Matched Filter)
+            w = 1.0 / jnp.clip(sigma, _EPS, None) ** 2
+
+            def _lnL_one(f: jnp.ndarray, m: jnp.ndarray, w_: jnp.ndarray) -> jnp.ndarray:
+                s_mm = jnp.sum((m * m) * w_)
+                s_fm = jnp.sum((f * m) * w_)
+                alpha = s_fm / (s_mm + _EPS)
+                r = f - alpha * m
+                chi2 = jnp.sum((r * r) * w_)
+                norm = jnp.sum(jnp.log(_TWO_PI / w_))
+                return -0.5 * (chi2 + norm)
+
+            lnL = jnp.sum(jax.vmap(_lnL_one)(data, model_ts, w))
+            numpyro.factor("logL", lnL)
         else:
-            piBarr = _get_piBarr()
-            Fs = piBarr(nu_grid, Tstar)
-            Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
-            model_ts = planet_ts / jnp.clip(Fs_ts, _EPS, None) * (Rp / Rstar) ** 2
+            # Stitched inference: accumulate log-likelihood across chunks
+            w = 1.0 / jnp.clip(sigma, _EPS, None) ** 2
+            sum_w = jnp.sum(w, axis=1)
+            sum_f_w = jnp.sum(data * w, axis=1)
+            s_ff = jnp.sum((data * data) * w, axis=1)
+            norm = jnp.sum(jnp.log(_TWO_PI / w), axis=1)
 
-        # 9. Pipeline Corrections
-        # Ensure 2D shapes before any per-exposure operations
-        if model_ts.ndim == 1:
-            model_ts = model_ts[None, :]
-        if data.ndim == 1:
-            data = data[None, :]
-            sigma = sigma[None, :]
-        if model_ts.shape[1] == 0:
-            raise ValueError("model_ts has zero spectral points; check inst_nus/nu_grid")
+            sum_m = jnp.zeros_like(sum_w)
+            sum_m_w = jnp.zeros_like(sum_w)
+            sum_m2_w = jnp.zeros_like(sum_w)
+            sum_fm_w = jnp.zeros_like(sum_w)
 
-        if subtract_per_exposure_mean:
-            model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
+            rv = planet_rv_kms(phase, Kp, Vsys, dRV)
 
-        if apply_sysrem:
-            if (U is None) or (invvar_spec is None):
-                # This should be caught by caller, but safe to check
-                pass 
-            model_ts = sysrem_filter_model(model_ts, U, invvar_spec)
+            for (chunk_start, chunk_end, _core_start, _core_end, inst_start, inst_end), sops in zip(
+                stitch_plan, stitch_sops
+            ):
+                sop_rot_chunk, sop_inst_chunk = sops
+                nu_chunk = nu_grid[chunk_start:chunk_end]
 
-        # 10. Log-Likelihood (CCF-equivalent Matched Filter)
-        w = 1.0 / jnp.clip(sigma, _EPS, None) ** 2
+                dtau_chunk = jnp.zeros((art.pressure.size, nu_chunk.size))
 
-        def _lnL_one(f: jnp.ndarray, m: jnp.ndarray, w_: jnp.ndarray) -> jnp.ndarray:
-            s_mm = jnp.sum((m * m) * w_)
-            s_fm = jnp.sum((f * m) * w_)
+                # CIA
+                for molA, molB in [("H2", "H2"), ("H2", "He")]:
+                    key = molA + molB
+                    if key not in opa_cias:
+                        continue
+                    if cia_arg is not None:
+                        logacia_chunk = opa_cias[key].logacia_matrix(
+                            Tarr, **{cia_arg: nu_chunk}
+                        )
+                    else:
+                        logacia_matrix = opa_cias[key].logacia_matrix(Tarr)
+                        logacia_chunk = _slice_spectral_matrix(
+                            logacia_matrix, chunk_start, chunk_end, nu_grid.size
+                        )
+                    vmrX, vmrY = (vmrH2, vmrH2) if molB == "H2" else (vmrH2, vmrHe)
+                    dtau_chunk = dtau_chunk + art.opacity_profile_cia(
+                        logacia_chunk, Tarr, vmrX, vmrY, mmw[:, None], g
+                    )
+
+                # Molecules
+                for i, mol in enumerate(mol_names):
+                    if xs_arg is not None:
+                        xs_chunk = opa_mols[mol].xsmatrix(
+                            Tarr, art.pressure, **{xs_arg: nu_chunk}
+                        )
+                    else:
+                        xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
+                        xs_chunk = _slice_spectral_matrix(
+                            xsmatrix, chunk_start, chunk_end, nu_grid.size
+                        )
+                    dtau_chunk = dtau_chunk + art.opacity_profile_xs(
+                        xs_chunk, vmr_mols[i], mmw[:, None], g
+                    )
+
+                # Atoms
+                for i, atom in enumerate(atom_names):
+                    if xs_arg is not None:
+                        xs_chunk = opa_atoms[atom].xsmatrix(
+                            Tarr, art.pressure, **{xs_arg: nu_chunk}
+                        )
+                    else:
+                        xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
+                        xs_chunk = _slice_spectral_matrix(
+                            xsmatrix, chunk_start, chunk_end, nu_grid.size
+                        )
+                    dtau_chunk = dtau_chunk + art.opacity_profile_xs(
+                        xs_chunk, vmr_atoms[i], mmw[:, None], g
+                    )
+
+                rt = art.run(dtau_chunk, Tarr, mmw, Rp, g_btm)
+                rt = sop_rot_chunk.rigid_rotation(rt, vsini, 0.0, 0.0)
+                rt = sop_inst_chunk.ipgauss(rt, beta_inst)
+
+                inst_slice = inst_nus[inst_start:inst_end]
+                planet_ts = jax.vmap(lambda v: sop_inst_chunk.sampling(rt, v, inst_slice))(rv)
+
+                if mode == "transmission":
+                    model_ts = jnp.sqrt(planet_ts) * (Rp / Rstar)
+                else:
+                    piBarr = _get_piBarr()
+                    Fs = piBarr(nu_chunk, Tstar)
+                    Fs_ts = jax.vmap(lambda v: sop_inst_chunk.sampling(Fs, v, inst_slice))(rv)
+                    model_ts = planet_ts / jnp.clip(Fs_ts, _EPS, None) * (Rp / Rstar) ** 2
+
+                if model_ts.ndim == 1:
+                    model_ts = model_ts[None, :]
+
+                data_slice = data[:, inst_start:inst_end]
+                w_slice = w[:, inst_start:inst_end]
+
+                sum_m = sum_m + jnp.sum(model_ts, axis=1)
+                sum_m_w = sum_m_w + jnp.sum(model_ts * w_slice, axis=1)
+                sum_m2_w = sum_m2_w + jnp.sum((model_ts * model_ts) * w_slice, axis=1)
+                sum_fm_w = sum_fm_w + jnp.sum((data_slice * model_ts) * w_slice, axis=1)
+
+            if subtract_per_exposure_mean:
+                n_points = data.shape[1]
+                mean_m = sum_m / n_points
+                s_mm = sum_m2_w - 2.0 * mean_m * sum_m_w + (mean_m * mean_m) * sum_w
+                s_fm = sum_fm_w - mean_m * sum_f_w
+            else:
+                s_mm = sum_m2_w
+                s_fm = sum_fm_w
+
             alpha = s_fm / (s_mm + _EPS)
-            r = f - alpha * m
-            chi2 = jnp.sum((r * r) * w_)
-            norm = jnp.sum(jnp.log(_TWO_PI / w_))
-            return -0.5 * (chi2 + norm)
-
-        lnL = jnp.sum(jax.vmap(_lnL_one)(data, model_ts, w))
-        numpyro.factor("logL", lnL)
+            chi2 = s_ff - 2.0 * alpha * s_fm + (alpha * alpha) * s_mm
+            lnL = jnp.sum(-0.5 * (chi2 + norm))
+            numpyro.factor("logL", lnL)
 
         # Deterministics for tracking
         numpyro.deterministic("Kp_kms", Kp)

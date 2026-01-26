@@ -353,6 +353,7 @@ def run_retrieval(
         config.DIFFMODE,
         config.TLOW,
         config.THIGH,
+        cutwing=config.PREMODIT_CUTWING,
     )
     print(f"  Loaded {len(opa_mols)} molecular species: {list(opa_mols.keys())}")
 
@@ -365,6 +366,7 @@ def run_retrieval(
         config.DIFFMODE,
         config.TLOW,
         config.THIGH,
+        cutwing=config.PREMODIT_CUTWING,
     )
     if opa_atoms:
         print(f"  Loaded {len(opa_atoms)} atomic species: {list(opa_atoms.keys())}")
@@ -421,6 +423,12 @@ def run_retrieval(
         Tlow=config.TLOW,
         Thigh=config.THIGH,
         phase_mode=phase_mode,
+        stitch_inference=config.ENABLE_INFERENCE_STITCHING,
+        stitch_chunk_points=config.INFERENCE_STITCH_CHUNK_POINTS,
+        stitch_n_chunks=config.INFERENCE_STITCH_NCHUNKS,
+        stitch_guard_kms=config.INFERENCE_STITCH_GUARD_KMS,
+        stitch_guard_points=config.INFERENCE_STITCH_GUARD_POINTS,
+        stitch_min_guard_points=config.INFERENCE_STITCH_MIN_GUARD_POINTS,
     )
     print(f"  Model created (phase_mode={phase_mode})")
 

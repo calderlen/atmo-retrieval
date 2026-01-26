@@ -34,7 +34,29 @@ WAV_MIN_OFFSET = 100  # Angstroms
 WAV_MAX_OFFSET = 100  # Angstroms
 
 # preMODIT parameters
-NDIV = 8 
+# NDIV controls wavenumber stitching (OpaPremodit nstitch) to reduce device memory.
+NDIV = 250
+# Line-wing truncation (relative to grid spacing). Set to None to auto-scale as 1/(2*NDIV).
+PREMODIT_CUTWING = None
+
+# ==============================================================================
+# INFERENCE GRID STITCHING (OPTIONAL)
+# ==============================================================================
+# Chunk the forward model across the wavenumber grid to reduce GPU memory during
+# inference. Enable only if full-grid inference is too large.
+ENABLE_INFERENCE_STITCHING = False
+# Target number of grid points in each chunk core (excludes guard points).
+# Ignored if INFERENCE_STITCH_NCHUNKS is set.
+INFERENCE_STITCH_CHUNK_POINTS = 50000
+# Explicit number of chunks. If set, overrides INFERENCE_STITCH_CHUNK_POINTS.
+INFERENCE_STITCH_NCHUNKS = None
+# Guard band in km/s to mitigate edge effects from broadening + Doppler shifts.
+# If INFERENCE_STITCH_GUARD_POINTS is set, this is ignored.
+INFERENCE_STITCH_GUARD_KMS = 300.0
+# Explicit guard size in grid points (overrides INFERENCE_STITCH_GUARD_KMS).
+INFERENCE_STITCH_GUARD_POINTS = None
+# Minimum guard size in grid points (applies when guard is computed from km/s).
+INFERENCE_STITCH_MIN_GUARD_POINTS = 256
 
 # ==============================================================================
 # CLOUD/HAZE PARAMETERS

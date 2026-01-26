@@ -268,6 +268,30 @@ def _opa_grid_matches(opa: OpaPremodit, nu_grid: np.ndarray) -> bool:
     return np.isclose(opa_grid[0], nu_grid[0]) and np.isclose(opa_grid[-1], nu_grid[-1])
 
 
+def _resolve_cutwing(ndiv: int, cutwing: float | None) -> float:
+    """Resolve line-wing truncation parameter for preMODIT."""
+    if cutwing is None:
+        return 1.0 / (2 * max(int(ndiv), 1))
+    return float(cutwing)
+
+
+def _opa_settings_match(
+    opa: OpaPremodit, ndiv: int, diffmode: int, cutwing: float
+) -> bool:
+    """Check whether cached opacity settings match stitching parameters."""
+    aux = getattr(opa, "aux", {}) or {}
+    nstitch = aux.get("nstitch")
+    if nstitch is None or int(nstitch) != int(ndiv):
+        return False
+    dm = aux.get("diffmode")
+    if dm is None or int(dm) != int(diffmode):
+        return False
+    cw = aux.get("cutwing")
+    if cw is None or not np.isclose(float(cw), float(cutwing)):
+        return False
+    return True
+
+
 def build_premodit_from_snapshot(
     snapshot: object,
     molmass: float,
@@ -277,8 +301,15 @@ def build_premodit_from_snapshot(
     diffmode: int,
     Tlow: float,
     Thigh: float,
+    cutwing: float | None = None,
 ) -> OpaPremodit:
     """Create preMODIT opacity from database snapshot and save it."""
+    cutwing_val = _resolve_cutwing(ndiv, cutwing)
+    if ndiv > 1 and diffmode not in (0,):
+        print(
+            f"  Warning: stitching (ndiv={ndiv}) is recommended with forward-mode "
+            f"differentiation (diffmode=0). Current diffmode={diffmode}."
+        )
     opa = OpaPremodit.from_snapshot(
         snapshot,
         nu_grid,
@@ -287,10 +318,20 @@ def build_premodit_from_snapshot(
         auto_trange=[Tlow, Thigh],
         dit_grid_resolution=1,
         allow_32bit=True,
-        cutwing=1 / (2 * ndiv),
+        cutwing=cutwing_val,
     )
     opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
-    saveopa(opa, str(opa_path), format="zarr", aux={"molmass": molmass})
+    saveopa(
+        opa,
+        str(opa_path),
+        format="zarr",
+        aux={
+            "molmass": molmass,
+            "nstitch": int(ndiv),
+            "cutwing": float(cutwing_val),
+            "diffmode": int(diffmode),
+        },
+    )
     return opa
 
 
@@ -304,23 +345,42 @@ def load_or_build_opacity(
     diffmode: int,
     Tlow: float,
     Thigh: float,
-) -> tuple[OpaPremodit, float]:
+    cutwing: float | None = None,
+    load_only: bool = False,
+) -> tuple[OpaPremodit | None, float | None]:
     """Load saved opacity or build from database snapshot."""
     path = str(path)
+    cutwing_val = _resolve_cutwing(ndiv, cutwing)
     if opa_load:
         try:
             opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
             opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
             if not _opa_grid_matches(opa, nu_grid):
                 raise ValueError("Cached opacity grid mismatch.")
+            if not _opa_settings_match(opa, ndiv, diffmode, cutwing_val):
+                raise ValueError("Cached opacity stitching settings mismatch.")
             return opa, opa.aux["molmass"]
         except Exception:
+            if load_only:
+                print(f"  Warning: Could not load saved opacity for {mol} (load-only). Skipping.")
+                return None, None
             print(f"  Warning: Could not load saved opacity for {mol}, building from database...")
+    elif load_only:
+        print(f"  Warning: OPA_LOAD disabled; skipping {mol} (load-only).")
+        return None, None
 
     mdb = mdb_factory(path)
     molmass = mdb.molmass
     opa = build_premodit_from_snapshot(
-        mdb.to_snapshot(), molmass, mol, nu_grid, ndiv, diffmode, Tlow, Thigh
+        mdb.to_snapshot(),
+        molmass,
+        mol,
+        nu_grid,
+        ndiv,
+        diffmode,
+        Tlow,
+        Thigh,
+        cutwing=cutwing_val,
     )
     del mdb
     return opa, molmass
@@ -335,6 +395,9 @@ def load_molecular_opacities(
     diffmode: int,
     Tlow: float,
     Thigh: float,
+    cutwing: float | None = None,
+    load_only: bool = False,
+    on_species_loaded: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, OpaPremodit], jnp.ndarray]:
     """Load or create all molecular opacities for HITEMP and ExoMol."""
     opa_mols = {}
@@ -347,20 +410,48 @@ def load_molecular_opacities(
         print(f"  * {mol} (HITEMP)")
         mdb_factory = lambda p: MdbHitemp(p, nu_grid, gpu_transfer=False, isotope=1)
         opa, molmass = load_or_build_opacity(
-            mol, path, mdb_factory, opa_load, nu_grid, ndiv, diffmode, Tlow, Thigh
+            mol,
+            path,
+            mdb_factory,
+            opa_load,
+            nu_grid,
+            ndiv,
+            diffmode,
+            Tlow,
+            Thigh,
+            cutwing=cutwing,
+            load_only=load_only,
         )
+        if opa is None or molmass is None:
+            continue
         opa_mols[mol] = opa
         molmass_list.append(molmass)
+        if on_species_loaded is not None:
+            on_species_loaded(f"mol:{mol}")
 
     # ExoMol molecules
     for mol, path in molpath_exomol.items():
         print(f"  * {mol} (ExoMol)")
         mdb_factory = lambda p: MdbExomol(p, nu_grid, gpu_transfer=False)
         opa, molmass = load_or_build_opacity(
-            mol, path, mdb_factory, opa_load, nu_grid, ndiv, diffmode, Tlow, Thigh
+            mol,
+            path,
+            mdb_factory,
+            opa_load,
+            nu_grid,
+            ndiv,
+            diffmode,
+            Tlow,
+            Thigh,
+            cutwing=cutwing,
+            load_only=load_only,
         )
+        if opa is None or molmass is None:
+            continue
         opa_mols[mol] = opa
         molmass_list.append(molmass)
+        if on_species_loaded is not None:
+            on_species_loaded(f"mol:{mol}")
 
     return opa_mols, jnp.array(molmass_list)
 
@@ -373,6 +464,9 @@ def load_atomic_opacities(
     diffmode: int,
     Tlow: float,
     Thigh: float,
+    cutwing: float | None = None,
+    load_only: bool = False,
+    on_species_loaded: Callable[[str], None] | None = None,
     db_kurucz: str | None = None,
     db_vald: str | None = None,
     auto_download: bool = True,
@@ -392,6 +486,7 @@ def load_atomic_opacities(
 
     if not atomic_species:
         return opa_atoms, jnp.array(atommass_list)
+    cutwing_val = _resolve_cutwing(ndiv, cutwing)
 
     # Import Kurucz/VALD helpers
     try:
@@ -427,15 +522,25 @@ def load_atomic_opacities(
                 opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
                 if not _opa_grid_matches(opa, nu_grid):
                     raise ValueError("Cached opacity grid mismatch.")
+                if not _opa_settings_match(opa, ndiv, diffmode, cutwing_val):
+                    raise ValueError("Cached opacity stitching settings mismatch.")
                 molmass = opa.aux.get("molmass", None)
                 if molmass is None:
                     raise KeyError("Missing molmass in cached opacity.")
                 opa_atoms[atom] = opa
                 atommass_list.append(molmass)
                 print(f"  * {atom} (cached)")
+                if on_species_loaded is not None:
+                    on_species_loaded(f"atom:{atom}")
                 continue
             except Exception:
+                if load_only:
+                    print(f"  Warning: Could not load saved opacity for {atom} (load-only). Skipping.")
+                    continue
                 print(f"  Warning: Could not load saved opacity for {atom}, building from database...")
+        elif load_only:
+            print(f"  Warning: OPA_LOAD disabled; skipping {atom} (load-only).")
+            continue
 
         snapshot = None
         molmass = None
@@ -480,9 +585,12 @@ def load_atomic_opacities(
             diffmode,
             Tlow,
             Thigh,
+            cutwing=cutwing_val,
         )
         opa_atoms[atom] = opa
         atommass_list.append(molmass)
+        if on_species_loaded is not None:
+            on_species_loaded(f"atom:{atom}")
 
     if not opa_atoms:
         print("  No atomic opacities loaded (data not available or download required)")

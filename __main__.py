@@ -1,6 +1,7 @@
 import argparse
 import sys
 import os
+from datetime import datetime
 from pathlib import Path
 
 
@@ -165,6 +166,94 @@ def create_parser():
         action="store_true",
         help="Compute species template cross-correlations before retrieval"
     )
+    diag_group.add_argument(
+        "--profile-memory",
+        action="store_true",
+        help="Profile GPU/RAM usage for the configured run and exit"
+    )
+    diag_group.add_argument(
+        "--profile-sweep",
+        action="store_true",
+        help="Run a parameter sweep of memory profiling and exit"
+    )
+    diag_group.add_argument(
+        "--profile-load-only",
+        action="store_true",
+        help="Only load cached opacities when profiling (skip builds)"
+    )
+    diag_group.add_argument(
+        "--profile-skip-opacities",
+        action="store_true",
+        help="Skip loading opacities during profiling"
+    )
+    diag_group.add_argument(
+        "--profile-log",
+        type=str,
+        default=None,
+        help="Path to save profiler output (appends if exists)"
+    )
+    diag_group.add_argument(
+        "--nfree",
+        type=int,
+        default=10,
+        help="Number of free parameters for memory estimation (default: 10)"
+    )
+    diag_group.add_argument(
+        "--sweep-nfree",
+        type=str,
+        default=None,
+        help='Comma-separated list for nfree sweep (e.g., "5,10,20,50")'
+    )
+    diag_group.add_argument(
+        "--sweep-nlayer",
+        type=str,
+        default=None,
+        help='Comma-separated list for nlayer sweep (e.g., "50,100,150")'
+    )
+    diag_group.add_argument(
+        "--sweep-nspec",
+        type=str,
+        default=None,
+        help='Comma-separated list for N_SPECTRAL_POINTS sweep (e.g., "50000,100000")'
+    )
+    diag_group.add_argument(
+        "--sweep-wrange",
+        type=str,
+        default=None,
+        help='Comma-separated wavelength range scale factors (e.g., "0.5,0.75,1.0,1.25")'
+    )
+    diag_group.add_argument(
+        "--sweep-wrange-mode",
+        type=str,
+        choices=["fixed_n", "fixed_res"],
+        default="fixed_res",
+        help="How to sweep wavelength range (default: fixed_res)"
+    )
+    diag_group.add_argument(
+        "--sweep-hard-fail",
+        action="store_true",
+        help="Abort sweep when estimated memory exceeds GPU total"
+    )
+
+    # Species selection (runtime overrides)
+    species_group = parser.add_argument_group("Species Selection")
+    species_group.add_argument(
+        "--atoms",
+        type=str,
+        default=None,
+        help='Comma-separated atomic species list (e.g., "Fe I,Fe II,Na I")'
+    )
+    species_group.add_argument(
+        "--molecules",
+        type=str,
+        default=None,
+        help='Comma-separated molecular species list (e.g., "H2O,CO,TiO")'
+    )
+    species_group.add_argument(
+        "--no-molecules",
+        action="store_true",
+        help="Disable all molecular opacities (use atoms only)"
+    )
 
     # Execution options
     exec_group = parser.add_argument_group("Execution")
@@ -188,6 +277,11 @@ def create_parser():
         type=int,
         default=42,
         help="Random seed (default: 42)"
+    )
+    exec_group.add_argument(
+        "--no-preallocate",
+        action="store_true",
+        help="Disable JAX GPU preallocation (slower but safer on memory)"
     )
 
     # Output options
@@ -235,6 +329,7 @@ def load_custom_config(config_path):
 def apply_cli_overrides(args):
     """Apply command-line argument overrides to config."""
     import config
+    import re
 
     # Planet and ephemeris selection
     if args.planet:
@@ -317,6 +412,34 @@ def apply_cli_overrides(args):
     elif args.disable_tellurics:
         config.ENABLE_TELLURICS = False
 
+    # Species selection
+    def _parse_csv(value: str) -> list[str]:
+        parts = [p.strip() for p in re.split(r"[,\n]+", value) if p.strip()]
+        return parts
+
+    if args.no_molecules:
+        config.MOLPATH_HITEMP = {}
+        config.MOLPATH_EXOMOL = {}
+        if args.molecules:
+            print("Warning: --no-molecules overrides --molecules.")
+    elif args.molecules:
+        wanted = set(_parse_csv(args.molecules))
+        mol_h = {k: v for k, v in config.MOLPATH_HITEMP.items() if k in wanted}
+        mol_e = {k: v for k, v in config.MOLPATH_EXOMOL.items() if k in wanted}
+        missing = wanted - set(mol_h.keys()) - set(mol_e.keys())
+        if missing:
+            print(f"Warning: Unknown molecules ignored: {', '.join(sorted(missing))}")
+        config.MOLPATH_HITEMP = mol_h
+        config.MOLPATH_EXOMOL = mol_e
+
+    if args.atoms:
+        wanted = set(_parse_csv(args.atoms))
+        atoms = {k: v for k, v in config.ATOMIC_SPECIES.items() if k in wanted}
+        missing = wanted - set(atoms.keys())
+        if missing:
+            print(f"Warning: Unknown atoms ignored: {', '.join(sorted(missing))}")
+        config.ATOMIC_SPECIES = atoms
+
     return config
 
 
@@ -397,6 +520,17 @@ def main():
     parser = create_parser()
     args = parser.parse_args()
 
+    # Default to no-preallocation for profiling runs unless explicitly overridden.
+    if args.profile_memory or args.profile_sweep:
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+        os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+
+    if args.no_preallocate:
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+        os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+
     # Handle info commands first (before loading full config)
     if args.list_planets:
         import config
@@ -430,6 +564,66 @@ def main():
     # Print configuration summary
     if not args.quiet:
         print_config_summary(config, args)
+
+    def _default_profile_log(kind: str) -> str:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = os.path.join(config.DIR_SAVE, "profiling")
+        os.makedirs(log_dir, exist_ok=True)
+        return os.path.join(log_dir, f"{kind}_{ts}.log")
+
+    if args.profile_memory:
+        from pipeline.memory_profile import run_memory_profile
+
+        if args.profile_log is None:
+            args.profile_log = _default_profile_log("memory_profile")
+            print(f"Profiler log: {args.profile_log}")
+
+        run_memory_profile(
+            mode=args.mode or config.RETRIEVAL_MODE,
+            nfree=args.nfree,
+            load_only=args.profile_load_only,
+            skip_opacities=args.profile_skip_opacities,
+            log_path=args.profile_log,
+        )
+        return 0
+
+    if args.profile_sweep:
+        from pipeline.memory_profile import run_memory_sweep
+
+        if args.profile_log is None:
+            args.profile_log = _default_profile_log("memory_sweep")
+            print(f"Profiler log: {args.profile_log}")
+
+        def _parse_int_list(value: str | None, default: list[int]) -> list[int]:
+            if value is None:
+                return default
+            parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
+            return [int(p) for p in parts]
+
+        def _parse_float_list(value: str | None, default: list[float]) -> list[float]:
+            if value is None:
+                return default
+            parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
+            return [float(p) for p in parts]
+
+        nfree_vals = _parse_int_list(args.sweep_nfree, [1, 5, 10, 20, 50, 100])
+        nlayer_vals = _parse_int_list(args.sweep_nlayer, [20, 50, 75, 100, 150, 200])
+        nspec_vals = _parse_int_list(args.sweep_nspec, [50000, 100000, 150000, 200000, 250000])
+        wrange_vals = _parse_float_list(args.sweep_wrange, [0.5, 0.75, 1.0, 1.25, 1.5])
+
+        run_memory_sweep(
+            mode=args.mode or config.RETRIEVAL_MODE,
+            nfree_values=nfree_vals,
+            nlayer_values=nlayer_vals,
+            nspec_values=nspec_vals,
+            wrange_scales=wrange_vals,
+            wrange_mode=args.sweep_wrange_mode,
+            load_only=args.profile_load_only,
+            skip_opacities=args.profile_skip_opacities,
+            hard_fail=args.sweep_hard_fail,
+            log_path=args.profile_log,
+        )
+        return 0
 
     # Run retrieval
     try:

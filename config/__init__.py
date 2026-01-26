@@ -52,6 +52,13 @@ from .model_config import (
     WAV_MIN_OFFSET,
     WAV_MAX_OFFSET,
     NDIV,
+    PREMODIT_CUTWING,
+    ENABLE_INFERENCE_STITCHING,
+    INFERENCE_STITCH_CHUNK_POINTS,
+    INFERENCE_STITCH_NCHUNKS,
+    INFERENCE_STITCH_GUARD_KMS,
+    INFERENCE_STITCH_GUARD_POINTS,
+    INFERENCE_STITCH_MIN_GUARD_POINTS,
     CLOUD_WIDTH,
     CLOUD_INTEGRATED_TAU,
     ENABLE_TELLURICS,
@@ -169,6 +176,22 @@ def save_run_config(
         f.write(f"Wavelength range: {wav_min} - {wav_max} Angstroms\n")
         f.write(f"Spectral points: {N_SPECTRAL_POINTS}\n")
         f.write(f"Resolution: R = {get_resolution():,}\n\n")
+
+        # preMODIT stitching
+        f.write("preMODIT STITCHING\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"NDIV (nstitch): {NDIV}\n")
+        f.write(f"Cutwing: {PREMODIT_CUTWING}\n\n")
+
+        # Inference stitching
+        f.write("INFERENCE GRID STITCHING\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Enabled: {ENABLE_INFERENCE_STITCHING}\n")
+        f.write(f"Chunk points: {INFERENCE_STITCH_CHUNK_POINTS}\n")
+        f.write(f"Chunks (override): {INFERENCE_STITCH_NCHUNKS}\n")
+        f.write(f"Guard (km/s): {INFERENCE_STITCH_GUARD_KMS}\n")
+        f.write(f"Guard points (override): {INFERENCE_STITCH_GUARD_POINTS}\n")
+        f.write(f"Min guard points: {INFERENCE_STITCH_MIN_GUARD_POINTS}\n\n")
 
         # Atmospheric setup
         f.write("ATMOSPHERIC SETUP\n")
