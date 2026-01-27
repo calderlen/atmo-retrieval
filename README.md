@@ -1,4 +1,4 @@
-This codebase performs Bayesian atmospheric retrieval on transmission and/or emission spectra of ultra-hot Jupiters, specifically designed for KELT-20b observations with PEPSI/LBT.
+This codebase performs Bayesian atmospheric retrieval on transmission and/or emission spectra of exoplanet atmospheres
 
 ## Architecture
 
@@ -145,7 +145,6 @@ python __main__.py --help
 │   ├── load.py            #   Data loading
 │   ├── preprocess.py      #   PEPSI data preprocessing
 │   ├── tellurics.py       #   Telluric fitting and correction (HITRAN H2O)
-│   └── horus.py           #   Doppler shadow removal
 ├── physics/               # Forward-model physics
 │   ├── grid_setup.py      #   Wavenumber grid and spectral operators
 │   ├── model.py           #   NumPyro atmospheric model
