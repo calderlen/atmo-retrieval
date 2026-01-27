@@ -919,15 +919,15 @@ def create_retrieval_model(
             dot_atoms = jnp.dot(atom_masses, vmr_atoms)
         else:
             vmr_atoms = jnp.zeros((0, art.pressure.size))
-            sum_atoms = 0.0
-            dot_atoms = 0.0
+            sum_atoms = jnp.zeros((art.pressure.size,))
+            dot_atoms = jnp.zeros((art.pressure.size,))
 
         if len(mol_names) > 0:
             sum_mols = jnp.sum(vmr_mols, axis=0)
             dot_mols = jnp.dot(mol_masses, vmr_mols)
         else:
-            sum_mols = 0.0
-            dot_mols = 0.0
+            sum_mols = jnp.zeros((art.pressure.size,))
+            dot_mols = jnp.zeros((art.pressure.size,))
 
         vmr_tot = jnp.clip(sum_mols + sum_atoms, 0.0, 1.0)
         vmrH2 = (1.0 - vmr_tot) * (6.0 / 7.0)

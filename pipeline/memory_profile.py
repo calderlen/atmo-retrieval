@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import builtins
 import os
 import re
+import subprocess
 import sys
 from typing import Iterable, TextIO
 
@@ -16,6 +17,8 @@ _RESET = "\033[0m"
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _LOG_HANDLE: TextIO | None = None
 _LOG_PATH: str | None = None
+_MACOS_GPU_INFO: str | None = None
+_MACOS_GPU_INFO_PRINTED = False
 
 
 def _red(text: str) -> str:
@@ -144,6 +147,120 @@ def _get_gpu_info() -> GpuInfo | None:
         return None
 
 
+def _macos_gpu_static_info() -> str | None:
+    global _MACOS_GPU_INFO
+    if _MACOS_GPU_INFO is not None:
+        return _MACOS_GPU_INFO
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType", "-detailLevel", "mini"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        _MACOS_GPU_INFO = None
+        return None
+
+    chipset = None
+    cores = None
+    memory = None
+    metal = None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip()
+        val = val.strip()
+        if key in ("Chipset Model", "Model", "GPU") and chipset is None:
+            chipset = val
+        elif key in ("Total Number of Cores", "Cores") and cores is None:
+            cores = val
+        elif key in ("VRAM (Total)", "Memory", "VRAM") and memory is None:
+            memory = val
+        elif key == "Metal Support" and metal is None:
+            metal = val
+
+    parts: list[str] = []
+    if chipset:
+        parts.append(chipset)
+    if cores:
+        parts.append(f"cores {cores}")
+    if memory:
+        parts.append(f"mem {memory}")
+    if metal:
+        metal_label = metal if metal.lower().startswith("metal") else f"Metal {metal}"
+        parts.append(metal_label)
+
+    _MACOS_GPU_INFO = " | ".join(parts) if parts else None
+    return _MACOS_GPU_INFO
+
+
+def _maybe_print_powermetrics_sample() -> None:
+    flag = os.environ.get("ATMO_POWERMETRICS", "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return
+    if sys.platform != "darwin":
+        return
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        print("  GPU (powermetrics): set ATMO_POWERMETRICS=1 and run with sudo to sample")
+        return
+    try:
+        result = subprocess.run(
+            ["powermetrics", "--samplers", "gpu_power", "-n", "1", "-i", "1000"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        print(f"  GPU (powermetrics): failed ({exc})")
+        return
+
+    freq = None
+    active = None
+    idle = None
+    power = None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("GPU HW active frequency:"):
+            freq = line.split(":", 1)[1].strip()
+        elif line.startswith("GPU HW active residency:"):
+            active = line.split(":", 1)[1].strip()
+        elif line.startswith("GPU idle residency:"):
+            idle = line.split(":", 1)[1].strip()
+        elif line.startswith("GPU Power:"):
+            power = line.split(":", 1)[1].strip()
+
+    parts: list[str] = []
+    if freq:
+        parts.append(f"freq {freq}")
+    if active:
+        parts.append(f"active {active.split('(')[0].strip()}")
+    if idle:
+        parts.append(f"idle {idle.split('(')[0].strip()}")
+    if power:
+        parts.append(f"power {power}")
+    if parts:
+        print(f"  GPU (powermetrics): {' | '.join(parts)}")
+    else:
+        print("  GPU (powermetrics): sample captured but could not parse output")
+
+
+def _maybe_print_macos_gpu_info() -> None:
+    global _MACOS_GPU_INFO_PRINTED
+    if _MACOS_GPU_INFO_PRINTED:
+        return
+    _MACOS_GPU_INFO_PRINTED = True
+    info = _macos_gpu_static_info()
+    if info:
+        print(f"  GPU (macOS): {info}")
+    else:
+        print("  GPU (macOS): system_profiler did not return display info")
+    _maybe_print_powermetrics_sample()
+
+
 def _print_memory_snapshot(label: str, tracker: dict[str, object] | None = None) -> None:
     ram = _get_ram_info()
     gpu = _get_gpu_info()
@@ -169,7 +286,11 @@ def _print_memory_snapshot(label: str, tracker: dict[str, object] | None = None)
                 tracker["max_used"] = float(gpu.used_bytes)
                 tracker["label"] = label
     else:
-        print("  GPU: unavailable (install cuda-python or pynvml for GPU stats)")
+        if sys.platform == "darwin":
+            print("  GPU: unavailable (macOS does not expose CUDA/NVML memory stats)")
+            _maybe_print_macos_gpu_info()
+        else:
+            print("  GPU: unavailable (install cuda-python or pynvml for GPU stats)")
 
 
 def _estimate_device_memory(

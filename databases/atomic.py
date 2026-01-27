@@ -218,7 +218,15 @@ def load_kurucz_atomic(
     if not filepath.exists():
         raise FileNotFoundError(f"Kurucz gfall file not found: {filepath}")
 
-    adb = AdbKurucz(str(filepath), nu_grid, gpu_transfer=False)
+    try:
+        adb = AdbKurucz(str(filepath), nu_grid, gpu_transfer=False)
+    except AttributeError as exc:
+        # ExoJAX 2.2.x can access ielem/iion even when gpu_transfer=False.
+        # Retry with gpu_transfer=True for compatibility.
+        if "ielem" in str(exc) or "iion" in str(exc):
+            adb = AdbKurucz(str(filepath), nu_grid, gpu_transfer=True)
+        else:
+            raise
     mask = _species_mask(adb, element, iion, code)
     return adb, mask
 
@@ -232,7 +240,13 @@ def load_vald_atomic(
     element, ionization = parse_species(species)
     iion = ionization_to_iion(ionization)
     code = element_to_atomic_number(element)
-    adb = AdbVald(str(vald_file), nu_grid, gpu_transfer=False)
+    try:
+        adb = AdbVald(str(vald_file), nu_grid, gpu_transfer=False)
+    except AttributeError as exc:
+        if "ielem" in str(exc) or "iion" in str(exc):
+            adb = AdbVald(str(vald_file), nu_grid, gpu_transfer=True)
+        else:
+            raise
     mask = _species_mask(adb, element, iion, code)
     return adb, mask
 

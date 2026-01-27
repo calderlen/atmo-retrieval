@@ -44,7 +44,7 @@ PREMODIT_CUTWING = None
 # ==============================================================================
 # Chunk the forward model across the wavenumber grid to reduce GPU memory during
 # inference. Enable only if full-grid inference is too large.
-ENABLE_INFERENCE_STITCHING = False
+ENABLE_INFERENCE_STITCHING = True
 # Target number of grid points in each chunk core (excludes guard points).
 # Ignored if INFERENCE_STITCH_NCHUNKS is set.
 INFERENCE_STITCH_CHUNK_POINTS = 50000
