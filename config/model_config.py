@@ -22,8 +22,8 @@ PRESSURE_TOP = 1e-8
 PRESSURE_BTM = 1e2
 
 # Temperature range [K]
-TLOW = 1500.0
-THIGH = 4500.0
+T_LOW = 1500.0
+T_HIGH = 4500.0
 
 # ==============================================================================
 # SPECTRAL GRID PARAMETERS

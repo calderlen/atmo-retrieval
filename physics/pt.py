@@ -9,9 +9,9 @@ def isothermal_profile(art: object, T0: float) -> jnp.ndarray:
     """Isothermal temperature profile."""
     return T0 * jnp.ones_like(art.pressure)
 
-def numpyro_isothermal(art: object, Tlow: float, Thigh: float) -> jnp.ndarray:
+def numpyro_isothermal(art: object, T_low: float, T_high: float) -> jnp.ndarray:
     """Isothermal profile with NumPyro sampling."""
-    T0 = numpyro.sample("T0", dist.Uniform(Tlow, Thigh))
+    T0 = numpyro.sample("T0", dist.Uniform(T_low, T_high))
     return isothermal_profile(art, T0)
 
 
@@ -24,10 +24,10 @@ def gradient_profile(art: object, T_bottom: float, T_top: float) -> jnp.ndarray:
     return T_bottom + (T_top - T_bottom) * frac
 
 
-def numpyro_gradient(art: object, Tlow: float, Thigh: float) -> jnp.ndarray:
+def numpyro_gradient(art: object, T_low: float, T_high: float) -> jnp.ndarray:
     """Linear gradient profile with NumPyro sampling."""
-    T_bottom = numpyro.sample("T_bottom", dist.Uniform(Tlow, Thigh))
-    T_top = numpyro.sample("T_top", dist.Uniform(Tlow, Thigh))
+    T_bottom = numpyro.sample("T_bottom", dist.Uniform(T_low, T_high))
+    T_top = numpyro.sample("T_top", dist.Uniform(T_low, T_high))
     return gradient_profile(art, T_bottom, T_top)
 
 
@@ -79,10 +79,10 @@ def madhu_seager_profile(
     Tarr = T_high + (T_deep - T_high) * f_transition
     return Tarr
 
-def numpyro_madhu_seager(art: object, Tlow: float, Thigh: float) -> jnp.ndarray:
+def numpyro_madhu_seager(art: object, T_low: float, T_high: float) -> jnp.ndarray:
     """Madhusudhan-Seager profile with NumPyro sampling."""
-    T_deep = numpyro.sample("T_deep", dist.Uniform(Tlow, Thigh))
-    T_high = numpyro.sample("T_high", dist.Uniform(Tlow, Thigh))
+    T_deep = numpyro.sample("T_deep", dist.Uniform(T_low, T_high))
+    T_high = numpyro.sample("T_high", dist.Uniform(T_low, T_high))
     log_P_trans = numpyro.sample("log_P_trans", dist.Uniform(-8, 2))
     delta_P = numpyro.sample("delta_P", dist.Uniform(0.1, 3.0))
 
@@ -97,8 +97,8 @@ def numpyro_madhu_seager(art: object, Tlow: float, Thigh: float) -> jnp.ndarray:
 def free_temperature_profile(
     art: object,
     n_layers: int = 5,
-    Tlow: float = 1000,
-    Thigh: float = 4000,
+    T_low: float = 1000,
+    T_high: float = 4000,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Free temperature profile with piecewise linear interpolation."""
     log_p = jnp.log10(art.pressure)
@@ -106,7 +106,7 @@ def free_temperature_profile(
 
     T_nodes = []
     for i in range(n_layers):
-        T_i = numpyro.sample(f"T_node_{i}", dist.Uniform(Tlow, Thigh))
+        T_i = numpyro.sample(f"T_node_{i}", dist.Uniform(T_low, T_high))
         T_nodes.append(T_i)
     T_nodes = jnp.array(T_nodes)
 
@@ -117,8 +117,8 @@ def free_temperature_profile(
 def numpyro_free_temperature(
     art: object,
     n_layers: int = 5,
-    Tlow: float = 1000,
-    Thigh: float = 4000,
+    T_low: float = 1000,
+    T_high: float = 4000,
 ) -> jnp.ndarray:
     """Free temperature profile with NumPyro sampling."""
-    return free_temperature_profile(art, n_layers, Tlow, Thigh)[0]
+    return free_temperature_profile(art, n_layers, T_low, T_high)[0]

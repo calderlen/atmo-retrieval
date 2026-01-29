@@ -466,7 +466,7 @@ def run_memory_profile(
             pressure_btm=config.PRESSURE_BTM,
             nlayer=nlayer if nlayer is not None else config.NLAYER,
         )
-    art.change_temperature_range(config.TLOW, config.THIGH)
+    art.change_temperature_range(config.T_LOW, config.T_HIGH)
     _print_memory_snapshot("After RT setup", tracker=gpu_tracker)
 
     print("\n[3/4] Loading opacities...")
@@ -487,8 +487,8 @@ def run_memory_profile(
             opa_load,
             config.NDIV,
             config.DIFFMODE,
-            config.TLOW,
-            config.THIGH,
+            config.T_LOW,
+            config.T_HIGH,
             cutwing=config.PREMODIT_CUTWING,
             load_only=load_only,
             on_species_loaded=_after_species,
@@ -499,8 +499,8 @@ def run_memory_profile(
             opa_load,
             config.NDIV,
             config.DIFFMODE,
-            config.TLOW,
-            config.THIGH,
+            config.T_LOW,
+            config.T_HIGH,
             cutwing=config.PREMODIT_CUTWING,
             load_only=load_only,
             on_species_loaded=_after_species,

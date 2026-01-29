@@ -677,8 +677,8 @@ def create_retrieval_model(
     temperature_profile: Literal[
         "isothermal", "gradient", "madhu_seager", "free", "guillot"
     ] = "guillot",
-    Tlow: float = 400.0,
-    Thigh: float = 3000.0,
+    T_low: float = 400.0,
+    T_high: float = 3000.0,
     Tirr_std: float | None = None,  # If None, uses uniform prior on Tirr
     Tint_fixed: float = 100.0,
     log_kappa_ir_bounds: tuple[float, float] = (-4.0, 0.0),
@@ -719,7 +719,7 @@ def create_retrieval_model(
         instrument_resolution: Spectral resolution R
         inst_nus: Instrument wavenumber grid
         temperature_profile: TP profile type
-        Tlow, Thigh: Temperature bounds (K)
+        T_low, T_high: Temperature bounds (K)
         Tirr_std: If provided, use normal prior on Tirr with T_eq as mean
         Tint_fixed: Internal temperature (K)
         log_kappa_ir_bounds: Prior bounds on log10(kappa_IR)
@@ -949,7 +949,7 @@ def create_retrieval_model(
                     "Tirr", dist.TruncatedNormal(Tirr_mean, Tirr_std, low=0.0)
                 )
             else:
-                Tirr = numpyro.sample("Tirr", dist.Uniform(Tlow, Thigh))
+                Tirr = numpyro.sample("Tirr", dist.Uniform(T_low, T_high))
 
             log_kappa_ir = numpyro.sample(
                 "log_kappa_ir", dist.Uniform(*log_kappa_ir_bounds)
@@ -966,14 +966,14 @@ def create_retrieval_model(
             )
 
         elif temperature_profile == "isothermal":
-            T0 = numpyro.sample("T0", dist.Uniform(Tlow, Thigh))
+            T0 = numpyro.sample("T0", dist.Uniform(T_low, T_high))
             Tarr = T0 * jnp.ones_like(art.pressure)
         elif temperature_profile == "gradient":
-            Tarr = numpyro_gradient(art, Tlow, Thigh)
+            Tarr = numpyro_gradient(art, T_low, T_high)
         elif temperature_profile == "madhu_seager":
-            Tarr = numpyro_madhu_seager(art, Tlow, Thigh)
+            Tarr = numpyro_madhu_seager(art, T_low, T_high)
         elif temperature_profile == "free":
-            Tarr = numpyro_free_temperature(art, n_layers=5, Tlow=Tlow, Thigh=Thigh)
+            Tarr = numpyro_free_temperature(art, n_layers=5, T_low=T_low, T_high=T_high)
         else:
             raise ValueError(f"Unknown temperature profile: {temperature_profile}")
 

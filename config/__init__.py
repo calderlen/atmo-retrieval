@@ -46,8 +46,8 @@ from .model_config import (
     NLAYER,
     PRESSURE_TOP,
     PRESSURE_BTM,
-    TLOW,
-    THIGH,
+    T_LOW,
+    T_HIGH,
     N_SPECTRAL_POINTS,
     WAV_MIN_OFFSET,
     WAV_MAX_OFFSET,
@@ -198,7 +198,7 @@ def save_run_config(
         f.write("-" * 70 + "\n")
         f.write(f"Layers: {NLAYER}\n")
         f.write(f"Pressure range: {PRESSURE_TOP:.2e} - {PRESSURE_BTM:.2e} bar\n")
-        f.write(f"Temperature range: {TLOW} - {THIGH} K\n")
+        f.write(f"Temperature range: {T_LOW} - {T_HIGH} K\n")
         f.write(f"Cloud width: {CLOUD_WIDTH}\n")
         f.write(f"Cloud integrated tau: {CLOUD_INTEGRATED_TAU}\n\n")
 

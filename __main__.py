@@ -503,7 +503,7 @@ def print_config_summary(config, args):
     print(f"\nAtmosphere:")
     print(f"  Layers: {config.NLAYER}")
     print(f"  Pressure: {config.PRESSURE_TOP:.1e} - {config.PRESSURE_BTM:.1e} bar")
-    print(f"  Temperature: {config.TLOW}-{config.THIGH} K")
+    print(f"  Temperature: {config.T_LOW}-{config.T_HIGH} K")
 
     print(f"\nMolecules:")
     for mol in list(config.MOLPATH_HITEMP.keys()) + list(config.MOLPATH_EXOMOL.keys()):
