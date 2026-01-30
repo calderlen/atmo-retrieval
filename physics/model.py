@@ -28,7 +28,7 @@ from physics.pt import (
     numpyro_free_temperature,
     numpyro_gradient,
     numpyro_madhu_seager,
-    numpyro_pspline_knots,
+    numpyro_pspline_knots_on_art_grid,
 )
 
 
@@ -1044,7 +1044,7 @@ def create_retrieval_model(
         elif pt_profile == "free":
             Tarr = numpyro_free_temperature(art, n_layers=5, T_low=T_low, T_high=T_high)
         elif pt_profile == "pspline":
-            Tarr = numpyro_pspline_knots(art.pressure, T_low=T_low, T_high=T_high)
+            Tarr = numpyro_pspline_knots_on_art_grid(art, T_low=T_low, T_high=T_high)
         else:
             raise ValueError(f"Unknown P-T profile: {pt_profile}")
 
