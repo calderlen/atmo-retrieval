@@ -834,6 +834,9 @@ def create_retrieval_model(
     cia_arg = None
     if opa_mols:
         xs_arg = _resolve_spectral_arg(next(iter(opa_mols.values())).xsmatrix)
+    elif opa_atoms:
+        # Atoms use same OpaPremodit API - check for chunk-friendly xsmatrix
+        xs_arg = _resolve_spectral_arg(next(iter(opa_atoms.values())).xsmatrix)
     if opa_cias:
         cia_arg = _resolve_spectral_arg(next(iter(opa_cias.values())).logacia_matrix)
 
