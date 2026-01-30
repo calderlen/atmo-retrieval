@@ -20,6 +20,7 @@ from typing import Callable
 OBSERVATORY = "lbt"
 INSTRUMENT = "PEPSI"
 OBSERVING_MODE = "full"
+RESOLUTION_MODE = "uhr"  # Options: "standard" (R=50k), "hr" (R=120k), "uhr" (R=270k)
 
 
 # ==============================================================================
@@ -141,7 +142,12 @@ TELLURIC_REGIONS: dict[str, dict[str, list[tuple[float, float]]]] = {
 INSTRUMENTS: dict[str, dict[str, dict]] = {
     "lbt": {
         "PEPSI": {
-            "resolution": 120000,
+            "resolution": 270000,  # Default to UHR mode
+            "resolution_modes": {
+                "standard": 50000,   # 300 µm fiber
+                "hr": 120000,        # 200 µm fiber (High Resolution)
+                "uhr": 270000,       # 100 µm fiber (Ultra-High Resolution)
+            },
             "header_keys": _PEPSI_HEADER_KEYS,
             "fits_columns": _PEPSI_FITS_COLUMNS,
             "get_data_patterns": _pepsi_data_patterns,
@@ -214,17 +220,26 @@ def get_mode_config(
 def get_resolution(
     observatory: str | None = None,
     instrument: str | None = None,
+    resolution_mode: str | None = None,
 ) -> int:
     """Get spectral resolving power R = λ/Δλ for instrument.
 
     Args:
         observatory: Observatory name (default: active OBSERVATORY)
         instrument: Instrument name (default: active INSTRUMENT)
+        resolution_mode: Resolution mode (default: active RESOLUTION_MODE).
+            For PEPSI: "standard" (R=50k), "hr" (R=120k), "uhr" (R=270k)
 
     Returns:
         Spectral resolution
     """
-    return get_instrument_config(observatory, instrument)["resolution"]
+    config = get_instrument_config(observatory, instrument)
+    res_mode = resolution_mode or RESOLUTION_MODE
+
+    # If instrument has resolution_modes, use that; otherwise fall back to default
+    if "resolution_modes" in config and res_mode in config["resolution_modes"]:
+        return config["resolution_modes"][res_mode]
+    return config["resolution"]
 
 
 def get_wavelength_range(

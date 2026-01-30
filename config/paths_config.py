@@ -194,5 +194,7 @@ OPA_LOAD = True
 OPA_SAVE = False
 
 # Atomic database preferences
-# Kurucz line lists are auto-downloaded from kurucz.harvard.edu
-USE_KURUCZ_VALD = True
+# Kurucz: auto-downloaded from kurucz.harvard.edu
+# VALD: requires manual download from vald.astro.uu.se (place in .db_VALD/)
+USE_KURUCZ = True
+USE_VALD = True

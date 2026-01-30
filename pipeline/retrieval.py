@@ -210,20 +210,20 @@ def run_retrieval(
     skip_svi: bool = False,
     svi_only: bool = False,
     no_plots: bool = False,
-    temperature_profile: str = "guillot",
+    pt_profile: str = "pspline",
     phase_mode: PhaseMode = "shared",
     check_aliasing: bool = False,
     compute_contribution: bool = True,
     seed: int = 42,
 ) -> None:
     """Run atmospheric retrieval.
-    
+
     Args:
         mode: "transmission" or "emission"
         skip_svi: Skip SVI warm-up, go straight to MCMC
         svi_only: Run only SVI, skip MCMC
         no_plots: Skip diagnostic plots
-        temperature_profile: T-P profile type (guillot, isothermal, madhu_seager, free)
+        pt_profile: P-T profile type (guillot, isothermal, gradient, madhu_seager, free, pspline)
         phase_mode: How to model phase-dependent velocity offset:
             - "shared": Single dRV for all exposures (default)
             - "per_exposure": Independent dRV for each exposure
@@ -243,7 +243,7 @@ def run_retrieval(
     config.save_run_config(
         output_dir=output_dir,
         mode=mode,
-        temperature_profile=temperature_profile,
+        pt_profile=pt_profile,
         skip_svi=skip_svi,
         svi_only=svi_only,
         seed=seed,
@@ -388,7 +388,7 @@ def run_retrieval(
         print(f"  (Full aliasing analysis requires template generation - see aliasing.py)")
         print(f"  Aliasing directory: {aliasing_dir}")
 
-    print(f"\n[6/7] Building {mode} forward model ({temperature_profile} T-P)...")
+    print(f"\n[6/7] Building {mode} forward model ({pt_profile} P-T)...")
     
     # Convert params to format expected by create_retrieval_model
     model_params = {
@@ -419,9 +419,9 @@ def run_retrieval(
         sop_inst=sop_inst,
         instrument_resolution=Rinst,
         inst_nus=inst_nus,
-        temperature_profile=temperature_profile,
-        Tlow=config.T_LOW,
-        Thigh=config.T_HIGH,
+        pt_profile=pt_profile,
+        T_low=config.T_LOW,
+        T_high=config.T_HIGH,
         phase_mode=phase_mode,
         stitch_inference=config.ENABLE_INFERENCE_STITCHING,
         stitch_chunk_points=config.INFERENCE_STITCH_CHUNK_POINTS,
@@ -443,12 +443,6 @@ def run_retrieval(
 
     if not skip_svi:
         print(f"  SVI warm-up: {config.SVI_NUM_STEPS} steps, LR={config.SVI_LEARNING_RATE}")
-        print("  (SVI not yet implemented, skipping to MCMC)")
-
-    if svi_only:
-        print("\n  SVI-only mode not yet implemented")
-        print(f"  Configuration saved to: {output_dir}/")
-        return
 
     # Run MCMC directly
     print(f"\n  Running HMC-NUTS sampling...")
@@ -496,7 +490,7 @@ def run_retrieval(
                 opa_atoms=opa_atoms,
                 opa_cias=opa_cias,
                 nu_grid=nu_grid,
-                temperature_profile=temperature_profile,
+                pt_profile=pt_profile,
                 use_median=True,
             )
             

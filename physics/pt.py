@@ -122,3 +122,88 @@ def numpyro_free_temperature(
 ) -> jnp.ndarray:
     """Free temperature profile with NumPyro sampling."""
     return free_temperature_profile(art, n_layers, T_low, T_high)[0]
+
+
+def _validate_pressure_bar(pressure_bar: jnp.ndarray) -> jnp.ndarray:
+    p = jnp.asarray(pressure_bar)
+    if p.ndim != 1:
+        raise ValueError("pressure_bar must be 1D")
+    if jnp.any(~jnp.isfinite(p)) or jnp.any(p <= 0.0):
+        raise ValueError("pressure_bar must be finite and > 0 everywhere")
+    return p
+
+
+def pspline_knots_profile_on_grid(
+    pressure_bar: jnp.ndarray,
+    T_knots: jnp.ndarray,
+    *,
+    pressure_eval_bar: jnp.ndarray,
+) -> jnp.ndarray:
+    """Interpolate knot temperatures (even in log10 P) onto an arbitrary pressure grid.
+
+    Knots are evenly spaced in log10(pressure_bar) range.
+    Evaluated at log10(pressure_eval_bar).
+    Interpolation is linear in log10(P) (JAX-friendly).
+    """
+    p_ref = _validate_pressure_bar(pressure_bar)
+    p_eval = _validate_pressure_bar(pressure_eval_bar)
+    T_knots = jnp.asarray(T_knots)
+    if T_knots.ndim != 1:
+        raise ValueError("T_knots must be 1D")
+    if T_knots.size < 3:
+        raise ValueError("need at least 3 knots to define second differences")
+
+    logp_min = jnp.log10(jnp.min(p_ref))
+    logp_max = jnp.log10(jnp.max(p_ref))
+    logp_knots = jnp.linspace(logp_min, logp_max, T_knots.size)
+
+    logp_eval = jnp.log10(p_eval)
+    T_eval = jnp.interp(logp_eval, logp_knots, T_knots)
+    return T_eval
+
+
+def numpyro_pspline_knots_on_art_grid(
+    art: object,
+    *,
+    n_knots: int = 15, #must be >= 3
+    T_low: float = 100.0,
+    T_high: float = 6000.0,
+    inv_gamma_a: float = 1.0,
+    inv_gamma_b: float = 5.0e-5,
+) -> jnp.ndarray:
+    """Line+2015-style TP prior with ART-grid evaluation.
+
+    Physics convention: pressure is in bar; we use log10(P) for knot placement
+    and interpolation. Roughness penalty is on discrete 2nd differences of knot T.
+
+    Returns
+    -------
+    Tarr : jnp.ndarray
+        Temperature on the ART pressure grid (same length as art.pressure).
+    """
+
+    p_bar = _validate_pressure_bar(art.pressure)
+
+    # Knot temperatures
+    T_knots = jnp.stack(
+        [numpyro.sample(f"T_{i}", dist.Uniform(T_low, T_high)) for i in range(n_knots)]
+    )
+
+    # Smoothness hyperparameter γ
+    gamma = numpyro.sample("gamma", dist.InverseGamma(inv_gamma_a, inv_gamma_b))
+
+    # Discrete second differences on knots
+    d2 = T_knots[2:] - 2.0 * T_knots[1:-1] + T_knots[:-2]
+    n = d2.size
+
+    # log p(T | γ) up to an additive constant
+    logp = -0.5 * gamma * jnp.sum(d2**2) + 0.5 * n * jnp.log(gamma)
+    numpyro.factor("tp_smoothness", logp)
+
+    # Evaluate directly on ART grid (no n_fine)
+    Tarr = pspline_knots_profile_on_grid(
+        pressure_bar=p_bar,
+        T_knots=T_knots,
+        pressure_eval_bar=p_bar,
+    )
+    return Tarr

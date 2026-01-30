@@ -90,7 +90,8 @@ from .paths_config import (
     DIR_SAVE,
     OPA_LOAD,
     OPA_SAVE,
-    USE_KURUCZ_VALD,
+    USE_KURUCZ,
+    USE_VALD,
 )
 
 from .inference_config import (
@@ -106,7 +107,7 @@ from .inference_config import (
 def save_run_config(
     output_dir: str,
     mode: str,
-    temperature_profile: str,
+    pt_profile: str,
     skip_svi: bool,
     svi_only: bool,
     seed: int,
@@ -116,7 +117,7 @@ def save_run_config(
     Args:
         output_dir: Directory to save config log
         mode: Retrieval mode (transmission/emission)
-        temperature_profile: Temperature profile type
+        pt_profile: P-T profile type
         skip_svi: Whether SVI was skipped
         svi_only: Whether only SVI was run
         seed: Random seed
@@ -163,7 +164,7 @@ def save_run_config(
         f.write("RETRIEVAL CONFIGURATION\n")
         f.write("-" * 70 + "\n")
         f.write(f"Mode: {mode}\n")
-        f.write(f"Temperature profile: {temperature_profile}\n")
+        f.write(f"P-T profile: {pt_profile}\n")
         f.write(f"Output directory: {output_dir}\n\n")
 
         # Wavelength/spectral setup

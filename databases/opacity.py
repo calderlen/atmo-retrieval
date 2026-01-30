@@ -470,6 +470,8 @@ def load_atomic_opacities(
     db_kurucz: str | None = None,
     db_vald: str | None = None,
     auto_download: bool = True,
+    use_kurucz: bool | None = None,
+    use_vald: bool | None = None,
 ) -> tuple[dict[str, OpaPremodit], jnp.ndarray]:
     """Load atomic opacities from Kurucz or VALD databases.
 
@@ -478,14 +480,30 @@ def load_atomic_opacities(
 
     Source priority:
         1. Cached .zarr opacity (if opa_load=True)
-        2. Kurucz gfall (auto-download enabled)
-        3. VALD3 extract file (if available)
+        2. Kurucz gfall (if use_kurucz=True, auto-download enabled)
+        3. VALD3 extract file (if use_vald=True and file available)
+
+    Args:
+        use_kurucz: Enable Kurucz database (default: from config.USE_KURUCZ)
+        use_vald: Enable VALD database (default: from config.USE_VALD)
     """
     opa_atoms = {}
     atommass_list = []
 
     if not atomic_species:
         return opa_atoms, jnp.array(atommass_list)
+
+    # Get defaults from config if not specified
+    from config.paths_config import DB_KURUCZ, DB_VALD, USE_KURUCZ, USE_VALD
+    if use_kurucz is None:
+        use_kurucz = USE_KURUCZ
+    if use_vald is None:
+        use_vald = USE_VALD
+
+    if not use_kurucz and not use_vald:
+        print("  Warning: Both USE_KURUCZ and USE_VALD are False, skipping atomic opacities")
+        return opa_atoms, jnp.array(atommass_list)
+
     cutwing_val = _resolve_cutwing(ndiv, cutwing)
 
     # Import Kurucz/VALD helpers
@@ -502,16 +520,16 @@ def load_atomic_opacities(
         print(f"  Warning: Kurucz/VALD disabled ({exc})")
         return opa_atoms, jnp.array(atommass_list)
 
-    from config.paths_config import DB_KURUCZ, DB_VALD
     if db_kurucz is None:
         db_kurucz = DB_KURUCZ
     if db_vald is None:
         db_vald = DB_VALD
-    db_kurucz = pathlib.Path(db_kurucz)
-    db_vald = pathlib.Path(db_vald) if db_vald is not None else None
+    db_kurucz = pathlib.Path(db_kurucz) if use_kurucz else None
+    db_vald = pathlib.Path(db_vald) if use_vald and db_vald is not None else None
     vald_file = resolve_vald_file(db_vald) if db_vald is not None else None
 
-    print("Loading atomic line databases (Kurucz)...")
+    sources_str = "/".join(filter(None, ["Kurucz" if use_kurucz else None, "VALD" if use_vald else None]))
+    print(f"Loading atomic line databases ({sources_str})...")
 
     for atom, atom_meta in atomic_species.items():
         cache_name = f"atom_{atom.replace(' ', '_')}"
@@ -547,24 +565,30 @@ def load_atomic_opacities(
         source = None
         reasons = []
 
-        # Try Kurucz first
-        try:
-            adb, mask = load_kurucz_atomic(atom, nu_grid, db_kurucz, auto_download=auto_download)
-            snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
-            source = "Kurucz"
-        except Exception as exc:
-            reasons.append(f"Kurucz: {exc}")
-
-        # Fall back to VALD if available
-        if snapshot is None and vald_file is not None:
+        # Try Kurucz first (if enabled)
+        if use_kurucz and db_kurucz is not None:
             try:
-                adb, mask = load_vald_atomic(atom, nu_grid, vald_file)
+                adb, mask = load_kurucz_atomic(atom, nu_grid, db_kurucz, auto_download=auto_download)
                 snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
-                source = "VALD"
+                source = "Kurucz"
             except Exception as exc:
-                reasons.append(f"VALD: {exc}")
-        elif snapshot is None and vald_file is None:
-            reasons.append("VALD: no extract file found")
+                reasons.append(f"Kurucz: {exc}")
+        elif not use_kurucz:
+            reasons.append("Kurucz: disabled")
+
+        # Fall back to VALD if available (if enabled)
+        if snapshot is None and use_vald:
+            if vald_file is not None:
+                try:
+                    adb, mask = load_vald_atomic(atom, nu_grid, vald_file)
+                    snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
+                    source = "VALD"
+                except Exception as exc:
+                    reasons.append(f"VALD: {exc}")
+            else:
+                reasons.append("VALD: no extract file found")
+        elif not use_vald:
+            reasons.append("VALD: disabled")
 
         # Fix missing molmass
         if snapshot is not None and (molmass is None or (isinstance(molmass, float) and np.isnan(molmass))):

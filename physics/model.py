@@ -28,6 +28,7 @@ from physics.pt import (
     numpyro_free_temperature,
     numpyro_gradient,
     numpyro_madhu_seager,
+    numpyro_pspline_knots,
 )
 
 
@@ -307,19 +308,19 @@ def compute_dtau(
     opa_cias: dict[str, OpaCIA],
     nu_grid: jnp.ndarray,
     Tarr: jnp.ndarray,
-    vmr_mols: dict[str, jnp.ndarray],
-    vmr_atoms: dict[str, jnp.ndarray],
+    mmr_mols: dict[str, jnp.ndarray],
+    mmr_atoms: dict[str, jnp.ndarray],
     vmrH2: jnp.ndarray,
     vmrHe: jnp.ndarray,
     mmw: jnp.ndarray,
     g: jnp.ndarray,
 ) -> jnp.ndarray:
     """Compute optical depth matrix dtau for given atmospheric state.
-    
+
     This is a standalone function that extracts the dtau computation logic
     from the NumPyro model, allowing computation of contribution functions
     from posterior samples.
-    
+
     Args:
         art: ExoJAX atmospheric radiative transfer object
         opa_mols: Dictionary of molecular opacity objects
@@ -327,19 +328,19 @@ def compute_dtau(
         opa_cias: Dictionary of CIA opacity objects
         nu_grid: Wavenumber grid
         Tarr: Temperature array per layer
-        vmr_mols: Dict mapping molecule name -> VMR profile array
-        vmr_atoms: Dict mapping atom name -> VMR profile array
-        vmrH2: H2 volume mixing ratio profile
-        vmrHe: He volume mixing ratio profile
+        mmr_mols: Dict mapping molecule name -> MMR profile array
+        mmr_atoms: Dict mapping atom name -> MMR profile array
+        vmrH2: H2 volume mixing ratio profile (for CIA)
+        vmrHe: He volume mixing ratio profile (for CIA)
         mmw: Mean molecular weight profile
         g: Gravity profile
-        
+
     Returns:
         dtau: Optical depth matrix, shape (n_layers, n_wavenumber)
     """
     dtau = jnp.zeros((art.pressure.size, nu_grid.size))
-    
-    # CIA contributions
+
+    # CIA contributions (use VMR for collision partners)
     for molA, molB in [("H2", "H2"), ("H2", "He")]:
         key = molA + molB
         if key in opa_cias:
@@ -348,23 +349,23 @@ def compute_dtau(
             dtau = dtau + art.opacity_profile_cia(
                 logacia_matrix, Tarr, vmrX, vmrY, mmw[:, None], g
             )
-    
-    # Molecular contributions
-    for mol, vmr in vmr_mols.items():
+
+    # Molecular contributions (use MMR for opacity_profile_xs)
+    for mol, mmr in mmr_mols.items():
         if mol in opa_mols:
             xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
             dtau = dtau + art.opacity_profile_xs(
-                xsmatrix, vmr, mmw[:, None], g
+                xsmatrix, mmr, mmw[:, None], g
             )
-    
-    # Atomic contributions
-    for atom, vmr in vmr_atoms.items():
+
+    # Atomic contributions (use MMR for opacity_profile_xs)
+    for atom, mmr in mmr_atoms.items():
         if atom in opa_atoms:
             xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
             dtau = dtau + art.opacity_profile_xs(
-                xsmatrix, vmr, mmw[:, None], g
+                xsmatrix, mmr, mmw[:, None], g
             )
-    
+
     return dtau
 
 
@@ -375,27 +376,27 @@ def compute_dtau_per_species(
     opa_cias: dict[str, OpaCIA],
     nu_grid: jnp.ndarray,
     Tarr: jnp.ndarray,
-    vmr_mols: dict[str, jnp.ndarray],
-    vmr_atoms: dict[str, jnp.ndarray],
+    mmr_mols: dict[str, jnp.ndarray],
+    mmr_atoms: dict[str, jnp.ndarray],
     vmrH2: jnp.ndarray,
     vmrHe: jnp.ndarray,
     mmw: jnp.ndarray,
     g: jnp.ndarray,
 ) -> dict[str, jnp.ndarray]:
     """Compute optical depth matrix dtau for each species separately.
-    
+
     Useful for understanding the contribution of individual species
     to the total opacity at each wavelength and pressure level.
-    
+
     Args:
         Same as compute_dtau()
-        
+
     Returns:
         Dict mapping species name -> dtau array, shape (n_layers, n_wavenumber)
     """
     dtau_dict = {}
-    
-    # CIA contributions
+
+    # CIA contributions (use VMR for collision partners)
     for molA, molB in [("H2", "H2"), ("H2", "He")]:
         key = molA + molB
         if key in opa_cias:
@@ -404,44 +405,44 @@ def compute_dtau_per_species(
             dtau_dict[f"CIA_{key}"] = art.opacity_profile_cia(
                 logacia_matrix, Tarr, vmrX, vmrY, mmw[:, None], g
             )
-    
-    # Molecular contributions
-    for mol, vmr in vmr_mols.items():
+
+    # Molecular contributions (use MMR for opacity_profile_xs)
+    for mol, mmr in mmr_mols.items():
         if mol in opa_mols:
             xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
             dtau_dict[mol] = art.opacity_profile_xs(
-                xsmatrix, vmr, mmw[:, None], g
+                xsmatrix, mmr, mmw[:, None], g
             )
-    
-    # Atomic contributions
-    for atom, vmr in vmr_atoms.items():
+
+    # Atomic contributions (use MMR for opacity_profile_xs)
+    for atom, mmr in mmr_atoms.items():
         if atom in opa_atoms:
             xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
             dtau_dict[atom] = art.opacity_profile_xs(
-                xsmatrix, vmr, mmw[:, None], g
+                xsmatrix, mmr, mmw[:, None], g
             )
-    
+
     return dtau_dict
 
 
 def reconstruct_temperature_profile(
     posterior_params: dict,
     art: object,
-    temperature_profile: str = "guillot",
+    pt_profile: str = "pspline",
     Tint_fixed: float = 100.0,
 ) -> jnp.ndarray:
     """Reconstruct temperature profile from posterior parameter values.
-    
+
     Args:
         posterior_params: Dict of parameter values (e.g., median of posterior)
         art: ExoJAX art object (provides pressure grid)
-        temperature_profile: Type of T-P profile ("guillot", "isothermal", etc.)
+        pt_profile: Type of P-T profile ("guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline")
         Tint_fixed: Fixed internal temperature for Guillot profile
-        
+
     Returns:
         Tarr: Temperature array per layer
     """
-    if temperature_profile == "guillot":
+    if pt_profile == "guillot":
         Tirr = posterior_params.get("Tirr", 2500.0)
         log_kappa_ir = posterior_params.get("log_kappa_ir", -2.0)
         log_gamma = posterior_params.get("log_gamma", 0.0)
@@ -460,11 +461,11 @@ def reconstruct_temperature_profile(
             gamma=jnp.power(10.0, log_gamma),
         )
         
-    elif temperature_profile == "isothermal":
+    elif pt_profile == "isothermal":
         T0 = posterior_params.get("T0", 2500.0)
         Tarr = T0 * jnp.ones_like(art.pressure)
-        
-    elif temperature_profile == "gradient":
+
+    elif pt_profile == "gradient":
         # Linear gradient in log-pressure
         T_btm = posterior_params.get("T_btm", 3000.0)
         T_top = posterior_params.get("T_top", 1500.0)
@@ -472,95 +473,129 @@ def reconstruct_temperature_profile(
         log_p_btm = jnp.log10(art.pressure[-1])
         log_p_top = jnp.log10(art.pressure[0])
         Tarr = T_top + (T_btm - T_top) * (log_p - log_p_top) / (log_p_btm - log_p_top)
-        
+
     else:
-        raise ValueError(f"Unsupported temperature profile for reconstruction: {temperature_profile}")
+        raise ValueError(f"Unsupported P-T profile for reconstruction: {pt_profile}")
     
     return Tarr
 
 
-def reconstruct_vmrs(
+def reconstruct_vmr_scalars(
     posterior_params: dict,
-    art: object,
     mol_names: list[str],
     atom_names: list[str],
-) -> tuple[dict[str, jnp.ndarray], dict[str, jnp.ndarray]]:
-    """Reconstruct VMR profiles from posterior parameter values.
-    
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Extract VMR scalar values from posterior parameter values.
+
     Args:
         posterior_params: Dict of parameter values (e.g., median of posterior)
-        art: ExoJAX art object (provides pressure grid for profile shape)
         mol_names: List of molecule names to reconstruct
         atom_names: List of atom names to reconstruct
-        
+
     Returns:
         Tuple of (vmr_mols, vmr_atoms) where each is a dict mapping
-        species name -> constant VMR profile array
+        species name -> scalar VMR value
     """
     vmr_mols = {}
     for mol in mol_names:
         key = f"logVMR_{mol}"
         if key in posterior_params:
             logVMR = posterior_params[key]
-            vmr_mols[mol] = art.constant_mmr_profile(jnp.power(10.0, logVMR))
-    
+            vmr_mols[mol] = float(jnp.power(10.0, logVMR))
+
     vmr_atoms = {}
     for atom in atom_names:
         key = f"logVMR_{atom}"
         if key in posterior_params:
             logVMR = posterior_params[key]
-            vmr_atoms[atom] = art.constant_mmr_profile(jnp.power(10.0, logVMR))
-    
+            vmr_atoms[atom] = float(jnp.power(10.0, logVMR))
+
     return vmr_mols, vmr_atoms
 
 
-def reconstruct_mmw_and_h2he(
-    vmr_mols: dict[str, jnp.ndarray],
-    vmr_atoms: dict[str, jnp.ndarray],
+def compute_mmw_and_h2he_from_vmr(
+    vmr_mols: dict[str, float],
+    vmr_atoms: dict[str, float],
     mol_names: list[str],
     atom_names: list[str],
-    art: object,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[float, float, float]:
     """Compute mean molecular weight and H2/He VMRs from species VMRs.
-    
+
     Args:
-        vmr_mols: Dict mapping molecule name -> VMR profile
-        vmr_atoms: Dict mapping atom name -> VMR profile
+        vmr_mols: Dict mapping molecule name -> scalar VMR
+        vmr_atoms: Dict mapping atom name -> scalar VMR
         mol_names: List of molecule names (for mass lookup)
         atom_names: List of atom names (for mass lookup)
-        art: ExoJAX art object
-        
+
     Returns:
-        Tuple of (mmw, vmrH2, vmrHe) arrays
+        Tuple of (mmw, vmrH2, vmrHe) scalar values
     """
     # Compute molecular masses
     mol_masses = {m: molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names}
-    # For atoms, extract element name from species notation (e.g., "Fe I" -> "Fe")
     atom_masses = {
         a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names
     }
-    
+
     # Sum VMRs
-    sum_mols = sum(vmr_mols.values()) if vmr_mols else 0.0
-    sum_atoms = sum(vmr_atoms.values()) if vmr_atoms else 0.0
-    vmr_tot = jnp.clip(sum_mols + sum_atoms, 0.0, 1.0)
-    
+    vmr_trace_tot = sum(vmr_mols.values()) + sum(vmr_atoms.values())
+    vmr_trace_tot = min(max(vmr_trace_tot, 0.0), 1.0)
+
     # H2/He fill (solar ratio 6:1)
-    vmrH2 = (1.0 - vmr_tot) * (6.0 / 7.0)
-    vmrHe = (1.0 - vmr_tot) * (1.0 / 7.0)
-    
-    # Mean molecular weight
-    dot_mols = sum(mol_masses[m] * vmr for m, vmr in vmr_mols.items()) if vmr_mols else 0.0
-    dot_atoms = sum(atom_masses[a] * vmr for a, vmr in vmr_atoms.items()) if vmr_atoms else 0.0
-    
-    mmw = (
-        molinfo.molmass_isotope("H2") * vmrH2
-        + molinfo.molmass_isotope("He", db_HIT=False) * vmrHe
-        + dot_mols
-        + dot_atoms
-    )
-    
+    vmrH2 = (1.0 - vmr_trace_tot) * (6.0 / 7.0)
+    vmrHe = (1.0 - vmr_trace_tot) * (1.0 / 7.0)
+
+    # Mean molecular weight from VMRs
+    mass_H2 = molinfo.molmass_isotope("H2")
+    mass_He = molinfo.molmass_isotope("He", db_HIT=False)
+    mmw = mass_H2 * vmrH2 + mass_He * vmrHe
+    mmw += sum(mol_masses[m] * v for m, v in vmr_mols.items())
+    mmw += sum(atom_masses[a] * v for a, v in vmr_atoms.items())
+
     return mmw, vmrH2, vmrHe
+
+
+def convert_vmr_to_mmr_profiles(
+    vmr_mols: dict[str, float],
+    vmr_atoms: dict[str, float],
+    mol_names: list[str],
+    atom_names: list[str],
+    mmw: float,
+    art: object,
+) -> tuple[dict[str, jnp.ndarray], dict[str, jnp.ndarray]]:
+    """Convert VMR scalars to MMR profiles for opacity calculations.
+
+    MMR_i = VMR_i * (M_i / mmw)
+
+    Args:
+        vmr_mols: Dict mapping molecule name -> scalar VMR
+        vmr_atoms: Dict mapping atom name -> scalar VMR
+        mol_names: List of molecule names (for mass lookup)
+        atom_names: List of atom names (for mass lookup)
+        mmw: Mean molecular weight
+        art: ExoJAX art object (for creating constant profiles)
+
+    Returns:
+        Tuple of (mmr_mols, mmr_atoms) where each is a dict mapping
+        species name -> constant MMR profile array
+    """
+    mol_masses = {m: molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names}
+    atom_masses = {
+        a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names
+    }
+
+    mmr_mols = {}
+    for mol, vmr in vmr_mols.items():
+        mass = mol_masses[mol]
+        mmr = vmr * (mass / mmw)
+        mmr_mols[mol] = art.constant_mmr_profile(mmr)
+
+    mmr_atoms = {}
+    for atom, vmr in vmr_atoms.items():
+        mass = atom_masses[atom]
+        mmr = vmr * (mass / mmw)
+        mmr_atoms[atom] = art.constant_mmr_profile(mmr)
+
+    return mmr_mols, mmr_atoms
 
 
 def compute_atmospheric_state_from_posterior(
@@ -570,7 +605,7 @@ def compute_atmospheric_state_from_posterior(
     opa_atoms: dict[str, OpaPremodit],
     opa_cias: dict[str, OpaCIA],
     nu_grid: jnp.ndarray,
-    temperature_profile: str = "guillot",
+    pt_profile: str = "pspline",
     use_median: bool = True,
 ) -> dict:
     """Compute full atmospheric state from posterior samples.
@@ -585,7 +620,7 @@ def compute_atmospheric_state_from_posterior(
         opa_atoms: Atomic opacity objects
         opa_cias: CIA opacity objects
         nu_grid: Wavenumber grid
-        temperature_profile: T-P profile type
+        pt_profile: P-T profile type
         use_median: If True, use median; else use mean
         
     Returns:
@@ -615,47 +650,59 @@ def compute_atmospheric_state_from_posterior(
     # Get species lists from opacity objects
     mol_names = list(opa_mols.keys())
     atom_names = list(opa_atoms.keys())
-    
+
     # Reconstruct temperature profile
-    Tarr = reconstruct_temperature_profile(params, art, temperature_profile)
-    
-    # Reconstruct VMRs
-    vmr_mols, vmr_atoms = reconstruct_vmrs(params, art, mol_names, atom_names)
-    
-    # Compute mean molecular weight and H2/He
-    mmw, vmrH2, vmrHe = reconstruct_mmw_and_h2he(
-        vmr_mols, vmr_atoms, mol_names, atom_names, art
+    Tarr = reconstruct_temperature_profile(params, art, pt_profile)
+
+    # Reconstruct VMR scalars from posterior
+    vmr_mols, vmr_atoms = reconstruct_vmr_scalars(params, mol_names, atom_names)
+
+    # Compute mean molecular weight and H2/He VMRs from VMR scalars
+    mmw, vmrH2, vmrHe = compute_mmw_and_h2he_from_vmr(
+        vmr_mols, vmr_atoms, mol_names, atom_names
     )
-    
+
+    # Convert VMR to MMR profiles for opacity calculations
+    mmr_mols, mmr_atoms = convert_vmr_to_mmr_profiles(
+        vmr_mols, vmr_atoms, mol_names, atom_names, mmw, art
+    )
+
+    # Create constant profiles for H2/He VMR (for CIA) and mmw
+    vmrH2_profile = art.constant_mmr_profile(vmrH2)
+    vmrHe_profile = art.constant_mmr_profile(vmrHe)
+    mmw_profile = art.constant_mmr_profile(mmw)
+
     # Compute gravity profile
     Rp = params.get("Rp", 1.5) * RJ
     Mp = params.get("Mp", 1.0) * MJ
     g_btm = gravity_jupiter(Rp / RJ, Mp / MJ)
-    g = art.gravity_profile(Tarr, mmw, Rp, g_btm)
-    
-    # Compute total dtau
+    g = art.gravity_profile(Tarr, mmw_profile, Rp, g_btm)
+
+    # Compute total dtau (pass MMR profiles for molecules/atoms, VMR for CIA)
     dtau = compute_dtau(
         art, opa_mols, opa_atoms, opa_cias, nu_grid,
-        Tarr, vmr_mols, vmr_atoms, vmrH2, vmrHe, mmw, g
+        Tarr, mmr_mols, mmr_atoms, vmrH2_profile, vmrHe_profile, mmw_profile, g
     )
-    
+
     # Compute per-species dtau
     dtau_per_species = compute_dtau_per_species(
         art, opa_mols, opa_atoms, opa_cias, nu_grid,
-        Tarr, vmr_mols, vmr_atoms, vmrH2, vmrHe, mmw, g
+        Tarr, mmr_mols, mmr_atoms, vmrH2_profile, vmrHe_profile, mmw_profile, g
     )
-    
+
     return {
         'dtau': dtau,
         'dtau_per_species': dtau_per_species,
         'Tarr': Tarr,
         'pressure': art.pressure,
         'dParr': art.dParr,
-        'mmw': mmw,
-        'vmrH2': vmrH2,
-        'vmrHe': vmrHe,
-        'vmr_mols': vmr_mols,
-        'vmr_atoms': vmr_atoms,
+        'mmw': mmw_profile,
+        'vmrH2': vmrH2_profile,
+        'vmrHe': vmrHe_profile,
+        'vmr_mols': vmr_mols,  # scalar VMRs for reference
+        'vmr_atoms': vmr_atoms,  # scalar VMRs for reference
+        'mmr_mols': mmr_mols,  # MMR profiles used in opacity
+        'mmr_atoms': mmr_atoms,  # MMR profiles used in opacity
         'params': params,
     }
 
@@ -673,10 +720,10 @@ def create_retrieval_model(
     sop_inst: SopInstProfile,
     instrument_resolution: float,  # Replaced beta_inst. Provide R (e.g. 130000)
     inst_nus: jnp.ndarray,
-    # temperature (Default: Guillot)
-    temperature_profile: Literal[
-        "isothermal", "gradient", "madhu_seager", "free", "guillot"
-    ] = "guillot",
+    # P-T profile (Default: pspline)
+    pt_profile: Literal[
+        "guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline"
+    ] = "pspline",
     T_low: float = 400.0,
     T_high: float = 3000.0,
     Tirr_std: float | None = None,  # If None, uses uniform prior on Tirr
@@ -718,7 +765,7 @@ def create_retrieval_model(
         sop_inst: Instrument profile operator
         instrument_resolution: Spectral resolution R
         inst_nus: Instrument wavenumber grid
-        temperature_profile: TP profile type
+        pt_profile: P-T profile type (guillot, isothermal, gradient, madhu_seager, free, pspline)
         T_low, T_high: Temperature bounds (K)
         Tirr_std: If provided, use normal prior on Tirr with T_eq as mean
         Tint_fixed: Internal temperature (K)
@@ -896,54 +943,76 @@ def create_retrieval_model(
         Rstar = numpyro.sample("Rstar", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0)) * Rs
         Rp = numpyro.sample("Rp", dist.TruncatedNormal(Rp_mean, Rp_std, low=0.0)) * RJ
 
-        # 2. Composition
-        vmr_mols_list = []
+        # 2. Composition (sample VMR, convert to MMR for opacity calculations)
+        # Step 1: Sample VMRs for all species (raw, may sum to > 1)
+        vmr_mols_raw = []
         for mol in mol_names:
             logVMR = numpyro.sample(f"logVMR_{mol}", dist.Uniform(-15.0, 0.0))
-            vmr_mols_list.append(art.constant_mmr_profile(jnp.power(10.0, logVMR)))
-        
-        # Handle shape if no molecules (edge case)
-        if len(mol_names) > 0:
-            vmr_mols = jnp.array(vmr_mols_list)
-        else:
-            vmr_mols = jnp.zeros((0, art.pressure.size))
+            vmr_mols_raw.append(jnp.power(10.0, logVMR))
 
-        vmr_atoms_list = []
+        vmr_atoms_raw = []
         for atom in atom_names:
             logVMR = numpyro.sample(f"logVMR_{atom}", dist.Uniform(-15.0, 0.0))
-            vmr_atoms_list.append(art.constant_mmr_profile(jnp.power(10.0, logVMR)))
-        
-        if len(atom_names) > 0:
-            vmr_atoms = jnp.array(vmr_atoms_list)
-            sum_atoms = jnp.sum(vmr_atoms, axis=0)
-            dot_atoms = jnp.dot(atom_masses, vmr_atoms)
+            vmr_atoms_raw.append(jnp.power(10.0, logVMR))
+
+        # Step 2: Renormalize trace VMRs if they sum to > 1 (ensure valid composition)
+        n_mols = len(vmr_mols_raw)
+        n_atoms = len(vmr_atoms_raw)
+        if n_mols + n_atoms > 0:
+            vmr_trace_arr = jnp.array(vmr_mols_raw + vmr_atoms_raw)
+            sum_trace = jnp.sum(vmr_trace_arr)
+            # Scale down if sum exceeds 1 (leave tiny room for H2/He)
+            scale = jnp.where(sum_trace > 1.0, (1.0 - 1e-12) / sum_trace, 1.0)
+            vmr_trace_arr = vmr_trace_arr * scale
+            # Split back into molecules and atoms
+            vmr_mols_scalar = [vmr_trace_arr[i] for i in range(n_mols)]
+            vmr_atoms_scalar = [vmr_trace_arr[n_mols + i] for i in range(n_atoms)]
+            vmr_trace_tot = jnp.sum(vmr_trace_arr)
         else:
-            vmr_atoms = jnp.zeros((0, art.pressure.size))
-            sum_atoms = jnp.zeros((art.pressure.size,))
-            dot_atoms = jnp.zeros((art.pressure.size,))
+            vmr_mols_scalar = []
+            vmr_atoms_scalar = []
+            vmr_trace_tot = 0.0
 
-        if len(mol_names) > 0:
-            sum_mols = jnp.sum(vmr_mols, axis=0)
-            dot_mols = jnp.dot(mol_masses, vmr_mols)
+        # Step 3: Fill remainder with H2/He (solar ratio 6:1)
+        vmrH2 = (1.0 - vmr_trace_tot) * (6.0 / 7.0)
+        vmrHe = (1.0 - vmr_trace_tot) * (1.0 / 7.0)
+
+        # Step 4: Compute mean molecular weight from (renormalized) VMRs
+        mass_H2 = molinfo.molmass_isotope("H2")
+        mass_He = molinfo.molmass_isotope("He", db_HIT=False)
+        mmw = mass_H2 * vmrH2 + mass_He * vmrHe
+        if n_mols > 0:
+            mmw = mmw + sum(m * v for m, v in zip(mol_masses, vmr_mols_scalar))
+        if n_atoms > 0:
+            mmw = mmw + sum(m * v for m, v in zip(atom_masses, vmr_atoms_scalar))
+
+        # Step 5: Convert VMR to MMR and create profiles
+        # MMR_i = VMR_i * (M_i / mmw)
+        if n_mols > 0:
+            mmr_mols = jnp.array([
+                art.constant_mmr_profile(vmr * (mass / mmw))
+                for vmr, mass in zip(vmr_mols_scalar, mol_masses)
+            ])
         else:
-            sum_mols = jnp.zeros((art.pressure.size,))
-            dot_mols = jnp.zeros((art.pressure.size,))
+            mmr_mols = jnp.zeros((0, art.pressure.size))
 
-        vmr_tot = jnp.clip(sum_mols + sum_atoms, 0.0, 1.0)
-        vmrH2 = (1.0 - vmr_tot) * (6.0 / 7.0)
-        vmrHe = (1.0 - vmr_tot) * (1.0 / 7.0)
+        if n_atoms > 0:
+            mmr_atoms = jnp.array([
+                art.constant_mmr_profile(vmr * (mass / mmw))
+                for vmr, mass in zip(vmr_atoms_scalar, atom_masses)
+            ])
+        else:
+            mmr_atoms = jnp.zeros((0, art.pressure.size))
 
-        mmw = (
-            molinfo.molmass_isotope("H2") * vmrH2
-            + molinfo.molmass_isotope("He", db_HIT=False) * vmrHe
-            + dot_mols
-            + dot_atoms
-        )
+        # Step 6: Create constant profiles for CIA inputs and mmw
+        vmrH2_prof = art.constant_mmr_profile(vmrH2)
+        vmrHe_prof = art.constant_mmr_profile(vmrHe)
+        mmw_prof = art.constant_mmr_profile(mmw)
 
         # 3. Temperature & Gravity
         g_btm = gravity_jupiter(Rp / RJ, Mp / MJ)
 
-        if temperature_profile == "guillot":
+        if pt_profile == "guillot":
             if (Tirr_mean is not None) and (Tirr_std is not None):
                 Tirr = numpyro.sample(
                     "Tirr", dist.TruncatedNormal(Tirr_mean, Tirr_std, low=0.0)
@@ -965,19 +1034,21 @@ def create_retrieval_model(
                 gamma=jnp.power(10.0, log_gamma),
             )
 
-        elif temperature_profile == "isothermal":
+        elif pt_profile == "isothermal":
             T0 = numpyro.sample("T0", dist.Uniform(T_low, T_high))
             Tarr = T0 * jnp.ones_like(art.pressure)
-        elif temperature_profile == "gradient":
+        elif pt_profile == "gradient":
             Tarr = numpyro_gradient(art, T_low, T_high)
-        elif temperature_profile == "madhu_seager":
+        elif pt_profile == "madhu_seager":
             Tarr = numpyro_madhu_seager(art, T_low, T_high)
-        elif temperature_profile == "free":
+        elif pt_profile == "free":
             Tarr = numpyro_free_temperature(art, n_layers=5, T_low=T_low, T_high=T_high)
+        elif pt_profile == "pspline":
+            Tarr = numpyro_pspline_knots(art.pressure, T_low=T_low, T_high=T_high)
         else:
-            raise ValueError(f"Unknown temperature profile: {temperature_profile}")
+            raise ValueError(f"Unknown P-T profile: {pt_profile}")
 
-        g = art.gravity_profile(Tarr, mmw, Rp, g_btm)
+        g = art.gravity_profile(Tarr, mmw_prof, Rp, g_btm)
 
         # 4. Opacity Calculation + Forward Model (full grid or stitched)
         # Ensure 2D shapes for downstream operations
@@ -993,33 +1064,33 @@ def create_retrieval_model(
         if stitch_plan is None:
             dtau = jnp.zeros((art.pressure.size, nu_grid.size))
 
-            # CIA
+            # CIA (use VMR profiles for collision partners)
             for molA, molB in [("H2", "H2"), ("H2", "He")]:
                 key = molA + molB
                 if key not in opa_cias:
                     continue
                 logacia_matrix = opa_cias[key].logacia_matrix(Tarr)
-                vmrX, vmrY = (vmrH2, vmrH2) if molB == "H2" else (vmrH2, vmrHe)
+                vmrX, vmrY = (vmrH2_prof, vmrH2_prof) if molB == "H2" else (vmrH2_prof, vmrHe_prof)
                 dtau = dtau + art.opacity_profile_cia(
-                    logacia_matrix, Tarr, vmrX, vmrY, mmw[:, None], g
+                    logacia_matrix, Tarr, vmrX, vmrY, mmw_prof[:, None], g
                 )
 
-            # Molecules
+            # Molecules (use MMR for opacity_profile_xs)
             for i, mol in enumerate(mol_names):
                 xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
                 dtau = dtau + art.opacity_profile_xs(
-                    xsmatrix, vmr_mols[i], mmw[:, None], g
+                    xsmatrix, mmr_mols[i], mmw_prof[:, None], g
                 )
 
-            # Atoms
+            # Atoms (use MMR for opacity_profile_xs)
             for i, atom in enumerate(atom_names):
                 xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
                 dtau = dtau + art.opacity_profile_xs(
-                    xsmatrix, vmr_atoms[i], mmw[:, None], g
+                    xsmatrix, mmr_atoms[i], mmw_prof[:, None], g
                 )
 
             # 5. Radiative Transfer
-            rt = art.run(dtau, Tarr, mmw, Rp, g_btm)
+            rt = art.run(dtau, Tarr, mmw_prof, Rp, g_btm)
 
             # 6. Rotation & Instrument Broadening
             rt = sop_rot.rigid_rotation(rt, vsini, 0.0, 0.0)
@@ -1104,12 +1175,12 @@ def create_retrieval_model(
                         logacia_chunk = _slice_spectral_matrix(
                             logacia_matrix, chunk_start, chunk_end, nu_grid.size
                         )
-                    vmrX, vmrY = (vmrH2, vmrH2) if molB == "H2" else (vmrH2, vmrHe)
+                    vmrX, vmrY = (vmrH2_prof, vmrH2_prof) if molB == "H2" else (vmrH2_prof, vmrHe_prof)
                     dtau_chunk = dtau_chunk + art.opacity_profile_cia(
-                        logacia_chunk, Tarr, vmrX, vmrY, mmw[:, None], g
+                        logacia_chunk, Tarr, vmrX, vmrY, mmw_prof[:, None], g
                     )
 
-                # Molecules
+                # Molecules (use MMR for opacity_profile_xs)
                 for i, mol in enumerate(mol_names):
                     if xs_arg is not None:
                         xs_chunk = opa_mols[mol].xsmatrix(
@@ -1121,10 +1192,10 @@ def create_retrieval_model(
                             xsmatrix, chunk_start, chunk_end, nu_grid.size
                         )
                     dtau_chunk = dtau_chunk + art.opacity_profile_xs(
-                        xs_chunk, vmr_mols[i], mmw[:, None], g
+                        xs_chunk, mmr_mols[i], mmw_prof[:, None], g
                     )
 
-                # Atoms
+                # Atoms (use MMR for opacity_profile_xs)
                 for i, atom in enumerate(atom_names):
                     if xs_arg is not None:
                         xs_chunk = opa_atoms[atom].xsmatrix(
@@ -1136,10 +1207,10 @@ def create_retrieval_model(
                             xsmatrix, chunk_start, chunk_end, nu_grid.size
                         )
                     dtau_chunk = dtau_chunk + art.opacity_profile_xs(
-                        xs_chunk, vmr_atoms[i], mmw[:, None], g
+                        xs_chunk, mmr_atoms[i], mmw_prof[:, None], g
                     )
 
-                rt = art.run(dtau_chunk, Tarr, mmw, Rp, g_btm)
+                rt = art.run(dtau_chunk, Tarr, mmw_prof, Rp, g_btm)
                 rt = sop_rot_chunk.rigid_rotation(rt, vsini, 0.0, 0.0)
                 rt = sop_inst_chunk.ipgauss(rt, beta_inst)
 

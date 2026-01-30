@@ -119,11 +119,11 @@ def create_parser():
     # Model options
     model_group = parser.add_argument_group("Model Options")
     model_group.add_argument(
-        "--temperature-profile",
+        "--pt-profile",
         type=str,
-        choices=["isothermal", "gradient", "madhu_seager", "free"],
+        choices=["guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline"],
         default=None,
-        help="Temperature profile type (default: isothermal for transmission)"
+        help="P-T profile type (default: pspline)"
     )
     model_group.add_argument(
         "--enable-tellurics",
@@ -253,6 +253,11 @@ def create_parser():
         "--no-molecules",
         action="store_true",
         help="Disable all molecular opacities (use atoms only)"
+    )
+    species_group.add_argument(
+        "--no-atoms",
+        action="store_true",
+        help="Disable all atomic opacities (use molecules only)"
     )
 
     # Execution options
@@ -432,7 +437,11 @@ def apply_cli_overrides(args):
         config.MOLPATH_HITEMP = mol_h
         config.MOLPATH_EXOMOL = mol_e
 
-    if args.atoms:
+    if args.no_atoms:
+        config.ATOMIC_SPECIES = {}
+        if args.atoms:
+            print("Warning: --no-atoms overrides --atoms.")
+    elif args.atoms:
         wanted = set(_parse_csv(args.atoms))
         atoms = {k: v for k, v in config.ATOMIC_SPECIES.items() if k in wanted}
         missing = wanted - set(atoms.keys())
@@ -637,12 +646,12 @@ def main():
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                temperature_profile=args.temperature_profile or "isothermal",
+                pt_profile=args.pt_profile or "pspline",
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,
             )
-        
+
         elif args.phase_bin:
             from pipeline.retrieval_binned import run_phase_binned_retrieval
             
@@ -652,7 +661,7 @@ def main():
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                temperature_profile=args.temperature_profile or "isothermal",
+                pt_profile=args.pt_profile or "pspline",
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,
@@ -667,7 +676,7 @@ def main():
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                temperature_profile=args.temperature_profile or "isothermal",
+                pt_profile=args.pt_profile or "pspline",
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,
@@ -682,7 +691,7 @@ def main():
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                temperature_profile=args.temperature_profile or "madhu_seager",
+                pt_profile=args.pt_profile or "pspline",
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,
