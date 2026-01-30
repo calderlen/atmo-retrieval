@@ -29,6 +29,7 @@ from physics.pt import (
     numpyro_gradient,
     numpyro_madhu_seager,
     numpyro_pspline_knots_on_art_grid,
+    numpyro_gp_temperature,
 )
 
 
@@ -428,7 +429,7 @@ def compute_dtau_per_species(
 def reconstruct_temperature_profile(
     posterior_params: dict,
     art: object,
-    pt_profile: str = "pspline",
+    pt_profile: str = "gp",
     Tint_fixed: float = 100.0,
 ) -> jnp.ndarray:
     """Reconstruct temperature profile from posterior parameter values.
@@ -436,7 +437,7 @@ def reconstruct_temperature_profile(
     Args:
         posterior_params: Dict of parameter values (e.g., median of posterior)
         art: ExoJAX art object (provides pressure grid)
-        pt_profile: Type of P-T profile ("guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline")
+        pt_profile: Type of P-T profile ("guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline", "gp")
         Tint_fixed: Fixed internal temperature for Guillot profile
 
     Returns:
@@ -605,7 +606,7 @@ def compute_atmospheric_state_from_posterior(
     opa_atoms: dict[str, OpaPremodit],
     opa_cias: dict[str, OpaCIA],
     nu_grid: jnp.ndarray,
-    pt_profile: str = "pspline",
+    pt_profile: str = "gp",
     use_median: bool = True,
 ) -> dict:
     """Compute full atmospheric state from posterior samples.
@@ -722,8 +723,8 @@ def create_retrieval_model(
     inst_nus: jnp.ndarray,
     # P-T profile (Default: pspline)
     pt_profile: Literal[
-        "guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline"
-    ] = "pspline",
+        "guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline", "gp"
+    ] = "gp",
     T_low: float = 400.0,
     T_high: float = 3000.0,
     Tirr_std: float | None = None,  # If None, uses uniform prior on Tirr
@@ -765,7 +766,7 @@ def create_retrieval_model(
         sop_inst: Instrument profile operator
         instrument_resolution: Spectral resolution R
         inst_nus: Instrument wavenumber grid
-        pt_profile: P-T profile type (guillot, isothermal, gradient, madhu_seager, free, pspline)
+        pt_profile: P-T profile type (guillot, isothermal, gradient, madhu_seager, free, pspline, gp)
         T_low, T_high: Temperature bounds (K)
         Tirr_std: If provided, use normal prior on Tirr with T_eq as mean
         Tint_fixed: Internal temperature (K)
@@ -1045,6 +1046,8 @@ def create_retrieval_model(
             Tarr = numpyro_free_temperature(art, n_layers=5, T_low=T_low, T_high=T_high)
         elif pt_profile == "pspline":
             Tarr = numpyro_pspline_knots_on_art_grid(art, T_low=T_low, T_high=T_high)
+        elif pt_profile == "gp":
+            Tarr = numpyro_gp_temperature(art, T_low=T_low, T_high=T_high)
         else:
             raise ValueError(f"Unknown P-T profile: {pt_profile}")
 

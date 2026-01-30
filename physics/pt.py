@@ -138,34 +138,27 @@ def pspline_knots_profile_on_grid(
     T_knots: jnp.ndarray,
     *,
     pressure_eval_bar: jnp.ndarray,
-    n_knots: int,  # Pass explicitly to avoid JAX tracer issues
 ) -> jnp.ndarray:
     """Interpolate knot temperatures (even in log10 P) onto an arbitrary pressure grid.
 
     Knots are evenly spaced in log10(pressure_bar) range.
     Evaluated at log10(pressure_eval_bar).
     Interpolation is linear in log10(P) (JAX-friendly).
-
-    Note: n_knots must be passed explicitly as a concrete int to avoid JAX abstract
-    tracing issues during MCMC sampling (T_knots.shape[0] returns a tracer).
     """
     p_ref = _validate_pressure_bar(pressure_bar)
     p_eval = _validate_pressure_bar(pressure_eval_bar)
-
-    # Ensure T_knots is 1D JAX array
-    T_knots_arr = jnp.atleast_1d(jnp.asarray(T_knots))
-    if T_knots_arr.ndim > 1:
-        T_knots_arr = T_knots_arr.ravel()
-
-    if n_knots < 3:
+    T_knots = jnp.asarray(T_knots)
+    if T_knots.ndim != 1:
+        raise ValueError("T_knots must be 1D")
+    if T_knots.size < 3:
         raise ValueError("need at least 3 knots to define second differences")
 
-    logp_min = jnp.log10(p_ref.min())
-    logp_max = jnp.log10(p_ref.max())
-    logp_knots = jnp.linspace(logp_min, logp_max, n_knots)  # Use concrete n_knots
+    logp_min = jnp.log10(jnp.min(p_ref))
+    logp_max = jnp.log10(jnp.max(p_ref))
+    logp_knots = jnp.linspace(logp_min, logp_max, T_knots.size)
 
     logp_eval = jnp.log10(p_eval)
-    T_eval = jnp.interp(logp_eval, logp_knots, T_knots_arr)
+    T_eval = jnp.interp(logp_eval, logp_knots, T_knots)
     return T_eval
 
 
@@ -191,32 +184,112 @@ def numpyro_pspline_knots_on_art_grid(
 
     p_bar = _validate_pressure_bar(art.pressure)
 
-    # Sample knot temperatures individually (like free_temperature_profile)
-    T_knots = []
-    for i in range(n_knots):
-        T_i = numpyro.sample(f"T_knot_{i}", dist.Uniform(T_low, T_high))
-        T_knots.append(T_i)
-
-    # Stack into array - use jnp.stack instead of jnp.array for better tracer handling
-    T_knots = jnp.stack(T_knots)
+    # Knot temperatures
+    T_knots = jnp.stack(
+        [numpyro.sample(f"T_{i}", dist.Uniform(T_low, T_high)) for i in range(n_knots)]
+    )
 
     # Smoothness hyperparameter γ
     gamma = numpyro.sample("gamma", dist.InverseGamma(inv_gamma_a, inv_gamma_b))
 
     # Discrete second differences on knots
     d2 = T_knots[2:] - 2.0 * T_knots[1:-1] + T_knots[:-2]
+    n = d2.size
 
     # log p(T | γ) up to an additive constant
-    # Use concrete n_knots instead of d2.shape[0] to avoid JAX tracer issues during MCMC
-    n_d2 = n_knots - 2  # d2 has length n_knots - 2
-    logp = -0.5 * gamma * jnp.sum(d2**2) + 0.5 * n_d2 * jnp.log(gamma)
+    logp = -0.5 * gamma * jnp.sum(d2**2) + 0.5 * n * jnp.log(gamma)
     numpyro.factor("tp_smoothness", logp)
 
-    # Inline interpolation instead of calling another function
-    logp_min = jnp.log10(p_bar.min())
-    logp_max = jnp.log10(p_bar.max())
-    logp_knots = jnp.linspace(logp_min, logp_max, n_knots)
-    logp_grid = jnp.log10(p_bar)
+    # Evaluate directly on ART grid (no n_fine)
+    Tarr = pspline_knots_profile_on_grid(
+        pressure_bar=p_bar,
+        T_knots=T_knots,
+        pressure_eval_bar=p_bar,
+    )
+    return Tarr
 
-    Tarr = jnp.interp(logp_grid, logp_knots, T_knots)
+def _gp_kernel_rbf(x: jnp.ndarray, amp: jnp.ndarray, ell: jnp.ndarray) -> jnp.ndarray:
+    """Squared-exponential (RBF) kernel: K_ij = amp^2 * exp(-0.5 * (Δx/ell)^2)."""
+    dx = x[:, None] - x[None, :]
+    return (amp**2) * jnp.exp(-0.5 * (dx / jnp.clip(ell, 1e-12, None)) ** 2)
+
+
+def _gp_kernel_matern32(x: jnp.ndarray, amp: jnp.ndarray, ell: jnp.ndarray) -> jnp.ndarray:
+    """Matérn-3/2 kernel: K_ij = amp^2 * (1 + r) exp(-r), r = sqrt(3)*|Δx|/ell."""
+    dx = jnp.abs(x[:, None] - x[None, :])
+    r = jnp.sqrt(3.0) * dx / jnp.clip(ell, 1e-12, None)
+    return (amp**2) * (1.0 + r) * jnp.exp(-r)
+
+
+def numpyro_gp_temperature(
+    art: object,
+    *,
+    T_low: float = 400.0,
+    T_high: float = 6000.0,
+    mean_kind: str = "isothermal",   # {"isothermal","linear"}
+    kernel: str = "matern32",        # {"matern32","rbf"}
+    # Hyperpriors (tune these):
+    amp_scale: float = 800.0,        # K, typical vertical variation
+    ell_loc: float = 0.7,            # in dex of log10P, correlation length
+    ell_scale: float = 0.5,          # in dex, spread of lengthscale prior
+    jitter: float = 1.0e-6,          # numerical stability (in K^2 after scaling)
+    obs_nugget: float = 1.0,         # K, tiny extra diagonal "nugget" for robustness
+) -> jnp.ndarray:
+    """
+    Sample a temperature profile on ART's pressure grid using a GP prior on T(log10 P).
+
+    Returns
+    -------
+    Tarr : jnp.ndarray
+        Shape (art.pressure.size,), temperatures on ART grid.
+    """
+    # x = log10(P/bar) on ART grid
+    x = jnp.log10(jnp.asarray(art.pressure))
+
+    # Optional: center/scale x for numerics (still interpretable because ell is in dex pre-scaling).
+    # Keep a copy of original-dex coordinate for ell interpretation:
+    x_dex = x
+    x = (x - jnp.mean(x)) / (jnp.std(x) + 1e-12)
+
+    # Mean function
+    if mean_kind == "isothermal":
+        T0 = numpyro.sample("T0", dist.Uniform(T_low, T_high))
+        mu = T0 * jnp.ones_like(x)
+    elif mean_kind == "linear":
+        # Linear mean in logP (in dex space)
+        T_mid = numpyro.sample("T_mid", dist.Uniform(T_low, T_high))
+        dT_dlogP = numpyro.sample("dT_dlogP", dist.Normal(0.0, 1500.0))  # K per dex (broad)
+        mu = T_mid + dT_dlogP * (x_dex - jnp.mean(x_dex))
+    else:
+        raise ValueError("mean_kind must be 'isothermal' or 'linear'.")
+
+    # GP hyperparameters
+    amp = numpyro.sample("gp_amp", dist.HalfNormal(amp_scale))  # K
+    # Put ell in dex units (more interpretable), then map to standardized-x units
+    ell_dex = numpyro.sample("gp_ell_dex", dist.LogNormal(jnp.log(ell_loc), ell_scale))
+    # Convert dex-lengthscale to standardized-x lengthscale:
+    # x_std = (x_dex - mean)/std, so Δx_std = Δx_dex / std_dex
+    std_dex = jnp.std(x_dex) + 1e-12
+    ell = ell_dex / std_dex
+
+    # Kernel matrix
+    if kernel == "rbf":
+        K = _gp_kernel_rbf(x, amp, ell)
+    elif kernel == "matern32":
+        K = _gp_kernel_matern32(x, amp, ell)
+    else:
+        raise ValueError("kernel must be 'matern32' or 'rbf'.")
+
+    # Diagonal stabilization:
+    # - jitter is dimensionless here; multiply by amp^2 for scale-consistent stabilization
+    # - obs_nugget adds a small K to diagonal to avoid near-singular cases in practice
+    n = x.size
+    K = K + (jitter * (amp**2) + (obs_nugget**2)) * jnp.eye(n)
+
+    # Sample T ~ N(mu, K)
+    Tarr = numpyro.sample("Tarr", dist.MultivariateNormal(loc=mu, covariance_matrix=K))
+
+    # Optional hard bounds (keeps RT stable; remove if you want tails)
+    Tarr = jnp.clip(Tarr, T_low, T_high)
+
     return Tarr

@@ -51,6 +51,7 @@ def create_parser():
 
     # Data options
     data_group = parser.add_argument_group("Data")
+    data_group.add_argument("--epoch", type=str, default=None, help="Observation epoch (YYYYMMDD) for multi-epoch data")
     data_group.add_argument("--data-dir", type=str, default=None, help="Override data directory path")
     data_group.add_argument("--wavelength-range", type=str, choices=["blue", "green", "red", "full"], default=None, help="Wavelength range mode (default: from config)")
 
@@ -125,9 +126,9 @@ def create_parser():
     model_group.add_argument(
         "--pt-profile",
         type=str,
-        choices=["guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline"],
+        choices=["guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline", "gp"],
         default=None,
-        help="P-T profile type (default: pspline)"
+        help="P-T profile type (default: gp)"
     )
     model_group.add_argument(
         "--enable-tellurics",
@@ -650,7 +651,7 @@ def main():
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                pt_profile=args.pt_profile or "pspline",
+                pt_profile=args.pt_profile or "gp",
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,
@@ -665,7 +666,7 @@ def main():
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                pt_profile=args.pt_profile or "pspline",
+                pt_profile=args.pt_profile or "gp",
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,
@@ -677,10 +678,11 @@ def main():
             logger.info("Starting transmission retrieval...")
             run_retrieval(
                 mode="transmission",
+                epoch=args.epoch,
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                pt_profile=args.pt_profile or "pspline",
+                pt_profile=args.pt_profile or "gp",
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,
@@ -692,10 +694,11 @@ def main():
             logger.info("Starting emission retrieval...")
             run_retrieval(
                 mode="emission",
+                epoch=args.epoch,
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                pt_profile=args.pt_profile or "pspline",
+                pt_profile=args.pt_profile or "gp",
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,

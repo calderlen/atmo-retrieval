@@ -186,7 +186,7 @@ Configuration is split into logical modules under `config/`:
 - **instrument_config.py**: Spectrograph and observatory settings
   - `RESOLUTION`, `OBSERVING_MODE`, wavelength ranges
   - FITS header key mappings and file patterns
-  - Default `OBSERVING_MODE` is `full` (combined red+blue via `dataio.preprocess --arm full`)
+  - Default `OBSERVING_MODE` is `full` (combined red+blue via `dataio.make_transmission --arm full`)
 
 - **model_config.py**: Radiative transfer parameters
   - Pressure/temperature ranges, atmospheric layers

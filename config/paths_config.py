@@ -118,16 +118,19 @@ from .instrument_config import OBSERVING_MODE
 from .model_config import RETRIEVAL_MODE
 
 
-def get_data_dir(planet: str | None = None, arm: str | None = None) -> Path:
-    """Get data directory for a planet and arm."""
+def get_data_dir(planet: str | None = None, arm: str | None = None, epoch: str | None = None) -> Path:
+    """Get data directory for a planet, arm, and optional epoch."""
     planet = planet or PLANET
     arm = arm or OBSERVING_MODE
-    return INPUT_DIR / "spectra" / planet.lower().replace("-", "") / arm
+    base = INPUT_DIR / "spectra" / planet.lower().replace("-", "")
+    if epoch:
+        return base / epoch / arm
+    return base / arm
 
 
-def get_transmission_paths(planet: str | None = None, arm: str | None = None) -> dict[str, Path]:
+def get_transmission_paths(planet: str | None = None, arm: str | None = None, epoch: str | None = None) -> dict[str, Path]:
     """Get paths to transmission data files."""
-    data_dir = get_data_dir(planet, arm=arm)
+    data_dir = get_data_dir(planet, arm=arm, epoch=epoch)
     return {
         "wavelength": data_dir / "wavelength_transmission.npy",
         "spectrum": data_dir / "spectrum_transmission.npy",
@@ -135,9 +138,9 @@ def get_transmission_paths(planet: str | None = None, arm: str | None = None) ->
     }
 
 
-def get_emission_paths(planet: str | None = None, arm: str | None = None) -> dict[str, Path]:
+def get_emission_paths(planet: str | None = None, arm: str | None = None, epoch: str | None = None) -> dict[str, Path]:
     """Get paths to emission data files."""
-    data_dir = get_data_dir(planet, arm=arm)
+    data_dir = get_data_dir(planet, arm=arm, epoch=epoch)
     return {
         "wavelength": data_dir / "wavelength_emission.npy",
         "spectrum": data_dir / "spectrum_emission.npy",

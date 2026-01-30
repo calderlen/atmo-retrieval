@@ -207,10 +207,11 @@ def _report_cia_coverage(cia_paths: dict[str, str], nu_grid: np.ndarray) -> None
 
 def run_retrieval(
     mode: str = "transmission",
+    epoch: str | None = None,
     skip_svi: bool = False,
     svi_only: bool = False,
     no_plots: bool = False,
-    pt_profile: str = "pspline",
+    pt_profile: str = "gp",
     phase_mode: PhaseMode = "shared",
     check_aliasing: bool = False,
     compute_contribution: bool = True,
@@ -220,10 +221,11 @@ def run_retrieval(
 
     Args:
         mode: "transmission" or "emission"
+        epoch: Observation epoch (YYYYMMDD) for multi-epoch data
         skip_svi: Skip SVI warm-up, go straight to MCMC
         svi_only: Run only SVI, skip MCMC
         no_plots: Skip diagnostic plots
-        pt_profile: P-T profile type (guillot, isothermal, gradient, madhu_seager, free, pspline)
+        pt_profile: P-T profile type (guillot, isothermal, gradient, madhu_seager, free, pspline, gp)
         phase_mode: How to model phase-dependent velocity offset:
             - "shared": Single dRV for all exposures (default)
             - "per_exposure": Independent dRV for each exposure
@@ -254,10 +256,15 @@ def run_retrieval(
     print(f"\nTarget: {config.PLANET} ({config.EPHEMERIS})")
     
     print("\n[1/7] Loading time-series data...")
-    data_paths = config.TRANSMISSION_DATA if mode == "transmission" else config.EMISSION_DATA
+    if epoch:
+        print(f"  Using epoch: {epoch}")
+    data_paths = (
+        config.get_transmission_paths(epoch=epoch) if mode == "transmission"
+        else config.get_emission_paths(epoch=epoch)
+    )
 
     try:
-        data_dir = config.get_data_dir()
+        data_dir = config.get_data_dir(epoch=epoch)
         wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
         print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
         print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")

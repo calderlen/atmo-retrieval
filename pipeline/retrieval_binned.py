@@ -21,7 +21,7 @@ from typing import Literal
 import numpy as np
 
 from config.planets_config import PHASE_BINS, get_params
-from dataio.preprocess import filter_data_by_phase, get_phase_boundaries, summarize_phase_coverage
+from dataio.make_transmission import filter_data_by_phase, get_phase_boundaries, summarize_phase_coverage
 
 
 def run_phase_binned_retrieval(
