@@ -138,27 +138,34 @@ def pspline_knots_profile_on_grid(
     T_knots: jnp.ndarray,
     *,
     pressure_eval_bar: jnp.ndarray,
+    n_knots: int,  # Pass explicitly to avoid JAX tracer issues
 ) -> jnp.ndarray:
     """Interpolate knot temperatures (even in log10 P) onto an arbitrary pressure grid.
 
     Knots are evenly spaced in log10(pressure_bar) range.
     Evaluated at log10(pressure_eval_bar).
     Interpolation is linear in log10(P) (JAX-friendly).
+
+    Note: n_knots must be passed explicitly as a concrete int to avoid JAX abstract
+    tracing issues during MCMC sampling (T_knots.shape[0] returns a tracer).
     """
     p_ref = _validate_pressure_bar(pressure_bar)
     p_eval = _validate_pressure_bar(pressure_eval_bar)
-    T_knots = jnp.asarray(T_knots)
-    if T_knots.ndim != 1:
-        raise ValueError("T_knots must be 1D")
-    if T_knots.size < 3:
+
+    # Ensure T_knots is 1D JAX array
+    T_knots_arr = jnp.atleast_1d(jnp.asarray(T_knots))
+    if T_knots_arr.ndim > 1:
+        T_knots_arr = T_knots_arr.ravel()
+
+    if n_knots < 3:
         raise ValueError("need at least 3 knots to define second differences")
 
-    logp_min = jnp.log10(jnp.min(p_ref))
-    logp_max = jnp.log10(jnp.max(p_ref))
-    logp_knots = jnp.linspace(logp_min, logp_max, T_knots.size)
+    logp_min = jnp.log10(p_ref.min())
+    logp_max = jnp.log10(p_ref.max())
+    logp_knots = jnp.linspace(logp_min, logp_max, n_knots)  # Use concrete n_knots
 
     logp_eval = jnp.log10(p_eval)
-    T_eval = jnp.interp(logp_eval, logp_knots, T_knots)
+    T_eval = jnp.interp(logp_eval, logp_knots, T_knots_arr)
     return T_eval
 
 
@@ -184,26 +191,32 @@ def numpyro_pspline_knots_on_art_grid(
 
     p_bar = _validate_pressure_bar(art.pressure)
 
-    # Knot temperatures
-    T_knots = jnp.stack(
-        [numpyro.sample(f"T_{i}", dist.Uniform(T_low, T_high)) for i in range(n_knots)]
-    )
+    # Sample knot temperatures individually (like free_temperature_profile)
+    T_knots = []
+    for i in range(n_knots):
+        T_i = numpyro.sample(f"T_knot_{i}", dist.Uniform(T_low, T_high))
+        T_knots.append(T_i)
+
+    # Stack into array - use jnp.stack instead of jnp.array for better tracer handling
+    T_knots = jnp.stack(T_knots)
 
     # Smoothness hyperparameter γ
     gamma = numpyro.sample("gamma", dist.InverseGamma(inv_gamma_a, inv_gamma_b))
 
     # Discrete second differences on knots
     d2 = T_knots[2:] - 2.0 * T_knots[1:-1] + T_knots[:-2]
-    n = d2.size
 
     # log p(T | γ) up to an additive constant
-    logp = -0.5 * gamma * jnp.sum(d2**2) + 0.5 * n * jnp.log(gamma)
+    # Use concrete n_knots instead of d2.shape[0] to avoid JAX tracer issues during MCMC
+    n_d2 = n_knots - 2  # d2 has length n_knots - 2
+    logp = -0.5 * gamma * jnp.sum(d2**2) + 0.5 * n_d2 * jnp.log(gamma)
     numpyro.factor("tp_smoothness", logp)
 
-    # Evaluate directly on ART grid (no n_fine)
-    Tarr = pspline_knots_profile_on_grid(
-        pressure_bar=p_bar,
-        T_knots=T_knots,
-        pressure_eval_bar=p_bar,
-    )
+    # Inline interpolation instead of calling another function
+    logp_min = jnp.log10(p_bar.min())
+    logp_max = jnp.log10(p_bar.max())
+    logp_knots = jnp.linspace(logp_min, logp_max, n_knots)
+    logp_grid = jnp.log10(p_bar)
+
+    Tarr = jnp.interp(logp_grid, logp_knots, T_knots)
     return Tarr
