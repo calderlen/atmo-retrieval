@@ -21,8 +21,8 @@ def create_parser():
     target_group.add_argument(
         "--planet",
         type=str,
-        default=None,
-        help="Target planet (default: KELT-20b). Use --list-planets to see options"
+        required=True,
+        help="Target planet (required). Use --list-planets to see options"
     )
     target_group.add_argument(
         "--ephemeris",
@@ -42,7 +42,7 @@ def create_parser():
     )
 
     # Retrieval mode
-    parser.add_argument("--mode", type=str, choices=["transmission", "emission"])
+    parser.add_argument("--mode", type=str, choices=["transmission", "emission"], required=True, help="Retrieval mode (required)")
 
     # Configuration
     config_group = parser.add_argument_group("Configuration")
@@ -51,7 +51,7 @@ def create_parser():
 
     # Data options
     data_group = parser.add_argument_group("Data")
-    data_group.add_argument("--epoch", type=str, default=None, help="Observation epoch (YYYYMMDD) for multi-epoch data")
+    data_group.add_argument("--epoch", type=str, required=True, help="Observation epoch (YYYYMMDD) (required)")
     data_group.add_argument("--data-dir", type=str, default=None, help="Override data directory path")
     data_group.add_argument("--wavelength-range", type=str, choices=["blue", "green", "red", "full"], default=None, help="Wavelength range mode (default: from config)")
 
@@ -711,7 +711,7 @@ def main():
         return 130
 
     except Exception as e:
-        logger.error(f"Error: {e}", exc_info=args.verbose)
+        logger.error(f"Error: {e}", exc_info=True)
         return 1
 
 

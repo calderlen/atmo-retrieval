@@ -1213,11 +1213,35 @@ def create_retrieval_model(
                         xs_chunk, mmr_atoms[i], mmw_prof[:, None], g
                     )
 
+                # Debug: check dtau_chunk shape before RT
+                if dtau_chunk.shape[1] != nu_chunk.size:
+                    raise ValueError(
+                        f"dtau_chunk shape mismatch: dtau_chunk.shape={dtau_chunk.shape}, "
+                        f"nu_chunk.size={nu_chunk.size}"
+                    )
+
                 rt = art.run(dtau_chunk, Tarr, mmw_prof, Rp, g_btm)
                 rt = sop_rot_chunk.rigid_rotation(rt, vsini, 0.0, 0.0)
+
+                # ExoJAX's rigid_rotation can return 1 fewer element due to a bug
+                # in convolve_same (irfft called without explicit n). Pad to match.
+                expected_size = sop_rot_chunk.nu_grid.shape[0]
+                if rt.shape[0] < expected_size:
+                    pad_width = expected_size - rt.shape[0]
+                    rt = jnp.pad(rt, (0, pad_width), mode="edge")
+
                 rt = sop_inst_chunk.ipgauss(rt, beta_inst)
 
+                # Same boundary handling for ipgauss (ExoJAX's convolve_same has a
+                # bug where irfft is called without explicit n, causing 1-element
+                # size reduction for odd FFT lengths)
+                expected_size = sop_inst_chunk.nu_grid.shape[0]
+                if rt.shape[0] < expected_size:
+                    pad_width = expected_size - rt.shape[0]
+                    rt = jnp.pad(rt, (0, pad_width), mode="edge")
+
                 inst_slice = inst_nus[inst_start:inst_end]
+
                 planet_ts = jax.vmap(lambda v: sop_inst_chunk.sampling(rt, v, inst_slice))(rv)
 
                 if mode == "transmission":
