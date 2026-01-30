@@ -1,8 +1,12 @@
 import argparse
 import sys
 import os
+import warnings
 from datetime import datetime
 from pathlib import Path
+
+# Show each unique warning only once (suppresses repeated exojax warnings)
+warnings.filterwarnings("once")
 
 
 def create_parser():
