@@ -4,8 +4,12 @@ Bayesian atmospheric retrieval for exoplanet transmission and emission spectra.
 
 ## Installation
 
+Clone the repository and install dependencies:
+
 ```bash
-pip install -e .
+git clone <repo-url> atmo-retrieval
+cd atmo-retrieval
+pip install jax numpyro exojax astropy matplotlib corner
 ```
 
 Requires JAX, NumPyro, ExoJAX, and standard scientific Python packages.
@@ -14,15 +18,17 @@ Requires JAX, NumPyro, ExoJAX, and standard scientific Python packages.
 
 ### Command Line Interface
 
+Run from within the `atmo-retrieval` directory:
+
 ```bash
 # Basic transmission retrieval
-python -m atmo-retrieval \
+python __main__.py \
     --planet KELT-20b \
     --mode transmission \
     --epoch 20250601
 
 # Emission retrieval with custom settings
-python -m atmo-retrieval \
+python __main__.py \
     --planet WASP-76b \
     --mode emission \
     --epoch 20240315 \
@@ -31,14 +37,14 @@ python -m atmo-retrieval \
     --mcmc-samples 2000
 
 # Quick test run (100 SVI steps, 100 MCMC samples)
-python -m atmo-retrieval \
+python __main__.py \
     --planet KELT-20b \
     --mode transmission \
     --epoch 20250601 \
     --quick
 
 # Select specific species
-python -m atmo-retrieval \
+python __main__.py \
     --planet KELT-20b \
     --mode transmission \
     --epoch 20250601 \
@@ -46,15 +52,15 @@ python -m atmo-retrieval \
     --atoms "Fe I,Na I"
 
 # Phase-binned retrieval (ingress/full/egress)
-python -m atmo-retrieval \
+python __main__.py \
     --planet KELT-20b \
     --mode transmission \
     --epoch 20250601 \
     --all-phase-bins
 
 # List available planets and ephemerides
-python -m atmo-retrieval --list-planets --planet KELT-20b
-python -m atmo-retrieval --list-ephemerides --planet KELT-20b
+python __main__.py --list-planets --planet KELT-20b
+python __main__.py --list-ephemerides --planet KELT-20b
 ```
 
 ### Python API
