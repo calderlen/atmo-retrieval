@@ -31,6 +31,7 @@ from physics.pt import (
     numpyro_pspline_knots_on_art_grid,
     numpyro_gp_temperature,
 )
+from physics.chemistry import CompositionSolver, ConstantVMR
 
 
 _EPS = 1.0e-30
@@ -743,6 +744,8 @@ def create_retrieval_model(
     stitch_guard_kms: float | None = None,
     stitch_guard_points: int | None = None,
     stitch_min_guard_points: int = 128,
+    # Chemistry/composition solver
+    composition_solver: CompositionSolver | None = None,
 ) -> Callable:
     """Create NumPyro model for atmospheric retrieval.
 
@@ -826,6 +829,10 @@ def create_retrieval_model(
         )
     else:
         atom_masses = jnp.zeros((0,))
+
+    # Default composition solver if not provided
+    if composition_solver is None:
+        composition_solver = ConstantVMR()
 
     if (mode == "emission") and (Tstar is None):
         raise ValueError("Tstar is required for emission mode.")
@@ -948,70 +955,14 @@ def create_retrieval_model(
         Rp = numpyro.sample("Rp", dist.TruncatedNormal(Rp_mean, Rp_std, low=0.0)) * RJ
 
         # 2. Composition (sample VMR, convert to MMR for opacity calculations)
-        # Step 1: Sample VMRs for all species (raw, may sum to > 1)
-        vmr_mols_raw = []
-        for mol in mol_names:
-            logVMR = numpyro.sample(f"logVMR_{mol}", dist.Uniform(-15.0, 0.0))
-            vmr_mols_raw.append(jnp.power(10.0, logVMR))
-
-        vmr_atoms_raw = []
-        for atom in atom_names:
-            logVMR = numpyro.sample(f"logVMR_{atom}", dist.Uniform(-15.0, 0.0))
-            vmr_atoms_raw.append(jnp.power(10.0, logVMR))
-
-        # Step 2: Renormalize trace VMRs if they sum to > 1 (ensure valid composition)
-        n_mols = len(vmr_mols_raw)
-        n_atoms = len(vmr_atoms_raw)
-        if n_mols + n_atoms > 0:
-            vmr_trace_arr = jnp.array(vmr_mols_raw + vmr_atoms_raw)
-            sum_trace = jnp.sum(vmr_trace_arr)
-            # Scale down if sum exceeds 1 (leave tiny room for H2/He)
-            scale = jnp.where(sum_trace > 1.0, (1.0 - 1e-12) / sum_trace, 1.0)
-            vmr_trace_arr = vmr_trace_arr * scale
-            # Split back into molecules and atoms
-            vmr_mols_scalar = [vmr_trace_arr[i] for i in range(n_mols)]
-            vmr_atoms_scalar = [vmr_trace_arr[n_mols + i] for i in range(n_atoms)]
-            vmr_trace_tot = jnp.sum(vmr_trace_arr)
-        else:
-            vmr_mols_scalar = []
-            vmr_atoms_scalar = []
-            vmr_trace_tot = 0.0
-
-        # Step 3: Fill remainder with H2/He (solar ratio 6:1)
-        vmrH2 = (1.0 - vmr_trace_tot) * (6.0 / 7.0)
-        vmrHe = (1.0 - vmr_trace_tot) * (1.0 / 7.0)
-
-        # Step 4: Compute mean molecular weight from (renormalized) VMRs
-        mass_H2 = molinfo.molmass_isotope("H2")
-        mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw = mass_H2 * vmrH2 + mass_He * vmrHe
-        if n_mols > 0:
-            mmw = mmw + sum(m * v for m, v in zip(mol_masses, vmr_mols_scalar))
-        if n_atoms > 0:
-            mmw = mmw + sum(m * v for m, v in zip(atom_masses, vmr_atoms_scalar))
-
-        # Step 5: Convert VMR to MMR and create profiles
-        # MMR_i = VMR_i * (M_i / mmw)
-        if n_mols > 0:
-            mmr_mols = jnp.array([
-                art.constant_mmr_profile(vmr * (mass / mmw))
-                for vmr, mass in zip(vmr_mols_scalar, mol_masses)
-            ])
-        else:
-            mmr_mols = jnp.zeros((0, art.pressure.size))
-
-        if n_atoms > 0:
-            mmr_atoms = jnp.array([
-                art.constant_mmr_profile(vmr * (mass / mmw))
-                for vmr, mass in zip(vmr_atoms_scalar, atom_masses)
-            ])
-        else:
-            mmr_atoms = jnp.zeros((0, art.pressure.size))
-
-        # Step 6: Create constant profiles for CIA inputs and mmw
-        vmrH2_prof = art.constant_mmr_profile(vmrH2)
-        vmrHe_prof = art.constant_mmr_profile(vmrHe)
-        mmw_prof = art.constant_mmr_profile(mmw)
+        comp = composition_solver.sample(
+            mol_names, mol_masses, atom_names, atom_masses, art
+        )
+        mmr_mols = comp.mmr_mols
+        mmr_atoms = comp.mmr_atoms
+        vmrH2_prof = comp.vmrH2_prof
+        vmrHe_prof = comp.vmrHe_prof
+        mmw_prof = comp.mmw_prof
 
         # 3. Temperature & Gravity
         g_btm = gravity_jupiter(Rp / RJ, Mp / MJ)

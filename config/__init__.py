@@ -79,6 +79,8 @@ from .paths_config import (
     MOLPATH_HITEMP,
     MOLPATH_EXOMOL,
     ATOMIC_SPECIES,
+    DEFAULT_SPECIES,
+    USE_DEFAULT_SPECIES,
     get_data_dir,
     get_transmission_paths,
     get_emission_paths,
@@ -203,7 +205,7 @@ def save_run_config(
         f.write(f"Cloud width: {CLOUD_WIDTH}\n")
         f.write(f"Cloud integrated tau: {CLOUD_INTEGRATED_TAU}\n\n")
 
-        # Molecules
+        # Molecules and atoms
         f.write("OPACITY SOURCES\n")
         f.write("-" * 70 + "\n")
         f.write("Molecules (HITEMP):\n")
@@ -212,6 +214,9 @@ def save_run_config(
         f.write("Molecules (ExoMol):\n")
         for mol in MOLPATH_EXOMOL.keys():
             f.write(f"  - {mol}\n")
+        f.write("Atomic species:\n")
+        for atom in ATOMIC_SPECIES.keys():
+            f.write(f"  - {atom}\n")
         f.write("\nCIA sources: H2-H2, H2-He\n")
         f.write(f"Opacity loading: {OPA_LOAD}\n")
         f.write(f"Opacity saving: {OPA_SAVE}\n\n")

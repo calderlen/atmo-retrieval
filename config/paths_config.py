@@ -201,3 +201,31 @@ OPA_SAVE = False
 # VALD: requires manual download from vald.astro.uu.se (place in .db_VALD/)
 USE_KURUCZ = True
 USE_VALD = True
+
+# ==============================================================================
+# DEFAULT SPECIES SELECTION
+# ==============================================================================
+# Species detected in literature (used by default unless --all-species is set)
+# Based on high-resolution detections from multiple instruments (PEPSI, HARPS-N,
+# CARMENES, EXPRES, FIES) - see literature compilation table.
+#
+# To use all available species instead of this subset, pass --all-species to CLI.
+# To override with a custom list, use --atoms "Fe I,Na I" or --molecules "H2O,CO".
+
+DEFAULT_SPECIES = {
+    "atoms": [
+        "Na I",   # Detected in multiple studies (PEPSI, HARPS-N, CARMENES, EXPRES)
+        "Mg I",   # Detected (EXPRES)
+        "Ca II",  # Detected (CARMENES, HARPS-N)
+        "Cr I",   # Detected (PEPSI)
+        "Cr II",  # Detected (EXPRES)
+        "Fe I",   # Strong detection in most studies
+        "Fe II",  # Strong detection in most studies
+    ],
+    "molecules": [
+        "FeH",    # Detected (CARMENES)
+    ],
+}
+
+# Set to True to use DEFAULT_SPECIES by default, False to use all available species
+USE_DEFAULT_SPECIES = True

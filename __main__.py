@@ -264,6 +264,11 @@ def create_parser():
         action="store_true",
         help="Disable all atomic opacities (use molecules only)"
     )
+    species_group.add_argument(
+        "--all-species",
+        action="store_true",
+        help="Use all available species instead of the default detected subset"
+    )
 
     # Execution options
     exec_group = parser.add_argument_group("Execution")
@@ -426,6 +431,29 @@ def apply_cli_overrides(args):
     def _parse_csv(value: str) -> list[str]:
         parts = [p.strip() for p in re.split(r"[,\n]+", value) if p.strip()]
         return parts
+
+    # Apply default species filter unless --all-species or explicit selection
+    use_defaults = (
+        config.USE_DEFAULT_SPECIES
+        and not args.all_species
+        and not args.atoms
+        and not args.molecules
+        and not args.no_atoms
+        and not args.no_molecules
+    )
+    if use_defaults:
+        default_atoms = set(config.DEFAULT_SPECIES.get("atoms", []))
+        default_mols = set(config.DEFAULT_SPECIES.get("molecules", []))
+        config.ATOMIC_SPECIES = {
+            k: v for k, v in config.ATOMIC_SPECIES.items() if k in default_atoms
+        }
+        config.MOLPATH_HITEMP = {
+            k: v for k, v in config.MOLPATH_HITEMP.items() if k in default_mols
+        }
+        config.MOLPATH_EXOMOL = {
+            k: v for k, v in config.MOLPATH_EXOMOL.items() if k in default_mols
+        }
+        print(f"Using default detected species (pass --all-species for full set)")
 
     if args.no_molecules:
         config.MOLPATH_HITEMP = {}
