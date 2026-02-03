@@ -15,7 +15,8 @@ RETRIEVAL_MODE = "transmission"  # Options: "transmission", "emission"
 # ==============================================================================
 
 DIFFMODE = 0
-NLAYER = 100  # Number of atmospheric layers
+#NLAYER = 100  # Number of atmospheric layers
+NLAYER = 20
 
 # Pressure range [bar]
 PRESSURE_TOP = 1e-8 
@@ -29,7 +30,8 @@ T_HIGH = 4500.0
 # SPECTRAL GRID PARAMETERS
 # ==============================================================================
 
-N_SPECTRAL_POINTS = 250000
+#N_SPECTRAL_POINTS = 250000
+N_SPECTRAL_POINTS = 50000
 WAV_MIN_OFFSET = 100  # Angstroms
 WAV_MAX_OFFSET = 100  # Angstroms
 
