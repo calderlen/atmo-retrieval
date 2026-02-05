@@ -1,5 +1,3 @@
-"""Orchestrates high-resolution spectroscopic retrieval pipeline."""
-
 import jax
 from pathlib import Path
 from jax import random
@@ -23,17 +21,6 @@ from plotting.plot import (
 
 
 def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load time-series spectroscopic data.
-
-    Expected files in data_dir:
-        - wavelength.npy: (n_wavelengths,) wavelength array in Angstroms
-        - data.npy: (n_exposures, n_wavelengths) flux time-series
-        - sigma.npy: (n_exposures, n_wavelengths) uncertainties
-        - phase.npy: (n_exposures,) orbital phase for each exposure
-        
-    Returns:
-        (wavelength, data, sigma, phase)
-    """
     from pathlib import Path
     data_dir = Path(data_dir)
 
@@ -54,7 +41,6 @@ def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, 
 
 
 def _normalize_phase(phase: np.ndarray) -> np.ndarray:
-    """Validate and normalize phase so mid-transit is near 0.0."""
     phase = np.asarray(phase)
     if phase.size == 0:
         return phase
@@ -97,7 +83,6 @@ def _preflight_spectrum_checks(
     phase: np.ndarray,
     inst_nus: np.ndarray,
 ) -> None:
-    """Validate inputs before building the forward model."""
     errors = []
 
     wav_obs = np.asarray(wav_obs)
@@ -158,7 +143,6 @@ def _preflight_spectrum_checks(
 
 
 def _preflight_grid_checks(inst_nus: np.ndarray, nu_grid: np.ndarray) -> None:
-    """Validate that the model grid covers the instrument grid."""
     inst_nus = np.asarray(inst_nus)
     nu_grid = np.asarray(nu_grid)
 
@@ -184,7 +168,6 @@ def _preflight_grid_checks(inst_nus: np.ndarray, nu_grid: np.ndarray) -> None:
 
 
 def _cia_header_range(path: str) -> tuple[float, float] | None:
-    """Read CIA wavenumber min/max from header line if possible."""
     try:
         with open(path, "r") as f:
             header = f.readline().strip().split()
@@ -198,14 +181,12 @@ def _cia_header_range(path: str) -> tuple[float, float] | None:
 
 
 def _format_um(nu_cm: float) -> float:
-    """Convert wavenumber (cm^-1) to wavelength (um)."""
     if nu_cm <= 0:
         return float("nan")
     return 1.0e4 / nu_cm
 
 
 def _report_cia_coverage(cia_paths: dict[str, str], nu_grid: np.ndarray) -> None:
-    """Print CIA coverage and overlap with the model grid."""
     nu_grid = np.asarray(nu_grid)
     if nu_grid.size == 0:
         return
@@ -250,8 +231,8 @@ def run_retrieval(
     skip_svi: bool = False,
     svi_only: bool = False,
     no_plots: bool = False,
-    pt_profile: str = "gp",
-    phase_mode: PhaseMode = "shared",
+    pt_profile: str = "guillot",
+    phase_mode: PhaseMode = "global",
     check_aliasing: bool = False,
     compute_contribution: bool = True,
     seed: int = 42,
@@ -260,31 +241,6 @@ def run_retrieval(
     sigma: np.ndarray | None = None,
     phase: np.ndarray | None = None,
 ) -> None:
-    """Run atmospheric retrieval.
-
-    Args:
-        mode: "transmission" or "emission"
-        epoch: Observation epoch (YYYYMMDD) for multi-epoch data
-        data_dir: Optional override for data directory
-        data_format: "auto", "timeseries", or "spectrum"
-        skip_svi: Skip SVI warm-up, go straight to MCMC
-        svi_only: Run only SVI, skip MCMC
-        no_plots: Skip diagnostic plots
-        pt_profile: P-T profile type (guillot, isothermal, gradient, madhu_seager, free, pspline, gp)
-        phase_mode: How to model phase-dependent velocity offset:
-            - "shared": Single dRV for all exposures (default)
-            - "per_exposure": Independent dRV for each exposure
-            - "hierarchical": dRV[i] ~ Normal(dRV_mean, dRV_scatter)
-            - "linear": dRV = dRV_0 + dRV_slope * phase
-            - "quadratic": dRV = a + b*phase + c*phase^2
-        check_aliasing: Run species aliasing diagnostics before retrieval
-        compute_contribution: Compute and plot contribution function after MCMC
-        seed: Random seed
-        wav_obs: Optional wavelength array for pre-loaded data
-        data: Optional pre-loaded data array
-        sigma: Optional pre-loaded uncertainty array
-        phase: Optional pre-loaded phase array
-    """
     # Create timestamped output directory
     base_dir = config.DIR_SAVE or config.get_output_dir()
     output_dir = config.create_timestamped_dir(base_dir)

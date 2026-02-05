@@ -1,5 +1,3 @@
-"""Visualization functions for retrieval diagnostics."""
-
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,7 +5,6 @@ import corner
 
 
 def plot_svi_loss(loss_values: np.ndarray, save_path: str) -> None:
-    """Plot SVI loss trajectory."""
     fig, ax = plt.subplots(figsize=(6, 4))
     x = np.arange(len(loss_values))
     ax.plot(x, np.asarray(loss_values), lw=1.5)
@@ -29,7 +26,6 @@ def plot_transmission_spectrum(
     rp_svi: np.ndarray,
     save_path: str,
 ) -> None:
-    """Plot transmission spectrum: observed vs model."""
     rp_hmc_np = np.asarray(rp_hmc)
     mean = rp_hmc_np.mean(axis=0)
     std = rp_hmc_np.std(axis=0)
@@ -62,7 +58,6 @@ def plot_emission_spectrum(
     fp_svi: np.ndarray,
     save_path: str,
 ) -> None:
-    """Plot emission spectrum: observed vs model."""
     fp_hmc_np = np.asarray(fp_hmc)
     mean = fp_hmc_np.mean(axis=0)
     std = fp_hmc_np.std(axis=0)
@@ -93,7 +88,6 @@ def plot_temperature_profile(
     save_path: str,
     Ncurve: int = 100,
 ) -> None:
-    """Plot retrieved temperature-pressure profile."""
     fig, ax = plt.subplots(figsize=(6, 7))
 
     if "T0" in posterior_samples:
@@ -143,7 +137,6 @@ def _corner_data(
     sample_dict: dict,
     variables: list[str],
 ) -> tuple[np.ndarray | None, list[str] | None]:
-    """Extract corner plot data from sample dictionary."""
     cols = []
     labels = []
     available = [v for v in variables if v in sample_dict]
@@ -164,7 +157,6 @@ def plot_corner(
     variables: list[str] | None = None,
     save_path: str | None = None,
 ) -> None:
-    """Create corner plot for parameter distributions."""
     datasets = []
     labels = None
 
@@ -209,7 +201,6 @@ def create_transmission_plots(
     art: object,
     output_dir: str,
 ) -> None:
-    """Generate all transmission retrieval diagnostic plots."""
     print("Generating diagnostic plots...")
 
     plot_svi_loss(losses, os.path.join(output_dir, "svi_loss.png"))
@@ -253,28 +244,14 @@ def plot_phase_trace(
     save_path: str | None = None,
     show_exposures: bool = True,
 ) -> None:
-    """Plot parameter evolution across orbital phase with uncertainty bands.
-    
-    Works for per-exposure and smooth phase models. Shows how the parameter
-    (typically dRV) varies through the transit.
-    
-    Args:
-        posteriors: Dict with 'samples' containing posterior samples
-        phase: Orbital phase array (0 = mid-transit)
-        param: Parameter to plot (default: 'dRV')
-        save_path: Path to save figure (if None, displays)
-        show_exposures: Show individual exposure estimates as points
-    """
     fig, ax = plt.subplots(figsize=(10, 5))
     
     samples = posteriors.get("samples", posteriors)
     
-    # Check if we have per-exposure samples
     if param in samples:
         param_samples = np.asarray(samples[param])
         
         if param_samples.ndim == 1:
-            # Single value (shared mode) - plot as horizontal band
             mean = np.mean(param_samples)
             std = np.std(param_samples)
             q16, q84 = np.percentile(param_samples, [16, 84])
@@ -283,16 +260,13 @@ def plot_phase_trace(
             ax.axhspan(q16, q84, alpha=0.3, color='C0', label='68% CI')
             
         elif param_samples.ndim == 2:
-            # Per-exposure or interpolated values
             n_samples, n_exp = param_samples.shape
             
-            # Compute statistics per exposure
             means = np.mean(param_samples, axis=0)
             stds = np.std(param_samples, axis=0)
             q16 = np.percentile(param_samples, 16, axis=0)
             q84 = np.percentile(param_samples, 84, axis=0)
             
-            # Sort by phase for plotting
             sort_idx = np.argsort(phase)
             phase_sorted = phase[sort_idx]
             means_sorted = means[sort_idx]
@@ -307,39 +281,18 @@ def plot_phase_trace(
                 ax.errorbar(phase, means, yerr=stds, fmt='o', color='C0', 
                           alpha=0.6, markersize=6, capsize=2)
     
-    # Check for linear/quadratic model parameters
-    if f"{param}_0" in samples or f"{param}_a" in samples:
-        # Generate smooth curve
+    if f"{param}_0" in samples:
         phase_fine = np.linspace(phase.min(), phase.max(), 200)
         
-        if f"{param}_0" in samples and f"{param}_slope" in samples:
-            # Linear model
-            p0 = np.asarray(samples[f"{param}_0"])
-            slope = np.asarray(samples[f"{param}_slope"])
-            
-            curves = p0[:, None] + slope[:, None] * phase_fine[None, :]
-            mean_curve = np.mean(curves, axis=0)
-            q16_curve = np.percentile(curves, 16, axis=0)
-            q84_curve = np.percentile(curves, 84, axis=0)
-            
-            ax.fill_between(phase_fine, q16_curve, q84_curve,
-                          alpha=0.3, color='C0', label='68% CI')
-            ax.plot(phase_fine, mean_curve, 'C0-', lw=2, label='Linear trend')
-            
-        elif f"{param}_a" in samples:
-            # Quadratic model
-            pa = np.asarray(samples[f"{param}_a"])
-            pb = np.asarray(samples[f"{param}_b"])
-            pc = np.asarray(samples[f"{param}_c"])
-            
-            curves = pa[:, None] + pb[:, None] * phase_fine[None, :] + pc[:, None] * phase_fine[None, :]**2
-            mean_curve = np.mean(curves, axis=0)
-            q16_curve = np.percentile(curves, 16, axis=0)
-            q84_curve = np.percentile(curves, 84, axis=0)
-            
-            ax.fill_between(phase_fine, q16_curve, q84_curve,
-                          alpha=0.3, color='C0', label='68% CI')
-            ax.plot(phase_fine, mean_curve, 'C0-', lw=2, label='Quadratic trend')
+        p0 = np.asarray(samples[f"{param}_0"])
+        slope = np.asarray(samples[f"{param}_slope"])
+        curves = p0[:, None] + slope[:, None] * phase_fine[None, :]
+        mean_curve = np.mean(curves, axis=0)
+        q16_curve = np.percentile(curves, 16, axis=0)
+        q84_curve = np.percentile(curves, 84, axis=0)
+        ax.fill_between(phase_fine, q16_curve, q84_curve,
+                      alpha=0.3, color='C0', label='68% CI')
+        ax.plot(phase_fine, mean_curve, 'C0-', lw=2, label='Linear trend')
     
     ax.axhline(0, color='k', ls='--', alpha=0.5, lw=1)
     ax.axvline(0, color='k', ls=':', alpha=0.5, lw=1, label='Mid-transit')
@@ -365,13 +318,6 @@ def plot_phase_comparison(
     params: list[str],
     save_path: str | None = None,
 ) -> None:
-    """Create overlaid corner plot comparing posteriors across phase bins.
-    
-    Args:
-        bin_posteriors: Dict mapping bin_name -> posterior samples dict
-        params: List of parameters to include in corner plot
-        save_path: Path to save figure
-    """
     colors = {'T12': 'C0', 'T23': 'C1', 'T34': 'C2'}
     
     fig = None
@@ -419,14 +365,6 @@ def plot_aliasing_matrix(
     save_path: str | None = None,
     threshold: float = 0.3,
 ) -> None:
-    """Plot heatmap of peak cross-correlations between all species pairs.
-    
-    Args:
-        matrix: Square matrix of peak correlations
-        species_names: List of species names (same order as matrix)
-        save_path: Path to save figure
-        threshold: Correlation threshold to highlight (default 0.3)
-    """
     fig, ax = plt.subplots(figsize=(10, 8))
     
     # Use diverging colormap centered at 0
@@ -473,22 +411,12 @@ def plot_ccf_pair(
     species_b: str,
     save_path: str | None = None,
 ) -> None:
-    """Plot cross-correlation function between two species templates.
-    
-    Args:
-        ccf: CCF array
-        velocities: Velocity array (km/s)
-        species_a: First species name
-        species_b: Second species name
-        save_path: Path to save figure
-    """
     fig, ax = plt.subplots(figsize=(8, 4))
     
     ax.plot(velocities, ccf, 'C0-', lw=1.5)
     ax.axhline(0, color='k', ls='--', alpha=0.5, lw=1)
     ax.axvline(0, color='r', ls=':', alpha=0.7, lw=1, label='v = 0')
     
-    # Mark peak
     peak_idx = np.argmax(np.abs(ccf))
     ax.scatter(velocities[peak_idx], ccf[peak_idx], s=100, c='r', marker='*',
               zorder=5, label=f'Peak: r = {ccf[peak_idx]:.3f}')

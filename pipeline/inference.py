@@ -1,5 +1,3 @@
-"""Stochastic Variational Inference (SVI) and HMC-NUTS sampling."""
-
 import os
 from typing import Callable
 from contextlib import redirect_stdout
@@ -22,7 +20,6 @@ def create_prior_guide(
     Rstar_mean: float,
     Rstar_std: float,
 ) -> Callable:
-    """Create prior guide for Mp and Rs during SVI."""
     def prior_guide(data: jnp.ndarray, sigma: jnp.ndarray, phase: jnp.ndarray, **kwargs) -> dict:
         Mp = numpyro.sample("Mp", dist.TruncatedNormal(Mp_mean, Mp_std, low=0.0))
         Rstar = numpyro.sample("Rstar", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0))
@@ -38,7 +35,6 @@ def build_guide(
     Rstar_mean: float,
     Rstar_std: float,
 ) -> AutoGuideList:
-    """Construct AutoGuideList with separated priors for Mp/Rs."""
     guide = AutoGuideList(model_c)
     prior_guide = create_prior_guide(Mp_mean, Mp_std, Rstar_mean, Rstar_std)
     guide.append(prior_guide)
@@ -55,7 +51,6 @@ def save_svi_outputs(
     init_values: dict,
     output_dir: str,
 ) -> None:
-    """Save SVI results to disk."""
     params_cpu = {k: np.asarray(jax.device_get(v)) for k, v in params.items()}
     losses_cpu = np.asarray(jax.device_get(losses))
     init_cpu = {k: np.asarray(jax.device_get(v)) for k, v in init_values.items()}
@@ -83,7 +78,6 @@ def run_svi(
     num_steps: int = 1000,
     lr: float = 0.005,
 ) -> tuple[dict, jnp.ndarray, Callable, dict, AutoGuideList]:
-    """Run Stochastic Variational Inference."""
     guide = build_guide(model_c, Mp_mean, Mp_std, Rstar_mean, Rstar_std)
     optimizer = optim.Adam(lr)
     svi = SVI(model_c, guide, optimizer, loss=Trace_ELBO())
@@ -121,7 +115,6 @@ def run_mcmc(
     max_tree_depth: int = 5,
     num_chains: int = 1,
 ) -> tuple[MCMC, dict]:
-    """Run HMC-NUTS sampling."""
     kernel = NUTS(
         model_c,
         max_tree_depth=max_tree_depth,
@@ -151,7 +144,6 @@ def generate_predictions(
     phase: jnp.ndarray,
     output_dir: str,
 ) -> dict:
-    """Generate predictive spectrum from posterior samples."""
     pred = Predictive(model_c, posterior_sample, return_sites=["Rp"])
     predictions = pred(rng_key, data=data, sigma=sigma, phase=phase)
 

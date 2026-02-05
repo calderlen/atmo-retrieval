@@ -1,22 +1,17 @@
-"""Temperature-pressure profiles for ultra-hot Jupiters."""
-
 import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 
 
 def isothermal_profile(art: object, T0: float) -> jnp.ndarray:
-    """Isothermal temperature profile."""
     return T0 * jnp.ones_like(art.pressure)
 
 def numpyro_isothermal(art: object, T_low: float, T_high: float) -> jnp.ndarray:
-    """Isothermal profile with NumPyro sampling."""
     T0 = numpyro.sample("T0", dist.Uniform(T_low, T_high))
     return isothermal_profile(art, T0)
 
 
 def gradient_profile(art: object, T_bottom: float, T_top: float) -> jnp.ndarray:
-    """Linear temperature gradient from bottom to top of atmosphere."""
     log_p = jnp.log10(art.pressure)
     log_p_min, log_p_max = log_p.min(), log_p.max()
     # Linear interpolation in log-pressure
@@ -25,7 +20,6 @@ def gradient_profile(art: object, T_bottom: float, T_top: float) -> jnp.ndarray:
 
 
 def numpyro_gradient(art: object, T_low: float, T_high: float) -> jnp.ndarray:
-    """Linear gradient profile with NumPyro sampling."""
     T_bottom = numpyro.sample("T_bottom", dist.Uniform(T_low, T_high))
     T_top = numpyro.sample("T_top", dist.Uniform(T_low, T_high))
     return gradient_profile(art, T_bottom, T_top)
@@ -39,14 +33,6 @@ def guillot_profile(
     kappa_ir_cgs: float,
     gamma: float,
 ) -> jnp.ndarray:
-    """Grey radiative-equilibrium profile (Guillot 2010 form).
-
-    Physics convention:
-      τ(P) = κ_IR * P / g with P in dyn/cm² (1 bar = 1e6 dyn/cm²), g in cm/s².
-
-      T⁴ = (3/4) Tint⁴ (2/3 + τ)
-         + (3/4) Tirr⁴ [ 2/3 + 1/(√3 γ) + (γ/√3 - 1/(√3 γ)) exp(-√3 γ τ) ].
-    """
     P_cgs = pressure_bar * 1.0e6
     tau = kappa_ir_cgs * P_cgs / jnp.clip(g_cgs, 1.0e-20, None)
 
@@ -69,7 +55,6 @@ def madhu_seager_profile(
     P_trans: float,
     delta_P: float,
 ) -> jnp.ndarray:
-    """Madhusudhan & Seager (2009) smoothly-varying profile with inversions."""
     log_p = jnp.log10(art.pressure)
     log_p_trans = jnp.log10(P_trans)
 
@@ -80,7 +65,6 @@ def madhu_seager_profile(
     return Tarr
 
 def numpyro_madhu_seager(art: object, T_low: float, T_high: float) -> jnp.ndarray:
-    """Madhusudhan-Seager profile with NumPyro sampling."""
     T_deep = numpyro.sample("T_deep", dist.Uniform(T_low, T_high))
     T_high = numpyro.sample("T_high", dist.Uniform(T_low, T_high))
     log_P_trans = numpyro.sample("log_P_trans", dist.Uniform(-8, 2))
@@ -92,15 +76,12 @@ def numpyro_madhu_seager(art: object, T_low: float, T_high: float) -> jnp.ndarra
 
 
 
-# TODO: this requires strong priors and careful tuning to work
-
 def free_temperature_profile(
     art: object,
     n_layers: int = 5,
     T_low: float = 1000,
     T_high: float = 4000,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Free temperature profile with piecewise linear interpolation."""
     log_p = jnp.log10(art.pressure)
     log_p_nodes = jnp.linspace(log_p.min(), log_p.max(), n_layers)
 
@@ -120,7 +101,6 @@ def numpyro_free_temperature(
     T_low: float = 1000,
     T_high: float = 4000,
 ) -> jnp.ndarray:
-    """Free temperature profile with NumPyro sampling."""
     return free_temperature_profile(art, n_layers, T_low, T_high)[0]
 
 
@@ -139,12 +119,6 @@ def pspline_knots_profile_on_grid(
     *,
     pressure_eval_bar: jnp.ndarray,
 ) -> jnp.ndarray:
-    """Interpolate knot temperatures (even in log10 P) onto an arbitrary pressure grid.
-
-    Knots are evenly spaced in log10(pressure_bar) range.
-    Evaluated at log10(pressure_eval_bar).
-    Interpolation is linear in log10(P) (JAX-friendly).
-    """
     p_ref = _validate_pressure_bar(pressure_bar)
     p_eval = _validate_pressure_bar(pressure_eval_bar)
     T_knots = jnp.asarray(T_knots)
@@ -171,16 +145,6 @@ def numpyro_pspline_knots_on_art_grid(
     inv_gamma_a: float = 1.0,
     inv_gamma_b: float = 5.0e-5,
 ) -> jnp.ndarray:
-    """Line+2015-style TP prior with ART-grid evaluation.
-
-    Physics convention: pressure is in bar; we use log10(P) for knot placement
-    and interpolation. Roughness penalty is on discrete 2nd differences of knot T.
-
-    Returns
-    -------
-    Tarr : jnp.ndarray
-        Temperature on the ART pressure grid (same length as art.pressure).
-    """
 
     p_bar = _validate_pressure_bar(art.pressure)
 
@@ -209,13 +173,11 @@ def numpyro_pspline_knots_on_art_grid(
     return Tarr
 
 def _gp_kernel_rbf(x: jnp.ndarray, amp: jnp.ndarray, ell: jnp.ndarray) -> jnp.ndarray:
-    """Squared-exponential (RBF) kernel: K_ij = amp^2 * exp(-0.5 * (Δx/ell)^2)."""
     dx = x[:, None] - x[None, :]
     return (amp**2) * jnp.exp(-0.5 * (dx / jnp.clip(ell, 1e-12, None)) ** 2)
 
 
 def _gp_kernel_matern32(x: jnp.ndarray, amp: jnp.ndarray, ell: jnp.ndarray) -> jnp.ndarray:
-    """Matérn-3/2 kernel: K_ij = amp^2 * (1 + r) exp(-r), r = sqrt(3)*|Δx|/ell."""
     dx = jnp.abs(x[:, None] - x[None, :])
     r = jnp.sqrt(3.0) * dx / jnp.clip(ell, 1e-12, None)
     return (amp**2) * (1.0 + r) * jnp.exp(-r)
@@ -235,14 +197,6 @@ def numpyro_gp_temperature(
     jitter: float = 1.0e-6,          # numerical stability (in K^2 after scaling)
     obs_nugget: float = 1.0,         # K, tiny extra diagonal "nugget" for robustness
 ) -> jnp.ndarray:
-    """
-    Sample a temperature profile on ART's pressure grid using a GP prior on T(log10 P).
-
-    Returns
-    -------
-    Tarr : jnp.ndarray
-        Shape (art.pressure.size,), temperatures on ART grid.
-    """
     # x = log10(P/bar) on ART grid
     x = jnp.log10(jnp.asarray(art.pressure))
 

@@ -5,12 +5,10 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
-# Show each unique warning only once (suppresses repeated exojax warnings)
 warnings.filterwarnings("once")
 
 
 def create_parser():
-    """Create argument parser for CLI."""
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -154,9 +152,9 @@ def create_parser():
     phase_group.add_argument(
         "--phase-mode",
         type=str,
-        choices=["shared", "per_exposure", "hierarchical", "linear", "quadratic"],
-        default="shared",
-        help="How to model phase-dependent velocity offset dRV (default: shared)"
+        choices=["global", "per_exposure", "linear"],
+        default="global",
+        help="How to model phase-dependent velocity offset dRV (default: global)"
     )
     phase_group.add_argument(
         "--phase-bin",
@@ -338,7 +336,6 @@ def create_parser():
 
 
 def load_custom_config(config_path):
-    """Load custom configuration file."""
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("custom_config", config_path)
@@ -349,7 +346,6 @@ def load_custom_config(config_path):
 
 
 def apply_custom_config(custom_config):
-    """Overlay custom config values onto the base config module."""
     import config as base_config
 
     for name in dir(custom_config):
@@ -360,7 +356,6 @@ def apply_custom_config(custom_config):
 
 
 def apply_cli_overrides(args):
-    """Apply command-line argument overrides to config."""
     import config
     import re
 
@@ -504,7 +499,6 @@ def apply_cli_overrides(args):
 
 
 def setup_logging(args):
-    """Setup logging based on verbosity."""
     import logging
 
     if args.quiet:
@@ -529,7 +523,6 @@ def setup_logging(args):
 
 
 def print_config_summary(config, args):
-    """Print configuration summary."""
     params = config.get_params()
     
     print("\n" + "="*70)
@@ -542,7 +535,7 @@ def print_config_summary(config, args):
     print(f"  T_star: {params['T_star']} K")
 
     print(f"\nMode: {config.RETRIEVAL_MODE.upper()}")
-    print(f"Phase mode: {args.phase_mode if hasattr(args, 'phase_mode') else 'shared'}")
+    print(f"Phase mode: {args.phase_mode if hasattr(args, 'phase_mode') else 'global'}")
     if hasattr(args, 'phase_bin') and args.phase_bin:
         print(f"Phase bin: {args.phase_bin}")
     if hasattr(args, 'all_phase_bins') and args.all_phase_bins:
@@ -576,7 +569,6 @@ def print_config_summary(config, args):
 
 
 def main():
-    """Main CLI entry point."""
     parser = create_parser()
     args = parser.parse_args()
 

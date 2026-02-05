@@ -1,17 +1,3 @@
-"""
-Phase-binned retrieval runner for limb asymmetry analysis.
-
-This module orchestrates running separate atmospheric retrievals for different
-orbital phase bins (T12=ingress, T23=full transit, T34=egress) to detect
-and characterize limb asymmetries in transmission spectra.
-
-The workflow is:
-1. Filter data to specific phase bin(s)
-2. Run independent retrieval for each bin
-3. Compare posteriors across bins
-4. Statistical tests for asymmetry detection
-"""
-
 from __future__ import annotations
 
 import os
@@ -34,22 +20,6 @@ def run_phase_binned_retrieval(
     data_format: str = "auto",
     **retrieval_kwargs,
 ) -> dict[str, dict]:
-    """Run separate retrievals for each phase bin.
-    
-    This function runs independent retrievals for each specified phase bin,
-    storing results in separate subdirectories. After all retrievals complete,
-    it generates comparison statistics.
-    
-    Args:
-        phase_bins: List of phase bins to analyze ("T12", "T23", "T34")
-        base_output_dir: Base directory for output (bins stored in subdirs)
-        **retrieval_kwargs: Additional arguments passed to run_retrieval
-            - params: Planet parameters dict
-            - Other retrieval configuration options
-            
-    Returns:
-        Dict mapping bin_name -> retrieval results (posteriors, summary, etc.)
-    """
     if mode != "transmission":
         raise ValueError("Phase-binned retrieval is only supported for transmission mode.")
 
@@ -175,16 +145,6 @@ def compare_phase_posteriors(
     params_to_compare: list[str] | None = None,
     output_dir: str | None = None,
 ) -> dict:
-    """Compare posteriors across phase bins with statistical tests.
-    
-    Args:
-        posteriors: Dict mapping bin_name -> posterior samples dict
-        params_to_compare: Parameters to compare (default: dRV, logVMRs)
-        output_dir: Directory to save comparison outputs
-        
-    Returns:
-        Dict with comparison statistics
-    """
     from scipy import stats
     
     bin_names = list(posteriors.keys())
@@ -192,9 +152,7 @@ def compare_phase_posteriors(
     if len(bin_names) < 2:
         return {"error": "Need at least 2 bins for comparison"}
     
-    # Default parameters to compare
     if params_to_compare is None:
-        # Find common parameters across all bins
         all_params = set()
         for post in posteriors.values():
             if isinstance(post, dict) and "samples" in post:
@@ -344,27 +302,15 @@ def detect_asymmetry(
     param: str = "dRV",
     significance_threshold: float = 2.0,
 ) -> dict:
-    """Test for significant asymmetry between ingress and egress.
-    
-    Args:
-        posteriors: Dict with at least "T12" (ingress) and "T34" (egress)
-        param: Parameter to test for asymmetry
-        significance_threshold: Sigma threshold for detection (default 2.0)
-        
-    Returns:
-        Dict with asymmetry detection results
-    """
     if "T12" not in posteriors or "T34" not in posteriors:
         return {"error": "Need both T12 and T34 bins for asymmetry test"}
     
-    # Get samples
     try:
         samples_ingress = posteriors["T12"]["samples"][param]
         samples_egress = posteriors["T34"]["samples"][param]
     except (KeyError, TypeError):
         return {"error": f"Parameter {param} not found in posteriors"}
     
-    # Handle multi-dimensional samples
     if samples_ingress.ndim > 1:
         samples_ingress = samples_ingress.mean(axis=-1)
     if samples_egress.ndim > 1:
