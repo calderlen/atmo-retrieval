@@ -725,7 +725,7 @@ def create_retrieval_model(
     # P-T profile (Default: pspline)
     pt_profile: Literal[
         "guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline", "gp"
-    ] = "gp",
+    ] = "guillot",
     T_low: float = 400.0,
     T_high: float = 3000.0,
     Tirr_std: float | None = None,  # If None, uses uniform prior on Tirr

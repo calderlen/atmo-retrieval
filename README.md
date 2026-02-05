@@ -32,7 +32,7 @@ python __main__.py \
     --planet WASP-76b \
     --mode emission \
     --epoch 20240315 \
-    --pt-profile gp \
+    --pt-profile guillot \
     --svi-steps 2000 \
     --mcmc-samples 2000
 
@@ -72,7 +72,7 @@ from pipeline.retrieval import run_retrieval
 run_retrieval(
     mode="transmission",
     epoch="20250601",
-    pt_profile="gp",           # Gaussian Process P-T profile
+    pt_profile="guillot",      # Guillot P-T profile (default)
     phase_mode="shared",       # Single dRV for all exposures
     skip_svi=False,
     svi_only=False,
@@ -219,7 +219,7 @@ model = create_retrieval_model(
     sop_inst=sop_inst,
     instrument_resolution=130000,
     inst_nus=inst_nus,
-    pt_profile="gp",        # Options: isothermal, gradient, guillot, gp, pspline, free
+    pt_profile="guillot",   # Options: isothermal, gradient, guillot, gp, pspline, free
     phase_mode="shared",    # Options: shared, per_exposure, hierarchical, linear, quadratic
 )
 ```
@@ -343,7 +343,7 @@ from physics.pt import (
 # - "isothermal": Constant temperature
 # - "gradient": Linear in log-P
 # - "guillot": Radiative-convective equilibrium
-# - "gp": Gaussian Process prior (recommended)
+# - "gp": Gaussian Process prior
 # - "pspline": Piecewise spline
 # - "free": Free parameters per layer
 ```
