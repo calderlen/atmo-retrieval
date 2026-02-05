@@ -405,7 +405,7 @@ def summarize_phase_coverage(
     Returns:
         Dict with bin statistics (count, phase range, etc.)
     """
-    contacts = get_contact_phases(params)
+    contacts = compute_contact_phases(params)
     bin_indices = get_phase_bin_indices(phase, params)
     
     summary = {

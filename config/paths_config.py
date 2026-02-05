@@ -29,6 +29,9 @@ DB_KURUCZ = Path(os.environ.get("KURUCZ_DIR") or INPUT_DIR / ".db_kurucz")
 DB_VALD = Path(os.environ.get("VALD_DIR") or INPUT_DIR / ".db_VALD")
 DB_CIA = Path(os.environ.get("CIA_DIR") or INPUT_DIR / ".db_CIA")
 
+for db_dir in (DB_HITEMP, DB_EXOMOL, DB_EXOATOM, DB_KURUCZ, DB_VALD, DB_CIA):
+    db_dir.mkdir(parents=True, exist_ok=True)
+
 # CIA paths
 CIA_PATHS = {
     "H2H2": DB_CIA / "H2-H2_2011.cia",

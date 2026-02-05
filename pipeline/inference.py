@@ -23,10 +23,10 @@ def create_prior_guide(
     Rstar_std: float,
 ) -> Callable:
     """Create prior guide for Mp and Rs during SVI."""
-    def prior_guide(rp_mean: jnp.ndarray, rp_std: jnp.ndarray) -> dict:
+    def prior_guide(data: jnp.ndarray, sigma: jnp.ndarray, phase: jnp.ndarray, **kwargs) -> dict:
         Mp = numpyro.sample("Mp", dist.TruncatedNormal(Mp_mean, Mp_std, low=0.0))
-        Rs = numpyro.sample("Rs", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0))
-        return {"Mp": Mp, "Rs": Rs}
+        Rstar = numpyro.sample("Rstar", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0))
+        return {"Mp": Mp, "Rstar": Rstar}
 
     return prior_guide
 
@@ -43,7 +43,7 @@ def build_guide(
     prior_guide = create_prior_guide(Mp_mean, Mp_std, Rstar_mean, Rstar_std)
     guide.append(prior_guide)
 
-    model_hidden = handlers.block(model_c, hide=["Mp", "Rs", "rp_mu"])
+    model_hidden = handlers.block(model_c, hide=["Mp", "Rstar", "Rp"])
     guide.append(AutoMultivariateNormal(model_hidden))
 
     return guide
@@ -72,8 +72,9 @@ def save_svi_outputs(
 def run_svi(
     model_c: Callable,
     rng_key: jax.Array,
-    rp_mean: jnp.ndarray,
-    rp_std: jnp.ndarray,
+    data: jnp.ndarray,
+    sigma: jnp.ndarray,
+    phase: jnp.ndarray,
     Mp_mean: float,
     Mp_std: float,
     Rstar_mean: float,
@@ -90,15 +91,16 @@ def run_svi(
     svi_result = svi.run(
         rng_key,
         num_steps,
-        rp_mean=rp_mean,
-        rp_std=rp_std,
+        data=data,
+        sigma=sigma,
+        phase=phase,
     )
 
     params = svi_result.params
     losses = svi_result.losses
 
     svi_median = guide[-1].median(params)
-    svi_median.update({"Mp": Mp_mean, "Rs": Rstar_mean})
+    svi_median.update({"Mp": Mp_mean, "Rstar": Rstar_mean})
     init_strategy = init_to_value(values=svi_median)
 
     save_svi_outputs(params, losses, svi_median, output_dir)
@@ -109,8 +111,9 @@ def run_svi(
 def run_mcmc(
     model_c: Callable,
     rng_key: jax.Array,
-    rp_mean: jnp.ndarray,
-    rp_std: jnp.ndarray,
+    data: jnp.ndarray,
+    sigma: jnp.ndarray,
+    phase: jnp.ndarray,
     init_strategy: Callable,
     output_dir: str,
     num_warmup: int = 1000,
@@ -126,7 +129,7 @@ def run_mcmc(
     )
 
     mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, num_chains=num_chains)
-    mcmc.run(rng_key, rp_mean=rp_mean, rp_std=rp_std)
+    mcmc.run(rng_key, data=data, sigma=sigma, phase=phase)
 
     mcmc.print_summary()
     with open(os.path.join(output_dir, "mcmc_summary.txt"), "w") as f:
@@ -143,13 +146,15 @@ def generate_predictions(
     model_c: Callable,
     rng_key: jax.Array,
     posterior_sample: dict,
-    rp_std: jnp.ndarray,
+    data: jnp.ndarray,
+    sigma: jnp.ndarray,
+    phase: jnp.ndarray,
     output_dir: str,
 ) -> dict:
     """Generate predictive spectrum from posterior samples."""
-    pred = Predictive(model_c, posterior_sample, return_sites=["rp"])
-    predictions = pred(rng_key, rp_mean=None, rp_std=rp_std)
+    pred = Predictive(model_c, posterior_sample, return_sites=["Rp"])
+    predictions = pred(rng_key, data=data, sigma=sigma, phase=phase)
 
-    jnp.save(os.path.join(output_dir, "rp_pred"), predictions["rp"])
+    jnp.save(os.path.join(output_dir, "rp_pred"), predictions["Rp"])
 
     return predictions

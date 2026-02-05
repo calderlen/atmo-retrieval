@@ -1,6 +1,7 @@
 """Orchestrates high-resolution spectroscopic retrieval pipeline."""
 
 import jax
+from pathlib import Path
 from jax import random
 import jax.numpy as jnp
 import numpy as np
@@ -21,7 +22,7 @@ from plotting.plot import (
 )
 
 
-def load_timeseries_data(data_dir: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load time-series spectroscopic data.
 
     Expected files in data_dir:
@@ -35,13 +36,49 @@ def load_timeseries_data(data_dir: str) -> tuple[np.ndarray, np.ndarray, np.ndar
     """
     from pathlib import Path
     data_dir = Path(data_dir)
-    
+
+    required = ["wavelength.npy", "data.npy", "sigma.npy", "phase.npy"]
+    missing = [name for name in required if not (data_dir / name).exists()]
+    if missing:
+        missing_fmt = ", ".join(missing)
+        raise FileNotFoundError(
+            f"Missing time-series files in {data_dir}: {missing_fmt}"
+        )
+
     wavelength = np.load(data_dir / "wavelength.npy")
     data = np.load(data_dir / "data.npy")
     sigma = np.load(data_dir / "sigma.npy")
     phase = np.load(data_dir / "phase.npy")
     
     return wavelength, data, sigma, phase
+
+
+def _normalize_phase(phase: np.ndarray) -> np.ndarray:
+    """Validate and normalize phase so mid-transit is near 0.0."""
+    phase = np.asarray(phase)
+    if phase.size == 0:
+        return phase
+
+    phase_min = float(np.nanmin(phase))
+    phase_max = float(np.nanmax(phase))
+    median = float(np.nanmedian(phase))
+
+    if 0.0 <= phase_min and phase_max <= 1.0 and abs(median - 0.5) < 0.2:
+        print("  Phase appears centered on 0.5; shifting to mid-transit at 0.0")
+        phase = phase - 0.5
+
+    if phase_min < -0.5 or phase_max > 0.5:
+        phase = (phase + 0.5) % 1.0 - 0.5
+
+    phase_min = float(np.nanmin(phase))
+    phase_max = float(np.nanmax(phase))
+    if phase_min < -0.5 or phase_max > 0.5:
+        raise ValueError(
+            "Phase values must fall in [-0.5, 0.5] after normalization. "
+            f"Got range {phase_min:.4f} .. {phase_max:.4f}."
+        )
+
+    return phase
 
 
 def _format_range(arr: np.ndarray) -> str:
@@ -208,6 +245,8 @@ def _report_cia_coverage(cia_paths: dict[str, str], nu_grid: np.ndarray) -> None
 def run_retrieval(
     mode: str = "transmission",
     epoch: str | None = None,
+    data_dir: str | Path | None = None,
+    data_format: str = "auto",
     skip_svi: bool = False,
     svi_only: bool = False,
     no_plots: bool = False,
@@ -216,12 +255,18 @@ def run_retrieval(
     check_aliasing: bool = False,
     compute_contribution: bool = True,
     seed: int = 42,
+    wav_obs: np.ndarray | None = None,
+    data: np.ndarray | None = None,
+    sigma: np.ndarray | None = None,
+    phase: np.ndarray | None = None,
 ) -> None:
     """Run atmospheric retrieval.
 
     Args:
         mode: "transmission" or "emission"
         epoch: Observation epoch (YYYYMMDD) for multi-epoch data
+        data_dir: Optional override for data directory
+        data_format: "auto", "timeseries", or "spectrum"
         skip_svi: Skip SVI warm-up, go straight to MCMC
         svi_only: Run only SVI, skip MCMC
         no_plots: Skip diagnostic plots
@@ -235,6 +280,10 @@ def run_retrieval(
         check_aliasing: Run species aliasing diagnostics before retrieval
         compute_contribution: Compute and plot contribution function after MCMC
         seed: Random seed
+        wav_obs: Optional wavelength array for pre-loaded data
+        data: Optional pre-loaded data array
+        sigma: Optional pre-loaded uncertainty array
+        phase: Optional pre-loaded phase array
     """
     # Create timestamped output directory
     base_dir = config.DIR_SAVE or config.get_output_dir()
@@ -258,28 +307,69 @@ def run_retrieval(
     print("\n[1/7] Loading time-series data...")
     if epoch:
         print(f"  Using epoch: {epoch}")
-    data_paths = (
-        config.get_transmission_paths(epoch=epoch) if mode == "transmission"
-        else config.get_emission_paths(epoch=epoch)
-    )
-
-    try:
-        data_dir = config.get_data_dir(epoch=epoch)
-        wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
-        print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
+    if any(val is not None for val in (wav_obs, data, sigma, phase)):
+        if any(val is None for val in (wav_obs, data, sigma, phase)):
+            raise ValueError("Must provide wav_obs, data, sigma, and phase together.")
+        phase = _normalize_phase(phase)
+        print(f"  Using provided data: {data.shape[0]} exposures x {data.shape[1]} wavelengths")
         print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
-    except FileNotFoundError:
-        print("  Warning: time-series not found, loading single spectrum...")
-        wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
-            data_paths["wavelength"],
-            data_paths["spectrum"],
-            data_paths["uncertainty"],
-        )
-        # Create mock time-series (single exposure at phase=0.5)
-        data = spectrum[np.newaxis, :]
-        sigma = uncertainty[np.newaxis, :]
-        phase = np.array([0.5])
-        print(f"  Loaded single spectrum with {len(wav_obs)} points")
+    else:
+        if data_format not in {"auto", "timeseries", "spectrum"}:
+            raise ValueError(f"Unknown data_format: {data_format}")
+
+        resolved_data_dir = Path(data_dir) if data_dir is not None else config.get_data_dir(epoch=epoch)
+
+        if data_dir is not None:
+            suffix = "transmission" if mode == "transmission" else "emission"
+            data_paths = {
+                "wavelength": Path(data_dir) / f"wavelength_{suffix}.npy",
+                "spectrum": Path(data_dir) / f"spectrum_{suffix}.npy",
+                "uncertainty": Path(data_dir) / f"uncertainty_{suffix}.npy",
+            }
+        else:
+            data_paths = (
+                config.get_transmission_paths(epoch=epoch) if mode == "transmission"
+                else config.get_emission_paths(epoch=epoch)
+            )
+
+        if data_format == "timeseries":
+            wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
+            phase = _normalize_phase(phase)
+            print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
+            print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
+        elif data_format == "spectrum":
+            wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
+                str(data_paths["wavelength"]),
+                str(data_paths["spectrum"]),
+                str(data_paths["uncertainty"]),
+            )
+            data = spectrum[np.newaxis, :]
+            sigma = uncertainty[np.newaxis, :]
+            phase = np.array([0.0])
+            print(f"  Loaded single spectrum with {len(wav_obs)} points")
+        else:
+            try:
+                wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
+                phase = _normalize_phase(phase)
+                print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
+                print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
+            except FileNotFoundError as exc:
+                print("  Warning: time-series not found, loading single spectrum...")
+                try:
+                    wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
+                        str(data_paths["wavelength"]),
+                        str(data_paths["spectrum"]),
+                        str(data_paths["uncertainty"]),
+                    )
+                except FileNotFoundError:
+                    raise FileNotFoundError(
+                        "Could not find time-series or spectrum files. "
+                        f"Time-series error: {exc}"
+                    ) from exc
+                data = spectrum[np.newaxis, :]
+                sigma = uncertainty[np.newaxis, :]
+                phase = np.array([0.0])
+                print(f"  Loaded single spectrum with {len(wav_obs)} points")
     
     print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
 
@@ -448,26 +538,67 @@ def run_retrieval(
     print("\n[7/7] Running Bayesian inference...")
     rng_key = random.PRNGKey(seed)
 
+    if svi_only and skip_svi:
+        raise ValueError("Cannot set svi_only=True when skip_svi=True")
+
+    from numpyro.infer import MCMC, NUTS, init_to_median
+
+    init_strategy = init_to_median(num_samples=100)
     if not skip_svi:
         print(f"  SVI warm-up: {config.SVI_NUM_STEPS} steps, LR={config.SVI_LEARNING_RATE}")
+        rng_key, rng_key_ = random.split(rng_key)
+        _, _, init_strategy, _, _ = run_svi(
+            model_c,
+            rng_key_,
+            data=data_jnp,
+            sigma=sigma_jnp,
+            phase=phase_jnp,
+            Mp_mean=model_params["M_p"],
+            Mp_std=model_params["M_p_err"],
+            Rstar_mean=model_params["R_star"],
+            Rstar_std=model_params["R_star_err"],
+            output_dir=str(output_dir),
+            num_steps=config.SVI_NUM_STEPS,
+            lr=config.SVI_LEARNING_RATE,
+        )
+
+        if svi_only:
+            print("  SVI complete (svi_only=True); skipping MCMC.")
+            return
 
     # Run MCMC directly
     print(f"\n  Running HMC-NUTS sampling...")
     print(f"  Warmup: {config.MCMC_NUM_WARMUP}, Samples: {config.MCMC_NUM_SAMPLES}")
     print(f"  Chains: {config.MCMC_NUM_CHAINS}")
-    
-    from numpyro.infer import MCMC, NUTS
-    
-    kernel = NUTS(model_c, max_tree_depth=config.MCMC_MAX_TREE_DEPTH)
+
+    # Use median initialization or SVI-derived init values
+    kernel = NUTS(
+        model_c,
+        max_tree_depth=config.MCMC_MAX_TREE_DEPTH,
+        init_strategy=init_strategy,
+    )
     mcmc = MCMC(
-        kernel, 
-        num_warmup=config.MCMC_NUM_WARMUP, 
-        num_samples=config.MCMC_NUM_SAMPLES, 
+        kernel,
+        num_warmup=config.MCMC_NUM_WARMUP,
+        num_samples=config.MCMC_NUM_SAMPLES,
         num_chains=config.MCMC_NUM_CHAINS
     )
-    
+
     rng_key, rng_key_ = random.split(rng_key)
-    mcmc.run(rng_key_, data=data_jnp, sigma=sigma_jnp, phase=phase_jnp)
+    try:
+        mcmc.run(rng_key_, data=data_jnp, sigma=sigma_jnp, phase=phase_jnp)
+    except RuntimeError as e:
+        if "Cannot find valid initial parameters" in str(e):
+            print("\n  ERROR: Cannot initialize sampler. Possible causes:")
+            print("  - Model produces NaN/inf for all parameter combinations tried")
+            print("  - Priors are incompatible with data (wrong wavelength range, molecules, etc.)")
+            print("  - Forward model has numerical issues")
+            print("\n  Try:")
+            print("  1. Check that opacity files cover your wavelength range")
+            print("  2. Verify Kp/Vsys priors overlap with expected signal")
+            print("  3. Check temperature priors are reasonable")
+            print("  4. Run with fewer wavelength chunks or smaller wavelength range")
+        raise
     
     mcmc.print_summary()
     

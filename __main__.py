@@ -53,6 +53,13 @@ def create_parser():
     data_group = parser.add_argument_group("Data")
     data_group.add_argument("--epoch", type=str, required=True, help="Observation epoch (YYYYMMDD) (required)")
     data_group.add_argument("--data-dir", type=str, default=None, help="Override data directory path")
+    data_group.add_argument(
+        "--data-format",
+        type=str,
+        choices=["auto", "timeseries", "spectrum"],
+        default="auto",
+        help="Data format to load (default: auto)",
+    )
     data_group.add_argument("--wavelength-range", type=str, choices=["blue", "green", "red", "full"], default=None, help="Wavelength range mode (default: from config)")
 
     # Inference parameters
@@ -341,6 +348,17 @@ def load_custom_config(config_path):
     return custom_config
 
 
+def apply_custom_config(custom_config):
+    """Overlay custom config values onto the base config module."""
+    import config as base_config
+
+    for name in dir(custom_config):
+        if name.isupper():
+            setattr(base_config, name, getattr(custom_config, name))
+
+    return base_config
+
+
 def apply_cli_overrides(args):
     """Apply command-line argument overrides to config."""
     import config
@@ -596,7 +614,8 @@ def main():
     # Load config
     if args.config:
         logger.info(f"Loading custom config: {args.config}")
-        config = load_custom_config(args.config)
+        custom_config = load_custom_config(args.config)
+        config = apply_custom_config(custom_config)
     else:
         import config
 
@@ -676,6 +695,10 @@ def main():
             logger.info("Starting phase-binned retrieval (all bins)...")
             run_phase_binned_retrieval(
                 phase_bins=["T12", "T23", "T34"],
+                mode=args.mode,
+                epoch=args.epoch,
+                data_dir=args.data_dir,
+                data_format=args.data_format,
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
@@ -691,6 +714,10 @@ def main():
             logger.info(f"Starting retrieval for phase bin: {args.phase_bin}...")
             run_phase_binned_retrieval(
                 phase_bins=[args.phase_bin],
+                mode=args.mode,
+                epoch=args.epoch,
+                data_dir=args.data_dir,
+                data_format=args.data_format,
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
@@ -707,6 +734,8 @@ def main():
             run_retrieval(
                 mode="transmission",
                 epoch=args.epoch,
+                data_dir=args.data_dir,
+                data_format=args.data_format,
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
@@ -723,6 +752,8 @@ def main():
             run_retrieval(
                 mode="emission",
                 epoch=args.epoch,
+                data_dir=args.data_dir,
+                data_format=args.data_format,
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,

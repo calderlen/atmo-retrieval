@@ -83,7 +83,9 @@ def _patch_radis_dbmanager():
         return
 
     def _init(self, name, molecule, local_databases, *args, **kwargs):
-        return orig_init(self, name, molecule, str(local_databases), *args, **kwargs)
+        base_dir = pathlib.Path(local_databases).expanduser().resolve()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return orig_init(self, name, molecule, str(base_dir), *args, **kwargs)
 
     _init._path_patched = True
     radis_dbmanager.DatabaseManager.__init__ = _init
@@ -158,7 +160,16 @@ def _patch_radis_download():
                 temp_file_name = urlname.split("/")[-1]
                 temp_file_name = re.sub(r'[<>:\"/\\\\|?*&=]', "_", temp_file_name)
                 # Save downloads to the database directory, not project root
-                temp_file_path = str(self.local_databases / temp_file_name)
+                base_dir = pathlib.Path(self.local_databases).expanduser().resolve()
+                base_dir.mkdir(parents=True, exist_ok=True)
+                target_path = base_dir / temp_file_name
+                legacy_path = pathlib.Path(temp_file_name).resolve()
+                if legacy_path.exists() and not target_path.exists():
+                    try:
+                        legacy_path.rename(target_path)
+                    except Exception:
+                        pass
+                temp_file_path = str(target_path)
 
                 with open(temp_file_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
@@ -349,11 +360,16 @@ def load_or_build_opacity(
     load_only: bool = False,
 ) -> tuple[OpaPremodit | None, float | None]:
     """Load saved opacity or build from database snapshot."""
-    path = str(path)
+    path = str(pathlib.Path(path).expanduser().resolve())
+    pathlib.Path(path).mkdir(parents=True, exist_ok=True)
     cutwing_val = _resolve_cutwing(ndiv, cutwing)
     if opa_load:
         try:
             opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
+            legacy_opa_path = PROJECT_ROOT / f"opa_{mol}.zarr"
+            if legacy_opa_path.exists() and not opa_path.exists():
+                opa_path.parent.mkdir(parents=True, exist_ok=True)
+                legacy_opa_path.rename(opa_path)
             opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
             if not _opa_grid_matches(opa, nu_grid):
                 raise ValueError("Cached opacity grid mismatch.")

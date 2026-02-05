@@ -76,44 +76,13 @@ for dir in "$DATA_DIR"/????????_*; do
   planet=${base#*_}
 
   for arm in "${arms_list[@]}"; do
-    cmd=(python preprocess.py --epoch "$epoch" --planet "$planet" --arm "$arm" --data-dir "$DATA_DIR" --bin-size "$BIN_SIZE")
+    cmd=(python -m dataio.make_transmission --epoch "$epoch" --planet "$planet" --arm "$arm" --data-dir "$DATA_DIR" --bin-size "$BIN_SIZE")
 
     if [[ "$BARYCORR" -eq 1 ]]; then
       cmd+=(--barycorr)
     fi
     if [[ "$INTRODUCED_SHIFT" -eq 0 ]]; then
       cmd+=(--no-introduced-shift)
-    fi
-
-    if [[ "$CALC_TRANSMISSION" -eq 1 ]]; then
-      params=$(python - <<'PY' "$planet"
-import sys
-from config import PLANETS, EPHEMERIS, get_params
-
-planet = sys.argv[1]
-if planet not in PLANETS:
-    sys.exit(2)
-if EPHEMERIS in PLANETS[planet]:
-    eph = EPHEMERIS
-else:
-    eph = list(PLANETS[planet].keys())[0]
-params = get_params(planet, eph)
-
-def nom(v):
-    try:
-        return float(v.n)
-    except AttributeError:
-        return float(v)
-
-print(f"{nom(params['epoch'])}|{nom(params['period'])}|{nom(params['duration'])}|{params['RA']}|{params['Dec']}")
-PY
-      ) || {
-        echo "Skipping $epoch $planet $arm: no ephemeris in config"
-        continue
-      }
-
-      IFS='|' read -r t0 period duration ra dec <<< "$params"
-      cmd+=(--calculate-transmission --t0 "$t0" --period "$period" --duration "$duration" --ra "$ra" "--dec=$dec")
     fi
 
     echo "Running: ${cmd[*]}"

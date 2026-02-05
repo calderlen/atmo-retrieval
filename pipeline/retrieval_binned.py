@@ -16,17 +16,22 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 
+import config
 from config.planets_config import PHASE_BINS, get_params
-from dataio.make_transmission import filter_data_by_phase, get_phase_boundaries, summarize_phase_coverage
+from dataio.make_transmission import filter_data_by_phase, summarize_phase_coverage
+from pipeline.retrieval import load_timeseries_data, run_retrieval, _normalize_phase
 
 
 def run_phase_binned_retrieval(
     phase_bins: list[str] = ["T12", "T23", "T34"],
     base_output_dir: str = "output/phase_binned",
+    mode: str = "transmission",
+    epoch: str | None = None,
+    data_dir: str | Path | None = None,
+    data_format: str = "auto",
     **retrieval_kwargs,
 ) -> dict[str, dict]:
     """Run separate retrievals for each phase bin.
@@ -38,20 +43,30 @@ def run_phase_binned_retrieval(
     Args:
         phase_bins: List of phase bins to analyze ("T12", "T23", "T34")
         base_output_dir: Base directory for output (bins stored in subdirs)
-        **retrieval_kwargs: Additional arguments passed to run_transmission_retrieval
-            - data, sigma, phase: Required time-series data
+        **retrieval_kwargs: Additional arguments passed to run_retrieval
             - params: Planet parameters dict
             - Other retrieval configuration options
             
     Returns:
         Dict mapping bin_name -> retrieval results (posteriors, summary, etc.)
     """
-    from pipeline.retrieval import run_transmission_retrieval
-    
-    # Extract required data
-    data = retrieval_kwargs.pop("data")
-    sigma = retrieval_kwargs.pop("sigma")
-    phase = retrieval_kwargs.pop("phase")
+    if mode != "transmission":
+        raise ValueError("Phase-binned retrieval is only supported for transmission mode.")
+
+    if data_format == "spectrum":
+        raise ValueError("Phase-binned retrieval requires time-series data.")
+
+    resolved_data_dir = Path(data_dir) if data_dir is not None else config.get_data_dir(epoch=epoch)
+
+    try:
+        wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            "Phase-binned retrieval requires time-series files (wavelength.npy, data.npy, sigma.npy, phase.npy). "
+            f"Missing in {resolved_data_dir}."
+        ) from exc
+
+    phase = _normalize_phase(phase)
     params = retrieval_kwargs.get("params", get_params())
     
     # Validate phase bins
@@ -102,15 +117,19 @@ def run_phase_binned_retrieval(
         os.makedirs(bin_output_dir, exist_ok=True)
         
         # Run retrieval
+        previous_dir = config.DIR_SAVE
         try:
-            result = run_transmission_retrieval(
+            config.DIR_SAVE = str(bin_output_dir)
+            run_retrieval(
+                mode=mode,
+                epoch=epoch,
+                wav_obs=wav_obs,
                 data=data_bin,
                 sigma=sigma_bin,
                 phase=phase_bin,
-                output_dir=bin_output_dir,
                 **retrieval_kwargs,
             )
-            results[bin_name] = result
+            results[bin_name] = {"output_dir": str(bin_output_dir)}
             
             # Save bin-specific info
             np.savez(
@@ -125,9 +144,14 @@ def run_phase_binned_retrieval(
         except Exception as e:
             print(f"ERROR in {bin_name} retrieval: {e}")
             results[bin_name] = {"error": str(e)}
+        finally:
+            config.DIR_SAVE = previous_dir
     
     # Generate comparison if we have multiple successful retrievals
-    successful_bins = [b for b, r in results.items() if r is not None and "error" not in r]
+    successful_bins = [
+        b for b, r in results.items()
+        if isinstance(r, dict) and "samples" in r and "error" not in r
+    ]
     
     if len(successful_bins) >= 2:
         comparison_dir = os.path.join(base_output_dir, "comparison")
