@@ -12,55 +12,6 @@ from exojax.database import molinfo
 from config import chemistry_config as chem_config
 
 
-SOLAR_ABUNDANCES = {
-    "H2O": 5.4e-4,
-    "CO": 6.0e-4,
-    "CO2": 1.0e-7,
-    "CH4": 3.5e-4,
-    "NH3": 8.0e-5,
-    "H2S": 1.5e-5,
-    "HCN": 1.0e-7,
-    "C2H2": 1.0e-8,
-    "PH3": 3.0e-7,
-    "TiO": 1.0e-7,
-    "VO": 1.0e-8,
-    "FeH": 1.0e-8,
-    "SiO": 3.5e-5,
-    "Fe": 3.16e-5,
-    "Fe I": 3.16e-5,
-    "Fe II": 3.16e-6,
-    "Na": 2.14e-6,
-    "Na I": 2.14e-6,
-    "K": 1.35e-7,
-    "K I": 1.35e-7,
-    "Ca": 2.19e-6,
-    "Ca I": 2.19e-6,
-    "Ca II": 2.19e-6,
-    "Mg": 3.98e-5,
-    "Mg I": 3.98e-5,
-    "Ti": 8.91e-8,
-    "Ti I": 8.91e-8,
-    "Ti II": 8.91e-8,
-    "V": 1.00e-8,
-    "V I": 1.00e-8,
-    "Cr": 4.68e-7,
-    "Cr I": 4.68e-7,
-    "Mn": 3.47e-7,
-    "Mn I": 3.47e-7,
-    "Ni": 1.78e-6,
-    "Ni I": 1.78e-6,
-    "Si": 3.24e-5,
-    "Si I": 3.24e-5,
-    "Al": 2.82e-6,
-    "Al I": 2.82e-6,
-    "Li": 1.0e-9,
-    "Li I": 1.0e-9,
-    "C": 2.69e-4,
-    "O": 4.90e-4,
-    "N": 6.76e-5,
-}
-
-
 class CompositionState(NamedTuple):
 
     vmr_mols: list[jnp.ndarray]  # Scalar VMR per molecule
@@ -232,8 +183,6 @@ SOLAR_ABUNDANCES = {
     "N": 6.76e-5,    # log eps = 7.83 (total nitrogen)
 }
 
-SOLAR_C_O = 0.55
-
 _ELEMENT_RE = re.compile(r"([A-Z][a-z]?)(\d*)")
 
 
@@ -374,17 +323,53 @@ class FreeVMR:
 
 
 class EquilibriumChemistry(CompositionSolver):
+    """Simple equilibrium-like chemistry with [M/H] and C/O as free parameters."""
+
     def __init__(
         self,
         metallicity_range: tuple[float, float] = chem_config.METALLICITY_RANGE,
         co_ratio_range: tuple[float, float] = chem_config.CO_RATIO_RANGE,
         h2_he_ratio: float = chem_config.H2_HE_RATIO,
-        trace_cap: float = 0.5,
     ):
         self.metallicity_range = metallicity_range
         self.co_ratio_range = co_ratio_range
         self.h2_he_ratio = h2_he_ratio
-        self.trace_cap = trace_cap
+        self._c_solar = SOLAR_ABUNDANCES["C"]
+        self._o_solar = SOLAR_ABUNDANCES["O"]
+
+    def _co_scales(self, co_ratio: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        total_co = self._c_solar + self._o_solar
+        c_target = total_co * (co_ratio / (1.0 + co_ratio))
+        o_target = total_co * (1.0 / (1.0 + co_ratio))
+        c_scale = c_target / self._c_solar
+        o_scale = o_target / self._o_solar
+        return c_scale, o_scale
+
+    def _co_factor(
+        self,
+        n_c: int,
+        n_o: int,
+        c_scale: jnp.ndarray,
+        o_scale: jnp.ndarray,
+    ) -> jnp.ndarray:
+        if n_c == 0 and n_o == 0:
+            return jnp.array(1.0)
+        if n_c > 0 and n_o > 0:
+            return jnp.minimum(c_scale, o_scale)
+        if n_c > 0:
+            return c_scale
+        return o_scale
+
+    def _vmr_scalar(
+        self,
+        species: str,
+        metallicity: jnp.ndarray,
+        c_scale: jnp.ndarray,
+        o_scale: jnp.ndarray,
+    ) -> jnp.ndarray:
+        solar = SOLAR_ABUNDANCES.get(species, 1e-10)
+        n_c, n_o = _count_co(species)
+        return solar * metallicity * self._co_factor(n_c, n_o, c_scale, o_scale)
 
     def sample(
         self,
@@ -404,61 +389,38 @@ class EquilibriumChemistry(CompositionSolver):
         )
 
         metallicity = jnp.power(10.0, log_metallicity)
-        o_total = 4.90e-4 * metallicity
-        c_total = co_ratio * o_total
+        c_scale, o_scale = self._co_scales(co_ratio)
 
-        vmr_mols_scalar = []
-        for mol in mol_names:
-            mol_upper = mol.upper()
-            if mol_upper == "H2O":
-                vmr = jnp.where(co_ratio < 1.0, o_total - c_total, o_total * 0.01)
-            elif mol_upper == "CO":
-                vmr = jnp.minimum(c_total, o_total)
-            elif mol_upper == "CO2":
-                excess_o = jnp.maximum(o_total - c_total, 0.0)
-                vmr = excess_o * 0.01
-            elif mol_upper == "CH4":
-                vmr = jnp.where(co_ratio > 1.0, c_total - o_total, c_total * 0.001)
-            elif mol_upper == "HCN":
-                vmr = jnp.where(co_ratio > 1.0, c_total * 0.01, c_total * 1e-4)
-            elif mol_upper == "C2H2":
-                vmr = jnp.where(co_ratio > 1.5, c_total * 0.01, c_total * 1e-5)
-            elif mol_upper == "NH3":
-                n_total = 6.76e-5 * metallicity
-                vmr = n_total * 0.1
-            elif mol_upper == "H2S":
-                s_total = 1.5e-5 * metallicity
-                vmr = s_total
-            elif mol_upper in ("TIO", "TIOXIDE"):
-                vmr = 8.91e-8 * metallicity
-            elif mol_upper in ("VO", "VANADIUMOXIDE"):
-                vmr = 1.0e-8 * metallicity
-            elif mol_upper == "SIO":
-                vmr = 3.24e-5 * metallicity * 0.1
-            elif mol_upper == "FEH":
-                vmr = 3.16e-5 * metallicity * 0.01
-            else:
-                solar = SOLAR_ABUNDANCES.get(mol, 1e-10)
-                vmr = solar * metallicity
-            vmr_mols_scalar.append(vmr)
+        species = list(mol_names) + list(atom_names)
+        n_mols = len(mol_names)
+        n_atoms = len(atom_names)
+        n_species = len(species)
 
-        vmr_atoms_scalar = []
-        for atom in atom_names:
-            solar = SOLAR_ABUNDANCES.get(atom, 1e-10)
-            vmr_atoms_scalar.append(solar * metallicity)
+        if n_species > 0:
+            solar_arr = jnp.array([SOLAR_ABUNDANCES.get(s, 1e-10) for s in species])
+            counts = [_count_co(s) for s in species]
+            n_c = jnp.array([c[0] for c in counts], dtype=solar_arr.dtype)
+            n_o = jnp.array([c[1] for c in counts], dtype=solar_arr.dtype)
 
-        n_mols = len(vmr_mols_scalar)
-        n_atoms = len(vmr_atoms_scalar)
+            co_factor = jnp.where((n_c > 0) & (n_o > 0), jnp.minimum(c_scale, o_scale), 1.0)
+            co_factor = jnp.where((n_c > 0) & (n_o == 0), c_scale, co_factor)
+            co_factor = jnp.where((n_o > 0) & (n_c == 0), o_scale, co_factor)
 
-        if n_mols + n_atoms > 0:
-            vmr_trace_arr = jnp.array(vmr_mols_scalar + vmr_atoms_scalar)
+            vmr_trace_arr = solar_arr * metallicity * co_factor
             sum_trace = jnp.sum(vmr_trace_arr)
-            scale = jnp.where(sum_trace > self.trace_cap, self.trace_cap / sum_trace, 1.0)
+            scale = jnp.where(sum_trace > 1.0, (1.0 - 1e-12) / sum_trace, 1.0)
             vmr_trace_arr = vmr_trace_arr * scale
-            vmr_mols_scalar = [vmr_trace_arr[i] for i in range(n_mols)]
-            vmr_atoms_scalar = [vmr_trace_arr[n_mols + i] for i in range(n_atoms)]
+
+            vmr_mols_arr = vmr_trace_arr[:n_mols]
+            vmr_atoms_arr = vmr_trace_arr[n_mols:]
+            vmr_mols_scalar = [vmr_mols_arr[i] for i in range(n_mols)]
+            vmr_atoms_scalar = [vmr_atoms_arr[i] for i in range(n_atoms)]
             vmr_trace_tot = jnp.sum(vmr_trace_arr)
         else:
+            vmr_mols_arr = jnp.zeros((0,))
+            vmr_atoms_arr = jnp.zeros((0,))
+            vmr_mols_scalar = []
+            vmr_atoms_scalar = []
             vmr_trace_tot = jnp.array(0.0)
 
         h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
@@ -466,29 +428,35 @@ class EquilibriumChemistry(CompositionSolver):
         vmrH2 = (1.0 - vmr_trace_tot) * h2_frac
         vmrHe = (1.0 - vmr_trace_tot) * he_frac
 
+        mol_masses_arr = jnp.array(mol_masses)
+        atom_masses_arr = jnp.array(atom_masses)
+
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
         mmw = mass_H2 * vmrH2 + mass_He * vmrHe
-        mmw = mmw + sum(m * v for m, v in zip(mol_masses, vmr_mols_scalar))
-        mmw = mmw + sum(m * v for m, v in zip(atom_masses, vmr_atoms_scalar))
+        if n_mols > 0:
+            mmw = mmw + jnp.sum(mol_masses_arr * vmr_mols_arr)
+        if n_atoms > 0:
+            mmw = mmw + jnp.sum(atom_masses_arr * vmr_atoms_arr)
 
-        mmr_mols = (
-            jnp.array([
-                art.constant_mmr_profile(vmr * (mass / mmw))
-                for vmr, mass in zip(vmr_mols_scalar, mol_masses)
-            ]) if n_mols > 0 else jnp.zeros((0, art.pressure.size))
-        )
+        ones_prof = art.constant_mmr_profile(1.0)
+        vmrH2_prof = vmrH2 * ones_prof
+        vmrHe_prof = vmrHe * ones_prof
+        mmw_prof = mmw * ones_prof
 
-        mmr_atoms = (
-            jnp.array([
-                art.constant_mmr_profile(vmr * (mass / mmw))
-                for vmr, mass in zip(vmr_atoms_scalar, atom_masses)
-            ]) if n_atoms > 0 else jnp.zeros((0, art.pressure.size))
-        )
+        if n_mols > 0:
+            mmr_mols = (
+                (vmr_mols_arr * (mol_masses_arr / mmw))[:, None] * ones_prof[None, :]
+            )
+        else:
+            mmr_mols = jnp.zeros((0, art.pressure.size))
 
-        vmrH2_prof = art.constant_mmr_profile(vmrH2)
-        vmrHe_prof = art.constant_mmr_profile(vmrHe)
-        mmw_prof = art.constant_mmr_profile(mmw)
+        if n_atoms > 0:
+            mmr_atoms = (
+                (vmr_atoms_arr * (atom_masses_arr / mmw))[:, None] * ones_prof[None, :]
+            )
+        else:
+            mmr_atoms = jnp.zeros((0, art.pressure.size))
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
