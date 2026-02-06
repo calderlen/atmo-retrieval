@@ -207,8 +207,8 @@ def create_parser():
     diag_group.add_argument(
         "--nfree",
         type=int,
-        default=config.DEFAULT_PROFILE_NFREE,
-        help=f"Number of free parameters for memory estimation (default: {config.DEFAULT_PROFILE_NFREE})"
+        default=10,
+        help="Number of free parameters for memory estimation (default: 10)"
     )
     diag_group.add_argument(
         "--sweep-nfree",
@@ -238,8 +238,8 @@ def create_parser():
         "--sweep-wrange-mode",
         type=str,
         choices=["fixed_n", "fixed_res"],
-        default=config.DEFAULT_SWEEP_WRANGE_MODE,
-        help=f"How to sweep wavelength range (default: {config.DEFAULT_SWEEP_WRANGE_MODE})"
+        default="fixed_res",
+        help="How to sweep wavelength range (default: fixed_res)"
     )
     diag_group.add_argument(
         "--sweep-hard-fail",
@@ -297,8 +297,8 @@ def create_parser():
     exec_group.add_argument(
         "--seed",
         type=int,
-        default=config.DEFAULT_SEED,
-        help=f"Random seed (default: {config.DEFAULT_SEED})"
+        default=42,
+        help="Random seed (default: 42)"
     )
     exec_group.add_argument(
         "--no-preallocate",

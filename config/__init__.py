@@ -140,10 +140,15 @@ from .inference_config import (
     QUICK_MCMC_CHAINS,
 )
 
-from .cli_config import (
-    DEFAULT_SEED,
-    DEFAULT_PROFILE_NFREE,
-    DEFAULT_SWEEP_WRANGE_MODE,
+from .chemistry_config import (
+    LOG_VMR_MIN,
+    LOG_VMR_MAX,
+    H2_HE_RATIO,
+    N_VMR_NODES,
+    METALLICITY_RANGE,
+    CO_RATIO_RANGE,
+    LOG_KZZ_RANGE,
+    LOG_QUENCH_P_RANGE,
 )
 
 from .data_config import (
