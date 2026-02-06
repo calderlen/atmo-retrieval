@@ -42,11 +42,28 @@ CIA_PATHS = {
 MOLPATH_HITEMP = {
     "H2O": DB_HITEMP / "H2O",
     "CO": DB_HITEMP / "CO",
+    "CO2": DB_HITEMP / "CO2",
     "OH": DB_HITEMP / "OH",
+    "NO": DB_HITEMP / "NO",
 }
 
 # Molecular line lists (ExoMol)
 MOLPATH_EXOMOL = {
+    "CH4": DB_EXOMOL / "CH4/12C-1H4/10to10",
+    "NH3": DB_EXOMOL / "NH3/14N-1H3/CoYuTe",
+    "HCN": DB_EXOMOL / "HCN/1H-12C-14N/Harris",
+    "C2H2": DB_EXOMOL / "C2H2/12C2-1H2/aCeTY",
+    "C2H4": DB_EXOMOL / "C2H4/12C2-1H4/MaYTY",
+    "H2S": DB_EXOMOL / "H2S/1H2-32S/AYT2",
+    "SO": DB_EXOMOL / "SO/32S-16O/ExoMol",
+    "SO2": DB_EXOMOL / "SO2/32S-16O2/ExoAmes",
+    "SiO": DB_EXOMOL / "SiO/28Si-16O/SiOUVenIR",
+    "TiH": DB_EXOMOL / "TiH/48Ti-1H/TiH",
+    "MgH": DB_EXOMOL / "MgH/24Mg-1H/MgH",
+    "AlH": DB_EXOMOL / "AlH/27Al-1H/AlH",
+    "SiH": DB_EXOMOL / "SiH/28Si-1H/SiH",
+    "NaH": DB_EXOMOL / "NaH/23Na-1H/NaH",
+    "KH": DB_EXOMOL / "KH/39K-1H/KH",
     "TiO": DB_EXOMOL / "TiO/48Ti-16O/Toto",
     "VO": DB_EXOMOL / "VO/51V-16O/VOMYT",
     "FeH": DB_EXOMOL / "FeH/56Fe-1H/MoLLIST",
@@ -171,6 +188,10 @@ def get_output_dir(
     mode = mode or RETRIEVAL_MODE
 
     return PROJECT_ROOT / "output" / planet.lower().replace("-", "") / ephemeris / mode
+
+
+# Default output directory for phase-binned runs
+DEFAULT_PHASE_BINNED_OUTPUT_DIR = PROJECT_ROOT / "output" / "phase_binned"
 
 
 def create_timestamped_dir(base_dir: str | Path) -> Path:

@@ -8,6 +8,10 @@ from math import nan
 PLANET = "KELT-20b"
 EPHEMERIS = "Duck24"
 
+# Fallback defaults for Doppler shadow utilities
+DEFAULT_LAMBDA_ANGLE = 0.0
+DEFAULT_PERIOD_DAY = 1.0
+
 # ==============================================================================
 # Phase Bin Definitions
 # ==============================================================================

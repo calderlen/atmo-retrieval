@@ -19,3 +19,15 @@ MCMC_MAX_TREE_DEPTH = 10
 
 # Parallel chains
 MCMC_NUM_CHAINS = 4
+
+# ==============================================================================
+# INFERENCE BEHAVIOR DEFAULTS
+# ==============================================================================
+
+INIT_TO_MEDIAN_SAMPLES = 100
+
+# Quick mode defaults
+QUICK_SVI_STEPS = 100
+QUICK_MCMC_WARMUP = 100
+QUICK_MCMC_SAMPLES = 100
+QUICK_MCMC_CHAINS = 1

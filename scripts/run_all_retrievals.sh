@@ -13,7 +13,7 @@ Usage: scripts/run_all_retrievals.sh [options]
 Options:
   --spectra-dir DIR     Base spectra directory (default: input/spectra)
   --mode MODE           Retrieval mode (default: transmission)
-  --extra-args "..."     Extra args passed to __main__.py
+  --extra-args "..."     Extra args passed to retrieval entrypoint
   -h, --help            Show this help
 USAGE
 }
@@ -78,7 +78,7 @@ PY
 
   out_dir="output/${planet_dir}/${ephem}/${MODE}/${epoch}/${arm}"
 
-  cmd=(python __main__.py --mode "$MODE" --planet "$planet" --ephemeris "$ephem" --epoch "$epoch" --data-dir "$data_dir" --wavelength-range "$arm" --output "$out_dir")
+  cmd=(python -m atmo_retrieval --mode "$MODE" --planet "$planet" --ephemeris "$ephem" --epoch "$epoch" --data-dir "$data_dir" --wavelength-range "$arm" --output "$out_dir")
   if [[ -n "${HITRAN_USERNAME:-}" ]]; then
     cmd+=(--hitran-username "$HITRAN_USERNAME")
   fi

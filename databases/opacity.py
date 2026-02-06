@@ -24,16 +24,21 @@ OPA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Atomic mass lookup (most common isotopes)
 ATOMIC_MASSES = {
+    "H": 1.008,   # 1H
+    "He": 4.0026, # 4He
     "Al": 26.98,   # 27Al
     "B": 10.81,    # 11B
     "Ba": 137.33,  # 138Ba
     "Be": 9.01,    # 9Be
+    "C": 12.01,    # 12C
     "Ca": 40.08,   # 40Ca
+    "Cl": 35.45,   # 35Cl
     "Co": 58.93,   # 59Co
     "Cr": 52.00,   # 52Cr
     "Cs": 132.91,  # 133Cs
     "Cu": 63.55,   # 63Cu
     "Fe": 55.85,   # 56Fe
+    "F": 19.00,    # 19F
     "Ga": 69.72,   # 69Ga
     "Ge": 72.63,   # 74Ge
     "Hf": 178.49,  # 180Hf
@@ -44,15 +49,19 @@ ATOMIC_MASSES = {
     "Mg": 24.31,   # 24Mg
     "Mn": 54.94,   # 55Mn
     "Mo": 95.95,   # 98Mo
+    "N": 14.01,    # 14N
     "Na": 22.99,   # 23Na
     "Nb": 92.91,   # 93Nb
     "Ni": 58.69,   # 58Ni
+    "O": 16.00,    # 16O
     "Os": 190.23,  # 192Os
+    "P": 30.97,    # 31P
     "Pb": 207.2,   # 208Pb
     "Pd": 106.42,  # 106Pd
     "Rb": 85.47,   # 85Rb
     "Rh": 102.91,  # 103Rh
     "Ru": 101.07,  # 102Ru
+    "S": 32.06,    # 32S
     "Sc": 44.96,   # 45Sc
     "Si": 28.09,   # 28Si
     "Sn": 118.71,  # 120Sn

@@ -7,6 +7,8 @@ from pathlib import Path
 
 warnings.filterwarnings("once")
 
+import config
+
 
 def create_parser():
 
@@ -55,8 +57,8 @@ def create_parser():
         "--data-format",
         type=str,
         choices=["auto", "timeseries", "spectrum"],
-        default="auto",
-        help="Data format to load (default: auto)",
+        default=config.DEFAULT_DATA_FORMAT,
+        help=f"Data format to load (default: {config.DEFAULT_DATA_FORMAT})",
     )
     data_group.add_argument("--wavelength-range", type=str, choices=["blue", "green", "red", "full"], default=None, help="Wavelength range mode (default: from config)")
 
@@ -132,8 +134,8 @@ def create_parser():
         "--pt-profile",
         type=str,
         choices=["guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline", "gp"],
-        default=None,
-        help="P-T profile type (default: gp)"
+        default=config.PT_PROFILE_DEFAULT,
+        help=f"P-T profile type (default: {config.PT_PROFILE_DEFAULT})"
     )
     model_group.add_argument(
         "--enable-tellurics",
@@ -153,8 +155,8 @@ def create_parser():
         "--phase-mode",
         type=str,
         choices=["global", "per_exposure", "linear"],
-        default="global",
-        help="How to model phase-dependent velocity offset dRV (default: global)"
+        default=config.DEFAULT_PHASE_MODE,
+        help=f"How to model phase-dependent velocity offset dRV (default: {config.DEFAULT_PHASE_MODE})"
     )
     phase_group.add_argument(
         "--phase-bin",
@@ -205,8 +207,8 @@ def create_parser():
     diag_group.add_argument(
         "--nfree",
         type=int,
-        default=10,
-        help="Number of free parameters for memory estimation (default: 10)"
+        default=config.DEFAULT_PROFILE_NFREE,
+        help=f"Number of free parameters for memory estimation (default: {config.DEFAULT_PROFILE_NFREE})"
     )
     diag_group.add_argument(
         "--sweep-nfree",
@@ -236,8 +238,8 @@ def create_parser():
         "--sweep-wrange-mode",
         type=str,
         choices=["fixed_n", "fixed_res"],
-        default="fixed_res",
-        help="How to sweep wavelength range (default: fixed_res)"
+        default=config.DEFAULT_SWEEP_WRANGE_MODE,
+        help=f"How to sweep wavelength range (default: {config.DEFAULT_SWEEP_WRANGE_MODE})"
     )
     diag_group.add_argument(
         "--sweep-hard-fail",
@@ -295,8 +297,8 @@ def create_parser():
     exec_group.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Random seed (default: 42)"
+        default=config.DEFAULT_SEED,
+        help=f"Random seed (default: {config.DEFAULT_SEED})"
     )
     exec_group.add_argument(
         "--no-preallocate",
@@ -339,6 +341,8 @@ def load_custom_config(config_path):
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("custom_config", config_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load config module from: {config_path}")
     custom_config = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(custom_config)
 
@@ -409,11 +413,14 @@ def apply_cli_overrides(args):
 
     # Quick mode
     if args.quick:
-        config.SVI_NUM_STEPS = 100
-        config.MCMC_NUM_WARMUP = 100
-        config.MCMC_NUM_SAMPLES = 100
-        config.MCMC_NUM_CHAINS = 1
-        print("🚀 Quick mode: 100 SVI steps, 100 MCMC samples")
+        config.SVI_NUM_STEPS = config.QUICK_SVI_STEPS
+        config.MCMC_NUM_WARMUP = config.QUICK_MCMC_WARMUP
+        config.MCMC_NUM_SAMPLES = config.QUICK_MCMC_SAMPLES
+        config.MCMC_NUM_CHAINS = config.QUICK_MCMC_CHAINS
+        print(
+            f"🚀 Quick mode: {config.QUICK_SVI_STEPS} SVI steps, "
+            f"{config.QUICK_MCMC_SAMPLES} MCMC samples"
+        )
 
     # Inference parameters
     if args.svi_steps is not None:
@@ -620,6 +627,8 @@ def main():
 
     def _default_profile_log(kind: str) -> str:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if config.DIR_SAVE is None:
+            raise RuntimeError("DIR_SAVE is not set; cannot create profile log path")
         log_dir = os.path.join(config.DIR_SAVE, "profiling")
         os.makedirs(log_dir, exist_ok=True)
         return os.path.join(log_dir, f"{kind}_{ts}.log")
@@ -694,7 +703,7 @@ def main():
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                pt_profile=args.pt_profile or "gp",
+                pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,
@@ -713,7 +722,7 @@ def main():
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                pt_profile=args.pt_profile or "gp",
+                pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,
@@ -731,7 +740,7 @@ def main():
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                pt_profile=args.pt_profile or "gp",
+                pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,
@@ -749,7 +758,7 @@ def main():
                 skip_svi=args.skip_svi,
                 svi_only=args.svi_only,
                 no_plots=args.no_plots,
-                pt_profile=args.pt_profile or "gp",
+                pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
                 phase_mode=args.phase_mode,
                 check_aliasing=args.check_aliasing,
                 seed=args.seed,

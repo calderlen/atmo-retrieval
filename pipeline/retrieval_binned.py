@@ -12,14 +12,18 @@ from pipeline.retrieval import load_timeseries_data, run_retrieval, _normalize_p
 
 
 def run_phase_binned_retrieval(
-    phase_bins: list[str] = ["T12", "T23", "T34"],
-    base_output_dir: str = "output/phase_binned",
-    mode: str = "transmission",
+    phase_bins: list[str] | None = None,
+    base_output_dir: str | Path | None = None,
+    mode: str = config.RETRIEVAL_MODE,
     epoch: str | None = None,
     data_dir: str | Path | None = None,
-    data_format: str = "auto",
+    data_format: str = config.DEFAULT_DATA_FORMAT,
     **retrieval_kwargs,
 ) -> dict[str, dict]:
+    if phase_bins is None:
+        phase_bins = list(PHASE_BINS.keys())
+    if base_output_dir is None:
+        base_output_dir = config.DEFAULT_PHASE_BINNED_OUTPUT_DIR
     if mode != "transmission":
         raise ValueError("Phase-binned retrieval is only supported for transmission mode.")
 
@@ -54,7 +58,7 @@ def run_phase_binned_retrieval(
     print("\nPhase bin coverage:")
     for bin_name in phase_bins:
         info = coverage["bins"].get(bin_name, {})
-        count = info.get("count", 0)
+        count = info.get("count", config.DEFAULT_BIN_INFO_COUNT)
         if count > 0:
             print(f"  {bin_name} ({PHASE_BINS[bin_name]}): {count} exposures")
             print(f"    Phase range: {info['phase_min']:.4f} to {info['phase_max']:.4f}")
@@ -66,7 +70,7 @@ def run_phase_binned_retrieval(
     
     for bin_name in phase_bins:
         bin_info = coverage["bins"].get(bin_name, {})
-        if bin_info.get("count", 0) == 0:
+        if bin_info.get("count", config.DEFAULT_BIN_INFO_COUNT) == 0:
             print(f"\nSkipping {bin_name}: no exposures in this phase bin")
             results[bin_name] = None
             continue

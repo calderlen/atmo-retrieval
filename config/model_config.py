@@ -10,6 +10,9 @@ Instrument-specific settings (resolution, wavelength ranges) are in instrument.p
 
 RETRIEVAL_MODE = "transmission"  # Options: "transmission", "emission"
 
+# Default P-T profile
+PT_PROFILE_DEFAULT = "gp"
+
 # ==============================================================================
 # ATMOSPHERIC RT PARAMETERS
 # ==============================================================================
@@ -25,6 +28,46 @@ PRESSURE_BTM = 1e2
 # Temperature range [K]
 T_LOW = 1500.0
 T_HIGH = 4500.0
+
+# Guillot profile defaults and bounds
+TINT_FIXED = 100.0
+LOG_KAPPA_IR_BOUNDS = (-4.0, 0.0)
+LOG_GAMMA_BOUNDS = (-2.0, 2.0)
+
+# Model/inference defaults
+DEFAULT_KP = 150.0
+DEFAULT_KP_ERR = 20.0
+DEFAULT_RV_ABS = 0.0
+DEFAULT_RV_ABS_ERR = 5.0
+DEFAULT_TSTAR = 6000.0
+DEFAULT_RP_ERR = 0.1
+DEFAULT_MP_ERR = 0.1
+DEFAULT_RSTAR_ERR = 0.1
+
+# Stitching and broadening defaults
+STITCH_MIN_GUARD_POINTS = 128
+STITCH_VSINI_MAX = 150.0
+STITCH_VRMAX = 500.0
+
+# Guard estimation defaults
+DEFAULT_RP_MEAN = 1.0
+DEFAULT_KP_MEAN = 0.0
+DEFAULT_KP_ERR_MEAN = 0.0
+DEFAULT_RV_ABS_MEAN = 0.0
+DEFAULT_RV_ABS_ERR_MEAN = 0.0
+DEFAULT_RV_GUARD_EXTRA = 30.0
+DEFAULT_SIGMA_V_FACTOR = 5.0
+
+# Posterior reconstruction defaults
+DEFAULT_POSTERIOR_RP = 1.5
+DEFAULT_POSTERIOR_MP = 1.0
+
+# Pipeline behavior defaults
+SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT = True
+APPLY_SYSREM_DEFAULT = False
+
+# Phase modeling defaults
+DEFAULT_PHASE_MODE = "global"
 
 # ==============================================================================
 # SPECTRAL GRID PARAMETERS

@@ -1,0 +1,9 @@
+"""
+Defaults for telluric fitting utilities.
+"""
+
+TELLURIC_SPECIES_DEFAULT = "H2O"
+TELLURIC_N_GRID = 2 ** 15
+TELLURIC_T_RANGE = (150.0, 300.0)
+TELLURIC_MARGIN_CM1 = 10.0
+TELLURIC_VRMAX = 10.0

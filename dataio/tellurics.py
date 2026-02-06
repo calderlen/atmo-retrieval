@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import optax
 from tqdm import tqdm
 
+import config
 from exojax.database.api import MdbHitran
 from exojax.opacity.premodit import OpaPremodit
 from exojax.utils.grids import wavenumber_grid, wav2nu
@@ -31,9 +32,9 @@ class TelluricFitter:
     def __init__(
         self,
         wav_obs_aa: np.ndarray,
-        species: str = "H2O",
-        N_grid: int = 2**15,
-        T_range: tuple[float, float] = (150.0, 300.0),
+        species: str = config.TELLURIC_SPECIES_DEFAULT,
+        N_grid: int = config.TELLURIC_N_GRID,
+        T_range: tuple[float, float] = config.TELLURIC_T_RANGE,
     ) -> None:
         """Initialize telluric fitter.
         
@@ -49,7 +50,7 @@ class TelluricFitter:
         # Ensure wavenumber grid is ascending (ExoJAX requirement)
         wav_min, wav_max = self.wav_obs_aa.min(), self.wav_obs_aa.max()
         
-        margin = 10.0  # cm-1 margin for edge effects
+        margin = config.TELLURIC_MARGIN_CM1  # cm-1 margin for edge effects
         nus_start = wav2nu(wav_max, unit="AA") - margin
         nus_end = wav2nu(wav_min, unit="AA") + margin
         
@@ -75,7 +76,7 @@ class TelluricFitter:
         )
         
         # Instrumental profile operator
-        self.sop_inst = SopInstProfile(self.nus, vrmax=10.0)
+        self.sop_inst = SopInstProfile(self.nus, vrmax=config.TELLURIC_VRMAX)
         
         # Fitted parameters (set after fit())
         self.params = None

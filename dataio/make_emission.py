@@ -12,12 +12,14 @@ Currently not implemented.
 import argparse
 import sys
 
+import config
+
 
 def main():
     parser = argparse.ArgumentParser(description='Prepare emission spectra for retrieval')
     parser.add_argument('--epoch', type=str, required=True, help='Observation epoch (YYYYMMDD)')
-    parser.add_argument('--planet', type=str, default='KELT-20b', help='Planet name')
-    parser.add_argument('--arm', type=str, choices=['red', 'blue', 'full'], default='full', help='Spectrograph arm')
+    parser.add_argument('--planet', type=str, default=config.DEFAULT_DATA_PLANET, help='Planet name')
+    parser.add_argument('--arm', type=str, choices=['red', 'blue', 'full'], default=config.DEFAULT_DATA_ARM, help='Spectrograph arm')
 
     args = parser.parse_args()
 

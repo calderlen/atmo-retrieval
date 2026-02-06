@@ -20,6 +20,7 @@ from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation
 import astropy.units as u
 
+import config
 from config.instrument_config import (
     OBSERVATORY,
     get_data_patterns,
@@ -491,17 +492,17 @@ def _get_barycentric_velocity_mps(
 
 def _get_introduced_shift_mps(observation_epoch: str) -> float:
     """Get epoch-specific wavelength shift correction."""
-    return _INTRODUCED_SHIFTS_MPS.get(observation_epoch, 0.0)
+    return _INTRODUCED_SHIFTS_MPS.get(observation_epoch, config.DEFAULT_INTRODUCED_SHIFT_MPS)
 
 
 def get_pepsi_data(
     arm: str,
     observation_epoch: str,
     planet_name: str,
-    do_molecfit: bool = True,
-    data_dir: str = "input/raw",
-    barycentric_correction: bool = False,
-    apply_introduced_shift: bool = True,
+    do_molecfit: bool = config.DEFAULT_USE_MOLECFIT,
+    data_dir: str = config.DEFAULT_RAW_DATA_DIR,
+    barycentric_correction: bool = config.DEFAULT_BARYCORR,
+    apply_introduced_shift: bool = config.DEFAULT_INTRODUCED_SHIFT,
     regrid: bool = False,
     subtract_median: bool = False,
     run_sysrem: bool = False,
@@ -664,7 +665,11 @@ def get_pepsi_data(
     if run_sysrem:
         if n_systematics is None:
             # Default: 5 iterations for both regions
-            n_systematics = [5, 5] if arm == "red" else [5]
+            n_systematics = (
+                config.DEFAULT_SYSREM_N_SYSTEMATICS_RED
+                if arm == "red"
+                else config.DEFAULT_SYSREM_N_SYSTEMATICS_OTHER
+            )
         print(f"Running SYSREM with n_systematics={n_systematics}...")
         wave_1d = wave[0, :]  # Use first spectrum's wavelength grid
         fluxin, errorin, U_sysrem, no_tellurics = do_sysrem(
@@ -828,7 +833,7 @@ def calculate_transmission_spectrum(
 
 
 def bin_spectrum(
-    wave: np.ndarray, flux: np.ndarray, error: np.ndarray, bin_size: int = 50
+    wave: np.ndarray, flux: np.ndarray, error: np.ndarray, bin_size: int = config.DEFAULT_BIN_SIZE
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Bin spectrum to lower resolution."""
     npix = len(wave)
@@ -850,21 +855,21 @@ def bin_spectrum(
 def main():
     parser = argparse.ArgumentParser(description='Prepare PEPSI data for retrieval')
     parser.add_argument('--epoch', type=str, required=True, help='Observation epoch (YYYYMMDD)')
-    parser.add_argument('--planet', type=str, default='KELT-20b', help='Planet name')
-    parser.add_argument('--arm', type=str, choices=['red', 'blue', 'full'], default='full', help='Spectrograph arm')
-    parser.add_argument('--molecfit', action='store_true', default=True, help='Use molecfit-corrected data')
+    parser.add_argument('--planet', type=str, default=config.DEFAULT_DATA_PLANET, help='Planet name')
+    parser.add_argument('--arm', type=str, choices=['red', 'blue', 'full'], default=config.DEFAULT_DATA_ARM, help='Spectrograph arm')
+    parser.add_argument('--molecfit', action='store_true', default=config.DEFAULT_USE_MOLECFIT, help='Use molecfit-corrected data')
     parser.add_argument('--no-molecfit', action='store_false', dest='molecfit', help='Use uncorrected data')
-    parser.add_argument('--data-dir', type=str, default='input/raw', help='Raw data directory')
-    parser.add_argument('--barycorr', action='store_true', default=False,
+    parser.add_argument('--data-dir', type=str, default=config.DEFAULT_RAW_DATA_DIR, help='Raw data directory')
+    parser.add_argument('--barycorr', action='store_true', default=config.DEFAULT_BARYCORR,
                         help='Apply barycentric correction to wavelength grid')
     parser.add_argument('--no-barycorr', action='store_false', dest='barycorr',
                         help='Disable barycentric correction')
-    parser.add_argument('--introduced-shift', action='store_true', default=True,
+    parser.add_argument('--introduced-shift', action='store_true', default=config.DEFAULT_INTRODUCED_SHIFT,
                         help='Apply epoch-specific Molecfit shift (default)')
     parser.add_argument('--no-introduced-shift', action='store_false', dest='introduced_shift',
                         help='Disable epoch-specific Molecfit shift')
     parser.add_argument('--output-dir', type=str, default=None, help='Output directory (default: input/spectra/{planet}/{epoch}/{arm})')
-    parser.add_argument('--bin-size', type=int, default=50, help='Spectral binning (pixels)')
+    parser.add_argument('--bin-size', type=int, default=config.DEFAULT_BIN_SIZE, help='Spectral binning (pixels)')
 
     args = parser.parse_args()
 

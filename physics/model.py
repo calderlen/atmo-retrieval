@@ -11,6 +11,8 @@ import numpyro.distributions as dist
 
 PhaseMode = Literal["global", "per_exposure", "linear"]
 
+import config
+
 from exojax.database import molinfo
 from exojax.opacity.opacont import OpaCIA
 from exojax.opacity.premodit.api import OpaPremodit
@@ -69,17 +71,17 @@ def _estimate_guard_points(
     sigma_v = CKMS / (instrument_resolution * 2.3548200450309493)
 
     # Planet rotation broadening (km/s) using mean Rp
-    Rp_mean = float(params.get("R_p", 1.0))
+    Rp_mean = float(params.get("R_p", config.DEFAULT_RP_MEAN))
     vsini = (2.0 * np.pi * (Rp_mean * RJ) / (period_day * 86400.0) / 1.0e5)
 
     # RV guard from priors (3-sigma) + dRV prior
-    kp = float(params.get("Kp", 0.0))
-    kp_err = float(params.get("Kp_err", 0.0))
-    vsys = float(params.get("RV_abs", 0.0))
-    vsys_err = float(params.get("RV_abs_err", 0.0))
-    rv_guard = abs(vsys) + 3.0 * vsys_err + kp + 3.0 * kp_err + 30.0
+    kp = float(params.get("Kp", config.DEFAULT_KP_MEAN))
+    kp_err = float(params.get("Kp_err", config.DEFAULT_KP_ERR_MEAN))
+    vsys = float(params.get("RV_abs", config.DEFAULT_RV_ABS_MEAN))
+    vsys_err = float(params.get("RV_abs_err", config.DEFAULT_RV_ABS_ERR_MEAN))
+    rv_guard = abs(vsys) + 3.0 * vsys_err + kp + 3.0 * kp_err + config.DEFAULT_RV_GUARD_EXTRA
 
-    v_guard = rv_guard + max(vsini, 5.0 * sigma_v)
+    v_guard = rv_guard + max(vsini, config.DEFAULT_SIGMA_V_FACTOR * sigma_v)
     if guard_kms is not None:
         v_guard = max(float(guard_kms), v_guard)
 
@@ -341,12 +343,12 @@ def reconstruct_temperature_profile(
     # pt_profile: P-T profile name
     # Tint_fixed: internal temperature for Guillot profile
     if pt_profile == "guillot":
-        Tirr = posterior_params.get("Tirr", 2500.0)
-        log_kappa_ir = posterior_params.get("log_kappa_ir", -2.0)
-        log_gamma = posterior_params.get("log_gamma", 0.0)
+        Tirr = posterior_params["Tirr"]
+        log_kappa_ir = posterior_params["log_kappa_ir"]
+        log_gamma = posterior_params["log_gamma"]
         
-        Rp = posterior_params.get("Rp", 1.5)
-        Mp = posterior_params.get("Mp", 1.0)
+        Rp = posterior_params["Rp"]
+        Mp = posterior_params["Mp"]
         g_ref = gravity_surface(Rp, Mp)
         
         Tarr = guillot_profile(
@@ -359,21 +361,20 @@ def reconstruct_temperature_profile(
         )
         
     elif pt_profile == "isothermal":
-        T0 = posterior_params.get("T0", 2500.0)
+        T0 = posterior_params["T0"]
         Tarr = T0 * jnp.ones_like(art.pressure)
 
     elif pt_profile == "gradient":
         # Linear gradient in log-pressure
-        T_btm = posterior_params.get("T_btm", 3000.0)
-        T_top = posterior_params.get("T_top", 1500.0)
+        T_btm = posterior_params["T_btm"]
+        T_top = posterior_params["T_top"]
         log_p = jnp.log10(art.pressure)
         log_p_btm = jnp.log10(art.pressure[-1])
         log_p_top = jnp.log10(art.pressure[0])
         Tarr = T_top + (T_btm - T_top) * (log_p - log_p_top) / (log_p_btm - log_p_top)
 
     else:
-        T0 = posterior_params.get("T0", 2500.0)
-        Tarr = T0 * jnp.ones_like(art.pressure)
+        raise ValueError(f"Temperature reconstruction not implemented for profile: {pt_profile}")
     
     return Tarr
 
@@ -500,8 +501,8 @@ def compute_atmospheric_state_from_posterior(
     mmw_profile = art.constant_mmr_profile(mmw)
 
     # Compute gravity profile
-    Rp = params.get("Rp", 1.5) * RJ
-    Mp = params.get("Mp", 1.0) * MJ
+    Rp = params.get("Rp", config.DEFAULT_POSTERIOR_RP) * RJ
+    Mp = params.get("Mp", config.DEFAULT_POSTERIOR_MP) * MJ
     g_ref = gravity_surface(Rp / RJ, Mp / MJ)
     g = art.gravity_profile(Tarr, mmw_profile, Rp, g_ref)
 
@@ -550,28 +551,46 @@ def create_retrieval_model(
     # P-T profile (Default: pspline)
     pt_profile: Literal[
         "guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline", "gp"
-    ] = "guillot",
-    T_low: float = 400.0,
-    T_high: float = 3000.0,
+    ] = config.PT_PROFILE_DEFAULT,
+    T_low: float | None = None,
+    T_high: float | None = None,
     Tirr_std: float | None = None,  # If None, uses uniform prior on Tirr
-    Tint_fixed: float = 100.0,
-    log_kappa_ir_bounds: tuple[float, float] = (-4.0, 0.0),
-    log_gamma_bounds: tuple[float, float] = (-2.0, 2.0),
+    Tint_fixed: float | None = None,
+    log_kappa_ir_bounds: tuple[float, float] | None = None,
+    log_gamma_bounds: tuple[float, float] | None = None,
     # Phase-dependent velocity modeling
-    phase_mode: PhaseMode = "global",
+    phase_mode: PhaseMode = config.DEFAULT_PHASE_MODE,
     # Pipeline options
-    subtract_per_exposure_mean: bool = True,
-    apply_sysrem: bool = False,
+    subtract_per_exposure_mean: bool | None = None,
+    apply_sysrem: bool | None = None,
     # Inference grid stitching (optional)
-    stitch_inference: bool = False,
+    stitch_inference: bool | None = None,
     stitch_chunk_points: int | None = None,
     stitch_n_chunks: int | None = None,
     stitch_guard_kms: float | None = None,
     stitch_guard_points: int | None = None,
-    stitch_min_guard_points: int = 128,
+    stitch_min_guard_points: int | None = None,
     # Chemistry/composition solver
     composition_solver: CompositionSolver | None = None,
 ) -> Callable:
+    if T_low is None:
+        T_low = config.T_LOW
+    if T_high is None:
+        T_high = config.T_HIGH
+    if Tint_fixed is None:
+        Tint_fixed = config.TINT_FIXED
+    if log_kappa_ir_bounds is None:
+        log_kappa_ir_bounds = config.LOG_KAPPA_IR_BOUNDS
+    if log_gamma_bounds is None:
+        log_gamma_bounds = config.LOG_GAMMA_BOUNDS
+    if subtract_per_exposure_mean is None:
+        subtract_per_exposure_mean = config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT
+    if apply_sysrem is None:
+        apply_sysrem = config.APPLY_SYSREM_DEFAULT
+    if stitch_inference is None:
+        stitch_inference = config.ENABLE_INFERENCE_STITCHING
+    if stitch_min_guard_points is None:
+        stitch_min_guard_points = config.STITCH_MIN_GUARD_POINTS
     Kp_mean, Kp_std = params["Kp"], params["Kp_err"]
     Vsys_mean, Vsys_std = params["RV_abs"], params["RV_abs_err"]
     Rp_mean, Rp_std = params["R_p"], params["R_p_err"]
@@ -632,8 +651,8 @@ def create_retrieval_model(
             n_chunks=stitch_n_chunks,
         )
 
-        vsini_max = float(getattr(sop_rot, "vsini_max", 150.0))
-        vrmax = float(getattr(sop_inst, "vrmax", 500.0))
+        vsini_max = float(getattr(sop_rot, "vsini_max", config.STITCH_VSINI_MAX))
+        vrmax = float(getattr(sop_inst, "vrmax", config.STITCH_VRMAX))
         stitch_sops = []
         for chunk_start, chunk_end, *_ in stitch_plan:
             nu_chunk = jnp.array(nu_grid[chunk_start:chunk_end])

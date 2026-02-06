@@ -363,7 +363,7 @@ def run_retrieval(
     _preflight_grid_checks(inst_nus, nu_grid)
 
     sop_rot, sop_inst, _ = setup_spectral_operators(
-        nu_grid, Rinst, vsini_max=150.0, vrmax=500.0
+        nu_grid, Rinst, vsini_max=config.STITCH_VSINI_MAX, vrmax=config.STITCH_VRMAX
     )
     print("  Spectral operators initialized")
 
@@ -445,17 +445,17 @@ def run_retrieval(
     
     # Convert params to format expected by create_retrieval_model
     model_params = {
-        "Kp": params.get("Kp", 150.0),
-        "Kp_err": params.get("Kp_err", 20.0),
-        "RV_abs": params.get("RV_abs", 0.0),
-        "RV_abs_err": params.get("RV_abs_err", 5.0),
+        "Kp": params.get("Kp", config.DEFAULT_KP),
+        "Kp_err": params.get("Kp_err", config.DEFAULT_KP_ERR),
+        "RV_abs": params.get("RV_abs", config.DEFAULT_RV_ABS),
+        "RV_abs_err": params.get("RV_abs_err", config.DEFAULT_RV_ABS_ERR),
         "R_p": params["R_p"].nominal_value if hasattr(params["R_p"], "nominal_value") else params["R_p"],
-        "R_p_err": params["R_p"].std_dev if hasattr(params["R_p"], "std_dev") else 0.1,
+        "R_p_err": params["R_p"].std_dev if hasattr(params["R_p"], "std_dev") else config.DEFAULT_RP_ERR,
         "M_p": params["M_p"].nominal_value if hasattr(params["M_p"], "nominal_value") else params["M_p"],
-        "M_p_err": params["M_p"].std_dev if hasattr(params["M_p"], "std_dev") else 0.1,
+        "M_p_err": params["M_p"].std_dev if hasattr(params["M_p"], "std_dev") else config.DEFAULT_MP_ERR,
         "R_star": params["R_star"].nominal_value if hasattr(params["R_star"], "nominal_value") else params["R_star"],
-        "R_star_err": params["R_star"].std_dev if hasattr(params["R_star"], "std_dev") else 0.1,
-        "T_star": params.get("T_star", 6000.0),
+        "R_star_err": params["R_star"].std_dev if hasattr(params["R_star"], "std_dev") else config.DEFAULT_RSTAR_ERR,
+        "T_star": params.get("T_star", config.DEFAULT_TSTAR),
         "T_eq": params.get("T_eq"),
         "period": params["period"].nominal_value if hasattr(params["period"], "nominal_value") else params["period"],
     }
@@ -499,7 +499,7 @@ def run_retrieval(
 
     from numpyro.infer import MCMC, NUTS, init_to_median
 
-    init_strategy = init_to_median(num_samples=100)
+    init_strategy = init_to_median(num_samples=config.INIT_TO_MEDIAN_SAMPLES)
     if not skip_svi:
         print(f"  SVI warm-up: {config.SVI_NUM_STEPS} steps, LR={config.SVI_LEARNING_RATE}")
         rng_key, rng_key_ = random.split(rng_key)
@@ -659,7 +659,7 @@ def run_retrieval(
 
 if __name__ == "__main__":
     print("Running with default settings.")
-    print("For more options, use: python __main__.py --help\n")
+    print("For more options, use: python -m atmo_retrieval --help\n")
 
     if config.RETRIEVAL_MODE in ("transmission", "emission"):
         run_retrieval(mode=config.RETRIEVAL_MODE)

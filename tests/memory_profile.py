@@ -10,6 +10,7 @@ import subprocess
 import sys
 from typing import Iterable, TextIO
 
+import config
 
 _GIB = 1024 ** 3
 _RED = "\033[31m"
@@ -281,7 +282,7 @@ def _print_memory_snapshot(label: str, tracker: dict[str, object] | None = None)
             f"(free {_format_bytes(gpu.free_bytes)})"
         )
         if tracker is not None:
-            max_used = float(tracker.get("max_used", 0.0))
+            max_used = float(tracker.get("max_used", config.DEFAULT_TRACKER_MAX_USED))
             if gpu.used_bytes > max_used:
                 tracker["max_used"] = float(gpu.used_bytes)
                 tracker["label"] = label
@@ -531,7 +532,7 @@ def run_memory_profile(
             result.est_art_bytes = est.get("art_bytes")
             result.est_opa_bytes = est.get("opa_bytes")
 
-    max_used = float(gpu_tracker.get("max_used", 0.0))
+    max_used = float(gpu_tracker.get("max_used", config.DEFAULT_TRACKER_MAX_USED))
     if max_used > 0.0:
         label = gpu_tracker.get("label", "n/a")
         print(f"\nPeak GPU used: {_format_bytes(max_used)} (at {label})")
