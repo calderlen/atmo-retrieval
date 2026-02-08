@@ -37,6 +37,30 @@ run_retrieval(
 )
 ```
 
+## Module Flow
+
+```mermaid
+flowchart TD
+    A[atmo_retrieval.py<br/>CLI entrypoint] --> B[pipeline/retrieval.py<br/>orchestration]
+
+    B --> C[config/*<br/>runtime settings]
+    B --> D[dataio/load.py<br/>observed data loading]
+    B --> E[physics/grid_setup.py<br/>nu grid + operators]
+    B --> F[databases/opacity.py<br/>CIA/molecular/atomic opacities]
+    F --> G[databases/atomic.py<br/>Kurucz/VALD helpers]
+    B --> H[physics/model.py<br/>forward model]
+    H --> I[physics/pt.py<br/>P-T profiles]
+    H --> J[physics/chemistry.py<br/>composition]
+    B --> K[pipeline/inference.py<br/>SVI + NUTS]
+    B --> L[plotting/plot.py<br/>figures]
+
+    A --> M[pipeline/retrieval_binned.py<br/>phase-binned wrapper]
+    M --> B
+
+    N[dataio/make_transmission.py<br/>preprocessing utility] -. writes .-> O[input/spectra/.../*.npy]
+    O -. read by .-> B
+```
+
 ## Data Layout
 
 Expected input directory structure:
