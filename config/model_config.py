@@ -11,7 +11,7 @@ Instrument-specific settings (resolution, wavelength ranges) are in instrument.p
 RETRIEVAL_MODE = "transmission"  # Options: "transmission", "emission"
 
 # Default P-T profile
-PT_PROFILE_DEFAULT = "gp"
+PT_PROFILE_DEFAULT = "guillot"  # Options: "guillot", "isothermal", "free`"
 
 # ==============================================================================
 # ATMOSPHERIC RT PARAMETERS
@@ -23,7 +23,7 @@ NLAYER = 20
 
 # Pressure range [bar]
 PRESSURE_TOP = 1e-8 
-PRESSURE_BTM = 1e2
+PRESSURE_BTM = 1e0
 
 # Temperature range [K]
 T_LOW = 1500.0
@@ -35,7 +35,7 @@ LOG_KAPPA_IR_BOUNDS = (-4.0, 0.0)
 LOG_GAMMA_BOUNDS = (-2.0, 2.0)
 
 # Model/inference defaults
-DEFAULT_KP = 150.0
+DEFAULT_KP = 169.0
 DEFAULT_KP_ERR = 20.0
 DEFAULT_RV_ABS = 0.0
 DEFAULT_RV_ABS_ERR = 5.0

@@ -83,10 +83,7 @@ def _patch_path_contains():
 
 
 def _patch_radis_dbmanager():
-    try:
-        from radis.api import dbmanager as radis_dbmanager
-    except Exception:
-        return
+    from radis.api import dbmanager as radis_dbmanager
     orig_init = getattr(radis_dbmanager.DatabaseManager, "__init__", None)
     if orig_init is None or getattr(orig_init, "_path_patched", False):
         return
@@ -105,10 +102,7 @@ _patch_radis_dbmanager()
 
 
 def _patch_radis_download():
-    try:
-        from radis.api import dbmanager as radis_dbmanager
-    except Exception:
-        return
+    from radis.api import dbmanager as radis_dbmanager
     orig = getattr(radis_dbmanager.DatabaseManager, "download_and_parse", None)
     if orig is None or getattr(orig, "_no_head_patched", False):
         return
@@ -532,18 +526,14 @@ def load_atomic_opacities(
     cutwing_val = _resolve_cutwing(ndiv, cutwing)
 
     # Import Kurucz/VALD helpers
-    try:
-        from databases.atomic import (
-            load_kurucz_atomic,
-            load_vald_atomic,
-            create_atomic_snapshot,
-            resolve_vald_file,
-            parse_species,
-            ATOMIC_MASSES,
-        )
-    except ImportError as exc:
-        print(f"  Warning: Kurucz/VALD disabled ({exc})")
-        return opa_atoms, jnp.array(atommass_list)
+    from databases.atomic import (
+        load_kurucz_atomic,
+        load_vald_atomic,
+        create_atomic_snapshot,
+        resolve_vald_file,
+        parse_species,
+        ATOMIC_MASSES,
+    )
 
     if db_kurucz is None:
         db_kurucz = DB_KURUCZ

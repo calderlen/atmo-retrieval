@@ -516,13 +516,11 @@ def plot_contribution_function(
     """
     # Try to use ExoJAX's built-in contribution function if requested
     if use_exojax_plotcf:
-        try:
-            from exojax.plot.atmplot import plotcf
-            cf = plotcf(nu_grid, dtau, Tarr, pressure, dParr)
-            print("Used ExoJAX plotcf for contribution function")
-            return cf
-        except ImportError:
-            print("ExoJAX plotcf not available, using custom implementation")
+        from exojax.plot.atmplot import plotcf
+
+        cf = plotcf(nu_grid, dtau, Tarr, pressure, dParr)
+        print("Used ExoJAX plotcf for contribution function")
+        return cf
     
     # Compute contribution function
     cf = compute_contribution_function(dtau, Tarr, pressure, dParr)

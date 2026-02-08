@@ -3312,21 +3312,11 @@ class FastChemSolver:
         self.fastchem_data_dir = fastchem_data_dir
         self.include_condensation = include_condensation
 
-        # Try to import FastChem
         self.fastchem = None
-        self.fastchem_available = False
+        import pyfastchem
 
-        try:
-            import pyfastchem
-            self.pyfastchem = pyfastchem
-            self.fastchem_available = True
-        except ImportError:
-            print("Warning: pyfastchem not installed, falling back to analytic equilibrium")
-            self.fallback = EquilibriumChemistry(
-                metallicity_range=metallicity_range,
-                co_ratio_range=co_ratio_range,
-                h2_he_ratio=h2_he_ratio,
-            )
+        self.pyfastchem = pyfastchem
+        self.fastchem_available = True
 
     def _init_fastchem(self):
         """Initialize FastChem object (lazy loading)."""
@@ -3434,12 +3424,6 @@ class FastChemSolver:
 
         if Tarr is None:
             Tarr = jnp.full_like(Parr, 2000.0)
-
-        if not self.fastchem_available:
-            # Fall back to analytic equilibrium
-            return self.fallback.sample(
-                mol_names, mol_masses, atom_names, atom_masses, art, Tarr
-            )
 
         # Run FastChem
         vmr_dict = self._run_fastchem(Tarr, Parr, metallicity, co_ratio)
@@ -3926,12 +3910,10 @@ class VULCANSolver:
             import os
             if os.path.exists(vulcan_path):
                 sys.path.insert(0, vulcan_path)
-                try:
-                    import vulcan
-                    self.vulcan = vulcan
-                    self.vulcan_available = True
-                except ImportError:
-                    pass
+                import vulcan
+
+                self.vulcan = vulcan
+                self.vulcan_available = True
 
         if not self.vulcan_available:
             print("Warning: VULCAN not available, falling back to PhotochemicalSteadyState")

@@ -104,48 +104,19 @@ class ProfileResult:
 
 
 def _get_ram_info() -> RamInfo:
-    try:
-        import psutil
+    import psutil
 
-        proc = psutil.Process(os.getpid())
-        rss = proc.memory_info().rss
-        vm = psutil.virtual_memory()
-        return RamInfo(rss_bytes=rss, total_bytes=vm.total, available_bytes=vm.available)
-    except Exception:
-        pass
-
-    try:
-        import resource
-
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        if sys.platform == "darwin":
-            rss_bytes = int(rss)
-        else:
-            rss_bytes = int(rss * 1024)
-        return RamInfo(rss_bytes=rss_bytes)
-    except Exception:
-        return RamInfo()
+    proc = psutil.Process(os.getpid())
+    rss = proc.memory_info().rss
+    vm = psutil.virtual_memory()
+    return RamInfo(rss_bytes=rss, total_bytes=vm.total, available_bytes=vm.available)
 
 
 def _get_gpu_info() -> GpuInfo | None:
-    try:
-        from cuda import cudart
+    from cuda import cudart
 
-        free_bytes, total_bytes = cudart.cudaMemGetInfo()
-        return GpuInfo(int(free_bytes), int(total_bytes))
-    except Exception:
-        pass
-
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        pynvml.nvmlShutdown()
-        return GpuInfo(int(mem.free), int(mem.total))
-    except Exception:
-        return None
+    free_bytes, total_bytes = cudart.cudaMemGetInfo()
+    return GpuInfo(int(free_bytes), int(total_bytes))
 
 
 def _macos_gpu_static_info() -> str | None:
@@ -303,11 +274,7 @@ def _estimate_device_memory(
     hard_fail: bool = False,
     return_stats: bool = False,
 ) -> dict[str, float | None] | None:
-    try:
-        from exojax.utils.memuse import device_memory_use
-    except Exception as exc:
-        print(f"\nCould not import exojax.utils.memuse.device_memory_use ({exc}).")
-        return None
+    from exojax.utils.memuse import device_memory_use
 
     opa_items = list(opa_items)
     if not opa_items:

@@ -8,21 +8,10 @@ import urllib.request
 
 import numpy as np
 
-try:
-    # Official ExoJAX atomic database APIs (Kurucz/VALD).
-    from exojax.database.kurucz.api import AdbKurucz
-    from exojax.database.vald.api import AdbVald
-except Exception as exc:  # pragma: no cover
-    raise ImportError(
-        "ExoJAX Kurucz/VALD APIs are not available. "
-        "Install/upgrade ExoJAX so `exojax.database.kurucz.api` and "
-        "`exojax.database.vald.api` are present."
-    ) from exc
-
-try:
-    from exojax.database.contracts import MDBMeta, Lines, MDBSnapshot
-except Exception as exc:  # pragma: no cover
-    raise ImportError("ExoJAX MDBSnapshot contracts are required for atomic snapshots.") from exc
+# Official ExoJAX atomic database APIs (Kurucz/VALD).
+from exojax.database.kurucz.api import AdbKurucz
+from exojax.database.vald.api import AdbVald
+from exojax.database.contracts import MDBMeta, Lines, MDBSnapshot
 
 
 KURUCZ_BASE_URL = "http://kurucz.harvard.edu/linelists/gfall"

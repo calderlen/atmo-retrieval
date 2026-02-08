@@ -168,31 +168,8 @@ def _slice_spectral_matrix(
 def _get_piBarr():
     import importlib
 
-    candidates = (
-        "exojax.spec.planck",
-        "exojax.rt.planck",
-        "exojax.special.planck",
-    )
-    for modname in candidates:
-        try:
-            mod = importlib.import_module(modname)
-            fn = getattr(mod, "piBarr", None)
-            if fn is not None:
-                return fn
-        except Exception:
-            continue
-
-    try:
-        spec = importlib.import_module("exojax.spec")
-        planck = getattr(spec, "planck", None)
-        if planck is not None and hasattr(planck, "piBarr"):
-            return planck.piBarr
-    except Exception:
-        pass
-
-    raise ImportError(
-        "Could not import ExoJAX piBarr. Update ExoJAX or adjust the import path."
-    )
+    mod = importlib.import_module("exojax.spec.planck")
+    return mod.piBarr
 
 
 def _element_from_species(species_name: str) -> str:
