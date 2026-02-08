@@ -32,13 +32,7 @@ def run_phase_binned_retrieval(
 
     resolved_data_dir = Path(data_dir) if data_dir is not None else config.get_data_dir(epoch=epoch)
 
-    try:
-        wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
-    except FileNotFoundError as exc:
-        raise ValueError(
-            "Phase-binned retrieval requires time-series files (wavelength.npy, data.npy, sigma.npy, phase.npy). "
-            f"Missing in {resolved_data_dir}."
-        ) from exc
+    wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
 
     phase = _normalize_phase(phase)
     params = retrieval_kwargs.get("params", get_params())
@@ -104,7 +98,7 @@ def run_phase_binned_retrieval(
                 **retrieval_kwargs,
             )
             results[bin_name] = {"output_dir": str(bin_output_dir)}
-            
+
             # Save bin-specific info
             np.savez(
                 os.path.join(bin_output_dir, "phase_bin_info.npz"),
@@ -114,10 +108,6 @@ def run_phase_binned_retrieval(
                 phase_max=float(np.max(phase_bin)),
                 phase_values=phase_bin,
             )
-            
-        except Exception as e:
-            print(f"ERROR in {bin_name} retrieval: {e}")
-            results[bin_name] = {"error": str(e)}
         finally:
             config.DIR_SAVE = previous_dir
     
@@ -131,15 +121,11 @@ def run_phase_binned_retrieval(
         comparison_dir = os.path.join(base_output_dir, "comparison")
         os.makedirs(comparison_dir, exist_ok=True)
         
-        try:
-            comparison = compare_phase_posteriors(
-                {b: results[b] for b in successful_bins},
-                output_dir=comparison_dir,
-            )
-            results["comparison"] = comparison
-        except Exception as e:
-            print(f"ERROR generating comparison: {e}")
-            results["comparison"] = {"error": str(e)}
+        comparison = compare_phase_posteriors(
+            {b: results[b] for b in successful_bins},
+            output_dir=comparison_dir,
+        )
+        results["comparison"] = comparison
     
     return results
 
@@ -309,11 +295,8 @@ def detect_asymmetry(
     if "T12" not in posteriors or "T34" not in posteriors:
         return {"error": "Need both T12 and T34 bins for asymmetry test"}
     
-    try:
-        samples_ingress = posteriors["T12"]["samples"][param]
-        samples_egress = posteriors["T34"]["samples"][param]
-    except (KeyError, TypeError):
-        return {"error": f"Parameter {param} not found in posteriors"}
+    samples_ingress = posteriors["T12"]["samples"][param]
+    samples_egress = posteriors["T34"]["samples"][param]
     
     if samples_ingress.ndim > 1:
         samples_ingress = samples_ingress.mean(axis=-1)

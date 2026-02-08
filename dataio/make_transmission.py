@@ -481,11 +481,8 @@ def _get_barycentric_velocity_mps(
     used_keys = []
     for key in velocity_keys:
         if key in header:
-            try:
-                total_velocity += float(header[key])
-                used_keys.append(key)
-            except (TypeError, ValueError):
-                continue
+            total_velocity += float(header[key])
+            used_keys.append(key)
     return total_velocity, used_keys
 
 
@@ -617,10 +614,7 @@ def get_pepsi_data(
             print("Velocity correction: no RADVEL/OBSVEL/SSBVEL found; skipping")
 
         jd[i] = header[header_keys["jd"]]  # mid-exposure time
-        try:
-            snr_spectra[i] = header[header_keys["snr"]]
-        except KeyError:
-            snr_spectra[i] = np.percentile(fluxin[i, :] / errorin[i, :], 90)
+        snr_spectra[i] = header[header_keys["snr"]]
 
         exptime_val = header[header_keys["exptime"]]
         if isinstance(exptime_val, str):

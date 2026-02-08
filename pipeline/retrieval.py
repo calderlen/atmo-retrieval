@@ -167,17 +167,14 @@ def _preflight_grid_checks(inst_nus: np.ndarray, nu_grid: np.ndarray) -> None:
         raise ValueError(msg)
 
 
-def _cia_header_range(path: str) -> tuple[float, float] | None:
-    try:
-        with open(path, "r") as f:
-            header = f.readline().strip().split()
-        if len(header) < 3:
-            return None
-        nu_min = float(header[1])
-        nu_max = float(header[2])
-        return nu_min, nu_max
-    except Exception:
-        return None
+def _cia_header_range(path: str) -> tuple[float, float]:
+    with open(path, "r") as f:
+        header = f.readline().strip().split()
+    if len(header) < 3:
+        raise ValueError(f"CIA header in {path} does not contain min/max wavenumber fields.")
+    nu_min = float(header[1])
+    nu_max = float(header[2])
+    return nu_min, nu_max
 
 
 def _format_um(nu_cm: float) -> float:
@@ -200,9 +197,6 @@ def _report_cia_coverage(cia_paths: dict[str, str], nu_grid: np.ndarray) -> None
     )
     for name, path in cia_paths.items():
         rng = _cia_header_range(str(path))
-        if rng is None:
-            print(f"    {name}: could not read header for {path}")
-            continue
         cia_min, cia_max = rng
         cia_um_min = _format_um(cia_max)
         cia_um_max = _format_um(cia_min)
@@ -304,28 +298,10 @@ def run_retrieval(
             phase = np.array([0.0])
             print(f"  Loaded single spectrum with {len(wav_obs)} points")
         else:
-            try:
-                wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
-                phase = _normalize_phase(phase)
-                print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
-                print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
-            except FileNotFoundError as exc:
-                print("  Warning: time-series not found, loading single spectrum...")
-                try:
-                    wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
-                        str(data_paths["wavelength"]),
-                        str(data_paths["spectrum"]),
-                        str(data_paths["uncertainty"]),
-                    )
-                except FileNotFoundError:
-                    raise FileNotFoundError(
-                        "Could not find time-series or spectrum files. "
-                        f"Time-series error: {exc}"
-                    ) from exc
-                data = spectrum[np.newaxis, :]
-                sigma = uncertainty[np.newaxis, :]
-                phase = np.array([0.0])
-                print(f"  Loaded single spectrum with {len(wav_obs)} points")
+            wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
+            phase = _normalize_phase(phase)
+            print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
+            print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
     
     print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
 
@@ -541,20 +517,7 @@ def run_retrieval(
     )
 
     rng_key, rng_key_ = random.split(rng_key)
-    try:
-        mcmc.run(rng_key_, data=data_jnp, sigma=sigma_jnp, phase=phase_jnp)
-    except RuntimeError as e:
-        if "Cannot find valid initial parameters" in str(e):
-            print("\n  ERROR: Cannot initialize sampler. Possible causes:")
-            print("  - Model produces NaN/inf for all parameter combinations tried")
-            print("  - Priors are incompatible with data (wrong wavelength range, molecules, etc.)")
-            print("  - Forward model has numerical issues")
-            print("\n  Try:")
-            print("  1. Check that opacity files cover your wavelength range")
-            print("  2. Verify Kp/Vsys priors overlap with expected signal")
-            print("  3. Check temperature priors are reasonable")
-            print("  4. Run with fewer wavelength chunks or smaller wavelength range")
-        raise
+    mcmc.run(rng_key_, data=data_jnp, sigma=sigma_jnp, phase=phase_jnp)
     
     mcmc.print_summary()
     
@@ -572,84 +535,78 @@ def run_retrieval(
     # Compute contribution function from posterior
     if compute_contribution:
         print("\n  Computing contribution function from posterior...")
-        
-        try:
-            # Convert posterior samples from JAX to numpy
-            posterior_np = {k: np.array(v) for k, v in posterior_sample.items()}
-            
-            atmo_state = compute_atmospheric_state_from_posterior(
-                posterior_samples=posterior_np,
-                art=art,
-                opa_mols=opa_mols,
-                opa_atoms=opa_atoms,
-                opa_cias=opa_cias,
-                nu_grid=nu_grid,
-                pt_profile=pt_profile,
-                use_median=True,
-            )
-            
-            # Save atmospheric state
-            np.savez(
-                os.path.join(output_dir, "atmospheric_state.npz"),
+
+        # Convert posterior samples from JAX to numpy
+        posterior_np = {k: np.array(v) for k, v in posterior_sample.items()}
+
+        atmo_state = compute_atmospheric_state_from_posterior(
+            posterior_samples=posterior_np,
+            art=art,
+            opa_mols=opa_mols,
+            opa_atoms=opa_atoms,
+            opa_cias=opa_cias,
+            nu_grid=nu_grid,
+            pt_profile=pt_profile,
+            use_median=True,
+        )
+
+        # Save atmospheric state
+        np.savez(
+            os.path.join(output_dir, "atmospheric_state.npz"),
+            dtau=np.array(atmo_state['dtau']),
+            Tarr=np.array(atmo_state['Tarr']),
+            pressure=np.array(atmo_state['pressure']),
+            dParr=np.array(atmo_state['dParr']),
+            mmw=np.array(atmo_state['mmw']),
+            vmrH2=np.array(atmo_state['vmrH2']),
+            vmrHe=np.array(atmo_state['vmrHe']),
+        )
+
+        # Plot contribution function
+        if not no_plots:
+            print("  Plotting contribution function...")
+
+            # Total contribution function
+            plot_contribution_function(
+                nu_grid=np.array(nu_grid),
                 dtau=np.array(atmo_state['dtau']),
                 Tarr=np.array(atmo_state['Tarr']),
                 pressure=np.array(atmo_state['pressure']),
                 dParr=np.array(atmo_state['dParr']),
-                mmw=np.array(atmo_state['mmw']),
-                vmrH2=np.array(atmo_state['vmrH2']),
-                vmrHe=np.array(atmo_state['vmrHe']),
+                save_path=os.path.join(output_dir, "contribution_function.pdf"),
+                wavelength_unit="AA",
+                title=f"{config.PLANET} Contribution Function ({mode})",
             )
-            
-            # Plot contribution function
-            if not no_plots:
-                print("  Plotting contribution function...")
-                
-                # Total contribution function
-                cf = plot_contribution_function(
+
+            # Per-species contribution functions (if available)
+            if atmo_state['dtau_per_species']:
+                dtau_per_species_np = {
+                    k: np.array(v) for k, v in atmo_state['dtau_per_species'].items()
+                }
+
+                plot_contribution_per_species(
                     nu_grid=np.array(nu_grid),
-                    dtau=np.array(atmo_state['dtau']),
+                    dtau_per_species=dtau_per_species_np,
                     Tarr=np.array(atmo_state['Tarr']),
                     pressure=np.array(atmo_state['pressure']),
                     dParr=np.array(atmo_state['dParr']),
-                    save_path=os.path.join(output_dir, "contribution_function.pdf"),
+                    save_path=os.path.join(output_dir, "contribution_per_species.pdf"),
                     wavelength_unit="AA",
-                    title=f"{config.PLANET} Contribution Function ({mode})",
                 )
-                
-                # Per-species contribution functions (if available)
-                if atmo_state['dtau_per_species']:
-                    dtau_per_species_np = {
-                        k: np.array(v) for k, v in atmo_state['dtau_per_species'].items()
-                    }
-                    
-                    plot_contribution_per_species(
-                        nu_grid=np.array(nu_grid),
-                        dtau_per_species=dtau_per_species_np,
-                        Tarr=np.array(atmo_state['Tarr']),
-                        pressure=np.array(atmo_state['pressure']),
-                        dParr=np.array(atmo_state['dParr']),
-                        save_path=os.path.join(output_dir, "contribution_per_species.pdf"),
-                        wavelength_unit="AA",
-                    )
-                    
-                    # Combined plot
-                    plot_contribution_combined(
-                        nu_grid=np.array(nu_grid),
-                        dtau=np.array(atmo_state['dtau']),
-                        dtau_per_species=dtau_per_species_np,
-                        Tarr=np.array(atmo_state['Tarr']),
-                        pressure=np.array(atmo_state['pressure']),
-                        dParr=np.array(atmo_state['dParr']),
-                        save_path=os.path.join(output_dir, "contribution_combined.pdf"),
-                        wavelength_unit="AA",
-                    )
-                
-                print(f"  Contribution function plots saved to {output_dir}/")
-            
-        except Exception as e:
-            print(f"  Warning: Could not compute contribution function: {e}")
-            import traceback
-            traceback.print_exc()
+
+                # Combined plot
+                plot_contribution_combined(
+                    nu_grid=np.array(nu_grid),
+                    dtau=np.array(atmo_state['dtau']),
+                    dtau_per_species=dtau_per_species_np,
+                    Tarr=np.array(atmo_state['Tarr']),
+                    pressure=np.array(atmo_state['pressure']),
+                    dParr=np.array(atmo_state['dParr']),
+                    save_path=os.path.join(output_dir, "contribution_combined.pdf"),
+                    wavelength_unit="AA",
+                )
+
+            print(f"  Contribution function plots saved to {output_dir}/")
     
     print("\n" + "="*70)
     print("RETRIEVAL COMPLETE")

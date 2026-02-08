@@ -147,61 +147,46 @@ def _patch_radis_download():
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             }
 
-            try:
-                response = session.get(
-                    urlname, headers=headers, stream=True, allow_redirects=True
-                )
-                response.raise_for_status()
+            response = session.get(
+                urlname, headers=headers, stream=True, allow_redirects=True
+            )
+            response.raise_for_status()
 
-                content_type = response.headers.get("content-type", "").lower()
-                if "text/html" in content_type:
-                    raise requests.HTTPError(
-                        f"Received HTML instead of a data file for {urlname}. "
-                        "HITRAN login is likely required. Set HITRAN_USERNAME and HITRAN_PASSWORD."
-                    )
-
-                temp_file_name = urlname.split("/")[-1]
-                temp_file_name = re.sub(r'[<>:\"/\\\\|?*&=]', "_", temp_file_name)
-                # Save downloads to the database directory, not project root
-                base_dir = pathlib.Path(self.local_databases).expanduser().resolve()
-                base_dir.mkdir(parents=True, exist_ok=True)
-                target_path = base_dir / temp_file_name
-                legacy_path = pathlib.Path(temp_file_name).resolve()
-                if legacy_path.exists() and not target_path.exists():
-                    try:
-                        legacy_path.rename(target_path)
-                    except Exception:
-                        pass
-                temp_file_path = str(target_path)
-
-                with open(temp_file_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-
-                opener = radis_dbmanager.RequestsFileOpener(temp_file_path)
-
-                Nlines = self.parse_to_local_file(
-                    opener,
-                    urlname,
-                    local_file,
-                    pbar_active=(not parallel),
-                    pbar_t0=time() - t0,
-                    pbar_Ntot_estimate_factor=pbar_Ntot_estimate_factor,
-                    pbar_Nlines_already=Nlines_total,
-                    pbar_last=(Ndownload == Ntotal_downloads),
+            content_type = response.headers.get("content-type", "").lower()
+            if "text/html" in content_type:
+                raise requests.HTTPError(
+                    f"Received HTML instead of a data file for {urlname}. "
+                    "HITRAN login is likely required. Set HITRAN_USERNAME and HITRAN_PASSWORD."
                 )
 
-            except requests.RequestException as err:
-                raise type(err)(
-                    f"Problem downloading: {urlname}. Error: {str(err)}"
-                ).with_traceback(err.__traceback__)
-            except Exception as err:
-                raise type(err)(
-                    f"Problem parsing downloaded file from {urlname}. "
-                    "Check the error above. It may arise if the file wasn't properly downloaded.\n\n"
-                    f"Error: {str(err)}"
-                ).with_traceback(err.__traceback__)
+            temp_file_name = urlname.split("/")[-1]
+            temp_file_name = re.sub(r'[<>:\"/\\\\|?*&=]', "_", temp_file_name)
+            # Save downloads to the database directory, not project root
+            base_dir = pathlib.Path(self.local_databases).expanduser().resolve()
+            base_dir.mkdir(parents=True, exist_ok=True)
+            target_path = base_dir / temp_file_name
+            legacy_path = pathlib.Path(temp_file_name).resolve()
+            if legacy_path.exists() and not target_path.exists():
+                legacy_path.rename(target_path)
+            temp_file_path = str(target_path)
+
+            with open(temp_file_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            opener = radis_dbmanager.RequestsFileOpener(temp_file_path)
+
+            Nlines = self.parse_to_local_file(
+                opener,
+                urlname,
+                local_file,
+                pbar_active=(not parallel),
+                pbar_t0=time() - t0,
+                pbar_Ntot_estimate_factor=pbar_Ntot_estimate_factor,
+                pbar_Nlines_already=Nlines_total,
+                pbar_last=(Ndownload == Ntotal_downloads),
+            )
 
             return Nlines
 
@@ -242,38 +227,17 @@ def setup_cia_opacities(cia_paths: dict[str, str], nu_grid: np.ndarray) -> dict[
     """Setup CIA opacities for H2-H2 and H2-He."""
     opa_cias = {}
 
-    class _ZeroCIA:
-        """Fallback CIA that returns zero opacity (log10 = -inf)."""
-
-        def __init__(self, nu_size: int) -> None:
-            self._nu_size = int(nu_size)
-            self._is_dummy = True
-
-        def logacia_matrix(self, temperatures):
-            nlayer = len(temperatures)
-            return jnp.full((nlayer, self._nu_size), -jnp.inf)
-
     for name, path in cia_paths.items():
-        try:
-            cdb = CdbCIA(str(path), nurange=nu_grid)
-        except Exception as exc:
-            print(f"  Warning: Could not load CIA {name} ({exc})")
-            opa_cias[name] = _ZeroCIA(np.asarray(nu_grid).size)
-            continue
+        cdb = CdbCIA(str(path), nurange=nu_grid)
         if np.asarray(cdb.nucia).size == 0:
-            print(f"  Warning: CIA {name} has no overlap with nu_grid; skipping.")
-            opa_cias[name] = _ZeroCIA(np.asarray(nu_grid).size)
-            continue
+            raise ValueError(f"CIA {name} has no overlap with nu_grid.")
         opa_cias[name] = OpaCIA(cdb, nu_grid=nu_grid)
     return opa_cias
 
 
 def _opa_grid_matches(opa: OpaPremodit, nu_grid: np.ndarray) -> bool:
     """Check whether a cached opacity matches the current wavenumber grid."""
-    try:
-        opa_grid = np.asarray(opa.nu_grid)
-    except Exception:
-        return False
+    opa_grid = np.asarray(opa.nu_grid)
     nu_grid = np.asarray(nu_grid)
     if opa_grid.shape != nu_grid.shape:
         return False
@@ -367,23 +331,17 @@ def load_or_build_opacity(
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
     cutwing_val = _resolve_cutwing(ndiv, cutwing)
     if opa_load:
-        try:
-            opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
-            legacy_opa_path = PROJECT_ROOT / f"opa_{mol}.zarr"
-            if legacy_opa_path.exists() and not opa_path.exists():
-                opa_path.parent.mkdir(parents=True, exist_ok=True)
-                legacy_opa_path.rename(opa_path)
-            opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
-            if not _opa_grid_matches(opa, nu_grid):
-                raise ValueError("Cached opacity grid mismatch.")
-            if not _opa_settings_match(opa, ndiv, diffmode, cutwing_val):
-                raise ValueError("Cached opacity stitching settings mismatch.")
-            return opa, opa.aux["molmass"]
-        except Exception:
-            if load_only:
-                print(f"  Warning: Could not load saved opacity for {mol} (load-only). Skipping.")
-                return None, None
-            print(f"  Warning: Could not load saved opacity for {mol}, building from database...")
+        opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
+        legacy_opa_path = PROJECT_ROOT / f"opa_{mol}.zarr"
+        if legacy_opa_path.exists() and not opa_path.exists():
+            opa_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_opa_path.rename(opa_path)
+        opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
+        if not _opa_grid_matches(opa, nu_grid):
+            raise ValueError("Cached opacity grid mismatch.")
+        if not _opa_settings_match(opa, ndiv, diffmode, cutwing_val):
+            raise ValueError("Cached opacity stitching settings mismatch.")
+        return opa, opa.aux["molmass"]
     elif load_only:
         print(f"  Warning: OPA_LOAD disabled; skipping {mol} (load-only).")
         return None, None
@@ -550,69 +508,43 @@ def load_atomic_opacities(
         cache_name = f"atom_{atom.replace(' ', '_')}"
 
         if opa_load:
-            try:
-                opa_path = OPA_CACHE_DIR / f"opa_{cache_name}.zarr"
-                opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
-                if not _opa_grid_matches(opa, nu_grid):
-                    raise ValueError("Cached opacity grid mismatch.")
-                if not _opa_settings_match(opa, ndiv, diffmode, cutwing_val):
-                    raise ValueError("Cached opacity stitching settings mismatch.")
-                molmass = opa.aux.get("molmass", None)
-                if molmass is None:
-                    raise KeyError("Missing molmass in cached opacity.")
-                opa_atoms[atom] = opa
-                atommass_list.append(molmass)
-                print(f"  * {atom} (cached)")
-                if on_species_loaded is not None:
-                    on_species_loaded(f"atom:{atom}")
-                continue
-            except Exception:
-                if load_only:
-                    print(f"  Warning: Could not load saved opacity for {atom} (load-only). Skipping.")
-                    continue
-                print(f"  Warning: Could not load saved opacity for {atom}, building from database...")
+            opa_path = OPA_CACHE_DIR / f"opa_{cache_name}.zarr"
+            opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
+            if not _opa_grid_matches(opa, nu_grid):
+                raise ValueError("Cached opacity grid mismatch.")
+            if not _opa_settings_match(opa, ndiv, diffmode, cutwing_val):
+                raise ValueError("Cached opacity stitching settings mismatch.")
+            molmass = opa.aux.get("molmass", None)
+            if molmass is None:
+                raise KeyError("Missing molmass in cached opacity.")
+            opa_atoms[atom] = opa
+            atommass_list.append(molmass)
+            print(f"  * {atom} (cached)")
+            if on_species_loaded is not None:
+                on_species_loaded(f"atom:{atom}")
+            continue
         elif load_only:
             print(f"  Warning: OPA_LOAD disabled; skipping {atom} (load-only).")
             continue
 
-        snapshot = None
-        molmass = None
-        source = None
-        reasons = []
-
-        # Try Kurucz first (if enabled)
         if use_kurucz and db_kurucz is not None:
-            try:
-                adb, mask = load_kurucz_atomic(atom, nu_grid, db_kurucz, auto_download=auto_download)
-                snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
-                source = "Kurucz"
-            except Exception as exc:
-                reasons.append(f"Kurucz: {exc}")
-        elif not use_kurucz:
-            reasons.append("Kurucz: disabled")
-
-        # Fall back to VALD if available (if enabled)
-        if snapshot is None and use_vald:
-            if vald_file is not None:
-                try:
-                    adb, mask = load_vald_atomic(atom, nu_grid, vald_file)
-                    snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
-                    source = "VALD"
-                except Exception as exc:
-                    reasons.append(f"VALD: {exc}")
-            else:
-                reasons.append("VALD: no extract file found")
-        elif not use_vald:
-            reasons.append("VALD: disabled")
+            adb, mask = load_kurucz_atomic(atom, nu_grid, db_kurucz, auto_download=auto_download)
+            snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
+            source = "Kurucz"
+        elif use_vald and vald_file is not None:
+            adb, mask = load_vald_atomic(atom, nu_grid, vald_file)
+            snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
+            source = "VALD"
+        else:
+            raise ValueError(f"No atomic database source available for {atom}.")
 
         # Fix missing molmass
-        if snapshot is not None and (molmass is None or (isinstance(molmass, float) and np.isnan(molmass))):
+        if molmass is None or (isinstance(molmass, float) and np.isnan(molmass)):
             element, _ = parse_species(atom)
             molmass = ATOMIC_MASSES.get(element, molmass)
 
-        if snapshot is None:
-            print(f"  * {atom} (skipping - {'; '.join(reasons)})")
-            continue
+        if molmass is None:
+            raise ValueError(f"Could not determine atomic mass for {atom}.")
 
         print(f"  * {atom} ({source})")
         opa = build_premodit_from_snapshot(

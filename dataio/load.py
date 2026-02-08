@@ -49,10 +49,7 @@ def _parse_pipe_row(line: str) -> list[str]:
 def _parse_token(token: str) -> float | str | None:
     if token.lower() == "null":
         return None
-    try:
-        return float(token)
-    except ValueError:
-        return token
+    return float(token)
 
 
 def _to_float_array(values: list[float | str | None]) -> np.ndarray:
@@ -60,13 +57,7 @@ def _to_float_array(values: list[float | str | None]) -> np.ndarray:
     for i, val in enumerate(values):
         if val is None:
             continue
-        if isinstance(val, (float, int, np.floating, np.integer)):
-            out[i] = float(val)
-        else:
-            try:
-                out[i] = float(val)
-            except (TypeError, ValueError):
-                continue
+        out[i] = float(val)
     return out
 
 

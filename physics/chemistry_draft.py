@@ -4024,13 +4024,9 @@ class VULCANSolver:
 
             # Run VULCAN (simplified - actual implementation would be more complex)
             # This is a placeholder for the actual VULCAN interface
-            try:
-                # vulcan_output = self.vulcan.run(config_path, T=Tarr, P=Parr)
-                # return vulcan_output.vmr_dict
-                pass
-            except Exception as e:
-                print(f"VULCAN run failed: {e}")
-                return {}
+            # vulcan_output = self.vulcan.run(config_path, T=Tarr, P=Parr)
+            # return vulcan_output.vmr_dict
+            pass
 
         return {}
 

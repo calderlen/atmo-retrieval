@@ -688,91 +688,81 @@ def main():
         return 0
 
     # Run retrieval
-    try:
-        # Handle phase-binned retrieval
-        if args.all_phase_bins:
-            from pipeline.retrieval_binned import run_phase_binned_retrieval
-            
-            logger.info("Starting phase-binned retrieval (all bins)...")
-            run_phase_binned_retrieval(
-                phase_bins=["T12", "T23", "T34"],
-                mode=args.mode,
-                epoch=args.epoch,
-                data_dir=args.data_dir,
-                data_format=args.data_format,
-                skip_svi=args.skip_svi,
-                svi_only=args.svi_only,
-                no_plots=args.no_plots,
-                pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
-                phase_mode=args.phase_mode,
-                check_aliasing=args.check_aliasing,
-                seed=args.seed,
-            )
+    if args.all_phase_bins:
+        from pipeline.retrieval_binned import run_phase_binned_retrieval
 
-        elif args.phase_bin:
-            from pipeline.retrieval_binned import run_phase_binned_retrieval
-            
-            logger.info(f"Starting retrieval for phase bin: {args.phase_bin}...")
-            run_phase_binned_retrieval(
-                phase_bins=[args.phase_bin],
-                mode=args.mode,
-                epoch=args.epoch,
-                data_dir=args.data_dir,
-                data_format=args.data_format,
-                skip_svi=args.skip_svi,
-                svi_only=args.svi_only,
-                no_plots=args.no_plots,
-                pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
-                phase_mode=args.phase_mode,
-                check_aliasing=args.check_aliasing,
-                seed=args.seed,
-            )
-        
-        elif args.mode == "transmission":
-            from pipeline.retrieval import run_retrieval
+        logger.info("Starting phase-binned retrieval (all bins)...")
+        run_phase_binned_retrieval(
+            phase_bins=["T12", "T23", "T34"],
+            mode=args.mode,
+            epoch=args.epoch,
+            data_dir=args.data_dir,
+            data_format=args.data_format,
+            skip_svi=args.skip_svi,
+            svi_only=args.svi_only,
+            no_plots=args.no_plots,
+            pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
+            phase_mode=args.phase_mode,
+            check_aliasing=args.check_aliasing,
+            seed=args.seed,
+        )
 
-            logger.info("Starting transmission retrieval...")
-            run_retrieval(
-                mode="transmission",
-                epoch=args.epoch,
-                data_dir=args.data_dir,
-                data_format=args.data_format,
-                skip_svi=args.skip_svi,
-                svi_only=args.svi_only,
-                no_plots=args.no_plots,
-                pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
-                phase_mode=args.phase_mode,
-                check_aliasing=args.check_aliasing,
-                seed=args.seed,
-            )
+    elif args.phase_bin:
+        from pipeline.retrieval_binned import run_phase_binned_retrieval
 
-        elif args.mode == "emission":
-            from pipeline.retrieval import run_retrieval
+        logger.info(f"Starting retrieval for phase bin: {args.phase_bin}...")
+        run_phase_binned_retrieval(
+            phase_bins=[args.phase_bin],
+            mode=args.mode,
+            epoch=args.epoch,
+            data_dir=args.data_dir,
+            data_format=args.data_format,
+            skip_svi=args.skip_svi,
+            svi_only=args.svi_only,
+            no_plots=args.no_plots,
+            pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
+            phase_mode=args.phase_mode,
+            check_aliasing=args.check_aliasing,
+            seed=args.seed,
+        )
 
-            logger.info("Starting emission retrieval...")
-            run_retrieval(
-                mode="emission",
-                epoch=args.epoch,
-                data_dir=args.data_dir,
-                data_format=args.data_format,
-                skip_svi=args.skip_svi,
-                svi_only=args.svi_only,
-                no_plots=args.no_plots,
-                pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
-                phase_mode=args.phase_mode,
-                check_aliasing=args.check_aliasing,
-                seed=args.seed,
-            )
+    elif args.mode == "transmission":
+        from pipeline.retrieval import run_retrieval
 
-        return 0
+        logger.info("Starting transmission retrieval...")
+        run_retrieval(
+            mode="transmission",
+            epoch=args.epoch,
+            data_dir=args.data_dir,
+            data_format=args.data_format,
+            skip_svi=args.skip_svi,
+            svi_only=args.svi_only,
+            no_plots=args.no_plots,
+            pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
+            phase_mode=args.phase_mode,
+            check_aliasing=args.check_aliasing,
+            seed=args.seed,
+        )
 
-    except KeyboardInterrupt:
-        logger.warning("\nInterrupted by user")
-        return 130
+    elif args.mode == "emission":
+        from pipeline.retrieval import run_retrieval
 
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        return 1
+        logger.info("Starting emission retrieval...")
+        run_retrieval(
+            mode="emission",
+            epoch=args.epoch,
+            data_dir=args.data_dir,
+            data_format=args.data_format,
+            skip_svi=args.skip_svi,
+            svi_only=args.svi_only,
+            no_plots=args.no_plots,
+            pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
+            phase_mode=args.phase_mode,
+            check_aliasing=args.check_aliasing,
+            seed=args.seed,
+        )
+
+    return 0
 
 
 if __name__ == "__main__":

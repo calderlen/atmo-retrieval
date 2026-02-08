@@ -34,10 +34,7 @@ def set_profile_log(path: str | None, mode: str = "a") -> None:
     if _LOG_HANDLE is not None and _LOG_PATH == path:
         return
     if _LOG_HANDLE is not None:
-        try:
-            _LOG_HANDLE.close()
-        except Exception:
-            pass
+        _LOG_HANDLE.close()
         _LOG_HANDLE = None
     log_dir = os.path.dirname(path)
     if log_dir:
@@ -61,12 +58,9 @@ def _profile_print(*args, **kwargs) -> None:
     end = kwargs.get("end", "\n")
     text = sep.join(str(arg) for arg in args) + end
     text = _ANSI_RE.sub("", text)
-    try:
-        _LOG_HANDLE.write(text)
-        if kwargs.get("flush"):
-            _LOG_HANDLE.flush()
-    except Exception:
-        pass
+    _LOG_HANDLE.write(text)
+    if kwargs.get("flush"):
+        _LOG_HANDLE.flush()
 
 
 # Use red output for profiler logging in this module.
@@ -123,16 +117,12 @@ def _macos_gpu_static_info() -> str | None:
     global _MACOS_GPU_INFO
     if _MACOS_GPU_INFO is not None:
         return _MACOS_GPU_INFO
-    try:
-        result = subprocess.run(
-            ["system_profiler", "SPDisplaysDataType", "-detailLevel", "mini"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except Exception:
-        _MACOS_GPU_INFO = None
-        return None
+    result = subprocess.run(
+        ["system_profiler", "SPDisplaysDataType", "-detailLevel", "mini"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
 
     chipset = None
     cores = None
@@ -178,17 +168,13 @@ def _maybe_print_powermetrics_sample() -> None:
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         print("  GPU (powermetrics): set ATMO_POWERMETRICS=1 and run with sudo to sample")
         return
-    try:
-        result = subprocess.run(
-            ["powermetrics", "--samplers", "gpu_power", "-n", "1", "-i", "1000"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        )
-    except Exception as exc:
-        print(f"  GPU (powermetrics): failed ({exc})")
-        return
+    result = subprocess.run(
+        ["powermetrics", "--samplers", "gpu_power", "-n", "1", "-i", "1000"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
 
     freq = None
     active = None
@@ -285,13 +271,9 @@ def _estimate_device_memory(
     print("  Note: ExoJAX returns a float; we format it as bytes (GiB) for readability.")
 
     def safe_use(opa: object, *, art_obj: object | None, nfree_val: int | None) -> float | None:
-        try:
-            return float(
-                device_memory_use(opa, art=art_obj, nfree=nfree_val, print_summary=False)
-            )
-        except Exception as exc:
-            print(f"  Warning: device_memory_use failed ({exc})")
-            return None
+        return float(
+            device_memory_use(opa, art=art_obj, nfree=nfree_val, print_summary=False)
+        )
 
     first_name, first_opa = opa_items[0]
     base_with_art = safe_use(first_opa, art_obj=art, nfree_val=nfree)
