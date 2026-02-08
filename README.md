@@ -11,7 +11,6 @@ pip install jax numpyro exojax astropy matplotlib corner
 ## cli
 
 ```bash
-# General retrieval run
 python -m atmo_retrieval --planet KELT-20b --mode transmission --epoch 20250601
 ```
 
