@@ -11,14 +11,8 @@ pip install jax numpyro exojax astropy matplotlib corner
 ## cli
 
 ```bash
-# Transmission retrieval
+# General retrieval run
 python -m atmo_retrieval --planet KELT-20b --mode transmission --epoch 20250601
-
-# Emission retrieval with explicit P-T profile
-python -m atmo_retrieval --planet WASP-76b --mode emission --epoch 20240315 --pt-profile guillot
-
-# Quick smoke run
-python -m atmo_retrieval --planet KELT-20b --mode transmission --epoch 20250601 --quick
 ```
 
 ## code structure
