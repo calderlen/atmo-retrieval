@@ -1,14 +1,14 @@
 # atmo-retrieval
 
-Bayesian atmospheric retrieval for high-resolution exoplanet spectra.
+bayesian atmospheric retrieval for high-resolution exoplanet spectra
 
-## Install
+## install
 
 ```bash
 pip install jax numpyro exojax astropy matplotlib corner
 ```
 
-## Quick Start (CLI)
+## cli
 
 ```bash
 # Transmission retrieval
@@ -21,23 +21,7 @@ python -m atmo_retrieval --planet WASP-76b --mode emission --epoch 20240315 --pt
 python -m atmo_retrieval --planet KELT-20b --mode transmission --epoch 20250601 --quick
 ```
 
-## Quick Start (Python)
-
-```python
-from pipeline.retrieval import run_retrieval
-
-run_retrieval(
-    mode="transmission",
-    epoch="20250601",
-    pt_profile="guillot",
-    phase_mode="shared",
-    skip_svi=False,
-    svi_only=False,
-    seed=42,
-)
-```
-
-## Module Flow
+## code structure
 
 ```mermaid
 flowchart TD
@@ -61,9 +45,7 @@ flowchart TD
     O -. read by .-> B
 ```
 
-## Data Layout
-
-Expected input directory structure:
+## expected input directory structure
 
 ```
 input/spectra/{planet}/{epoch}/{arm}/
@@ -73,7 +55,7 @@ input/spectra/{planet}/{epoch}/{arm}/
   phase.npy
 ```
 
-## Outputs
+## outputs
 
 ```
 output/{planet}/{ephemeris}/{mode}/{timestamp}/
@@ -83,9 +65,3 @@ output/{planet}/{ephemeris}/{mode}/{timestamp}/
   atmospheric_state.npz
   contribution_function.pdf
 ```
-
-## Notes
-
-- Default P-T profile: `guillot`.
-- Database directories live under `input/.db_*` (override via env vars in `config/paths_config.py`).
-- Run from repo root.
