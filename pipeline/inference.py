@@ -39,7 +39,14 @@ def build_guide(
     prior_guide = create_prior_guide(Mp_mean, Mp_std, Rstar_mean, Rstar_std)
     guide.append(prior_guide)
 
-    model_hidden = handlers.block(model_c, hide=["Mp", "Rstar", "Rp"])
+    def _hide_from_autoguide(site: dict) -> bool:
+        if site["type"] != "sample":
+            return True
+        if site.get("is_observed", False):
+            return True
+        return site["name"] in {"Mp", "Rstar", "Rp"}
+
+    model_hidden = handlers.block(model_c, hide_fn=_hide_from_autoguide)
     guide.append(AutoMultivariateNormal(model_hidden))
 
     return guide

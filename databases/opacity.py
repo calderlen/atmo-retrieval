@@ -230,8 +230,12 @@ def setup_cia_opacities(cia_paths: dict[str, str], nu_grid: np.ndarray) -> dict[
     for name, path in cia_paths.items():
         cdb = CdbCIA(str(path), nurange=nu_grid)
         if np.asarray(cdb.nucia).size == 0:
-            raise ValueError(f"CIA {name} has no overlap with nu_grid.")
+            print(f"  Warning: CIA {name} has no overlap with nu_grid; skipping.")
+            continue
         opa_cias[name] = OpaCIA(cdb, nu_grid=nu_grid)
+
+    if not opa_cias:
+        print("  Warning: No CIA sources overlap nu_grid; continuing without CIA.")
     return opa_cias
 
 
