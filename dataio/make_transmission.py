@@ -142,9 +142,9 @@ def do_sysrem(
     residual_error: np.ndarray,
     arm: str,
     airmass: np.ndarray,
-    n_systematics: list[int],
     niter: int = 10,
     do_molecfit: bool = True,
+    stop_delta_stddev: float = config.DEFAULT_SYSREM_STOP_TOL,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Run SYSREM with separate treatment for telluric and non-telluric regions.
 
@@ -157,16 +157,15 @@ def do_sysrem(
         residual_error: Uncertainties, shape (n_spectra, npix)
         arm: Spectrograph arm ('red' or 'blue')
         airmass: Per-exposure airmass values, shape (n_spectra,)
-        n_systematics: Number of systematics to remove.
-            For red arm: [n_sys_nontelluric, n_sys_telluric]
-            For blue arm: [n_sys]
         niter: Number of iterations per systematic (default: 10)
         do_molecfit: If True, mask deep telluric regions (default: True)
+        stop_delta_stddev: Minimum sigma improvement required to accept a component
 
     Returns:
         corrected_flux: Systematics-corrected flux, shape (n_spectra, npix)
         corrected_error: Propagated uncertainties, shape (n_spectra, npix)
-        U_sysrem: Systematic vectors, shape (n_spectra, max_n_sys, n_chunks)
+        U_sysrem: Systematic vectors, shape (n_spectra, n_sys_used_max, n_chunks)
+            Columns not used in a given chunk are NaN.
         no_tellurics: Indices of non-telluric pixels
     """
     n_spectra = residual_flux.shape[0]
@@ -202,12 +201,19 @@ def do_sysrem(
         chunks = 1
         chunk_indices = [no_tellurics]
 
-    # Ensure n_systematics has correct length
-    if len(n_systematics) < chunks:
-        n_systematics = n_systematics + [n_systematics[-1]] * (chunks - len(n_systematics))
+    max_systematics = (
+        config.DEFAULT_SYSREM_MAX_SYSTEMATICS_RED
+        if arm == "red"
+        else config.DEFAULT_SYSREM_MAX_SYSTEMATICS_OTHER
+    )
 
-    max_n_sys = max(n_systematics)
-    U_sysrem = np.ones((n_spectra, max_n_sys, chunks))
+    # Ensure max_systematics has correct length
+    if len(max_systematics) < chunks:
+        max_systematics = max_systematics + [max_systematics[-1]] * (chunks - len(max_systematics))
+
+    max_n_sys = max(max_systematics)
+    U_sysrem = np.full((n_spectra, max_n_sys, chunks), np.nan, dtype=float)
+    n_systematics_used = [0] * chunks
 
     for chunk in range(chunks):
         this_one = chunk_indices[chunk]
@@ -215,7 +221,9 @@ def do_sysrem(
             continue
 
         npixhere = len(this_one)
-        n_sys_chunk = n_systematics[chunk]
+        n_sys_chunk = max_systematics[chunk]
+
+        stddev_prev = np.std(corrected_flux[:, this_one])
 
         for system in range(n_sys_chunk):
             c = np.zeros(npixhere)
@@ -295,25 +303,40 @@ def do_sysrem(
                         a[ep] = 0.0
                         sigma_a[ep] = 0.0
 
-            # Store systematic vector
+            syserr = a[:, np.newaxis] * c[np.newaxis, :]
+
+            # Error on systematic term
+            ratio_a = np.where(a != 0, sigma_a / np.abs(a), 0.0)[:, np.newaxis]
+            ratio_c = np.where(c != 0, sigma_c / np.abs(c), 0.0)[np.newaxis, :]
+            sigma_syserr = np.abs(syserr) * np.sqrt(ratio_a**2 + ratio_c**2)
+
+            # Stop when additional components stop improving scatter enough
+            trial_flux = corrected_flux[:, this_one] - syserr
+            stddev_next = np.std(trial_flux)
+            delta_stddev = stddev_prev - stddev_next
+            if delta_stddev <= stop_delta_stddev:
+                break
+
+            # Accept and apply this systematic
             U_sysrem[:, system, chunk] = a
+            corrected_flux[:, this_one] = trial_flux
+            corrected_error[:, this_one] = np.sqrt(
+                corrected_error[:, this_one]**2 + sigma_syserr**2
+            )
+            stddev_prev = stddev_next
+            n_systematics_used[chunk] += 1
 
-            # Remove systematic: flux -= a * c, propagate errors
-            for s in range(npixhere):
-                pix_idx = this_one[s]
-                syserr = a * c[s]
+        print(
+            f"SYSREM chunk {chunk + 1}/{chunks}: used {n_systematics_used[chunk]} "
+            f"of max {n_sys_chunk} systematics"
+        )
 
-                # Error on systematic term
-                sigma_syserr = np.where(
-                    (a != 0) & (c[s] != 0),
-                    np.abs(syserr) * np.sqrt((sigma_a / np.abs(a))**2 + (sigma_c[s] / np.abs(c[s]))**2),
-                    0.0
-                )
-
-                corrected_flux[:, pix_idx] -= syserr
-                corrected_error[:, pix_idx] = np.sqrt(
-                    corrected_error[:, pix_idx]**2 + sigma_syserr**2
-                )
+    # Trim trailing all-NaN columns if discovery mode stopped early.
+    used_max = max(n_systematics_used) if n_systematics_used else 0
+    if used_max > 0:
+        U_sysrem = U_sysrem[:, :used_max, :]
+    else:
+        U_sysrem = U_sysrem[:, :0, :]
 
     return corrected_flux, corrected_error, U_sysrem, no_tellurics
 
@@ -503,9 +526,10 @@ def get_pepsi_data(
     regrid: bool = False,
     subtract_median: bool = False,
     run_sysrem: bool = False,
-    n_systematics: list[int] | None = None,
     remove_doppler_shadow: bool = False,
     shadow_params: dict | None = None,
+    *,
+    sysrem_stop_tol: float = config.DEFAULT_SYSREM_STOP_TOL,
 ) -> tuple[np.ndarray, ...] | None:
     """Load and preprocess spectroscopic data from configured instrument.
 
@@ -520,9 +544,9 @@ def get_pepsi_data(
         regrid: Regrid all spectra to common wavelength grid
         subtract_median: Subtract median spectrum (stellar line removal)
         run_sysrem: Run SYSREM systematics removal
-        n_systematics: Number of SYSREM iterations [nontelluric, telluric] or [n]
         remove_doppler_shadow: Remove Doppler shadow (RM effect)
         shadow_params: Dict with 'phase', 'planet_params', 'stellar_params' for shadow removal
+        sysrem_stop_tol: Minimum sigma-improvement required to keep a SYSREM component
 
     Returns:
         Tuple of arrays: (wave, flux, error, jd, snr, exptime, airmass, n_spectra, npix)
@@ -656,19 +680,28 @@ def get_pepsi_data(
     # Step 4: SYSREM systematics removal
     U_sysrem = None
     no_tellurics = None
+    n_systematics_used = None
     if run_sysrem:
-        if n_systematics is None:
-            # Default: 5 iterations for both regions
-            n_systematics = (
-                config.DEFAULT_SYSREM_N_SYSTEMATICS_RED
-                if arm == "red"
-                else config.DEFAULT_SYSREM_N_SYSTEMATICS_OTHER
-            )
-        print(f"Running SYSREM with n_systematics={n_systematics}...")
+        sysrem_max_systematics = (
+            config.DEFAULT_SYSREM_MAX_SYSTEMATICS_RED
+            if arm == "red"
+            else config.DEFAULT_SYSREM_MAX_SYSTEMATICS_OTHER
+        )
+        print(
+            f"Running SYSREM (adaptive) with max_systematics={sysrem_max_systematics}, "
+            f"stop_tol={sysrem_stop_tol:.1e}..."
+        )
         wave_1d = wave[0, :]  # Use first spectrum's wavelength grid
         fluxin, errorin, U_sysrem, no_tellurics = do_sysrem(
-            wave_1d, fluxin, errorin, arm, airmass, n_systematics, do_molecfit=do_molecfit
+            wave_1d,
+            fluxin,
+            errorin,
+            arm,
+            airmass,
+            do_molecfit=do_molecfit,
+            stop_delta_stddev=sysrem_stop_tol,
         )
+        n_systematics_used = [int(np.sum(np.isfinite(U_sysrem[0, :, i]))) for i in range(U_sysrem.shape[2])]
 
     # Step 5: Doppler shadow removal
     shadow_model = None
@@ -692,6 +725,7 @@ def get_pepsi_data(
             'median_flux': median_flux,
             'U_sysrem': U_sysrem,
             'no_tellurics': no_tellurics,
+            'n_systematics_used': n_systematics_used,
             'shadow_model': shadow_model,
             'shadow_fit_info': shadow_fit_info,
         }

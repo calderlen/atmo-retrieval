@@ -38,6 +38,50 @@ flowchart TD
     O -. read by .-> B
 ```
 
+Filtered repository tree (code-focused):
+
+```text
+.
+├── atmo_retrieval.py
+├── config
+│   ├── __init__.py
+│   ├── chemistry_config.py
+│   ├── data_config.py
+│   ├── inference_config.py
+│   ├── instrument_config.py
+│   ├── model_config.py
+│   ├── paths_config.py
+│   ├── planets_config.py
+│   └── tellurics_config.py
+├── databases
+│   ├── atomic.py
+│   └── opacity.py
+├── dataio
+│   ├── import_nasa_archive.py
+│   ├── load.py
+│   ├── make_emission.py
+│   ├── make_transmission.py
+│   └── tellurics.py
+├── environment.yml
+├── physics
+│   ├── chemistry_draft.py
+│   ├── chemistry.py
+│   ├── grid_setup.py
+│   ├── model.py
+│   └── pt.py
+├── pipeline
+│   ├── inference.py
+│   ├── memory_profile.py
+│   ├── retrieval_binned.py
+│   └── retrieval.py
+├── plotting
+│   ├── __init__.py
+│   ├── aliasing.py
+│   └── plot.py
+└── tests
+    └── memory_profile.py
+```
+
 ## expected input directory structure
 
 ```

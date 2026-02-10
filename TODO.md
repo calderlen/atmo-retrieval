@@ -1,6 +1,8 @@
+- TODO: implement sysrem
+
+
+
 - TODO: need to subtract off the stellar spectrum and stuff, so look how atmo-analysis does it
-- TODO: reduce the resolution of the simulation -- make it match the resolution of the instrument (?)
-- TODO: profile the GPU memory requirements of the test model and various model complexities
 - TODO: i guess molecfit was already run on the tellurics so you don't need to model them out? check the do_molecfit logic in old code
 - TODO: determine what sort of atmospheric chemistry model you're going to use
     - free chemistry: sample log Xi directly as parameters and run NUTS/HCM/nested sampling
@@ -27,38 +29,4 @@
     - All others have tau = NaN and will error until filled in
     - Need values for: Lund17, Singh24, WASP-76b, KELT-9b, WASP-12b, WASP-33b, WASP-18b, WASP-189b, MASCARA-1b, TOI-1431b, TOI-1518b
     - Sources: ExoFOP, discovery papers, or fit from TESS lightcurves
-
-
-- TODO: functions to review
-    - model
-         - compute_dtau
-         - compute_dtau_per_species
-         - reconstruct_temperature_profile
-         - reconstruct_vmrs
-         - reconstruct_mmw_and_h2he
-         - compute_atmospheric_state_from_posterior
-         - phase mods implemented within model function within create_retrieval_model
-    - preprocess
-        - compute_contact_phaes
-        - get_phase_boundaries
-        - regrid_to_common_wavelength
-        - subtract_median_spectrum
-        - do_sysrem
-        - get_phase_bin_mask
-        - filter_data_by_phase
-        - get_phase_bin_indices
-        - summarize_phase_coverage
-        - modifications to get_pepsi_data
-    - horus (everything b/c new module)
-    - plots
-         - plot_phase_trace
-         - plot_phase_comparison
-         - plot_aliasing_matrix
-         - plot_ccf_pair
-         - compute_contribution_function
-         - plot_contribution function
-         - plot_contribution_per_species
-         - plot_contribution_combined
-    - retrieval_binned (everything b/c new module)
-    - aliasing (everything b/c new module)
 
