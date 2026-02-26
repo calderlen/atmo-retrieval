@@ -3,6 +3,7 @@ Database paths, data paths, and output configuration.
 """
 
 import os
+from datetime import datetime
 from pathlib import Path
 
 from .planets_config import PLANET, EPHEMERIS
@@ -203,8 +204,6 @@ def create_timestamped_dir(base_dir: str | Path) -> Path:
     Returns:
         Path to timestamped directory (e.g., output/.../2026-01-24_14-30-45/)
     """
-    from datetime import datetime
-
     base_dir = Path(base_dir)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     timestamped_dir = base_dir / timestamp

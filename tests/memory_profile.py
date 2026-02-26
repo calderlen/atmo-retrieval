@@ -10,7 +10,19 @@ import subprocess
 import sys
 from typing import Iterable, TextIO
 
+import jax
+import psutil
+from cuda import cudart
+from exojax.rt import ArtTransPure, ArtEmisPure
+from exojax.utils.memuse import device_memory_use
+
 import config
+from physics.grid_setup import setup_wavenumber_grid
+from databases.opacity import (
+    setup_cia_opacities,
+    load_molecular_opacities,
+    load_atomic_opacities,
+)
 
 _GIB = 1024 ** 3
 _RED = "\033[31m"
@@ -98,8 +110,6 @@ class ProfileResult:
 
 
 def _get_ram_info() -> RamInfo:
-    import psutil
-
     proc = psutil.Process(os.getpid())
     rss = proc.memory_info().rss
     vm = psutil.virtual_memory()
@@ -107,8 +117,6 @@ def _get_ram_info() -> RamInfo:
 
 
 def _get_gpu_info() -> GpuInfo | None:
-    from cuda import cudart
-
     free_bytes, total_bytes = cudart.cudaMemGetInfo()
     return GpuInfo(int(free_bytes), int(total_bytes))
 
@@ -260,8 +268,6 @@ def _estimate_device_memory(
     hard_fail: bool = False,
     return_stats: bool = False,
 ) -> dict[str, float | None] | None:
-    from exojax.utils.memuse import device_memory_use
-
     opa_items = list(opa_items)
     if not opa_items:
         print("\nNo opacity objects found; skipping device memory estimate.")
@@ -361,16 +367,6 @@ def run_memory_profile(
     log_path: str | None = None,
 ) -> ProfileResult | None:
     """Profile approximate GPU/RAM usage for the configured retrieval."""
-    import config
-    from physics.grid_setup import setup_wavenumber_grid
-    from databases.opacity import (
-        setup_cia_opacities,
-        load_molecular_opacities,
-        load_atomic_opacities,
-    )
-    from exojax.rt import ArtTransPure, ArtEmisPure
-    import jax
-
     if log_path is not None:
         set_profile_log(log_path, mode="a")
     print("\nMEMORY PROFILE (approximate)")
@@ -506,8 +502,6 @@ def run_memory_sweep(
     log_path: str | None = None,
 ) -> None:
     """Sweep memory usage by varying one parameter at a time."""
-    import config
-
     base_wav_min, base_wav_max = config.get_wavelength_range()
     base_nlayer = config.NLAYER
     base_nspec = config.N_SPECTRAL_POINTS

@@ -1,13 +1,19 @@
-import jax
+import os
+from contextlib import redirect_stdout
 from pathlib import Path
+
+import jax
 from jax import random
 import jax.numpy as jnp
 import numpy as np
+from numpyro.infer import MCMC, NUTS, init_to_median
 
 from exojax.rt import ArtTransPure, ArtEmisPure
+from exojax.utils.grids import wav2nu
 
 import config
 from dataio.load import load_observed_spectrum, ResolutionInterpolator
+from plotting.aliasing import check_aliasing_with_fe, generate_aliasing_report
 from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from databases.opacity import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
 from physics.model import create_retrieval_model, PhaseMode, compute_atmospheric_state_from_posterior
@@ -21,7 +27,6 @@ from plotting.plot import (
 
 
 def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    from pathlib import Path
     data_dir = Path(data_dir)
 
     required = ["wavelength.npy", "data.npy", "sigma.npy", "phase.npy"]
@@ -306,7 +311,6 @@ def run_retrieval(
     print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
 
     # Convert to wavenumber
-    from exojax.utils.grids import wav2nu
     inst_nus = wav2nu(wav_obs, "AA")
     # Ensure wavenumber grid and data are in ascending order
     if inst_nus.size > 1 and np.any(np.diff(inst_nus) <= 0):
@@ -403,9 +407,6 @@ def run_retrieval(
     # Run aliasing diagnostics if requested
     if check_aliasing:
         print("\n  Running species aliasing diagnostics...")
-        from plotting.aliasing import check_aliasing_with_fe, generate_aliasing_report
-        import os
-        
         # Build templates from opacity objects
         # For now, just print a warning - full implementation would generate 
         # model spectra for each species
@@ -473,8 +474,6 @@ def run_retrieval(
     if svi_only and skip_svi:
         raise ValueError("Cannot set svi_only=True when skip_svi=True")
 
-    from numpyro.infer import MCMC, NUTS, init_to_median
-
     init_strategy = init_to_median(num_samples=config.INIT_TO_MEDIAN_SAMPLES)
     if not skip_svi:
         print(f"  SVI warm-up: {config.SVI_NUM_STEPS} steps, LR={config.SVI_LEARNING_RATE}")
@@ -522,9 +521,6 @@ def run_retrieval(
     mcmc.print_summary()
     
     # Save results
-    import os
-    from contextlib import redirect_stdout
-    
     with open(os.path.join(output_dir, "mcmc_summary.txt"), "w") as f:
         with redirect_stdout(f):
             mcmc.print_summary()

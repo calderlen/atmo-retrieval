@@ -1,4 +1,7 @@
 import argparse
+import importlib.util
+import logging
+import re
 import sys
 import os
 import warnings
@@ -8,6 +11,9 @@ from pathlib import Path
 warnings.filterwarnings("once")
 
 import config
+from pipeline.memory_profile import run_memory_profile, run_memory_sweep
+from pipeline.retrieval import run_retrieval
+from pipeline.retrieval_binned import run_phase_binned_retrieval
 
 
 def create_parser():
@@ -338,8 +344,6 @@ def create_parser():
 
 
 def load_custom_config(config_path):
-    import importlib.util
-
     spec = importlib.util.spec_from_file_location("custom_config", config_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load config module from: {config_path}")
@@ -350,19 +354,14 @@ def load_custom_config(config_path):
 
 
 def apply_custom_config(custom_config):
-    import config as base_config
-
     for name in dir(custom_config):
         if name.isupper():
-            setattr(base_config, name, getattr(custom_config, name))
+            setattr(config, name, getattr(custom_config, name))
 
-    return base_config
+    return config
 
 
 def apply_cli_overrides(args):
-    import config
-    import re
-
     # Planet and ephemeris selection
     if args.planet:
         config.PLANET = args.planet
@@ -506,8 +505,6 @@ def apply_cli_overrides(args):
 
 
 def setup_logging(args):
-    import logging
-
     if args.quiet:
         level = logging.ERROR
     elif args.verbose:
@@ -592,7 +589,6 @@ def main():
 
     # Handle info commands first (before loading full config)
     if args.list_planets:
-        import config
         print("\nAvailable planets:")
         for planet in config.list_planets():
             ephems = config.list_ephemerides(planet)
@@ -600,7 +596,6 @@ def main():
         return 0
 
     if args.list_ephemerides:
-        import config
         planet = args.planet or config.PLANET
         print(f"\nAvailable ephemerides for {planet}:")
         for ephem in config.list_ephemerides(planet):
@@ -615,9 +610,6 @@ def main():
         logger.info(f"Loading custom config: {args.config}")
         custom_config = load_custom_config(args.config)
         config = apply_custom_config(custom_config)
-    else:
-        import config
-
     # Apply CLI overrides
     config = apply_cli_overrides(args)
 
@@ -634,8 +626,6 @@ def main():
         return os.path.join(log_dir, f"{kind}_{ts}.log")
 
     if args.profile_memory:
-        from pipeline.memory_profile import run_memory_profile
-
         if args.profile_log is None:
             args.profile_log = _default_profile_log("memory_profile")
             print(f"Profiler log: {args.profile_log}")
@@ -650,8 +640,6 @@ def main():
         return 0
 
     if args.profile_sweep:
-        from pipeline.memory_profile import run_memory_sweep
-
         if args.profile_log is None:
             args.profile_log = _default_profile_log("memory_sweep")
             print(f"Profiler log: {args.profile_log}")
@@ -689,8 +677,6 @@ def main():
 
     # Run retrieval
     if args.all_phase_bins:
-        from pipeline.retrieval_binned import run_phase_binned_retrieval
-
         logger.info("Starting phase-binned retrieval (all bins)...")
         run_phase_binned_retrieval(
             phase_bins=["T12", "T23", "T34"],
@@ -708,8 +694,6 @@ def main():
         )
 
     elif args.phase_bin:
-        from pipeline.retrieval_binned import run_phase_binned_retrieval
-
         logger.info(f"Starting retrieval for phase bin: {args.phase_bin}...")
         run_phase_binned_retrieval(
             phase_bins=[args.phase_bin],
@@ -727,8 +711,6 @@ def main():
         )
 
     elif args.mode == "transmission":
-        from pipeline.retrieval import run_retrieval
-
         logger.info("Starting transmission retrieval...")
         run_retrieval(
             mode="transmission",
@@ -745,8 +727,6 @@ def main():
         )
 
     elif args.mode == "emission":
-        from pipeline.retrieval import run_retrieval
-
         logger.info("Starting emission retrieval...")
         run_retrieval(
             mode="emission",

@@ -1,20 +1,3 @@
-"""
-Species aliasing diagnostics for atmospheric retrieval.
-
-This module computes cross-correlations between species templates to identify
-potential aliasing/cross-talk. High correlation at v~0 between templates
-indicates that species may be confused in the retrieval.
-
-Key concept: If template A and template B have high cross-correlation at zero
-velocity offset, then a detection of species A could be partially caused by
-species B (or vice versa). This is particularly problematic when a strong
-species (like Fe I with many lines) aliases with a weaker species.
-
-References:
-    - Borsato et al. (2023) for aliasing methodology
-    - Petz et al. (2023) for PEPSI KELT-20b analysis
-"""
-
 from __future__ import annotations
 
 import numpy as np

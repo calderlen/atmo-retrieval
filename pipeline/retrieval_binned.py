@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import json
+
 import numpy as np
+from scipy import stats
 
 import config
 from config.planets_config import PHASE_BINS, get_params
@@ -135,8 +138,6 @@ def compare_phase_posteriors(
     params_to_compare: list[str] | None = None,
     output_dir: str | None = None,
 ) -> dict:
-    from scipy import stats
-    
     bin_names = list(posteriors.keys())
     
     if len(bin_names) < 2:
@@ -245,8 +246,6 @@ def compare_phase_posteriors(
     
     # Save comparison results
     if output_dir:
-        import json
-        
         # Convert numpy types to Python types for JSON serialization
         def convert_to_serializable(obj):
             if isinstance(obj, np.ndarray):

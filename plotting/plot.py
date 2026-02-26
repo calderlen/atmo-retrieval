@@ -1,7 +1,10 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import corner
+
+from exojax.plot.atmplot import plotcf
 
 
 def plot_svi_loss(loss_values: np.ndarray, save_path: str) -> None:
@@ -344,7 +347,6 @@ def plot_phase_comparison(
         )
         
         # For legend
-        from matplotlib.lines import Line2D
         handles.append(Line2D([0], [0], color=color, lw=2))
         labels_legend.append(bin_name)
     
@@ -516,8 +518,6 @@ def plot_contribution_function(
     """
     # Try to use ExoJAX's built-in contribution function if requested
     if use_exojax_plotcf:
-        from exojax.plot.atmplot import plotcf
-
         cf = plotcf(nu_grid, dtau, Tarr, pressure, dParr)
         print("Used ExoJAX plotcf for contribution function")
         return cf

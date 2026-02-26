@@ -7,14 +7,23 @@ atmospheric models.
 
 from __future__ import annotations
 
+import os
+import sys
+import tempfile
 from typing import NamedTuple, Protocol
 from functools import partial
+from pathlib import Path
 
+import h5py
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax
 import numpyro
 import numpyro.distributions as dist
+import pyfastchem
+import vulcan
+from scipy.interpolate import RegularGridInterpolator
 from exojax.database import molinfo
 
 
@@ -1233,9 +1242,6 @@ class EquilibriumChemistry:
 
     def _load_table(self, path: str) -> None:
         """Load pre-computed equilibrium chemistry table."""
-        import numpy as np
-        from pathlib import Path
-
         path = Path(path)
         if path.suffix == ".npz":
             data = np.load(path)
@@ -1247,7 +1253,6 @@ class EquilibriumChemistry:
                 "vmr": {k: data[k] for k in data.files if k.startswith("vmr_")},
             }
         elif path.suffix in (".h5", ".hdf5"):
-            import h5py
             with h5py.File(path, "r") as f:
                 self.table = {
                     "T_grid": f["T_grid"][:],
@@ -1420,9 +1425,6 @@ class EquilibriumChemistry:
         co_ratio: jnp.ndarray,
     ) -> jnp.ndarray:
         """Interpolate VMR from pre-computed table."""
-        from scipy.interpolate import RegularGridInterpolator
-        import numpy as np
-
         vmr_key = f"vmr_{species}"
         if vmr_key not in self.table["vmr"]:
             # Species not in table, fall back to analytic
@@ -3313,8 +3315,6 @@ class FastChemSolver:
         self.include_condensation = include_condensation
 
         self.fastchem = None
-        import pyfastchem
-
         self.pyfastchem = pyfastchem
         self.fastchem_available = True
 
@@ -3348,8 +3348,6 @@ class FastChemSolver:
 
         Returns dictionary of species VMR profiles.
         """
-        import numpy as np
-
         self._init_fastchem()
 
         if self.fastchem is None:
@@ -3906,12 +3904,8 @@ class VULCANSolver:
         # Check if VULCAN is available
         self.vulcan_available = False
         if vulcan_path is not None:
-            import sys
-            import os
             if os.path.exists(vulcan_path):
                 sys.path.insert(0, vulcan_path)
-                import vulcan
-
                 self.vulcan = vulcan
                 self.vulcan_available = True
 
@@ -3933,15 +3927,11 @@ class VULCANSolver:
 
     def _load_cached_grid(self) -> None:
         """Load pre-computed VULCAN results from cache."""
-        import os
-        from pathlib import Path
-
         if self.cache_dir is None:
             return
 
         cache_path = Path(self.cache_dir) / "vulcan_grid.npz"
         if cache_path.exists():
-            import numpy as np
             data = np.load(cache_path)
             self.cached_grid = {
                 "metallicity": data["metallicity"],
@@ -3962,9 +3952,6 @@ class VULCANSolver:
         """Interpolate VMRs from cached grid."""
         if self.cached_grid is None:
             return {}
-
-        from scipy.interpolate import RegularGridInterpolator
-        import numpy as np
 
         vmr_dict = {}
 
@@ -4002,10 +3989,6 @@ class VULCANSolver:
         """
         if not self.vulcan_available:
             return {}
-
-        import numpy as np
-        import tempfile
-        import os
 
         # Create temporary config file for VULCAN
         with tempfile.TemporaryDirectory() as tmpdir:

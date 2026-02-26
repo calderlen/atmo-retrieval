@@ -1,10 +1,14 @@
 """Opacity setup for molecular and atomic species."""
 
+import re
+from time import time
 from typing import Callable
 import os
 import numpy as np
 import jax.numpy as jnp
 import pathlib
+
+import requests
 
 # RADIS uses numba cache=True in some environments where caching is unsupported.
 os.environ.setdefault("NUMBA_DISABLE_CACHE", "1")
@@ -14,11 +18,21 @@ from exojax.opacity.opacont import OpaCIA
 from exojax.database.api import MdbHitemp, MdbExomol
 from exojax.opacity.premodit.api import OpaPremodit
 from exojax.opacity import saveopa
+from radis.api import dbmanager as radis_dbmanager
+from radis.api.hitempapi import login_to_hitran
 
 
 
 # Opacity cache directory (relative to project root)
-from config.paths_config import PROJECT_ROOT
+from config.paths_config import PROJECT_ROOT, DB_KURUCZ, DB_VALD, USE_KURUCZ, USE_VALD
+from databases.atomic import (
+    load_kurucz_atomic,
+    load_vald_atomic,
+    create_atomic_snapshot,
+    resolve_vald_file,
+    parse_species,
+    ATOMIC_MASSES as ATOMIC_MASSES_DB,
+)
 OPA_CACHE_DIR = PROJECT_ROOT / "input" / ".opa_cache"
 OPA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -83,7 +97,6 @@ def _patch_path_contains():
 
 
 def _patch_radis_dbmanager():
-    from radis.api import dbmanager as radis_dbmanager
     orig_init = getattr(radis_dbmanager.DatabaseManager, "__init__", None)
     if orig_init is None or getattr(orig_init, "_path_patched", False):
         return
@@ -102,16 +115,11 @@ _patch_radis_dbmanager()
 
 
 def _patch_radis_download():
-    from radis.api import dbmanager as radis_dbmanager
     orig = getattr(radis_dbmanager.DatabaseManager, "download_and_parse", None)
     if orig is None or getattr(orig, "_no_head_patched", False):
         return
 
     def download_and_parse(self, urlnames, local_files, N_files_total=None):
-        import re
-        import requests
-        from time import time
-
         if N_files_total is None:
             all_local_files, _ = self.get_filenames()
             N_files_total = len(all_local_files)
@@ -137,7 +145,6 @@ def _patch_radis_download():
 
             db_path = str(self.local_databases).lower()
             if "hitemp" in db_path:
-                from radis.api.hitempapi import login_to_hitran
                 session = login_to_hitran(verbose=verbose)
             else:
                 session = requests.Session()
@@ -475,7 +482,6 @@ def load_atomic_opacities(
         return opa_atoms, jnp.array(atommass_list)
 
     # Get defaults from config if not specified
-    from config.paths_config import DB_KURUCZ, DB_VALD, USE_KURUCZ, USE_VALD
     if use_kurucz is None:
         use_kurucz = USE_KURUCZ
     if use_vald is None:
@@ -486,16 +492,6 @@ def load_atomic_opacities(
         return opa_atoms, jnp.array(atommass_list)
 
     cutwing_val = _resolve_cutwing(ndiv, cutwing)
-
-    # Import Kurucz/VALD helpers
-    from databases.atomic import (
-        load_kurucz_atomic,
-        load_vald_atomic,
-        create_atomic_snapshot,
-        resolve_vald_file,
-        parse_species,
-        ATOMIC_MASSES,
-    )
 
     if db_kurucz is None:
         db_kurucz = DB_KURUCZ
@@ -545,7 +541,7 @@ def load_atomic_opacities(
         # Fix missing molmass
         if molmass is None or (isinstance(molmass, float) and np.isnan(molmass)):
             element, _ = parse_species(atom)
-            molmass = ATOMIC_MASSES.get(element, molmass)
+            molmass = ATOMIC_MASSES_DB.get(element, molmass)
 
         if molmass is None:
             raise ValueError(f"Could not determine atomic mass for {atom}.")

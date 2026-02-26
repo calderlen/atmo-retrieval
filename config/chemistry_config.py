@@ -37,6 +37,17 @@ METALLICITY_RANGE = (-2.0, 3.0)
 CO_RATIO_RANGE = (0.1, 2.0)
 
 # ==============================================================================
+# FASTCHEM GRID PARAMETERS
+# ==============================================================================
+
+FASTCHEM_N_TEMP = 50
+FASTCHEM_N_PRESSURE = 50
+FASTCHEM_T_MIN = 500.0
+FASTCHEM_T_MAX = 5000.0
+FASTCHEM_CACHE_DIR = "input/.fastchem_cache"
+FASTCHEM_DATA_DIR = None  # None = use pyfastchem defaults
+
+# ==============================================================================
 # DISEQUILIBRIUM CHEMISTRY
 # ==============================================================================
 

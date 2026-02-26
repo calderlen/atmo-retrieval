@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import warnings
 from typing import Callable, Literal
 
@@ -166,8 +167,6 @@ def _slice_spectral_matrix(
 
 
 def _get_piBarr():
-    import importlib
-
     mod = importlib.import_module("exojax.spec.planck")
     return mod.piBarr
 
@@ -452,8 +451,6 @@ def compute_atmospheric_state_from_posterior(
     pt_profile: str = "guillot",
     use_median: bool = True,
 ) -> dict:
-    import numpy as np
-    
     if use_median:
         params = {k: float(np.median(v)) for k, v in posterior_samples.items() 
                   if not k.startswith("_")}
@@ -684,17 +681,8 @@ def create_retrieval_model(
         Rstar = numpyro.sample("Rstar", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0)) * Rs
         Rp = numpyro.sample("Rp", dist.TruncatedNormal(Rp_mean, Rp_std, low=0.0)) * RJ
 
-        # 2. Composition (sample VMR, convert to MMR for opacity calculations)
-        comp = composition_solver.sample(
-            mol_names, mol_masses, atom_names, atom_masses, art
-        )
-        mmr_mols = comp.mmr_mols
-        mmr_atoms = comp.mmr_atoms
-        vmrH2_prof = comp.vmrH2_prof
-        vmrHe_prof = comp.vmrHe_prof
-        mmw_prof = comp.mmw_prof
-
-        # 3. Temperature & Gravity
+        # 2. Gravity & Temperature (computed before composition so Tarr
+        #    can be passed to temperature-dependent composition solvers)
         g_ref = gravity_surface(Rp / RJ, Mp / MJ)
 
         if pt_profile == "guillot":
@@ -734,6 +722,16 @@ def create_retrieval_model(
             Tarr = numpyro_gp_temperature(art, T_low=T_low, T_high=T_high)
         else:
             raise ValueError(f"Unknown P-T profile: {pt_profile}")
+
+        # 3. Composition (sample VMR, convert to MMR for opacity calculations)
+        comp = composition_solver.sample(
+            mol_names, mol_masses, atom_names, atom_masses, art, Tarr=Tarr
+        )
+        mmr_mols = comp.mmr_mols
+        mmr_atoms = comp.mmr_atoms
+        vmrH2_prof = comp.vmrH2_prof
+        vmrHe_prof = comp.vmrHe_prof
+        mmw_prof = comp.mmw_prof
 
         g = art.gravity_profile(Tarr, mmw_prof, Rp, g_ref)
 

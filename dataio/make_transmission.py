@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import os
+import sys
 import numpy as np
 from glob import glob
 from astropy.io import fits
@@ -29,7 +30,8 @@ from config.instrument_config import (
     get_resolution,
     TELLURIC_REGIONS,
 )
-from config.planets_config import PHASE_BINS
+from config.planets_config import PHASE_BINS, PLANETS, EPHEMERIS
+from dataio.horus import remove_doppler_shadow as _remove_shadow
 
 
 def compute_contact_phases(params: dict) -> dict[str, float]:
@@ -708,7 +710,6 @@ def get_pepsi_data(
     shadow_fit_info = None
     if remove_doppler_shadow and shadow_params is not None:
         print("Removing Doppler shadow (Rossiter-McLaughlin effect)...")
-        from dataio.horus import remove_doppler_shadow as _remove_shadow
         wave_1d = wave[0, :] if wave.ndim == 2 else wave
         fluxin, shadow_model, shadow_fit_info = _remove_shadow(
             fluxin, wave_1d,
@@ -946,8 +947,6 @@ def main():
     print(f"JD range: {jd.min():.4f} - {jd.max():.4f}")
 
     # Calculate transmission spectrum using planet config
-    from config.planets_config import PLANETS, EPHEMERIS
-
     planet_config = PLANETS.get(args.planet, {}).get(EPHEMERIS, {})
     if not planet_config:
         print(f"ERROR: Planet '{args.planet}' not found in config/planets_config.py")
@@ -1030,5 +1029,4 @@ def main():
 
 
 if __name__ == '__main__':
-    import sys
     sys.exit(main())

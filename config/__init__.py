@@ -10,6 +10,11 @@ Configuration is split into logical modules:
 - inference: SVI and MCMC sampling parameters
 """
 
+import os
+from datetime import datetime
+import platform
+import jax
+
 # Re-export everything for convenience
 from .planets_config import (
     PLANET,
@@ -197,11 +202,6 @@ def save_run_config(
         svi_only: Whether only SVI was run
         seed: Random seed
     """
-    import os
-    from datetime import datetime
-    import platform
-    import jax
-
     log_path = os.path.join(output_dir, "run_config.log")
 
     params = get_params()
