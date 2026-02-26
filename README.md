@@ -38,7 +38,7 @@ flowchart TD
     O -. read by .-> B
 ```
 
-Filtered repository tree (code-focused):
+modules:
 
 ```text
 .
