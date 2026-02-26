@@ -18,8 +18,7 @@ PT_PROFILE_DEFAULT = "guillot"  # Options: "guillot", "isothermal", "free`"
 # ==============================================================================
 
 DIFFMODE = 0
-#NLAYER = 100  # Number of atmospheric layers
-NLAYER = 20
+NLAYER = 20 # number of atmospheric layers
 
 # Pressure range [bar]
 PRESSURE_TOP = 1e-8 
@@ -35,19 +34,19 @@ LOG_KAPPA_IR_BOUNDS = (-4.0, 0.0)
 LOG_GAMMA_BOUNDS = (-2.0, 2.0)
 
 # Model/inference defaults
-DEFAULT_KP = 169.0
-DEFAULT_KP_ERR = 20.0
-DEFAULT_RV_ABS = 0.0
-DEFAULT_RV_ABS_ERR = 5.0
-DEFAULT_TSTAR = 6000.0
-DEFAULT_RP_ERR = 0.1
-DEFAULT_MP_ERR = 0.1
-DEFAULT_RSTAR_ERR = 0.1
+DEFAULT_KP = 169.0  # planet radial velocity semi-amplitude [km/s]
+DEFAULT_KP_ERR = 20.0 
+DEFAULT_RV_ABS = 0.0 # absolute RV shift [km/s]
+DEFAULT_RV_ABS_ERR = 1.0
+DEFAULT_TSTAR = 6000.0 # stellar temperature [K] 
+DEFAULT_RP_ERR = 0.1 # planet radius error (relative to Rp/Rs)
+DEFAULT_MP_ERR = 0.1 # planet mass error (relative to Mp/Ms)
+DEFAULT_RSTAR_ERR = 0.1 # stellar radius error (relative to Rstar)
 
 # Stitching and broadening defaults
-STITCH_MIN_GUARD_POINTS = 128
-STITCH_VSINI_MAX = 150.0
-STITCH_VRMAX = 500.0
+STITCH_MIN_GUARD_POINTS = 128 # Minimum guard points for stitching (applies when guard is computed from km/s)
+STITCH_VSINI_MAX = 150.0 # Maximum vsini for stitching (km/s). If either vsini or max RV shift exceeds this, stitching is enabled regardless of grid spacing.
+STITCH_VRMAX = 500.0 # Maximum RV shift for stitching (km/s). If either vsini or max RV shift exceeds this, stitching is enabled regardless of grid spacing.
 
 # Guard estimation defaults
 DEFAULT_RP_MEAN = 1.0
@@ -59,15 +58,15 @@ DEFAULT_RV_GUARD_EXTRA = 30.0
 DEFAULT_SIGMA_V_FACTOR = 5.0
 
 # Posterior reconstruction defaults
-DEFAULT_POSTERIOR_RP = 1.5
-DEFAULT_POSTERIOR_MP = 1.0
+DEFAULT_POSTERIOR_RP = 1.5 # Maximum Rp/Rs for posterior reconstruction (affects grid spacing and guard size)
+DEFAULT_POSTERIOR_MP = 1.0 # Maximum Mp/Ms for posterior reconstruction (affects guard size)
 
 # Pipeline behavior defaults
-SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT = True
-APPLY_SYSREM_DEFAULT = False
+SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT = True # Whether to subtract per-exposure mean from model and data before computing likelihood. Should be True for CCF-like likelihoods, but can be False for full-spectrum Gaussian likelihoods.
+APPLY_SYSREM_DEFAULT = True # Whether to apply SysRem-like filtering to model and data before computing likelihood. Should be True for CCF-like likelihoods, but can be False for full-spectrum Gaussian likelihoods. Requires U and invvar_spec from data preprocessing.
 
 # Phase modeling defaults
-DEFAULT_PHASE_MODE = "global"
+DEFAULT_PHASE_MODE = "global" 
 
 # ==============================================================================
 # SPECTRAL GRID PARAMETERS

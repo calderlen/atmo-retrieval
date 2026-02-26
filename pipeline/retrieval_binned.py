@@ -10,8 +10,14 @@ from scipy import stats
 
 import config
 from config.planets_config import PHASE_BINS, get_params
-from dataio.make_transmission import filter_data_by_phase, summarize_phase_coverage
-from pipeline.retrieval import load_timeseries_data, run_retrieval, _normalize_phase
+from dataio.make_transmission import summarize_phase_coverage
+from pipeline.retrieval import (
+    _load_sysrem_inputs,
+    _normalize_phase,
+    _validate_sysrem_inputs,
+    load_timeseries_data,
+    run_retrieval,
+)
 
 
 def run_phase_binned_retrieval(
@@ -39,6 +45,19 @@ def run_phase_binned_retrieval(
 
     phase = _normalize_phase(phase)
     params = retrieval_kwargs.get("params", get_params())
+    apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT)
+
+    U_sysrem = None
+    invvar_spec = None
+    if apply_sysrem:
+        U_raw, invvar_raw = _load_sysrem_inputs(resolved_data_dir)
+        U_sysrem, invvar_spec = _validate_sysrem_inputs(
+            U_raw, invvar_raw, n_exp=data.shape[0]
+        )
+        print(
+            f"Loaded SYSREM auxiliaries for phase-binned retrieval: "
+            f"U shape={U_sysrem.shape}, invvar_spec shape={invvar_spec.shape}"
+        )
     
     # Validate phase bins
     for bin_name in phase_bins:
@@ -77,9 +96,13 @@ def run_phase_binned_retrieval(
         print(f"{'='*70}")
         
         # Filter data to this phase bin
-        data_bin, sigma_bin, phase_bin = filter_data_by_phase(
-            data, sigma, phase, bin_name, params
-        )
+        indices = np.array(bin_info.get("indices", []), dtype=int)
+        data_bin = data[indices]
+        sigma_bin = sigma[indices]
+        phase_bin = phase[indices]
+
+        U_bin = None if U_sysrem is None else U_sysrem[indices]
+        invvar_bin = None if invvar_spec is None else invvar_spec[indices]
         
         print(f"Filtered to {len(phase_bin)} exposures")
         
@@ -98,6 +121,8 @@ def run_phase_binned_retrieval(
                 data=data_bin,
                 sigma=sigma_bin,
                 phase=phase_bin,
+                U=U_bin,
+                invvar_spec=invvar_bin,
                 **retrieval_kwargs,
             )
             results[bin_name] = {"output_dir": str(bin_output_dir)}

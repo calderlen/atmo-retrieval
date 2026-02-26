@@ -805,8 +805,9 @@ def create_retrieval_model(
 
             if apply_sysrem:
                 if (U is None) or (invvar_spec is None):
-                    # This should be caught by caller, but safe to check
-                    pass
+                    raise ValueError(
+                        "apply_sysrem=True requires both U and invvar_spec inputs."
+                    )
                 model_ts = sysrem_filter_model(model_ts, U, invvar_spec)
 
             # 10. Log-Likelihood (CCF-equivalent Matched Filter)

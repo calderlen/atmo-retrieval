@@ -45,6 +45,89 @@ def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, 
     return wavelength, data, sigma, phase
 
 
+def _load_sysrem_inputs(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    data_dir = Path(data_dir)
+
+    u_candidates = [
+        data_dir / "U.npy",
+        data_dir / "U_sysrem.npy",
+        data_dir / "U_sysrem.npz",
+    ]
+    invvar_candidates = [
+        data_dir / "invvar_spec.npy",
+        data_dir / "invvar.npy",
+    ]
+
+    u_path = next((p for p in u_candidates if p.exists()), None)
+    invvar_path = next((p for p in invvar_candidates if p.exists()), None)
+
+    if u_path is None or invvar_path is None:
+        raise FileNotFoundError(
+            "apply_sysrem=True requires SYSREM auxiliaries in data directory. "
+            "Expected one of {U.npy, U_sysrem.npy, U_sysrem.npz} and one of "
+            "{invvar_spec.npy, invvar.npy} in "
+            f"{data_dir}."
+        )
+
+    if u_path.suffix == ".npz":
+        with np.load(u_path) as u_data:
+            if "U" in u_data:
+                U = u_data["U"]
+            elif "U_sysrem" in u_data:
+                U = u_data["U_sysrem"]
+            else:
+                raise KeyError(
+                    f"{u_path} must contain key 'U' or 'U_sysrem'."
+                )
+    else:
+        U = np.load(u_path)
+
+    invvar_spec = np.load(invvar_path)
+    return U, invvar_spec
+
+
+def _validate_sysrem_inputs(
+    U: np.ndarray,
+    invvar_spec: np.ndarray,
+    n_exp: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    U = np.asarray(U)
+    invvar_spec = np.asarray(invvar_spec)
+
+    if U.ndim == 3:
+        if U.shape[2] != 1:
+            raise ValueError(
+                "SYSREM basis U has multiple chunks; retrieval currently supports "
+                f"only a single chunk. Got U.shape={U.shape}."
+            )
+        U = U[:, :, 0]
+
+    if U.ndim != 2:
+        raise ValueError(f"SYSREM basis U must be 2D; got shape {U.shape}.")
+    if invvar_spec.ndim != 1:
+        raise ValueError(
+            f"invvar_spec must be 1D over exposures; got shape {invvar_spec.shape}."
+        )
+
+    if U.shape[0] != n_exp:
+        raise ValueError(
+            f"U exposure axis mismatch: U.shape[0]={U.shape[0]} but n_exp={n_exp}."
+        )
+    if invvar_spec.size != n_exp:
+        raise ValueError(
+            "invvar_spec exposure axis mismatch: "
+            f"invvar_spec.size={invvar_spec.size} but n_exp={n_exp}."
+        )
+    if not np.all(np.isfinite(U)):
+        raise ValueError("SYSREM basis U contains non-finite values.")
+    if not np.all(np.isfinite(invvar_spec)):
+        raise ValueError("invvar_spec contains non-finite values.")
+    if np.any(invvar_spec <= 0):
+        raise ValueError("invvar_spec must be strictly positive.")
+
+    return U, invvar_spec
+
+
 def _normalize_phase(phase: np.ndarray) -> np.ndarray:
     phase = np.asarray(phase)
     if phase.size == 0:
@@ -239,6 +322,8 @@ def run_retrieval(
     data: np.ndarray | None = None,
     sigma: np.ndarray | None = None,
     phase: np.ndarray | None = None,
+    U: np.ndarray | None = None,
+    invvar_spec: np.ndarray | None = None,
 ) -> None:
     # Create timestamped output directory
     base_dir = config.DIR_SAVE or config.get_output_dir()
@@ -258,6 +343,15 @@ def run_retrieval(
     # Get planet parameters
     params = config.get_params()
     print(f"\nTarget: {config.PLANET} ({config.EPHEMERIS})")
+
+    apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT)
+    stitch_inference = bool(config.ENABLE_INFERENCE_STITCHING)
+    if apply_sysrem and stitch_inference:
+        print("  apply_sysrem=True: disabling inference stitching (unsupported combination).")
+        stitch_inference = False
+
+    U_sysrem: np.ndarray | None = None
+    invvar_spec: np.ndarray | None = None
     
     print("\n[1/7] Loading time-series data...")
     if epoch:
@@ -268,6 +362,19 @@ def run_retrieval(
         phase = _normalize_phase(phase)
         print(f"  Using provided data: {data.shape[0]} exposures x {data.shape[1]} wavelengths")
         print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
+        if apply_sysrem:
+            if U is None or invvar_spec is None:
+                raise ValueError(
+                    "apply_sysrem=True requires U and invvar_spec when providing "
+                    "wav_obs/data/sigma/phase directly."
+                )
+            U_sysrem, invvar_spec = _validate_sysrem_inputs(
+                U, invvar_spec, n_exp=data.shape[0]
+            )
+            print(
+                f"  Using provided SYSREM auxiliaries: U shape={U_sysrem.shape}, "
+                f"invvar_spec shape={invvar_spec.shape}"
+            )
     else:
         if data_format not in {"auto", "timeseries", "spectrum"}:
             raise ValueError(f"Unknown data_format: {data_format}")
@@ -292,6 +399,15 @@ def run_retrieval(
             phase = _normalize_phase(phase)
             print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
             print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
+            if apply_sysrem:
+                U_raw, invvar_raw = _load_sysrem_inputs(resolved_data_dir)
+                U_sysrem, invvar_spec = _validate_sysrem_inputs(
+                    U_raw, invvar_raw, n_exp=data.shape[0]
+                )
+                print(
+                    f"  Loaded SYSREM auxiliaries: U shape={U_sysrem.shape}, "
+                    f"invvar_spec shape={invvar_spec.shape}"
+                )
         elif data_format == "spectrum":
             wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
                 str(data_paths["wavelength"]),
@@ -302,11 +418,27 @@ def run_retrieval(
             sigma = uncertainty[np.newaxis, :]
             phase = np.array([0.0])
             print(f"  Loaded single spectrum with {len(wav_obs)} points")
+            if apply_sysrem:
+                raise ValueError(
+                    "apply_sysrem=True with data_format='spectrum' requires SYSREM "
+                    "auxiliaries tied to time-series exposures, which are unavailable "
+                    "for single-spectrum input. Use data_format='timeseries' or set "
+                    "APPLY_SYSREM_DEFAULT=False."
+                )
         else:
             wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
             phase = _normalize_phase(phase)
             print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
             print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
+            if apply_sysrem:
+                U_raw, invvar_raw = _load_sysrem_inputs(resolved_data_dir)
+                U_sysrem, invvar_spec = _validate_sysrem_inputs(
+                    U_raw, invvar_raw, n_exp=data.shape[0]
+                )
+                print(
+                    f"  Loaded SYSREM auxiliaries: U shape={U_sysrem.shape}, "
+                    f"invvar_spec shape={invvar_spec.shape}"
+                )
     
     print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
 
@@ -453,7 +585,8 @@ def run_retrieval(
         T_low=config.T_LOW,
         T_high=config.T_HIGH,
         phase_mode=phase_mode,
-        stitch_inference=config.ENABLE_INFERENCE_STITCHING,
+        apply_sysrem=apply_sysrem,
+        stitch_inference=stitch_inference,
         stitch_chunk_points=config.INFERENCE_STITCH_CHUNK_POINTS,
         stitch_n_chunks=config.INFERENCE_STITCH_NCHUNKS,
         stitch_guard_kms=config.INFERENCE_STITCH_GUARD_KMS,
@@ -466,6 +599,8 @@ def run_retrieval(
     data_jnp = jnp.array(data)
     sigma_jnp = jnp.array(sigma)
     phase_jnp = jnp.array(phase)
+    U_jnp = None if U_sysrem is None else jnp.array(U_sysrem)
+    invvar_spec_jnp = None if invvar_spec is None else jnp.array(invvar_spec)
 
     # Run inference
     print("\n[7/7] Running Bayesian inference...")
@@ -484,6 +619,8 @@ def run_retrieval(
             data=data_jnp,
             sigma=sigma_jnp,
             phase=phase_jnp,
+            U=U_jnp,
+            invvar_spec=invvar_spec_jnp,
             Mp_mean=model_params["M_p"],
             Mp_std=model_params["M_p_err"],
             Rstar_mean=model_params["R_star"],
@@ -516,7 +653,14 @@ def run_retrieval(
     )
 
     rng_key, rng_key_ = random.split(rng_key)
-    mcmc.run(rng_key_, data=data_jnp, sigma=sigma_jnp, phase=phase_jnp)
+    mcmc.run(
+        rng_key_,
+        data=data_jnp,
+        sigma=sigma_jnp,
+        phase=phase_jnp,
+        U=U_jnp,
+        invvar_spec=invvar_spec_jnp,
+    )
     
     mcmc.print_summary()
     

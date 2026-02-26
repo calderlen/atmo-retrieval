@@ -77,6 +77,8 @@ def run_svi(
     data: jnp.ndarray,
     sigma: jnp.ndarray,
     phase: jnp.ndarray,
+    U: jnp.ndarray | None,
+    invvar_spec: jnp.ndarray | None,
     Mp_mean: float,
     Mp_std: float,
     Rstar_mean: float,
@@ -95,6 +97,8 @@ def run_svi(
         data=data,
         sigma=sigma,
         phase=phase,
+        U=U,
+        invvar_spec=invvar_spec,
     )
 
     params = svi_result.params
