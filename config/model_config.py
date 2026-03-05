@@ -43,23 +43,9 @@ DEFAULT_RP_ERR = 0.1 # planet radius error (relative to Rp/Rs)
 DEFAULT_MP_ERR = 0.1 # planet mass error (relative to Mp/Ms)
 DEFAULT_RSTAR_ERR = 0.1 # stellar radius error (relative to Rstar)
 
-# Stitching and broadening defaults
-STITCH_MIN_GUARD_POINTS = 128 # Minimum guard points for stitching (applies when guard is computed from km/s)
-STITCH_VSINI_MAX = 150.0 # Maximum vsini for stitching (km/s). If either vsini or max RV shift exceeds this, stitching is enabled regardless of grid spacing.
-STITCH_VRMAX = 500.0 # Maximum RV shift for stitching (km/s). If either vsini or max RV shift exceeds this, stitching is enabled regardless of grid spacing.
-
-# Guard estimation defaults
-DEFAULT_RP_MEAN = 1.0
-DEFAULT_KP_MEAN = 0.0
-DEFAULT_KP_ERR_MEAN = 0.0
-DEFAULT_RV_ABS_MEAN = 0.0
-DEFAULT_RV_ABS_ERR_MEAN = 0.0
-DEFAULT_RV_GUARD_EXTRA = 30.0
-DEFAULT_SIGMA_V_FACTOR = 5.0
-
 # Posterior reconstruction defaults
-DEFAULT_POSTERIOR_RP = 1.5 # Maximum Rp/Rs for posterior reconstruction (affects grid spacing and guard size)
-DEFAULT_POSTERIOR_MP = 1.0 # Maximum Mp/Ms for posterior reconstruction (affects guard size)
+DEFAULT_POSTERIOR_RP = 1.5 # Maximum Rp/Rs for posterior reconstruction
+DEFAULT_POSTERIOR_MP = 1.0 # Maximum Mp/Ms for posterior reconstruction
 
 # Pipeline behavior defaults
 SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT = True # Whether to subtract per-exposure mean from model and data before computing likelihood. Should be True for CCF-like likelihoods, but can be False for full-spectrum Gaussian likelihoods.
@@ -78,29 +64,8 @@ WAV_MIN_OFFSET = 100  # Angstroms
 WAV_MAX_OFFSET = 100  # Angstroms
 
 # preMODIT parameters
-# NDIV controls wavenumber stitching (OpaPremodit nstitch) to reduce device memory.
-NDIV = 250
-# Line-wing truncation (relative to grid spacing). Set to None to auto-scale as 1/(2*NDIV).
+# Line-wing truncation (relative to grid spacing). Set to None to use the default.
 PREMODIT_CUTWING = None
-
-# ==============================================================================
-# INFERENCE GRID STITCHING (OPTIONAL)
-# ==============================================================================
-# Chunk the forward model across the wavenumber grid to reduce GPU memory during
-# inference. Enable only if full-grid inference is too large.
-ENABLE_INFERENCE_STITCHING = True
-# Target number of grid points in each chunk core (excludes guard points).
-# Ignored if INFERENCE_STITCH_NCHUNKS is set.
-INFERENCE_STITCH_CHUNK_POINTS = 50000
-# Explicit number of chunks. If set, overrides INFERENCE_STITCH_CHUNK_POINTS.
-INFERENCE_STITCH_NCHUNKS = None
-# Guard band in km/s to mitigate edge effects from broadening + Doppler shifts.
-# If INFERENCE_STITCH_GUARD_POINTS is set, this is ignored.
-INFERENCE_STITCH_GUARD_KMS = 300.0
-# Explicit guard size in grid points (overrides INFERENCE_STITCH_GUARD_KMS).
-INFERENCE_STITCH_GUARD_POINTS = None
-# Minimum guard size in grid points (applies when guard is computed from km/s).
-INFERENCE_STITCH_MIN_GUARD_POINTS = 256
 
 # ==============================================================================
 # CLOUD/HAZE PARAMETERS

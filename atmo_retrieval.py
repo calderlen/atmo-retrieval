@@ -5,13 +5,10 @@ import re
 import sys
 import os
 import warnings
-from datetime import datetime
-from pathlib import Path
 
 warnings.filterwarnings("once")
 
 import config
-from pipeline.memory_profile import run_memory_profile, run_memory_sweep
 from pipeline.retrieval import run_retrieval
 from pipeline.retrieval_binned import run_phase_binned_retrieval
 
@@ -144,6 +141,22 @@ def create_parser():
         help=f"P-T profile type (default: {config.PT_PROFILE_DEFAULT})"
     )
     model_group.add_argument(
+        "--chemistry-model",
+        type=str,
+        choices=["constant", "fastchem_hybrid_grid"],
+        default=config.CHEMISTRY_MODEL_DEFAULT,
+        help=(
+            "Chemistry/composition model "
+            f"(default: {config.CHEMISTRY_MODEL_DEFAULT})"
+        ),
+    )
+    model_group.add_argument(
+        "--fastchem-parameter-file",
+        type=str,
+        default=None,
+        help="Path to FastChem parameters.dat (required for fastchem_hybrid_grid)",
+    )
+    model_group.add_argument(
         "--enable-tellurics",
         action="store_true",
         default=None,
@@ -183,74 +196,6 @@ def create_parser():
         "--check-aliasing",
         action="store_true",
         help="Compute species template cross-correlations before retrieval"
-    )
-    diag_group.add_argument(
-        "--profile-memory",
-        action="store_true",
-        help="Profile GPU/RAM usage for the configured run and exit"
-    )
-    diag_group.add_argument(
-        "--profile-sweep",
-        action="store_true",
-        help="Run a parameter sweep of memory profiling and exit"
-    )
-    diag_group.add_argument(
-        "--profile-load-only",
-        action="store_true",
-        help="Only load cached opacities when profiling (skip builds)"
-    )
-    diag_group.add_argument(
-        "--profile-skip-opacities",
-        action="store_true",
-        help="Skip loading opacities during profiling"
-    )
-    diag_group.add_argument(
-        "--profile-log",
-        type=str,
-        default=None,
-        help="Path to save profiler output (appends if exists)"
-    )
-    diag_group.add_argument(
-        "--nfree",
-        type=int,
-        default=10,
-        help="Number of free parameters for memory estimation (default: 10)"
-    )
-    diag_group.add_argument(
-        "--sweep-nfree",
-        type=str,
-        default=None,
-        help='Comma-separated list for nfree sweep (e.g., "5,10,20,50")'
-    )
-    diag_group.add_argument(
-        "--sweep-nlayer",
-        type=str,
-        default=None,
-        help='Comma-separated list for nlayer sweep (e.g., "50,100,150")'
-    )
-    diag_group.add_argument(
-        "--sweep-nspec",
-        type=str,
-        default=None,
-        help='Comma-separated list for N_SPECTRAL_POINTS sweep (e.g., "50000,100000")'
-    )
-    diag_group.add_argument(
-        "--sweep-wrange",
-        type=str,
-        default=None,
-        help='Comma-separated wavelength range scale factors (e.g., "0.5,0.75,1.0,1.25")'
-    )
-    diag_group.add_argument(
-        "--sweep-wrange-mode",
-        type=str,
-        choices=["fixed_n", "fixed_res"],
-        default="fixed_res",
-        help="How to sweep wavelength range (default: fixed_res)"
-    )
-    diag_group.add_argument(
-        "--sweep-hard-fail",
-        action="store_true",
-        help="Abort sweep when estimated memory exceeds GPU total"
     )
 
     # Species selection (runtime overrides)
@@ -374,6 +319,12 @@ def apply_cli_overrides(args):
     # Retrieval mode
     if args.mode:
         config.RETRIEVAL_MODE = args.mode
+
+    # Chemistry model
+    if args.chemistry_model:
+        config.CHEMISTRY_MODEL_DEFAULT = args.chemistry_model
+    if args.fastchem_parameter_file:
+        config.FASTCHEM_PARAMETER_FILE = args.fastchem_parameter_file
 
     # Output directory (auto-set based on planet/ephemeris/mode)
     if args.output:
@@ -539,6 +490,10 @@ def print_config_summary(config, args):
     print(f"  T_star: {params['T_star']} K")
 
     print(f"\nMode: {config.RETRIEVAL_MODE.upper()}")
+    print(f"Chemistry model: {args.chemistry_model}")
+    if args.chemistry_model == "fastchem_hybrid_grid":
+        fc_file = args.fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
+        print(f"FastChem parameter file: {fc_file}")
     print(f"Phase mode: {args.phase_mode if hasattr(args, 'phase_mode') else 'global'}")
     if hasattr(args, 'phase_bin') and args.phase_bin:
         print(f"Phase bin: {args.phase_bin}")
@@ -576,12 +531,6 @@ def main():
     parser = create_parser()
     args = parser.parse_args()
 
-    # Default to no-preallocation for profiling runs unless explicitly overridden.
-    if args.profile_memory or args.profile_sweep:
-        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-        os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
-        os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
-
     if args.no_preallocate:
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
         os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
@@ -617,64 +566,6 @@ def main():
     if not args.quiet:
         print_config_summary(config, args)
 
-    def _default_profile_log(kind: str) -> str:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if config.DIR_SAVE is None:
-            raise RuntimeError("DIR_SAVE is not set; cannot create profile log path")
-        log_dir = os.path.join(config.DIR_SAVE, "profiling")
-        os.makedirs(log_dir, exist_ok=True)
-        return os.path.join(log_dir, f"{kind}_{ts}.log")
-
-    if args.profile_memory:
-        if args.profile_log is None:
-            args.profile_log = _default_profile_log("memory_profile")
-            print(f"Profiler log: {args.profile_log}")
-
-        run_memory_profile(
-            mode=args.mode or config.RETRIEVAL_MODE,
-            nfree=args.nfree,
-            load_only=args.profile_load_only,
-            skip_opacities=args.profile_skip_opacities,
-            log_path=args.profile_log,
-        )
-        return 0
-
-    if args.profile_sweep:
-        if args.profile_log is None:
-            args.profile_log = _default_profile_log("memory_sweep")
-            print(f"Profiler log: {args.profile_log}")
-
-        def _parse_int_list(value: str | None, default: list[int]) -> list[int]:
-            if value is None:
-                return default
-            parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
-            return [int(p) for p in parts]
-
-        def _parse_float_list(value: str | None, default: list[float]) -> list[float]:
-            if value is None:
-                return default
-            parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
-            return [float(p) for p in parts]
-
-        nfree_vals = _parse_int_list(args.sweep_nfree, [1, 5, 10, 20, 50, 100])
-        nlayer_vals = _parse_int_list(args.sweep_nlayer, [20, 50, 75, 100, 150, 200])
-        nspec_vals = _parse_int_list(args.sweep_nspec, [50000, 100000, 150000, 200000, 250000])
-        wrange_vals = _parse_float_list(args.sweep_wrange, [0.5, 0.75, 1.0, 1.25, 1.5])
-
-        run_memory_sweep(
-            mode=args.mode or config.RETRIEVAL_MODE,
-            nfree_values=nfree_vals,
-            nlayer_values=nlayer_vals,
-            nspec_values=nspec_vals,
-            wrange_scales=wrange_vals,
-            wrange_mode=args.sweep_wrange_mode,
-            load_only=args.profile_load_only,
-            skip_opacities=args.profile_skip_opacities,
-            hard_fail=args.sweep_hard_fail,
-            log_path=args.profile_log,
-        )
-        return 0
-
     # Run retrieval
     if args.all_phase_bins:
         logger.info("Starting phase-binned retrieval (all bins)...")
@@ -689,6 +580,8 @@ def main():
             no_plots=args.no_plots,
             pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
             phase_mode=args.phase_mode,
+            chemistry_model=args.chemistry_model,
+            fastchem_parameter_file=args.fastchem_parameter_file,
             check_aliasing=args.check_aliasing,
             seed=args.seed,
         )
@@ -706,6 +599,8 @@ def main():
             no_plots=args.no_plots,
             pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
             phase_mode=args.phase_mode,
+            chemistry_model=args.chemistry_model,
+            fastchem_parameter_file=args.fastchem_parameter_file,
             check_aliasing=args.check_aliasing,
             seed=args.seed,
         )
@@ -722,6 +617,8 @@ def main():
             no_plots=args.no_plots,
             pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
             phase_mode=args.phase_mode,
+            chemistry_model=args.chemistry_model,
+            fastchem_parameter_file=args.fastchem_parameter_file,
             check_aliasing=args.check_aliasing,
             seed=args.seed,
         )
@@ -738,6 +635,8 @@ def main():
             no_plots=args.no_plots,
             pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
             phase_mode=args.phase_mode,
+            chemistry_model=args.chemistry_model,
+            fastchem_parameter_file=args.fastchem_parameter_file,
             check_aliasing=args.check_aliasing,
             seed=args.seed,
         )

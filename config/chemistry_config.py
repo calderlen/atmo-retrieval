@@ -36,6 +36,9 @@ METALLICITY_RANGE = (-2.0, 3.0)
 # C/O ratio prior range (solar ~ 0.55)
 CO_RATIO_RANGE = (0.1, 2.0)
 
+# Solar elemental abundance table (Asplund 2020; log epsilon format)
+SOLAR_ABUNDANCE_FILE = "input/abundances/asplund_2020_extended"
+
 # ==============================================================================
 # FASTCHEM GRID PARAMETERS
 # ==============================================================================
@@ -46,6 +49,17 @@ FASTCHEM_T_MIN = 500.0
 FASTCHEM_T_MAX = 5000.0
 FASTCHEM_CACHE_DIR = "input/.fastchem_cache"
 FASTCHEM_DATA_DIR = None  # None = use pyfastchem defaults
+FASTCHEM_PARAMETER_FILE = None  # Path to FastChem parameters.dat
+
+# Chemistry solver selection
+CHEMISTRY_MODEL_DEFAULT = "constant"
+
+# Hybrid FastChem grid settings (NUTS-safe via JAX interpolation)
+FASTCHEM_HYBRID_CONTINUUM_SPECIES = ("H-", "e-", "H")
+FASTCHEM_HYBRID_N_METALLICITY = 17
+FASTCHEM_HYBRID_N_CO_RATIO = 17
+FASTCHEM_HYBRID_METALLICITY_RANGE = METALLICITY_RANGE
+FASTCHEM_HYBRID_CO_RATIO_RANGE = CO_RATIO_RANGE
 
 # ==============================================================================
 # DISEQUILIBRIUM CHEMISTRY

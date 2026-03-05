@@ -14,6 +14,7 @@ from exojax.utils.grids import wav2nu
 import config
 from dataio.load import load_observed_spectrum, ResolutionInterpolator
 from plotting.aliasing import check_aliasing_with_fe, generate_aliasing_report
+from physics.chemistry import ConstantVMR, FastChemHybridChemistry
 from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from databases.opacity import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
 from physics.model import create_retrieval_model, PhaseMode, compute_atmospheric_state_from_posterior
@@ -155,13 +156,44 @@ def _normalize_phase(phase: np.ndarray) -> np.ndarray:
     return phase
 
 
-def _format_range(arr: np.ndarray) -> str:
-    if arr is None:
-        return "None"
-    arr = np.asarray(arr)
-    if arr.size == 0:
-        return "empty"
-    return f"{np.nanmin(arr):.4g} .. {np.nanmax(arr):.4g}"
+def _build_composition_solver(
+    chemistry_model: str,
+    fastchem_parameter_file: str | None,
+):
+    model = chemistry_model.lower().strip()
+    if model == "constant":
+        return ConstantVMR()
+
+    if model == "fastchem_hybrid_grid":
+        parameter_file = fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
+        if parameter_file is None:
+            raise ValueError(
+                "chemistry_model='fastchem_hybrid_grid' requires a FastChem "
+                "parameters.dat path. Pass --fastchem-parameter-file or set "
+                "FASTCHEM_PARAMETER_FILE in config."
+            )
+
+        return FastChemHybridChemistry(
+            fastchem_parameter_file=parameter_file,
+            continuum_species=tuple(config.FASTCHEM_HYBRID_CONTINUUM_SPECIES),
+            metallicity_range=tuple(config.FASTCHEM_HYBRID_METALLICITY_RANGE),
+            co_ratio_range=tuple(config.FASTCHEM_HYBRID_CO_RATIO_RANGE),
+            n_metallicity=int(config.FASTCHEM_HYBRID_N_METALLICITY),
+            n_co_ratio=int(config.FASTCHEM_HYBRID_N_CO_RATIO),
+            log_vmr_min=float(config.LOG_VMR_MIN),
+            log_vmr_max=float(config.LOG_VMR_MAX),
+            h2_he_ratio=float(config.H2_HE_RATIO),
+            n_temp=int(config.FASTCHEM_N_TEMP),
+            n_pressure=int(config.FASTCHEM_N_PRESSURE),
+            t_min=float(config.FASTCHEM_T_MIN),
+            t_max=float(config.FASTCHEM_T_MAX),
+            cache_dir=config.FASTCHEM_CACHE_DIR,
+        )
+
+    raise ValueError(
+        f"Unknown chemistry_model: {chemistry_model}. "
+        "Choose from {'constant', 'fastchem_hybrid_grid'}."
+    )
 
 
 def _preflight_spectrum_checks(
@@ -171,8 +203,6 @@ def _preflight_spectrum_checks(
     phase: np.ndarray,
     inst_nus: np.ndarray,
 ) -> None:
-    errors = []
-
     wav_obs = np.asarray(wav_obs)
     data = np.asarray(data)
     sigma = np.asarray(sigma)
@@ -180,128 +210,63 @@ def _preflight_spectrum_checks(
     inst_nus = np.asarray(inst_nus)
 
     if wav_obs.size == 0:
-        errors.append("wavelength array is empty")
+        raise ValueError("wavelength array is empty")
     if inst_nus.size == 0:
-        errors.append("instrument wavenumber array is empty")
+        raise ValueError("instrument wavenumber array is empty")
     if data.ndim not in (1, 2):
-        errors.append(f"data has invalid ndim={data.ndim} (expected 1 or 2)")
+        raise ValueError(f"data has invalid ndim={data.ndim} (expected 1 or 2)")
     if sigma.shape != data.shape:
-        errors.append(f"sigma shape {sigma.shape} does not match data shape {data.shape}")
+        raise ValueError(f"sigma shape {sigma.shape} does not match data shape {data.shape}")
 
     if data.ndim == 1:
         if data.size != wav_obs.size:
-            errors.append(f"data length {data.size} != wavelength length {wav_obs.size}")
+            raise ValueError(f"data length {data.size} != wavelength length {wav_obs.size}")
         expected_exposures = 1
-    elif data.ndim == 2:
+    else:
         if data.shape[1] != wav_obs.size:
-            errors.append(
+            raise ValueError(
                 f"data spectral axis {data.shape[1]} != wavelength length {wav_obs.size}"
             )
         expected_exposures = data.shape[0]
-    else:
-        expected_exposures = None
 
     if phase.ndim != 1:
-        errors.append(f"phase has invalid ndim={phase.ndim} (expected 1)")
-    elif expected_exposures is not None and phase.size != expected_exposures:
-        errors.append(
+        raise ValueError(f"phase has invalid ndim={phase.ndim} (expected 1)")
+    if phase.size != expected_exposures:
+        raise ValueError(
             f"phase length {phase.size} != number of exposures {expected_exposures}"
         )
 
-    if not np.all(np.isfinite(wav_obs)):
-        errors.append("wavelength array contains non-finite values")
-    if not np.all(np.isfinite(inst_nus)):
-        errors.append("instrument wavenumber array contains non-finite values")
-    if not np.all(np.isfinite(data)):
-        errors.append("data array contains non-finite values")
-    if not np.all(np.isfinite(sigma)):
-        errors.append("sigma array contains non-finite values")
+    for name, arr in (
+        ("wavelength", wav_obs),
+        ("instrument wavenumber", inst_nus),
+        ("data", data),
+        ("sigma", sigma),
+        ("phase", phase),
+    ):
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"{name} array contains non-finite values")
 
-    if errors:
-        print("\nPreflight check failed:")
-        for err in errors:
-            print(f"  - {err}")
-        print("Diagnostics:")
-        print(f"  wav_obs: shape={wav_obs.shape}, range={_format_range(wav_obs)}")
-        print(f"  inst_nus: shape={inst_nus.shape}, range={_format_range(inst_nus)}")
-        print(f"  data: shape={data.shape}")
-        print(f"  sigma: shape={sigma.shape}")
-        print(f"  phase: shape={phase.shape}, range={_format_range(phase)}")
-        raise ValueError("Preflight check failed; see diagnostics above.")
+    if np.any(sigma <= 0):
+        raise ValueError("sigma must be strictly positive")
 
 
 def _preflight_grid_checks(inst_nus: np.ndarray, nu_grid: np.ndarray) -> None:
     inst_nus = np.asarray(inst_nus)
     nu_grid = np.asarray(nu_grid)
 
-    if nu_grid.size == 0:
-        raise ValueError("Preflight check failed: nu_grid is empty.")
+    if nu_grid.size == 0 or inst_nus.size == 0:
+        raise ValueError("nu_grid and inst_nus must be non-empty")
 
-    inst_min = np.nanmin(inst_nus) if inst_nus.size > 0 else np.nan
-    inst_max = np.nanmax(inst_nus) if inst_nus.size > 0 else np.nan
+    inst_min = np.nanmin(inst_nus)
+    inst_max = np.nanmax(inst_nus)
     nu_min = np.nanmin(nu_grid)
     nu_max = np.nanmax(nu_grid)
 
-    if inst_nus.size == 0:
-        raise ValueError("Preflight check failed: inst_nus is empty.")
-
     if inst_min < nu_min or inst_max > nu_max:
-        msg = (
-            "Preflight check failed: instrument wavenumber grid is outside model grid.\n"
-            f"  inst_nus range: {inst_min:.4g} .. {inst_max:.4g}\n"
-            f"  nu_grid range: {nu_min:.4g} .. {nu_max:.4g}\n"
-            "  Check wavelength range / offsets or data wavelength files."
-        )
-        raise ValueError(msg)
-
-
-def _cia_header_range(path: str) -> tuple[float, float]:
-    with open(path, "r") as f:
-        header = f.readline().strip().split()
-    if len(header) < 3:
-        raise ValueError(f"CIA header in {path} does not contain min/max wavenumber fields.")
-    nu_min = float(header[1])
-    nu_max = float(header[2])
-    return nu_min, nu_max
-
-
-def _format_um(nu_cm: float) -> float:
-    if nu_cm <= 0:
-        return float("nan")
-    return 1.0e4 / nu_cm
-
-
-def _report_cia_coverage(cia_paths: dict[str, str], nu_grid: np.ndarray) -> None:
-    nu_grid = np.asarray(nu_grid)
-    if nu_grid.size == 0:
-        return
-    grid_min = float(np.nanmin(nu_grid))
-    grid_max = float(np.nanmax(nu_grid))
-    grid_um_min = _format_um(grid_max)
-    grid_um_max = _format_um(grid_min)
-    print(
-        f"  CIA coverage check: model nu_grid {grid_min:.0f}-{grid_max:.0f} cm^-1 "
-        f"({grid_um_min:.3f}-{grid_um_max:.3f} um)"
-    )
-    for name, path in cia_paths.items():
-        rng = _cia_header_range(str(path))
-        cia_min, cia_max = rng
-        cia_um_min = _format_um(cia_max)
-        cia_um_max = _format_um(cia_min)
-        ov_min = max(cia_min, grid_min)
-        ov_max = min(cia_max, grid_max)
-        if ov_min >= ov_max:
-            overlap = "none"
-        else:
-            ov_um_min = _format_um(ov_max)
-            ov_um_max = _format_um(ov_min)
-            overlap = (
-                f"{ov_min:.0f}-{ov_max:.0f} cm^-1 "
-                f"({ov_um_min:.3f}-{ov_um_max:.3f} um)"
-            )
-        print(
-            f"    {name}: {cia_min:.0f}-{cia_max:.0f} cm^-1 "
-            f"({cia_um_min:.3f}-{cia_um_max:.3f} um), overlap: {overlap}"
+        raise ValueError(
+            "instrument wavenumber grid is outside model grid: "
+            f"inst_nus={inst_min:.4g}..{inst_max:.4g}, "
+            f"nu_grid={nu_min:.4g}..{nu_max:.4g}"
         )
 
 
@@ -315,6 +280,8 @@ def run_retrieval(
     no_plots: bool = False,
     pt_profile: str = "guillot",
     phase_mode: PhaseMode = "global",
+    chemistry_model: str = config.CHEMISTRY_MODEL_DEFAULT,
+    fastchem_parameter_file: str | None = None,
     check_aliasing: bool = False,
     compute_contribution: bool = True,
     seed: int = 42,
@@ -345,10 +312,6 @@ def run_retrieval(
     print(f"\nTarget: {config.PLANET} ({config.EPHEMERIS})")
 
     apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT)
-    stitch_inference = bool(config.ENABLE_INFERENCE_STITCHING)
-    if apply_sysrem and stitch_inference:
-        print("  apply_sysrem=True: disabling inference stitching (unsupported combination).")
-        stitch_inference = False
 
     U_sysrem: np.ndarray | None = None
     invvar_spec: np.ndarray | None = None
@@ -474,9 +437,7 @@ def run_retrieval(
     )
     _preflight_grid_checks(inst_nus, nu_grid)
 
-    sop_rot, sop_inst, _ = setup_spectral_operators(
-        nu_grid, Rinst, vsini_max=config.STITCH_VSINI_MAX, vrmax=config.STITCH_VRMAX
-    )
+    sop_rot, sop_inst, _ = setup_spectral_operators(nu_grid, Rinst)
     print("  Spectral operators initialized")
 
     # Setup atmospheric RT
@@ -500,7 +461,6 @@ def run_retrieval(
 
     # Load opacities
     print("\n[5/7] Loading opacities...")
-    _report_cia_coverage(config.CIA_PATHS, nu_grid)
 
     opa_cias = setup_cia_opacities(config.CIA_PATHS, nu_grid)
     n_cia = sum(1 for cia in opa_cias.values() if not getattr(cia, "_is_dummy", False))
@@ -514,7 +474,6 @@ def run_retrieval(
         config.MOLPATH_EXOMOL,
         nu_grid,
         config.OPA_LOAD,
-        config.NDIV,
         config.DIFFMODE,
         config.T_LOW,
         config.T_HIGH,
@@ -527,7 +486,6 @@ def run_retrieval(
         config.ATOMIC_SPECIES,
         nu_grid,
         config.OPA_LOAD,
-        config.NDIV,
         config.DIFFMODE,
         config.T_LOW,
         config.T_HIGH,
@@ -551,6 +509,12 @@ def run_retrieval(
         print(f"  Aliasing directory: {aliasing_dir}")
 
     print(f"\n[6/7] Building {mode} forward model ({pt_profile} P-T)...")
+    print(f"  Chemistry model: {chemistry_model}")
+
+    composition_solver = _build_composition_solver(
+        chemistry_model=chemistry_model,
+        fastchem_parameter_file=fastchem_parameter_file,
+    )
     
     # Convert params to format expected by create_retrieval_model
     model_params = {
@@ -586,12 +550,7 @@ def run_retrieval(
         T_high=config.T_HIGH,
         phase_mode=phase_mode,
         apply_sysrem=apply_sysrem,
-        stitch_inference=stitch_inference,
-        stitch_chunk_points=config.INFERENCE_STITCH_CHUNK_POINTS,
-        stitch_n_chunks=config.INFERENCE_STITCH_NCHUNKS,
-        stitch_guard_kms=config.INFERENCE_STITCH_GUARD_KMS,
-        stitch_guard_points=config.INFERENCE_STITCH_GUARD_POINTS,
-        stitch_min_guard_points=config.INFERENCE_STITCH_MIN_GUARD_POINTS,
+        composition_solver=composition_solver,
     )
     print(f"  Model created (phase_mode={phase_mode})")
 

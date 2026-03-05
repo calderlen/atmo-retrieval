@@ -67,16 +67,6 @@ from .model_config import (
     DEFAULT_RP_ERR,
     DEFAULT_MP_ERR,
     DEFAULT_RSTAR_ERR,
-    STITCH_MIN_GUARD_POINTS,
-    STITCH_VSINI_MAX,
-    STITCH_VRMAX,
-    DEFAULT_RP_MEAN,
-    DEFAULT_KP_MEAN,
-    DEFAULT_KP_ERR_MEAN,
-    DEFAULT_RV_ABS_MEAN,
-    DEFAULT_RV_ABS_ERR_MEAN,
-    DEFAULT_RV_GUARD_EXTRA,
-    DEFAULT_SIGMA_V_FACTOR,
     DEFAULT_POSTERIOR_RP,
     DEFAULT_POSTERIOR_MP,
     SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT,
@@ -85,14 +75,7 @@ from .model_config import (
     N_SPECTRAL_POINTS,
     WAV_MIN_OFFSET,
     WAV_MAX_OFFSET,
-    NDIV,
     PREMODIT_CUTWING,
-    ENABLE_INFERENCE_STITCHING,
-    INFERENCE_STITCH_CHUNK_POINTS,
-    INFERENCE_STITCH_NCHUNKS,
-    INFERENCE_STITCH_GUARD_KMS,
-    INFERENCE_STITCH_GUARD_POINTS,
-    INFERENCE_STITCH_MIN_GUARD_POINTS,
     CLOUD_WIDTH,
     CLOUD_INTEGRATED_TAU,
     ENABLE_TELLURICS,
@@ -146,12 +129,26 @@ from .inference_config import (
 )
 
 from .chemistry_config import (
+    CHEMISTRY_MODEL_DEFAULT,
     LOG_VMR_MIN,
     LOG_VMR_MAX,
     H2_HE_RATIO,
     N_VMR_NODES,
     METALLICITY_RANGE,
     CO_RATIO_RANGE,
+    SOLAR_ABUNDANCE_FILE,
+    FASTCHEM_N_TEMP,
+    FASTCHEM_N_PRESSURE,
+    FASTCHEM_T_MIN,
+    FASTCHEM_T_MAX,
+    FASTCHEM_CACHE_DIR,
+    FASTCHEM_DATA_DIR,
+    FASTCHEM_PARAMETER_FILE,
+    FASTCHEM_HYBRID_CONTINUUM_SPECIES,
+    FASTCHEM_HYBRID_N_METALLICITY,
+    FASTCHEM_HYBRID_N_CO_RATIO,
+    FASTCHEM_HYBRID_METALLICITY_RANGE,
+    FASTCHEM_HYBRID_CO_RATIO_RANGE,
     LOG_KZZ_RANGE,
     LOG_QUENCH_P_RANGE,
 )
@@ -253,21 +250,10 @@ def save_run_config(
         f.write(f"Spectral points: {N_SPECTRAL_POINTS}\n")
         f.write(f"Resolution: R = {get_resolution():,}\n\n")
 
-        # preMODIT stitching
-        f.write("preMODIT STITCHING\n")
+        # preMODIT grid
+        f.write("PREMODIT GRID\n")
         f.write("-" * 70 + "\n")
-        f.write(f"NDIV (nstitch): {NDIV}\n")
         f.write(f"Cutwing: {PREMODIT_CUTWING}\n\n")
-
-        # Inference stitching
-        f.write("INFERENCE GRID STITCHING\n")
-        f.write("-" * 70 + "\n")
-        f.write(f"Enabled: {ENABLE_INFERENCE_STITCHING}\n")
-        f.write(f"Chunk points: {INFERENCE_STITCH_CHUNK_POINTS}\n")
-        f.write(f"Chunks (override): {INFERENCE_STITCH_NCHUNKS}\n")
-        f.write(f"Guard (km/s): {INFERENCE_STITCH_GUARD_KMS}\n")
-        f.write(f"Guard points (override): {INFERENCE_STITCH_GUARD_POINTS}\n")
-        f.write(f"Min guard points: {INFERENCE_STITCH_MIN_GUARD_POINTS}\n\n")
 
         # Atmospheric setup
         f.write("ATMOSPHERIC SETUP\n")

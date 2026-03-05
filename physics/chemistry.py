@@ -18,6 +18,36 @@ from config import chemistry_config as chem_config
 
 logger = logging.getLogger(__name__)
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SOLAR_ABUNDANCE_FILE = _REPO_ROOT / chem_config.SOLAR_ABUNDANCE_FILE
+
+
+@lru_cache(maxsize=1)
+def _load_solar_element_abundances() -> dict[str, float]:
+    abundances: dict[str, float] = {}
+
+    with _SOLAR_ABUNDANCE_FILE.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            symbol = parts[0]
+            if symbol == "e-":
+                continue
+            try:
+                log_eps = float(parts[1])
+            except ValueError:
+                continue
+            abundances[symbol] = float(10.0 ** (log_eps - 12.0))
+
+    if "H" not in abundances:
+        raise ValueError(f"Hydrogen abundance missing from '{_SOLAR_ABUNDANCE_FILE}'.")
+    abundances["H"] = 1.0
+    return abundances
+
 
 class CompositionState(NamedTuple):
 
@@ -28,9 +58,9 @@ class CompositionState(NamedTuple):
     mmw: jnp.ndarray  # Mean molecular weight (scalar)
     mmr_mols: jnp.ndarray  # MMR profiles (n_mols, n_layers)
     mmr_atoms: jnp.ndarray  # MMR profiles (n_atoms, n_layers)
-    vmrH2_prof: jnp.ndarray  # H2 VMR profile (n_layers,)
-    vmrHe_prof: jnp.ndarray  # He VMR profile (n_layers,)
-    mmw_prof: jnp.ndarray  # MMW profile (n_layers,)
+    vmrH2_profile: jnp.ndarray  # H2 VMR profile (n_layers,)
+    vmrHe_profile: jnp.ndarray  # He VMR profile (n_layers,)
+    mmw_profile: jnp.ndarray  # MMW profile (n_layers,)
 
 
 class CompositionSolver(Protocol):
@@ -121,9 +151,9 @@ class ConstantVMR:
         )
 
         # Step 6: Create constant profiles for CIA inputs and mmw
-        vmrH2_prof = art.constant_mmr_profile(vmrH2)
-        vmrHe_prof = art.constant_mmr_profile(vmrHe)
-        mmw_prof = art.constant_mmr_profile(mmw)
+        vmrH2_profile = art.constant_mmr_profile(vmrH2)
+        vmrHe_profile = art.constant_mmr_profile(vmrHe)
+        mmw_profile = art.constant_mmr_profile(mmw)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -133,66 +163,33 @@ class ConstantVMR:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
-# ---------------------------------------------------------------------------
-# Solar abundances (Asplund et al. 2021, A&A 653, A141)
-# Values are number fractions relative to H (n_X / n_H)
-# ---------------------------------------------------------------------------
-SOLAR_ABUNDANCES = {
-    # Molecules (approximate VMR in solar-composition gas at ~1000K)
-    "H2O": 5.4e-4,
-    "CO": 6.0e-4,
-    "CO2": 1.0e-7,
-    "CH4": 3.5e-4,
-    "NH3": 8.0e-5,
-    "H2S": 1.5e-5,
-    "HCN": 1.0e-7,
-    "C2H2": 1.0e-8,
-    "PH3": 3.0e-7,
-    "TiO": 1.0e-7,
-    "VO": 1.0e-8,
-    "FeH": 1.0e-8,
-    "SiO": 3.5e-5,
-    # Atoms (solar photospheric, log eps scale converted to n_X/n_H)
-    "Fe": 3.16e-5,   # log eps = 7.50
-    "Fe I": 3.16e-5,
-    "Fe II": 3.16e-6,  # Rough ionization fraction
-    "Na": 2.14e-6,   # log eps = 6.33
-    "Na I": 2.14e-6,
-    "K": 1.35e-7,    # log eps = 5.13
-    "K I": 1.35e-7,
-    "Ca": 2.19e-6,   # log eps = 6.34
-    "Ca I": 2.19e-6,
-    "Ca II": 2.19e-6,
-    "Mg": 3.98e-5,   # log eps = 7.60
-    "Mg I": 3.98e-5,
-    "Ti": 8.91e-8,   # log eps = 4.95
-    "Ti I": 8.91e-8,
-    "Ti II": 8.91e-8,
-    "V": 1.00e-8,    # log eps = 3.93
-    "V I": 1.00e-8,
-    "Cr": 4.68e-7,   # log eps = 5.67
-    "Cr I": 4.68e-7,
-    "Mn": 3.47e-7,   # log eps = 5.54
-    "Mn I": 3.47e-7,
-    "Ni": 1.78e-6,   # log eps = 6.25
-    "Ni I": 1.78e-6,
-    "Si": 3.24e-5,   # log eps = 7.51
-    "Si I": 3.24e-5,
-    "Al": 2.82e-6,   # log eps = 6.45
-    "Al I": 2.82e-6,
-    "Li": 1.0e-9,    # log eps = 1.05 (depleted)
-    "Li I": 1.0e-9,
-    "C": 2.69e-4,    # log eps = 8.43 (total carbon)
-    "O": 4.90e-4,    # log eps = 8.69 (total oxygen)
-    "N": 6.76e-5,    # log eps = 7.83 (total nitrogen)
-}
-
 _ELEMENT_RE = re.compile(r"([A-Z][a-z]?)(\d*)")
+
+
+def _solar_abundance_for_species(species: str) -> float:
+    base = species.split()[0].replace("+", "").replace("-", "")
+    counts: list[tuple[str, int]] = []
+    for element, count_str in _ELEMENT_RE.findall(base):
+        count = int(count_str) if count_str else 1
+        counts.append((element, count))
+    if not counts:
+        return 1.0e-30
+
+    limiting = np.inf
+    for element, count in counts:
+        elem_abundance = SOLAR_ELEMENT_ABUNDANCES.get(element)
+        if elem_abundance is None:
+            return 1.0e-30
+        limiting = min(limiting, elem_abundance / float(count))
+    return float(max(limiting, 1.0e-30))
+
+
+SOLAR_ELEMENT_ABUNDANCES = _load_solar_element_abundances()
 
 
 @lru_cache(maxsize=None)
@@ -244,6 +241,9 @@ _FASTCHEM_SPECIES_MAP: dict[str, str] = {
     "CrH": "Cr1H1",
     "AlO": "Al1O1",
     "PH3": "H3P1",
+    "H-": "H1-",
+    "e-": "e-",
+    "H": "H",
     # Neutral atoms ("X I" → "X")
     "Fe": "Fe", "Fe I": "Fe",
     "Na": "Na", "Na I": "Na",
@@ -258,6 +258,7 @@ _FASTCHEM_SPECIES_MAP: dict[str, str] = {
     "Si": "Si", "Si I": "Si",
     "Al": "Al", "Al I": "Al",
     "Li": "Li", "Li I": "Li",
+    "H I": "H",
     "Co": "Co", "Co I": "Co",
     "Cu": "Cu", "Cu I": "Cu",
     "Zn": "Zn", "Zn I": "Zn",
@@ -366,28 +367,28 @@ class FreeVMR:
 
         h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
         he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe_prof = (1.0 - vmr_trace_tot) * he_frac
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # MMR_i = VMR_i * (M_i / mmw) - ensure correct 2D shape for empty cases
         mmr_mols = (
             jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ]) if n_mols > 0 else jnp.zeros((0, n_layers))
         )
 
         mmr_atoms = (
             jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ]) if n_atoms > 0 else jnp.zeros((0, n_layers))
         )
@@ -396,9 +397,9 @@ class FreeVMR:
         # Here we just use simple mean for consistency with downstream code that expects scalars
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -408,9 +409,9 @@ class FreeVMR:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 # TODO: equilibrium chemistry solver might be a good prior/baseline. but really going to need to either keep VMRs free or use a hybrid of quench + equilibrum + disequilibrium + photochemistry + ... for realistic modeling
@@ -419,10 +420,16 @@ class FreeVMR:
 # TODO: vertical transport parameterized by K_zz and then like tchem and t_dyn or more simply the pestimate of quench level
 # TODO: use CO as a proxy/tracer for the overall metallicity M/H of the atmosphere
 # TODO: The continuum problem. Public low resolution spectra? R ~ 10^2 - 10^3??
+#class QuenchedChemistry(CompositionSolver):
+#    pass
+#class Photochemistry:
+#    pass
 
+#class DisequilibriumChemistry:
+#    pass
 
-class EquilibriumChemistry(CompositionSolver):
-    """Simple equilibrium-like chemistry with [M/H] and C/O as free parameters."""
+#class ParametricMetallicityCOChemistry(CompositionSolver):
+#    """Simple equilibrium-like chemistry with [M/H] and C/O as free parameters."""
 
     def __init__(
         self,
@@ -433,8 +440,8 @@ class EquilibriumChemistry(CompositionSolver):
         self.metallicity_range = metallicity_range
         self.co_ratio_range = co_ratio_range
         self.h2_he_ratio = h2_he_ratio
-        self._c_solar = SOLAR_ABUNDANCES["C"]
-        self._o_solar = SOLAR_ABUNDANCES["O"]
+        self._c_solar = SOLAR_ELEMENT_ABUNDANCES["C"]
+        self._o_solar = SOLAR_ELEMENT_ABUNDANCES["O"]
 
     def _co_scales(self, co_ratio: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         total_co = self._c_solar + self._o_solar
@@ -466,7 +473,7 @@ class EquilibriumChemistry(CompositionSolver):
         c_scale: jnp.ndarray,
         o_scale: jnp.ndarray,
     ) -> jnp.ndarray:
-        solar = SOLAR_ABUNDANCES.get(species, 1e-10)
+        solar = _solar_abundance_for_species(species)
         n_c, n_o = _count_co(species)
         return solar * metallicity * self._co_factor(n_c, n_o, c_scale, o_scale)
 
@@ -497,7 +504,7 @@ class EquilibriumChemistry(CompositionSolver):
         n_species = len(species)
 
         if n_species > 0:
-            solar_arr = jnp.array([SOLAR_ABUNDANCES.get(s, 1e-10) for s in species])
+            solar_arr = jnp.array([_solar_abundance_for_species(s) for s in species])
             counts = [_count_co(s) for s in species]
             n_c = jnp.array([c[0] for c in counts], dtype=solar_arr.dtype)
             n_o = jnp.array([c[1] for c in counts], dtype=solar_arr.dtype)
@@ -540,9 +547,9 @@ class EquilibriumChemistry(CompositionSolver):
             mmw = mmw + jnp.sum(atom_masses_arr * vmr_atoms_arr)
 
         ones_prof = art.constant_mmr_profile(1.0)
-        vmrH2_prof = vmrH2 * ones_prof
-        vmrHe_prof = vmrHe * ones_prof
-        mmw_prof = mmw * ones_prof
+        vmrH2_profile = vmrH2 * ones_prof
+        vmrHe_profile = vmrHe * ones_prof
+        mmw_profile = mmw * ones_prof
 
         if n_mols > 0:
             mmr_mols = (
@@ -566,11 +573,11 @@ class EquilibriumChemistry(CompositionSolver):
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
-class FastChem(CompositionSolver):
+class FastChemEquilibriumChemistry(CompositionSolver):
     """Equilibrium chemistry via FastChem2.
 
     Pre-computes a 2D VMR grid over (T, P) at grid-build time,
@@ -581,7 +588,7 @@ class FastChem(CompositionSolver):
         self,
         fastchem_parameter_file: str | Path | None = None,
         log_metallicity: float = 0.0,
-        co_ratio: float = SOLAR_ABUNDANCES["C"] / SOLAR_ABUNDANCES["O"],
+        co_ratio: float = SOLAR_ELEMENT_ABUNDANCES["C"] / SOLAR_ELEMENT_ABUNDANCES["O"],
         n_temp: int = chem_config.FASTCHEM_N_TEMP,
         n_pressure: int = chem_config.FASTCHEM_N_PRESSURE,
         t_min: float = chem_config.FASTCHEM_T_MIN,
@@ -853,16 +860,16 @@ class FastChem(CompositionSolver):
             vmr_atoms_profiles.append(vmr_prof)
 
         # H2 and He profiles
-        vmrH2_prof = self._interp_2d(self._vmr_grids["H2"], Tarr, log_P)
-        vmrHe_prof = self._interp_2d(self._vmr_grids["He"], Tarr, log_P)
+        vmrH2_profile = self._interp_2d(self._vmr_grids["H2"], Tarr, log_P)
+        vmrHe_profile = self._interp_2d(self._vmr_grids["He"], Tarr, log_P)
 
         # MMW profile
-        mmw_prof = self._interp_2d(self._mmw_grid, Tarr, log_P)
+        mmw_profile = self._interp_2d(self._mmw_grid, Tarr, log_P)
 
         # Compute MMR from VMR: MMR_i = VMR_i * (M_i / mmw)
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -870,7 +877,7 @@ class FastChem(CompositionSolver):
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -879,9 +886,9 @@ class FastChem(CompositionSolver):
         # Column-averaged scalars for CompositionState
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -891,16 +898,13 @@ class FastChem(CompositionSolver):
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
-class QuenchedChemistry(CompositionSolver):
-    pass
 
-
-class FastChemCond(FastChem):
+class FastChemEquilibriumCondensationChemistry(FastChemEquilibriumChemistry):
     """FastChem chemistry with condensation enabled."""
 
     def __init__(
@@ -929,8 +933,411 @@ class FastChemCond(FastChem):
         return output_data
 
 
-class Photochemistry:
-    pass
+class FastChemHybridChemistry(FastChemEquilibriumChemistry):
+    """Hybrid chemistry with free trace VMRs and FastChem continuum species.
 
-class DisequilibriumChemistry:
-    pass
+    This solver is designed for HMC-NUTS: FastChem is evaluated offline onto a
+    cached 4D grid over ([M/H], C/O, T, P), and runtime sampling uses pure JAX
+    interpolation to inject continuum-relevant species (e.g. H-, e-, H).
+    """
+
+    def __init__(
+        self,
+        *args,
+        continuum_species: tuple[str, ...] = chem_config.FASTCHEM_HYBRID_CONTINUUM_SPECIES,
+        metallicity_range: tuple[float, float] = chem_config.FASTCHEM_HYBRID_METALLICITY_RANGE,
+        co_ratio_range: tuple[float, float] = chem_config.FASTCHEM_HYBRID_CO_RATIO_RANGE,
+        n_metallicity: int = chem_config.FASTCHEM_HYBRID_N_METALLICITY,
+        n_co_ratio: int = chem_config.FASTCHEM_HYBRID_N_CO_RATIO,
+        log_vmr_min: float = chem_config.LOG_VMR_MIN,
+        log_vmr_max: float = chem_config.LOG_VMR_MAX,
+        h2_he_ratio: float = chem_config.H2_HE_RATIO,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if n_metallicity < 2:
+            raise ValueError("n_metallicity must be >= 2.")
+        if n_co_ratio < 2:
+            raise ValueError("n_co_ratio must be >= 2.")
+
+        self.continuum_species = tuple(continuum_species)
+        self.metallicity_range = metallicity_range
+        self.co_ratio_range = co_ratio_range
+        self.n_metallicity = int(n_metallicity)
+        self.n_co_ratio = int(n_co_ratio)
+        self._log_metallicity_grid = np.linspace(
+            self.metallicity_range[0],
+            self.metallicity_range[1],
+            self.n_metallicity,
+        )
+        self._co_ratio_grid = np.linspace(
+            self.co_ratio_range[0],
+            self.co_ratio_range[1],
+            self.n_co_ratio,
+        )
+        self._hybrid_vmr_grids: dict[str, jnp.ndarray] | None = None
+        self._hybrid_species_built: list[str] | None = None
+
+        self._free_solver = ConstantVMR(
+            log_vmr_min=log_vmr_min,
+            log_vmr_max=log_vmr_max,
+            h2_he_ratio=h2_he_ratio,
+        )
+
+    def _hybrid_cache_key(self, pressure_bar: np.ndarray, species_names: list[str]) -> str:
+        h = hashlib.sha256()
+        h.update("v2".encode())
+        h.update(f"T:{self.n_temp},{self.t_min},{self.t_max}".encode())
+        h.update(f"P:{pressure_bar.size},{pressure_bar.min():.6e},{pressure_bar.max():.6e}".encode())
+        h.update(
+            (
+                f"MH:{self.n_metallicity},"
+                f"{self.metallicity_range[0]:.6f},"
+                f"{self.metallicity_range[1]:.6f}"
+            ).encode()
+        )
+        h.update(
+            (
+                f"CO:{self.n_co_ratio},"
+                f"{self.co_ratio_range[0]:.6f},"
+                f"{self.co_ratio_range[1]:.6f}"
+            ).encode()
+        )
+        h.update(f"species:{sorted(species_names)}".encode())
+        if self.fastchem_parameter_file is not None:
+            h.update(f"par:{self.fastchem_parameter_file}".encode())
+        return h.hexdigest()[:16]
+
+    def _resolve_fastchem_species_indices(
+        self,
+        fc: pyfastchem.FastChem,
+        species_names: list[str],
+    ) -> dict[str, int]:
+        fc_species_idx: dict[str, int] = {}
+        for name in species_names:
+            fc_symbol = _FASTCHEM_SPECIES_MAP.get(name)
+            if fc_symbol is None:
+                logger.warning("No FastChem mapping for species '%s', skipping.", name)
+                continue
+            idx = fc.getGasSpeciesIndex(fc_symbol)
+            if idx == pyfastchem.FASTCHEM_UNKNOWN_SPECIES:
+                logger.warning(
+                    "FastChem does not know species '%s' (symbol '%s'), skipping.",
+                    name,
+                    fc_symbol,
+                )
+                continue
+            fc_species_idx[name] = idx
+        return fc_species_idx
+
+    def _set_fastchem_abundances(
+        self,
+        fc: pyfastchem.FastChem,
+        solar_abundances: np.ndarray,
+        idx_c: int,
+        idx_o: int,
+        idx_h: int,
+        log_metallicity: float,
+        co_ratio: float,
+    ) -> None:
+        n_elements = fc.getElementNumber()
+        metallicity_factor = 10.0 ** float(log_metallicity)
+        co_ratio_safe = max(float(co_ratio), 1.0e-8)
+
+        abundances = solar_abundances.copy()
+        for ie in range(n_elements):
+            if ie != idx_h and fc.getElementSymbol(ie) != "He":
+                abundances[ie] = solar_abundances[ie] * metallicity_factor
+
+        solar_c = solar_abundances[idx_c] * metallicity_factor
+        solar_o = solar_abundances[idx_o] * metallicity_factor
+        total_co = solar_c + solar_o
+        abundances[idx_c] = total_co * (co_ratio_safe / (1.0 + co_ratio_safe))
+        abundances[idx_o] = total_co * (1.0 / (1.0 + co_ratio_safe))
+        fc.setElementAbundances(abundances.tolist())
+
+    def _build_hybrid_grid(
+        self,
+        pressure_bar: np.ndarray,
+        species_names: list[str],
+    ) -> None:
+        if self.fastchem_parameter_file is None:
+            raise ValueError(
+                "fastchem_parameter_file is required for FastChemHybridChemistry."
+            )
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        species_names = sorted(set(species_names))
+        cache_key = self._hybrid_cache_key(pressure_bar, species_names)
+        cache_file = self.cache_dir / f"fastchem_hybrid_grid_{cache_key}.npz"
+
+        if pressure_bar.size != self.n_pressure:
+            log_p_orig = np.log10(pressure_bar)
+            log_p_grid = np.linspace(log_p_orig.min(), log_p_orig.max(), self.n_pressure)
+        else:
+            log_p_grid = np.log10(pressure_bar)
+        self._log_P_grid = log_p_grid
+        p_grid = 10.0 ** log_p_grid
+
+        if cache_file.exists():
+            logger.info("Loading FastChem hybrid grid from cache: %s", cache_file)
+            data = np.load(cache_file, allow_pickle=True)
+            self._hybrid_vmr_grids = {
+                name: jnp.array(data[f"vmr_{name}"])
+                for name in species_names
+                if f"vmr_{name}" in data
+            }
+            self._hybrid_species_built = list(species_names)
+            return
+
+        logger.info(
+            "Building FastChem hybrid grid (%d x %d x %d x %d)...",
+            self.n_metallicity,
+            self.n_co_ratio,
+            self.n_temp,
+            self.n_pressure,
+        )
+
+        fc = pyfastchem.FastChem(str(self.fastchem_parameter_file), 0)
+        n_elements = fc.getElementNumber()
+        idx_c = fc.getElementIndex("C")
+        idx_o = fc.getElementIndex("O")
+        idx_h = fc.getElementIndex("H")
+        solar_abundances = np.array([fc.getElementAbundance(i) for i in range(n_elements)])
+
+        fc_species_idx = self._resolve_fastchem_species_indices(fc, species_names)
+        if not fc_species_idx:
+            self._hybrid_vmr_grids = {}
+            self._hybrid_species_built = list(species_names)
+            return
+
+        grid_shape = (self.n_metallicity, self.n_co_ratio, self.n_temp, self.n_pressure)
+        vmr_grids_np: dict[str, np.ndarray] = {
+            name: np.zeros(grid_shape, dtype=np.float64)
+            for name in fc_species_idx
+        }
+
+        t_flat = np.repeat(self._T_grid, self.n_pressure)
+        p_flat = np.tile(p_grid * 1e6, self.n_temp)
+
+        for i_mh, log_metallicity in enumerate(self._log_metallicity_grid):
+            for i_co, co_ratio in enumerate(self._co_ratio_grid):
+                self._set_fastchem_abundances(
+                    fc,
+                    solar_abundances,
+                    idx_c,
+                    idx_o,
+                    idx_h,
+                    float(log_metallicity),
+                    float(co_ratio),
+                )
+
+                output_data = self._run_fastchem(fc, t_flat, p_flat)
+                n_densities = np.array(output_data.number_densities)
+                total_n = np.clip(np.array(output_data.total_element_density), 1e-300, None)
+
+                for name, sp_idx in fc_species_idx.items():
+                    vmr = n_densities[:, sp_idx] / total_n
+                    vmr_grids_np[name][i_mh, i_co, :, :] = vmr.reshape(self.n_temp, self.n_pressure)
+
+        self._hybrid_vmr_grids = {name: jnp.array(g) for name, g in vmr_grids_np.items()}
+        self._hybrid_species_built = list(species_names)
+
+        save_dict = {
+            "log_metallicity_grid": np.asarray(self._log_metallicity_grid),
+            "co_ratio_grid": np.asarray(self._co_ratio_grid),
+            "T_grid": np.asarray(self._T_grid),
+            "log_P_grid": np.asarray(self._log_P_grid),
+        }
+        for name, grid in vmr_grids_np.items():
+            save_dict[f"vmr_{name}"] = np.asarray(grid)
+        np.savez_compressed(cache_file, **save_dict)
+        logger.info("FastChem hybrid grid saved to cache: %s", cache_file)
+
+    def _interp_4d(
+        self,
+        grid: jnp.ndarray,
+        log_metallicity: jnp.ndarray,
+        co_ratio: jnp.ndarray,
+        Tarr: jnp.ndarray,
+        log_P: jnp.ndarray,
+    ) -> jnp.ndarray:
+        mh_grid = jnp.array(self._log_metallicity_grid)
+        co_grid = jnp.array(self._co_ratio_grid)
+        t_grid = jnp.array(self._T_grid)
+        log_p_grid = jnp.array(self._log_P_grid)
+
+        mh_val = jnp.clip(log_metallicity, mh_grid[0], mh_grid[-1])
+        co_val = jnp.clip(co_ratio, co_grid[0], co_grid[-1])
+        t_val = jnp.clip(Tarr, t_grid[0], t_grid[-1])
+        log_p_val = jnp.clip(log_P, log_p_grid[0], log_p_grid[-1])
+
+        f_mh = jnp.interp(mh_val, mh_grid, jnp.arange(mh_grid.size))
+        i_mh = jnp.clip(jnp.floor(f_mh).astype(int), 0, mh_grid.size - 2)
+        w_mh = f_mh - i_mh
+
+        f_co = jnp.interp(co_val, co_grid, jnp.arange(co_grid.size))
+        i_co = jnp.clip(jnp.floor(f_co).astype(int), 0, co_grid.size - 2)
+        w_co = f_co - i_co
+
+        f_t = jnp.interp(t_val, t_grid, jnp.arange(t_grid.size))
+        i_t = jnp.clip(jnp.floor(f_t).astype(int), 0, t_grid.size - 2)
+        w_t = f_t - i_t
+
+        f_p = jnp.interp(log_p_val, log_p_grid, jnp.arange(log_p_grid.size))
+        i_p = jnp.clip(jnp.floor(f_p).astype(int), 0, log_p_grid.size - 2)
+        w_p = f_p - i_p
+
+        result = jnp.zeros_like(t_val)
+        for d_mh in (0, 1):
+            w0 = w_mh if d_mh else (1.0 - w_mh)
+            idx_mh = i_mh + d_mh
+            for d_co in (0, 1):
+                w1 = w_co if d_co else (1.0 - w_co)
+                idx_co = i_co + d_co
+                for d_t in (0, 1):
+                    w2 = w_t if d_t else (1.0 - w_t)
+                    idx_t = i_t + d_t
+                    for d_p in (0, 1):
+                        w3 = w_p if d_p else (1.0 - w_p)
+                        idx_p = i_p + d_p
+                        result = result + (w0 * w1 * w2 * w3) * grid[idx_mh, idx_co, idx_t, idx_p]
+        return result
+
+    def sample(
+        self,
+        mol_names: list[str],
+        mol_masses: list[float],
+        atom_names: list[str],
+        atom_masses: list[float],
+        art: object,
+        Tarr: jnp.ndarray | None = None,
+    ) -> CompositionState:
+        log_metallicity = numpyro.sample(
+            "log_metallicity",
+            dist.Uniform(self.metallicity_range[0], self.metallicity_range[1]),
+        )
+        co_ratio = numpyro.sample(
+            "C_O_ratio",
+            dist.Uniform(self.co_ratio_range[0], self.co_ratio_range[1]),
+        )
+
+        free_mol = [(n, m) for n, m in zip(mol_names, mol_masses) if n not in self.continuum_species]
+        free_atom = [(n, m) for n, m in zip(atom_names, atom_masses) if n not in self.continuum_species]
+
+        free_mol_names = [n for n, _ in free_mol]
+        free_mol_masses = [m for _, m in free_mol]
+        free_atom_names = [n for n, _ in free_atom]
+        free_atom_masses = [m for _, m in free_atom]
+
+        base = self._free_solver.sample(
+            free_mol_names,
+            free_mol_masses,
+            free_atom_names,
+            free_atom_masses,
+            art,
+            Tarr=Tarr,
+        )
+
+        if Tarr is None:
+            T_mid = (self.t_min + self.t_max) / 2.0
+            Tarr = jnp.full(art.pressure.shape, T_mid)
+
+        log_P = jnp.log10(art.pressure)
+        n_layers = art.pressure.size
+
+        mol_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in mol_names}
+        atom_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in atom_names}
+        for i, name in enumerate(free_mol_names):
+            mol_profile_map[name] = jnp.full(n_layers, base.vmr_mols[i])
+        for i, name in enumerate(free_atom_names):
+            atom_profile_map[name] = jnp.full(n_layers, base.vmr_atoms[i])
+
+        needed = [s for s in self.continuum_species if (s in mol_profile_map) or (s in atom_profile_map)]
+        if needed:
+            if self._hybrid_vmr_grids is None or any(
+                s not in self._hybrid_vmr_grids for s in needed
+            ):
+                self._build_hybrid_grid(np.asarray(art.pressure), needed)
+
+            overrides = {
+                species: self._interp_4d(
+                    self._hybrid_vmr_grids[species],
+                    log_metallicity,
+                    co_ratio,
+                    Tarr,
+                    log_P,
+                )
+                for species in needed
+                if species in self._hybrid_vmr_grids
+            }
+
+            for species, vmr_prof in overrides.items():
+                if species in mol_profile_map:
+                    mol_profile_map[species] = vmr_prof
+                else:
+                    atom_profile_map[species] = vmr_prof
+
+        vmr_mols_profiles = [mol_profile_map[name] for name in mol_names]
+        vmr_atoms_profiles = [atom_profile_map[name] for name in atom_names]
+
+        if (len(vmr_mols_profiles) + len(vmr_atoms_profiles)) > 0:
+            all_profiles = jnp.array(vmr_mols_profiles + vmr_atoms_profiles)
+            sum_trace = jnp.sum(all_profiles, axis=0)
+            scale = jnp.where(sum_trace > 1.0, (1.0 - 1.0e-12) / sum_trace, 1.0)
+            all_profiles = all_profiles * scale[None, :]
+            vmr_mols_profiles = [all_profiles[i] for i in range(len(vmr_mols_profiles))]
+            vmr_atoms_profiles = [
+                all_profiles[len(vmr_mols_profiles) + i] for i in range(len(vmr_atoms_profiles))
+            ]
+            vmr_trace_tot = jnp.sum(all_profiles, axis=0)
+        else:
+            vmr_trace_tot = jnp.zeros(n_layers)
+
+        h2_frac = self._free_solver.h2_he_ratio / (self._free_solver.h2_he_ratio + 1.0)
+        he_frac = 1.0 / (self._free_solver.h2_he_ratio + 1.0)
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
+
+        mass_H2 = molinfo.molmass_isotope("H2")
+        mass_He = molinfo.molmass_isotope("He", db_HIT=False)
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
+        for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
+            mmw_profile = mmw_profile + mass * vmr_prof
+        for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
+            mmw_profile = mmw_profile + mass * vmr_prof
+
+        if len(vmr_mols_profiles) > 0:
+            mmr_mols = jnp.array([
+                vmr_prof * (mass / mmw_profile)
+                for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
+            ])
+        else:
+            mmr_mols = jnp.zeros((0, n_layers))
+
+        if len(vmr_atoms_profiles) > 0:
+            mmr_atoms = jnp.array([
+                vmr_prof * (mass / mmw_profile)
+                for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
+            ])
+        else:
+            mmr_atoms = jnp.zeros((0, n_layers))
+
+        vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
+        vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
+
+        return CompositionState(
+            vmr_mols=vmr_mols_scalar,
+            vmr_atoms=vmr_atoms_scalar,
+            vmrH2=vmrH2,
+            vmrHe=vmrHe,
+            mmw=mmw,
+            mmr_mols=mmr_mols,
+            mmr_atoms=mmr_atoms,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
+        )

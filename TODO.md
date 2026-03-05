@@ -38,7 +38,6 @@
         - mean-subtracted?
     - need to combine spectra to construct a full-transit spectrum before passing to exoJAX
     - and normalize! with np.std
-    - memory_profile in pipeline should not exist?
     - explore possibility of 4D FastChem grid w/ [M/H], C/O as rescaling abundances -- ocmputing FastChem on this 4D (T, P, [M/H], C/O) grid
     - go through config and try setting up a run of atmo-retrieval
     - missing CUDA on home desktop---figure out why
@@ -61,4 +60,3 @@
     - MPI for Python that supports GPUs?
     - time runs w/ usr/bin/time in cluster
     - profile the scripts a lot before running on OSC
-

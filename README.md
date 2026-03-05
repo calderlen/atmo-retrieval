@@ -79,7 +79,6 @@ modules:
 │   ├── aliasing.py
 │   └── plot.py
 └── tests
-    └── memory_profile.py
 ```
 
 ## expected input directory structure

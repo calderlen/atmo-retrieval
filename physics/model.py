@@ -33,137 +33,10 @@ from physics.chemistry import CompositionSolver, ConstantVMR
 
 
 EPS = 1.0e-30
-CKMS = 299792.458
-
-
-def _closest_divisor(n: int, target: int) -> int:
-    if n <= 0:
-        return 1
-    target = max(1, int(target))
-    best = 1
-    best_delta = abs(target - 1)
-    limit = int(np.sqrt(n))
-    for d in range(1, limit + 1):
-        if n % d != 0:
-            continue
-        for cand in (d, n // d):
-            delta = abs(cand - target)
-            if delta < best_delta or (delta == best_delta and cand < best):
-                best = cand
-                best_delta = delta
-    return best
-
-
-def _estimate_guard_points(
-    nu_grid: np.ndarray,
-    instrument_resolution: float,
-    params: dict,
-    period_day: float,
-    guard_kms: float | None,
-    min_guard_points: int,
-) -> int:
-    nu_grid = np.asarray(nu_grid)
-    if nu_grid.size < 2:
-        return int(min_guard_points)
-    dnu = float(np.median(np.abs(np.diff(nu_grid))))
-    nu_ref = float(np.nanmax(nu_grid))
-
-    # Instrument sigma in km/s (approx)
-    sigma_v = CKMS / (instrument_resolution * 2.3548200450309493)
-
-    # Planet rotation broadening (km/s) using mean Rp
-    Rp_mean = float(params.get("R_p", config.DEFAULT_RP_MEAN))
-    vsini = (2.0 * np.pi * (Rp_mean * RJ) / (period_day * 86400.0) / 1.0e5)
-
-    # RV guard from priors (3-sigma) + dRV prior
-    kp = float(params.get("Kp", config.DEFAULT_KP_MEAN))
-    kp_err = float(params.get("Kp_err", config.DEFAULT_KP_ERR_MEAN))
-    vsys = float(params.get("RV_abs", config.DEFAULT_RV_ABS_MEAN))
-    vsys_err = float(params.get("RV_abs_err", config.DEFAULT_RV_ABS_ERR_MEAN))
-    rv_guard = abs(vsys) + 3.0 * vsys_err + kp + 3.0 * kp_err + config.DEFAULT_RV_GUARD_EXTRA
-
-    v_guard = rv_guard + max(vsini, config.DEFAULT_SIGMA_V_FACTOR * sigma_v)
-    if guard_kms is not None:
-        v_guard = max(float(guard_kms), v_guard)
-
-    guard_points = int(np.ceil((nu_ref * v_guard / CKMS) / dnu))
-    return max(int(min_guard_points), guard_points)
-
-
-def _build_chunk_plan(
-    nu_grid: np.ndarray,
-    inst_nus: np.ndarray,
-    guard_points: int,
-    *,
-    chunk_points: int | None = None,
-    n_chunks: int | None = None,
-) -> list[tuple[int, int, int, int, int, int]]:
-    nu_grid = np.asarray(nu_grid)
-    inst_nus = np.asarray(inst_nus)
-
-    if guard_points < 0:
-        raise ValueError("guard_points must be >= 0.")
-    if nu_grid.size <= 2 * guard_points:
-        raise ValueError("guard_points too large for nu_grid size.")
-
-    core_len = int(nu_grid.size - 2 * guard_points)
-    if core_len <= 0:
-        raise ValueError("Core length is non-positive; reduce guard_points.")
-
-    if n_chunks is None:
-        target = int(chunk_points) if chunk_points is not None else core_len
-        target = max(1, target)
-        n_chunks = max(1, int(round(core_len / target)))
-
-    n_chunks = _closest_divisor(core_len, int(n_chunks))
-    core_size = core_len // n_chunks
-    chunk_size = core_size + 2 * guard_points
-
-    # Ensure inst_nus are inside the core-safe region
-    nu_min_safe = nu_grid[guard_points]
-    nu_max_safe = nu_grid[-guard_points - 1]
-    if inst_nus.size == 0:
-        raise ValueError("inst_nus is empty.")
-    if inst_nus.min() < nu_min_safe or inst_nus.max() > nu_max_safe:
-        raise ValueError(
-            "Instrument grid extends into guard region. Increase WAV offsets or reduce guard."
-        )
-
-    chunks: list[tuple[int, int, int, int, int, int]] = []
-    for i in range(n_chunks):
-        core_start = guard_points + i * core_size
-        core_end = core_start + core_size
-        chunk_start = core_start - guard_points
-        chunk_end = core_end + guard_points
-
-        nu_core_min = nu_grid[core_start]
-        nu_core_max = nu_grid[core_end - 1]
-        inst_start = int(np.searchsorted(inst_nus, nu_core_min, side="left"))
-        inst_end = int(np.searchsorted(inst_nus, nu_core_max, side="right"))
-        if inst_end <= inst_start:
-            raise ValueError("Chunk has no instrument points; adjust chunk/guard.")
-
-        chunks.append((chunk_start, chunk_end, core_start, core_end, inst_start, inst_end))
-
-    # Sanity: chunk sizes are uniform
-    for chunk_start, chunk_end, *_ in chunks:
-        if (chunk_end - chunk_start) != chunk_size:
-            raise ValueError("Non-uniform chunk sizes detected; check chunk plan.")
-
-    return chunks
-
-
-def _slice_spectral_matrix(
-    matrix: jnp.ndarray,
-    start: int,
-    end: int,
-    n_nu: int,
-) -> jnp.ndarray:
-    if matrix.shape[-1] == n_nu:
-        return matrix[..., start:end]
-    if matrix.shape[0] == n_nu:
-        return matrix[start:end, ...]
-    raise ValueError("Unexpected spectral matrix shape; cannot slice.")
+CIA_COLLISION_PAIRS: tuple[tuple[str, str, str], ...] = (
+    ("H2H2", "H2", "H2"),
+    ("H2He", "H2", "He"),
+)
 
 
 def _get_piBarr():
@@ -218,6 +91,122 @@ def check_grid_resolution(
     else:
         print(f"[INFO] Grid check passed: {R_grid/R:.1f} pixels per FWHM (Target R={R}).")
 
+
+def _compute_cia_opacity_terms(
+    art: object,
+    opa_cias: dict[str, OpaCIA],
+    Tarr: jnp.ndarray,
+    vmrH2_profile: jnp.ndarray,
+    vmrHe_profile: jnp.ndarray,
+    mmw_profile: jnp.ndarray,
+    g: jnp.ndarray,
+) -> dict[str, jnp.ndarray]:
+    """Compute CIA optical-depth contributions keyed by CIA source name."""
+    vmr_profiles = {
+        "H2": vmrH2_profile,
+        "He": vmrHe_profile,
+    }
+
+    cia_terms: dict[str, jnp.ndarray] = {}
+    for cia_key, species_x, species_y in CIA_COLLISION_PAIRS:
+        cia = opa_cias.get(cia_key)
+        if cia is None:
+            continue
+        logacia_matrix = cia.logacia_matrix(Tarr)
+        cia_terms[f"CIA_{cia_key}"] = art.opacity_profile_cia(
+            logacia_matrix,
+            Tarr,
+            vmr_profiles[species_x],
+            vmr_profiles[species_y],
+            mmw_profile[:, None],
+            g,
+        )
+
+    return cia_terms
+
+
+def _compute_xs_opacity_terms(
+    art: object,
+    opa_by_species: dict[str, OpaPremodit],
+    Tarr: jnp.ndarray,
+    mmr_profiles: dict[str, jnp.ndarray],
+    mmw_profile: jnp.ndarray,
+    g: jnp.ndarray,
+) -> dict[str, jnp.ndarray]:
+    """Compute line-opacity optical-depth contributions keyed by species."""
+    xs_terms: dict[str, jnp.ndarray] = {}
+    for species, mmr_profile in mmr_profiles.items():
+        opa = opa_by_species.get(species)
+        if opa is None:
+            continue
+        xsmatrix = opa.xsmatrix(Tarr, art.pressure)
+        xs_terms[species] = art.opacity_profile_xs(
+            xsmatrix,
+            mmr_profile,
+            mmw_profile[:, None],
+            g,
+        )
+
+    return xs_terms
+
+
+def _compute_opacity_terms(
+    art: object,
+    opa_mols: dict[str, OpaPremodit],
+    opa_atoms: dict[str, OpaPremodit],
+    opa_cias: dict[str, OpaCIA],
+    Tarr: jnp.ndarray,
+    mmr_mols: dict[str, jnp.ndarray],
+    mmr_atoms: dict[str, jnp.ndarray],
+    vmrH2_profile: jnp.ndarray,
+    vmrHe_profile: jnp.ndarray,
+    mmw_profile: jnp.ndarray,
+    g: jnp.ndarray,
+) -> dict[str, jnp.ndarray]:
+    """Compute all opacity terms using a single canonical implementation."""
+    opacity_terms = _compute_cia_opacity_terms(
+        art,
+        opa_cias,
+        Tarr,
+        vmrH2_profile,
+        vmrHe_profile,
+        mmw_profile,
+        g,
+    )
+    opacity_terms.update(
+        _compute_xs_opacity_terms(
+            art,
+            opa_mols,
+            Tarr,
+            mmr_mols,
+            mmw_profile,
+            g,
+        )
+    )
+    opacity_terms.update(
+        _compute_xs_opacity_terms(
+            art,
+            opa_atoms,
+            Tarr,
+            mmr_atoms,
+            mmw_profile,
+            g,
+        )
+    )
+    return opacity_terms
+
+
+def _sum_opacity_terms(
+    opacity_terms: dict[str, jnp.ndarray],
+    art: object,
+    nu_grid: jnp.ndarray,
+) -> jnp.ndarray:
+    """Sum all opacity terms into total dtau."""
+    dtau = jnp.zeros((art.pressure.size, nu_grid.size))
+    for dtau_term in opacity_terms.values():
+        dtau = dtau + dtau_term
+    return dtau
+
 def compute_opacity(
     art: object,
     opa_mols: dict[str, OpaPremodit],
@@ -227,40 +216,25 @@ def compute_opacity(
     Tarr: jnp.ndarray,
     mmr_mols: dict[str, jnp.ndarray],
     mmr_atoms: dict[str, jnp.ndarray],
-    vmrH2: jnp.ndarray,
-    vmrHe: jnp.ndarray,
-    mmw: jnp.ndarray,
+    vmrH2_profile: jnp.ndarray,
+    vmrHe_profile: jnp.ndarray,
+    mmw_profile: jnp.ndarray,
     g: jnp.ndarray,
 ) -> jnp.ndarray:
-    dtau = jnp.zeros((art.pressure.size, nu_grid.size))
-
-    # CIA contributions (use VMR for collision partners)
-    for molA, molB in [("H2", "H2"), ("H2", "He")]:
-        key = molA + molB
-        if key in opa_cias:
-            logacia_matrix = opa_cias[key].logacia_matrix(Tarr)
-            vmrX, vmrY = (vmrH2, vmrH2) if molB == "H2" else (vmrH2, vmrHe)
-            dtau = dtau + art.opacity_profile_cia(
-                logacia_matrix, Tarr, vmrX, vmrY, mmw[:, None], g
-            )
-
-    # Molecular contributions (use MMR for opacity_profile_xs)
-    for mol, mmr in mmr_mols.items():
-        if mol in opa_mols:
-            xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
-            dtau = dtau + art.opacity_profile_xs(
-                xsmatrix, mmr, mmw[:, None], g
-            )
-
-    # Atomic contributions (use MMR for opacity_profile_xs)
-    for atom, mmr in mmr_atoms.items():
-        if atom in opa_atoms:
-            xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
-            dtau = dtau + art.opacity_profile_xs(
-                xsmatrix, mmr, mmw[:, None], g
-            )
-
-    return dtau
+    opacity_terms = _compute_opacity_terms(
+        art,
+        opa_mols,
+        opa_atoms,
+        opa_cias,
+        Tarr,
+        mmr_mols,
+        mmr_atoms,
+        vmrH2_profile,
+        vmrHe_profile,
+        mmw_profile,
+        g,
+    )
+    return _sum_opacity_terms(opacity_terms, art, nu_grid)
 
 
 def compute_opacity_per_species(
@@ -268,44 +242,27 @@ def compute_opacity_per_species(
     opa_mols: dict[str, OpaPremodit],
     opa_atoms: dict[str, OpaPremodit],
     opa_cias: dict[str, OpaCIA],
-    nu_grid: jnp.ndarray,
     Tarr: jnp.ndarray,
     mmr_mols: dict[str, jnp.ndarray],
     mmr_atoms: dict[str, jnp.ndarray],
-    vmrH2: jnp.ndarray,
-    vmrHe: jnp.ndarray,
-    mmw: jnp.ndarray,
+    vmrH2_profile: jnp.ndarray,
+    vmrHe_profile: jnp.ndarray,
+    mmw_profile: jnp.ndarray,
     g: jnp.ndarray,
 ) -> dict[str, jnp.ndarray]:
-    dtau_dict = {}
-
-    # CIA contributions (use VMR for collision partners)
-    for molA, molB in [("H2", "H2"), ("H2", "He")]:
-        key = molA + molB
-        if key in opa_cias:
-            logacia_matrix = opa_cias[key].logacia_matrix(Tarr)
-            vmrX, vmrY = (vmrH2, vmrH2) if molB == "H2" else (vmrH2, vmrHe)
-            dtau_dict[f"CIA_{key}"] = art.opacity_profile_cia(
-                logacia_matrix, Tarr, vmrX, vmrY, mmw[:, None], g
-            )
-
-    # Molecular contributions (use MMR for opacity_profile_xs)
-    for mol, mmr in mmr_mols.items():
-        if mol in opa_mols:
-            xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
-            dtau_dict[mol] = art.opacity_profile_xs(
-                xsmatrix, mmr, mmw[:, None], g
-            )
-
-    # Atomic contributions (use MMR for opacity_profile_xs)
-    for atom, mmr in mmr_atoms.items():
-        if atom in opa_atoms:
-            xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
-            dtau_dict[atom] = art.opacity_profile_xs(
-                xsmatrix, mmr, mmw[:, None], g
-            )
-
-    return dtau_dict
+    return _compute_opacity_terms(
+        art,
+        opa_mols,
+        opa_atoms,
+        opa_cias,
+        Tarr,
+        mmr_mols,
+        mmr_atoms,
+        vmrH2_profile,
+        vmrHe_profile,
+        mmw_profile,
+        g,
+    )
 
 
 def reconstruct_temperature_profile(
@@ -320,8 +277,8 @@ def reconstruct_temperature_profile(
     # Tint_fixed: internal temperature for Guillot profile
     if pt_profile == "guillot":
         Tirr = posterior_params["Tirr"]
-        log_kappa_ir = posterior_params["log_kappa_ir"]
-        log_gamma = posterior_params["log_gamma"]
+        kappa_ir_cgs = posterior_params["kappa_ir_cgs"]
+        gamma = posterior_params["gamma"]
         
         Rp = posterior_params["Rp"]
         Mp = posterior_params["Mp"]
@@ -332,8 +289,8 @@ def reconstruct_temperature_profile(
             g_cgs=g_ref,
             Tirr=Tirr,
             Tint=Tint_fixed,
-            kappa_ir_cgs=jnp.power(10.0, log_kappa_ir),
-            gamma=jnp.power(10.0, log_gamma),
+            kappa_ir_cgs=kappa_ir_cgs,
+            gamma=gamma,
         )
         
     elif pt_profile == "isothermal":
@@ -482,14 +439,33 @@ def compute_atmospheric_state_from_posterior(
 
     # Compute total dtau (pass MMR profiles for molecules/atoms, VMR for CIA)
     dtau = compute_opacity(
-        art, opa_mols, opa_atoms, opa_cias, nu_grid,
-        Tarr, mmr_mols, mmr_atoms, vmrH2_profile, vmrHe_profile, mmw_profile, g
+        art=art,
+        opa_mols=opa_mols,
+        opa_atoms=opa_atoms,
+        opa_cias=opa_cias,
+        nu_grid=nu_grid,
+        Tarr=Tarr,
+        mmr_mols=mmr_mols,
+        mmr_atoms=mmr_atoms,
+        vmrH2_profile=vmrH2_profile,
+        vmrHe_profile=vmrHe_profile,
+        mmw_profile=mmw_profile,
+        g=g,
     )
 
     # Compute per-species dtau
     dtau_per_species = compute_opacity_per_species(
-        art, opa_mols, opa_atoms, opa_cias, nu_grid,
-        Tarr, mmr_mols, mmr_atoms, vmrH2_profile, vmrHe_profile, mmw_profile, g
+        art=art,
+        opa_mols=opa_mols,
+        opa_atoms=opa_atoms,
+        opa_cias=opa_cias,
+        Tarr=Tarr,
+        mmr_mols=mmr_mols,
+        mmr_atoms=mmr_atoms,
+        vmrH2_profile=vmrH2_profile,
+        vmrHe_profile=vmrHe_profile,
+        mmw_profile=mmw_profile,
+        g=g,
     )
 
     return {
@@ -530,20 +506,13 @@ def create_retrieval_model(
     T_high: float | None = None,
     Tirr_std: float | None = None,  # If None, uses uniform prior on Tirr
     Tint_fixed: float | None = None,
-    log_kappa_ir_bounds: tuple[float, float] | None = None,
-    log_gamma_bounds: tuple[float, float] | None = None,
+    kappa_ir_cgs_bounds: tuple[float, float] | None = None,
+    gamma_bounds: tuple[float, float] | None = None,
     # Phase-dependent velocity modeling
     phase_mode: PhaseMode = config.DEFAULT_PHASE_MODE,
     # Pipeline options
     subtract_per_exposure_mean: bool | None = None,
     apply_sysrem: bool | None = None,
-    # Inference grid stitching (optional)
-    stitch_inference: bool | None = None,
-    stitch_chunk_points: int | None = None,
-    stitch_n_chunks: int | None = None,
-    stitch_guard_kms: float | None = None,
-    stitch_guard_points: int | None = None,
-    stitch_min_guard_points: int | None = None,
     # Chemistry/composition solver
     composition_solver: CompositionSolver | None = None,
 ) -> Callable:
@@ -553,18 +522,16 @@ def create_retrieval_model(
         T_high = config.T_HIGH
     if Tint_fixed is None:
         Tint_fixed = config.TINT_FIXED
-    if log_kappa_ir_bounds is None:
-        log_kappa_ir_bounds = config.LOG_KAPPA_IR_BOUNDS
-    if log_gamma_bounds is None:
-        log_gamma_bounds = config.LOG_GAMMA_BOUNDS
+    if kappa_ir_cgs_bounds is None:
+        kappa_ir_cgs_bounds = tuple(
+            float(10.0**bound) for bound in config.LOG_KAPPA_IR_BOUNDS
+        )
+    if gamma_bounds is None:
+        gamma_bounds = tuple(float(10.0**bound) for bound in config.LOG_GAMMA_BOUNDS)
     if subtract_per_exposure_mean is None:
         subtract_per_exposure_mean = config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT
     if apply_sysrem is None:
         apply_sysrem = config.APPLY_SYSREM_DEFAULT
-    if stitch_inference is None:
-        stitch_inference = config.ENABLE_INFERENCE_STITCHING
-    if stitch_min_guard_points is None:
-        stitch_min_guard_points = config.STITCH_MIN_GUARD_POINTS
     Kp_mean, Kp_std = params["Kp"], params["Kp_err"]
     Vsys_mean, Vsys_std = params["RV_abs"], params["RV_abs_err"]
     Rp_mean, Rp_std = params["R_p"], params["R_p_err"]
@@ -598,51 +565,6 @@ def create_retrieval_model(
     if (mode == "emission") and (Tstar is None):
         raise ValueError("Tstar is required for emission mode.")
 
-    stitch_plan = None
-    stitch_sops: list[tuple[SopRotation, SopInstProfile]] | None = None
-    if stitch_inference:
-        if apply_sysrem:
-            raise ValueError("SYSREM is not supported with inference stitching.")
-
-        guard_points = (
-            int(stitch_guard_points)
-            if stitch_guard_points is not None
-            else _estimate_guard_points(
-                np.asarray(nu_grid),
-                instrument_resolution,
-                params,
-                period_day,
-                stitch_guard_kms,
-                stitch_min_guard_points,
-            )
-        )
-
-        stitch_plan = _build_chunk_plan(
-            np.asarray(nu_grid),
-            np.asarray(inst_nus),
-            guard_points,
-            chunk_points=stitch_chunk_points,
-            n_chunks=stitch_n_chunks,
-        )
-
-        vsini_max = float(getattr(sop_rot, "vsini_max", config.STITCH_VSINI_MAX))
-        vrmax = float(getattr(sop_inst, "vrmax", config.STITCH_VRMAX))
-        stitch_sops = []
-        for chunk_start, chunk_end, *_ in stitch_plan:
-            nu_chunk = jnp.array(nu_grid[chunk_start:chunk_end])
-            stitch_sops.append(
-                (
-                    SopRotation(nu_chunk, vsini_max=vsini_max),
-                    SopInstProfile(nu_chunk, vrmax=vrmax),
-                )
-            )
-        chunk_size = stitch_plan[0][1] - stitch_plan[0][0]
-        core_size = chunk_size - 2 * guard_points
-        print(
-            f"[INFO] Inference stitching enabled: "
-            f"{len(stitch_plan)} chunks, core={core_size}, guard={guard_points}."
-        )
-
     # --- The NumPyro Model ---
     def model(
         data: jnp.ndarray,
@@ -674,6 +596,7 @@ def create_retrieval_model(
             dRV = dRV_0 + dRV_slope * phase
             numpyro.deterministic("dRV_at_ingress", dRV_0 + dRV_slope * jnp.min(phase))
             numpyro.deterministic("dRV_at_egress", dRV_0 + dRV_slope * jnp.max(phase))
+
         else:
             raise ValueError(f"Unknown phase_mode: {phase_mode}")
 
@@ -681,8 +604,7 @@ def create_retrieval_model(
         Rstar = numpyro.sample("Rstar", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0)) * Rs
         Rp = numpyro.sample("Rp", dist.TruncatedNormal(Rp_mean, Rp_std, low=0.0)) * RJ
 
-        # 2. Gravity & Temperature (computed before composition so Tarr
-        #    can be passed to temperature-dependent composition solvers)
+        # 2. Gravity & Temperature 
         g_ref = gravity_surface(Rp / RJ, Mp / MJ)
 
         if pt_profile == "guillot":
@@ -693,18 +615,18 @@ def create_retrieval_model(
             else:
                 Tirr = numpyro.sample("Tirr", dist.Uniform(T_low, T_high))
 
-            log_kappa_ir = numpyro.sample(
-                "log_kappa_ir", dist.Uniform(*log_kappa_ir_bounds)
+            kappa_ir_cgs = numpyro.sample(
+                "kappa_ir_cgs", dist.LogUniform(*kappa_ir_cgs_bounds)
             )
-            log_gamma = numpyro.sample("log_gamma", dist.Uniform(*log_gamma_bounds))
+            gamma = numpyro.sample("gamma", dist.LogUniform(*gamma_bounds))
 
             Tarr = guillot_profile(
                 pressure_bar=art.pressure,
                 g_cgs=g_ref,
                 Tirr=Tirr,
                 Tint=Tint_fixed,
-                kappa_ir_cgs=jnp.power(10.0, log_kappa_ir),
-                gamma=jnp.power(10.0, log_gamma),
+                kappa_ir_cgs=kappa_ir_cgs,
+                gamma=gamma,
             )
 
         elif pt_profile == "isothermal":
@@ -729,13 +651,13 @@ def create_retrieval_model(
         )
         mmr_mols = comp.mmr_mols
         mmr_atoms = comp.mmr_atoms
-        vmrH2_prof = comp.vmrH2_prof
-        vmrHe_prof = comp.vmrHe_prof
-        mmw_prof = comp.mmw_prof
+        vmrH2_profile = comp.vmrH2_profile
+        vmrHe_profile = comp.vmrHe_profile
+        mmw_profile = comp.mmw_profile
 
-        g = art.gravity_profile(Tarr, mmw_prof, Rp, g_ref)
+        g = art.gravity_profile(Tarr, mmw_profile, Rp, g_ref)
 
-        # 4. Opacity Calculation + Forward Model (full grid or stitched)
+        # 4. Opacity Calculation + Forward Model
         # Ensure 2D shapes for downstream operations
         if data.ndim == 1:
             data = data[None, :]
@@ -746,204 +668,77 @@ def create_retrieval_model(
             2.0 * jnp.pi * Rp / (period_day * 86400.0) / 1.0e5
         )  # cm/s -> km/s
 
-        if stitch_plan is None:
-            dtau = jnp.zeros((art.pressure.size, nu_grid.size))
+        mmr_mol_profiles = {mol: mmr_mols[i] for i, mol in enumerate(mol_names)}
+        mmr_atom_profiles = {atom: mmr_atoms[i] for i, atom in enumerate(atom_names)}
 
-            # CIA (use VMR profiles for collision partners)
-            for molA, molB in [("H2", "H2"), ("H2", "He")]:
-                key = molA + molB
-                if key not in opa_cias:
-                    continue
-                logacia_matrix = opa_cias[key].logacia_matrix(Tarr)
-                vmrX, vmrY = (vmrH2_prof, vmrH2_prof) if molB == "H2" else (vmrH2_prof, vmrHe_prof)
-                dtau = dtau + art.opacity_profile_cia(
-                    logacia_matrix, Tarr, vmrX, vmrY, mmw_prof[:, None], g
-                )
+        dtau = compute_opacity(
+            art=art,
+            opa_mols=opa_mols,
+            opa_atoms=opa_atoms,
+            opa_cias=opa_cias,
+            nu_grid=nu_grid,
+            Tarr=Tarr,
+            mmr_mols=mmr_mol_profiles,
+            mmr_atoms=mmr_atom_profiles,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
+            g=g,
+        )
 
-            # Molecules (use MMR for opacity_profile_xs)
-            for i, mol in enumerate(mol_names):
-                xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
-                dtau = dtau + art.opacity_profile_xs(
-                    xsmatrix, mmr_mols[i], mmw_prof[:, None], g
-                )
+        # 5. Radiative Transfer
+        rt = art.run(dtau, Tarr, mmw_profile, Rp, g_ref)
 
-            # Atoms (use MMR for opacity_profile_xs)
-            for i, atom in enumerate(atom_names):
-                xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
-                dtau = dtau + art.opacity_profile_xs(
-                    xsmatrix, mmr_atoms[i], mmw_prof[:, None], g
-                )
+        # 6. Rotation & Instrument Broadening
+        rt = sop_rot.rigid_rotation(rt, vsini, 0.0, 0.0)
+        rt = sop_inst.ipgauss(rt, beta_inst)
 
-            # 5. Radiative Transfer
-            rt = art.run(dtau, Tarr, mmw_prof, Rp, g_ref)
+        # 7. Time-Series Sampling (Doppler shift)
+        rv = planet_rv_kms(phase, Kp, Vsys, dRV)
+        planet_ts = jax.vmap(lambda v: sop_inst.sampling(rt, v, inst_nus))(rv)
 
-            # 6. Rotation & Instrument Broadening
-            rt = sop_rot.rigid_rotation(rt, vsini, 0.0, 0.0)
-            rt = sop_inst.ipgauss(rt, beta_inst)
-
-            # 7. Time-Series Sampling (Doppler shift)
-            rv = planet_rv_kms(phase, Kp, Vsys, dRV)
-            planet_ts = jax.vmap(lambda v: sop_inst.sampling(rt, v, inst_nus))(rv)
-
-            # 8. Contrast / Flux Ratio
-            if mode == "transmission":
-                model_ts = jnp.sqrt(planet_ts) * (Rp / Rstar)
-            else:
-                piBarr = _get_piBarr()
-                Fs = piBarr(nu_grid, Tstar)
-                Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
-                model_ts = planet_ts / jnp.clip(Fs_ts, EPS, None) * (Rp / Rstar) ** 2
-
-            # 9. Pipeline Corrections
-            if model_ts.ndim == 1:
-                model_ts = model_ts[None, :]
-            if model_ts.shape[1] == 0:
-                raise ValueError("model_ts has zero spectral points; check inst_nus/nu_grid")
-
-            if subtract_per_exposure_mean:
-                model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
-
-            if apply_sysrem:
-                if (U is None) or (invvar_spec is None):
-                    raise ValueError(
-                        "apply_sysrem=True requires both U and invvar_spec inputs."
-                    )
-                model_ts = sysrem_filter_model(model_ts, U, invvar_spec)
-
-            # 10. Log-Likelihood (CCF-equivalent Matched Filter)
-            w = 1.0 / jnp.clip(sigma, EPS, None) ** 2
-
-            def _lnL_one(f: jnp.ndarray, m: jnp.ndarray, w_: jnp.ndarray) -> jnp.ndarray:
-                s_mm = jnp.sum((m * m) * w_)
-                s_fm = jnp.sum((f * m) * w_)
-                alpha = s_fm / (s_mm + EPS)
-                r = f - alpha * m
-                chi2 = jnp.sum((r * r) * w_)
-                norm = jnp.sum(jnp.log((2.0 * jnp.pi) / w_))
-                return -0.5 * (chi2 + norm)
-
-            lnL = jnp.sum(jax.vmap(_lnL_one)(data, model_ts, w))
-            numpyro.factor("logL", lnL)
+        # 8. Contrast / Flux Ratio
+        if mode == "transmission":
+            model_ts = jnp.sqrt(planet_ts) * (Rp / Rstar)
         else:
-            # Stitched inference: accumulate log-likelihood across chunks
-            w = 1.0 / jnp.clip(sigma, EPS, None) ** 2
-            sum_w = jnp.sum(w, axis=1)
-            sum_f_w = jnp.sum(data * w, axis=1)
-            s_ff = jnp.sum((data * data) * w, axis=1)
-            norm = jnp.sum(jnp.log((2.0 * jnp.pi) / w), axis=1)
+            piBarr = _get_piBarr()
+            Fs = piBarr(nu_grid, Tstar)
+            Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
+            model_ts = planet_ts / jnp.clip(Fs_ts, EPS, None) * (Rp / Rstar) ** 2
 
-            sum_m = jnp.zeros_like(sum_w)
-            sum_m_w = jnp.zeros_like(sum_w)
-            sum_m2_w = jnp.zeros_like(sum_w)
-            sum_fm_w = jnp.zeros_like(sum_w)
+        # 9. Pipeline Corrections
+        if model_ts.ndim == 1:
+            model_ts = model_ts[None, :]
+        if model_ts.shape[1] == 0:
+            raise ValueError("model_ts has zero spectral points; check inst_nus/nu_grid")
 
-            rv = planet_rv_kms(phase, Kp, Vsys, dRV)
+        if subtract_per_exposure_mean:
+            model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
 
-            for (chunk_start, chunk_end, _core_start, _core_end, inst_start, inst_end), sops in zip(
-                stitch_plan, stitch_sops
-            ):
-                sop_rot_chunk, sop_inst_chunk = sops
-                nu_chunk = nu_grid[chunk_start:chunk_end]
+        if apply_sysrem:
+            if (U is None) or (invvar_spec is None):
+                raise ValueError(
+                    "apply_sysrem=True requires both U and invvar_spec inputs."
+                )
+            model_ts = sysrem_filter_model(model_ts, U, invvar_spec)
 
-                dtau_chunk = jnp.zeros((art.pressure.size, nu_chunk.size))
+        # 10. Log-likelihood (CCF-equivalent matched filter)
+        # i = spectrum/exposure index, j = pixel index
+        w_ij = 1.0 / jnp.clip(sigma, EPS, None) ** 2
 
-                # CIA
-                for molA, molB in [("H2", "H2"), ("H2", "He")]:
-                    key = molA + molB
-                    if key not in opa_cias:
-                        continue
-                    logacia_matrix = opa_cias[key].logacia_matrix(Tarr)
-                    logacia_chunk = _slice_spectral_matrix(
-                        logacia_matrix, chunk_start, chunk_end, nu_grid.size
-                    )
-                    vmrX, vmrY = (vmrH2_prof, vmrH2_prof) if molB == "H2" else (vmrH2_prof, vmrHe_prof)
-                    dtau_chunk = dtau_chunk + art.opacity_profile_cia(
-                        logacia_chunk, Tarr, vmrX, vmrY, mmw_prof[:, None], g
-                    )
+        def _lnL_exposure(
+            f_i: jnp.ndarray,
+            m_i: jnp.ndarray,
+            w_i: jnp.ndarray,
+        ) -> jnp.ndarray:
+            alpha_i = jnp.sum(w_i * f_i * m_i) / (jnp.sum(w_i * m_i**2) + EPS)
+            r_i = f_i - alpha_i * m_i
+            chi2_i = jnp.sum(w_i * r_i**2)
+            norm_i = jnp.sum(jnp.log((2.0 * jnp.pi) / w_i))
+            return -0.5 * (chi2_i + norm_i)
 
-                # Molecules (use MMR for opacity_profile_xs)
-                for i, mol in enumerate(mol_names):
-                    xsmatrix = opa_mols[mol].xsmatrix(Tarr, art.pressure)
-                    xs_chunk = _slice_spectral_matrix(
-                        xsmatrix, chunk_start, chunk_end, nu_grid.size
-                    )
-                    dtau_chunk = dtau_chunk + art.opacity_profile_xs(
-                        xs_chunk, mmr_mols[i], mmw_prof[:, None], g
-                    )
-
-                # Atoms (use MMR for opacity_profile_xs)
-                for i, atom in enumerate(atom_names):
-                    xsmatrix = opa_atoms[atom].xsmatrix(Tarr, art.pressure)
-                    xs_chunk = _slice_spectral_matrix(
-                        xsmatrix, chunk_start, chunk_end, nu_grid.size
-                    )
-                    dtau_chunk = dtau_chunk + art.opacity_profile_xs(
-                        xs_chunk, mmr_atoms[i], mmw_prof[:, None], g
-                    )
-
-                # Debug: check dtau_chunk shape before RT
-                if dtau_chunk.shape[1] != nu_chunk.size:
-                    raise ValueError(
-                        f"dtau_chunk shape mismatch: dtau_chunk.shape={dtau_chunk.shape}, "
-                        f"nu_chunk.size={nu_chunk.size}"
-                    )
-
-                rt = art.run(dtau_chunk, Tarr, mmw_prof, Rp, g_ref)
-                rt = sop_rot_chunk.rigid_rotation(rt, vsini, 0.0, 0.0)
-
-                # ExoJAX's rigid_rotation can return 1 fewer element due to a bug
-                # in convolve_same (irfft called without explicit n). Pad to match.
-                expected_size = sop_rot_chunk.nu_grid.shape[0]
-                if rt.shape[0] < expected_size:
-                    pad_width = expected_size - rt.shape[0]
-                    rt = jnp.pad(rt, (0, pad_width), mode="edge")
-
-                rt = sop_inst_chunk.ipgauss(rt, beta_inst)
-
-                # Same boundary handling for ipgauss (ExoJAX's convolve_same has a
-                # bug where irfft is called without explicit n, causing 1-element
-                # size reduction for odd FFT lengths)
-                expected_size = sop_inst_chunk.nu_grid.shape[0]
-                if rt.shape[0] < expected_size:
-                    pad_width = expected_size - rt.shape[0]
-                    rt = jnp.pad(rt, (0, pad_width), mode="edge")
-
-                inst_slice = inst_nus[inst_start:inst_end]
-
-                planet_ts = jax.vmap(lambda v: sop_inst_chunk.sampling(rt, v, inst_slice))(rv)
-
-                if mode == "transmission":
-                    model_ts = jnp.sqrt(planet_ts) * (Rp / Rstar)
-                else:
-                    piBarr = _get_piBarr()
-                    Fs = piBarr(nu_chunk, Tstar)
-                    Fs_ts = jax.vmap(lambda v: sop_inst_chunk.sampling(Fs, v, inst_slice))(rv)
-                    model_ts = planet_ts / jnp.clip(Fs_ts, EPS, None) * (Rp / Rstar) ** 2
-
-                if model_ts.ndim == 1:
-                    model_ts = model_ts[None, :]
-
-                data_slice = data[:, inst_start:inst_end]
-                w_slice = w[:, inst_start:inst_end]
-
-                sum_m = sum_m + jnp.sum(model_ts, axis=1)
-                sum_m_w = sum_m_w + jnp.sum(model_ts * w_slice, axis=1)
-                sum_m2_w = sum_m2_w + jnp.sum((model_ts * model_ts) * w_slice, axis=1)
-                sum_fm_w = sum_fm_w + jnp.sum((data_slice * model_ts) * w_slice, axis=1)
-
-            if subtract_per_exposure_mean:
-                n_points = data.shape[1]
-                mean_m = sum_m / n_points
-                s_mm = sum_m2_w - 2.0 * mean_m * sum_m_w + (mean_m * mean_m) * sum_w
-                s_fm = sum_fm_w - mean_m * sum_f_w
-            else:
-                s_mm = sum_m2_w
-                s_fm = sum_fm_w
-
-            alpha = s_fm / (s_mm + EPS)
-            chi2 = s_ff - 2.0 * alpha * s_fm + (alpha * alpha) * s_mm
-            lnL = jnp.sum(-0.5 * (chi2 + norm))
-            numpyro.factor("logL", lnL)
+        lnL = jnp.sum(jax.vmap(_lnL_exposure)(data, model_ts, w_ij))
+        numpyro.factor("logL", lnL)
 
         # Deterministics for tracking
         numpyro.deterministic("Kp_kms", Kp)

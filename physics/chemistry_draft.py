@@ -8,10 +8,11 @@ atmospheric models.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 from typing import NamedTuple, Protocol
-from functools import partial
+from functools import partial, lru_cache
 from pathlib import Path
 
 import h5py
@@ -25,6 +26,8 @@ import pyfastchem
 import vulcan
 from scipy.interpolate import RegularGridInterpolator
 from exojax.database import molinfo
+
+from config import chemistry_config as chem_config
 
 
 # ===========================================================================
@@ -832,9 +835,9 @@ class CompositionState(NamedTuple):
     mmw: jnp.ndarray  # Mean molecular weight (scalar)
     mmr_mols: jnp.ndarray  # MMR profiles (n_mols, n_layers)
     mmr_atoms: jnp.ndarray  # MMR profiles (n_atoms, n_layers)
-    vmrH2_prof: jnp.ndarray  # H2 VMR profile (n_layers,)
-    vmrHe_prof: jnp.ndarray  # He VMR profile (n_layers,)
-    mmw_prof: jnp.ndarray  # MMW profile (n_layers,)
+    vmrH2_profile: jnp.ndarray  # H2 VMR profile (n_layers,)
+    vmrHe_profile: jnp.ndarray  # He VMR profile (n_layers,)
+    mmw_profile: jnp.ndarray  # MMW profile (n_layers,)
 
 
 class CompositionSolver(Protocol):
@@ -971,9 +974,9 @@ class ConstantVMR:
             mmr_atoms = jnp.zeros((0, art.pressure.size))
 
         # Step 6: Create constant profiles for CIA inputs and mmw
-        vmrH2_prof = art.constant_mmr_profile(vmrH2)
-        vmrHe_prof = art.constant_mmr_profile(vmrHe)
-        mmw_prof = art.constant_mmr_profile(mmw)
+        vmrH2_profile = art.constant_mmr_profile(vmrH2)
+        vmrHe_profile = art.constant_mmr_profile(vmrHe)
+        mmw_profile = art.constant_mmr_profile(mmw)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -983,9 +986,9 @@ class ConstantVMR:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -1090,26 +1093,26 @@ class FreeVMR:
         # Step 3: Fill remainder with H2/He at each layer
         h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
         he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe_prof = (1.0 - vmr_trace_tot) * he_frac
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 
         # Step 4: Compute mean molecular weight profile
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         if n_mols > 0:
             for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-                mmw_prof = mmw_prof + mass * vmr_prof
+                mmw_profile = mmw_profile + mass * vmr_prof
         if n_atoms > 0:
             for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-                mmw_prof = mmw_prof + mass * vmr_prof
+                mmw_profile = mmw_profile + mass * vmr_prof
 
         # Step 5: Convert VMR to MMR profiles
         # MMR_i = VMR_i * (M_i / mmw)
         if n_mols > 0:
             mmr_mols = jnp.array(
                 [
-                    vmr_prof * (mass / mmw_prof)
+                    vmr_prof * (mass / mmw_profile)
                     for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
                 ]
             )
@@ -1119,7 +1122,7 @@ class FreeVMR:
         if n_atoms > 0:
             mmr_atoms = jnp.array(
                 [
-                    vmr_prof * (mass / mmw_prof)
+                    vmr_prof * (mass / mmw_profile)
                     for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
                 ]
             )
@@ -1130,9 +1133,9 @@ class FreeVMR:
         # Here we just use simple mean for consistency with downstream code that expects scalars
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -1142,71 +1145,63 @@ class FreeVMR:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
 # ---------------------------------------------------------------------------
-# Solar abundances (Asplund et al. 2021, A&A 653, A141)
-# Values are number fractions relative to H (n_X / n_H)
+# Solar abundances loaded from Asplund 2020 table
 # ---------------------------------------------------------------------------
-SOLAR_ABUNDANCES = {
-    # Molecules (approximate VMR in solar-composition gas at ~1000K)
-    "H2O": 5.4e-4,
-    "CO": 6.0e-4,
-    "CO2": 1.0e-7,
-    "CH4": 3.5e-4,
-    "NH3": 8.0e-5,
-    "H2S": 1.5e-5,
-    "HCN": 1.0e-7,
-    "C2H2": 1.0e-8,
-    "PH3": 3.0e-7,
-    "TiO": 1.0e-7,
-    "VO": 1.0e-8,
-    "FeH": 1.0e-8,
-    "SiO": 3.5e-5,
-    # Atoms (solar photospheric, log eps scale converted to n_X/n_H)
-    "Fe": 3.16e-5,   # log eps = 7.50
-    "Fe I": 3.16e-5,
-    "Fe II": 3.16e-6,  # Rough ionization fraction
-    "Na": 2.14e-6,   # log eps = 6.33
-    "Na I": 2.14e-6,
-    "K": 1.35e-7,    # log eps = 5.13
-    "K I": 1.35e-7,
-    "Ca": 2.19e-6,   # log eps = 6.34
-    "Ca I": 2.19e-6,
-    "Ca II": 2.19e-6,
-    "Mg": 3.98e-5,   # log eps = 7.60
-    "Mg I": 3.98e-5,
-    "Ti": 8.91e-8,   # log eps = 4.95
-    "Ti I": 8.91e-8,
-    "Ti II": 8.91e-8,
-    "V": 1.00e-8,    # log eps = 3.93
-    "V I": 1.00e-8,
-    "Cr": 4.68e-7,   # log eps = 5.67
-    "Cr I": 4.68e-7,
-    "Mn": 3.47e-7,   # log eps = 5.54
-    "Mn I": 3.47e-7,
-    "Ni": 1.78e-6,   # log eps = 6.25
-    "Ni I": 1.78e-6,
-    "Si": 3.24e-5,   # log eps = 7.51
-    "Si I": 3.24e-5,
-    "Al": 2.82e-6,   # log eps = 6.45
-    "Al I": 2.82e-6,
-    "Li": 1.0e-9,    # log eps = 1.05 (depleted)
-    "Li I": 1.0e-9,
-    "C": 2.69e-4,    # log eps = 8.43 (total carbon)
-    "O": 4.90e-4,    # log eps = 8.69 (total oxygen)
-    "N": 6.76e-5,    # log eps = 7.83 (total nitrogen)
-}
-
-# Solar C/O ratio
-SOLAR_C_O = 0.55
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SOLAR_ABUNDANCE_FILE = _REPO_ROOT / chem_config.SOLAR_ABUNDANCE_FILE
+_ELEMENT_RE = re.compile(r"([A-Z][a-z]?)(\d*)")
 
 
-class EquilibriumChemistry:
+@lru_cache(maxsize=1)
+def _load_solar_element_abundances() -> dict[str, float]:
+    abundances: dict[str, float] = {}
+    with _SOLAR_ABUNDANCE_FILE.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            symbol = parts[0]
+            if symbol == "e-":
+                continue
+            abundances[symbol] = 10.0 ** (float(parts[1]) - 12.0)
+
+    if "H" not in abundances:
+        raise ValueError(f"Hydrogen abundance missing from '{_SOLAR_ABUNDANCE_FILE}'.")
+    abundances["H"] = 1.0
+    return abundances
+
+
+def _solar_abundance_for_species(species: str) -> float:
+    base = species.split()[0].replace("+", "").replace("-", "")
+    counts = _ELEMENT_RE.findall(base)
+    if not counts:
+        return 1.0e-30
+
+    limiting = np.inf
+    for element, count_str in counts:
+        count = int(count_str) if count_str else 1
+        element_abundance = SOLAR_ABUNDANCES.get(element)
+        if element_abundance is None:
+            return 1.0e-30
+        limiting = min(limiting, element_abundance / float(count))
+    return float(max(limiting, 1.0e-30))
+
+
+SOLAR_ABUNDANCES = _load_solar_element_abundances()
+SOLAR_C_O = SOLAR_ABUNDANCES["C"] / SOLAR_ABUNDANCES["O"]
+
+
+class ParametricMetallicityCOChemistry:
     """Chemical equilibrium with [M/H] and C/O as free parameters.
 
     This solver interpolates pre-computed equilibrium chemistry tables
@@ -1299,7 +1294,7 @@ class EquilibriumChemistry:
         Z = metallicity
 
         if species_upper in ("FE", "FEI", "FEII"):
-            Fe_total = 3.16e-5 * Z
+            Fe_total = _solar_abundance_for_species("Fe") * Z
             # Iron condenses below ~1800K
             vmr = Fe_total * jnp.where(Tarr > 1800.0, 1.0, jnp.exp((Tarr - 1800.0) / 150.0))
             if "II" in species:
@@ -1314,21 +1309,21 @@ class EquilibriumChemistry:
             return vmr
 
         elif species_upper in ("NA", "NAI"):
-            Na_total = 2.14e-6 * Z
+            Na_total = _solar_abundance_for_species("Na") * Z
             chi_Na = 5.14  # eV
             ion_frac = self._saha_ionization(Tarr, Parr, chi_Na)
             vmr = Na_total * jnp.where(species_upper == "NAI", 1.0 - ion_frac, 1.0)
             return vmr
 
         elif species_upper in ("K", "KI"):
-            K_total = 1.35e-7 * Z
+            K_total = _solar_abundance_for_species("K") * Z
             chi_K = 4.34  # eV
             ion_frac = self._saha_ionization(Tarr, Parr, chi_K)
             vmr = K_total * jnp.where(species_upper == "KI", 1.0 - ion_frac, 1.0)
             return vmr
 
         elif species_upper in ("CA", "CAI", "CAII"):
-            Ca_total = 2.19e-6 * Z
+            Ca_total = _solar_abundance_for_species("Ca") * Z
             chi_Ca = 6.11  # eV
             ion_frac = self._saha_ionization(Tarr, Parr, chi_Ca)
             T_cond = 1500.0
@@ -1340,24 +1335,24 @@ class EquilibriumChemistry:
             return vmr
 
         elif species_upper in ("MG", "MGI"):
-            Mg_total = 3.98e-5 * Z
+            Mg_total = _solar_abundance_for_species("Mg") * Z
             T_cond = 1400.0
             vmr = Mg_total * jnp.where(Tarr > T_cond, 1.0, jnp.exp((Tarr - T_cond)/100))
             return vmr
 
         elif species_upper in ("TI", "TII", "TIII"):
-            Ti_total = 8.91e-8 * Z
+            Ti_total = _solar_abundance_for_species("Ti") * Z
             vmr = Ti_total * jnp.where(Tarr > 1800.0, 1.0, 0.01)
             return vmr
 
         elif species_upper in ("CR", "CRI"):
-            Cr_total = 4.68e-7 * Z
+            Cr_total = _solar_abundance_for_species("Cr") * Z
             vmr = Cr_total * jnp.where(Tarr > 1300.0, 1.0, 0.01)
             return vmr
 
         else:
             # Default: scaled solar with no T dependence
-            solar = SOLAR_ABUNDANCES.get(species, 1e-10)
+            solar = _solar_abundance_for_species(species)
             vmr = solar * Z * jnp.ones_like(Tarr)
             return vmr
 
@@ -1410,9 +1405,6 @@ class EquilibriumChemistry:
 
         This method now uses NASA polynomial thermodynamic data and Gibbs
         free energy calculations for accurate equilibrium chemistry.
-
-        For backwards compatibility, the method name is preserved but the
-        implementation uses proper thermodynamics.
         """
         return self._gibbs_equilibrium(species, Tarr, Parr, metallicity, co_ratio)
 
@@ -1527,22 +1519,22 @@ class EquilibriumChemistry:
         # Fill remainder with H2/He
         h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
         he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe_prof = (1.0 - vmr_trace_tot) * he_frac
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 
         # Compute mean molecular weight profile
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert VMR to MMR profiles
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -1550,7 +1542,7 @@ class EquilibriumChemistry:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -1559,9 +1551,9 @@ class EquilibriumChemistry:
         # Scalar outputs (column averages)
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -1571,9 +1563,9 @@ class EquilibriumChemistry:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -1590,7 +1582,7 @@ class QuenchChemistry:
 
     def __init__(
         self,
-        equilibrium_solver: EquilibriumChemistry | None = None,
+        equilibrium_solver: ParametricMetallicityCOChemistry | None = None,
         p_quench_range: tuple[float, float] = (1e-4, 1e2),
         metallicity_range: tuple[float, float] = (-2.0, 3.0),
         co_ratio_range: tuple[float, float] = (0.1, 2.0),
@@ -1599,7 +1591,7 @@ class QuenchChemistry:
         """Initialize quench chemistry solver.
 
         Args:
-            equilibrium_solver: EquilibriumChemistry instance for computing
+            equilibrium_solver: ParametricMetallicityCOChemistry instance for computing
                                 equilibrium VMRs. If None, creates one.
             p_quench_range: Prior range for quench pressure in bar
             metallicity_range: Prior range for log10([M/H])
@@ -1614,7 +1606,7 @@ class QuenchChemistry:
         if equilibrium_solver is not None:
             self.eq_solver = equilibrium_solver
         else:
-            self.eq_solver = EquilibriumChemistry(
+            self.eq_solver = ParametricMetallicityCOChemistry(
                 metallicity_range=metallicity_range,
                 co_ratio_range=co_ratio_range,
                 h2_he_ratio=h2_he_ratio,
@@ -1704,22 +1696,22 @@ class QuenchChemistry:
         # Fill remainder with H2/He
         h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
         he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe_prof = (1.0 - vmr_trace_tot) * he_frac
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 
         # Compute mean molecular weight
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -1727,7 +1719,7 @@ class QuenchChemistry:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -1736,9 +1728,9 @@ class QuenchChemistry:
         # Scalar outputs
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -1748,9 +1740,9 @@ class QuenchChemistry:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -1764,7 +1756,7 @@ class COMetallicity:
     Then derives individual species VMRs using Gibbs free energy minimization
     with NASA polynomial thermodynamic data for accurate equilibrium chemistry.
 
-    This is a wrapper around EquilibriumChemistry that provides a cleaner
+    This is a wrapper around ParametricMetallicityCOChemistry that provides a cleaner
     interface for the common case of retrieving metallicity and C/O ratio.
     """
 
@@ -1788,8 +1780,8 @@ class COMetallicity:
         self.h2_he_ratio = h2_he_ratio
         self.use_gibbs = use_gibbs
 
-        # Use the improved EquilibriumChemistry solver internally
-        self.eq_solver = EquilibriumChemistry(
+        # Use the improved ParametricMetallicityCOChemistry solver internally
+        self.eq_solver = ParametricMetallicityCOChemistry(
             metallicity_range=metallicity_range,
             co_ratio_range=co_ratio_range,
             h2_he_ratio=h2_he_ratio,
@@ -1871,22 +1863,22 @@ class COMetallicity:
             # Fill with H2/He
             h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
             he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-            vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac
-            vmrHe_prof = (1.0 - vmr_trace_tot) * he_frac
+            vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+            vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 
             # Compute mean molecular weight profile
             mass_H2 = molinfo.molmass_isotope("H2")
             mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-            mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+            mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
             for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-                mmw_prof = mmw_prof + mass * vmr_prof
+                mmw_profile = mmw_profile + mass * vmr_prof
             for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-                mmw_prof = mmw_prof + mass * vmr_prof
+                mmw_profile = mmw_profile + mass * vmr_prof
 
             # Convert to MMR
             if n_mols > 0:
                 mmr_mols = jnp.array([
-                    vmr_prof * (mass / mmw_prof)
+                    vmr_prof * (mass / mmw_profile)
                     for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
                 ])
             else:
@@ -1894,7 +1886,7 @@ class COMetallicity:
 
             if n_atoms > 0:
                 mmr_atoms = jnp.array([
-                    vmr_prof * (mass / mmw_prof)
+                    vmr_prof * (mass / mmw_profile)
                     for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
                 ])
             else:
@@ -1903,9 +1895,9 @@ class COMetallicity:
             # Scalar outputs
             vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
             vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-            vmrH2 = jnp.mean(vmrH2_prof)
-            vmrHe = jnp.mean(vmrHe_prof)
-            mmw = jnp.mean(mmw_prof)
+            vmrH2 = jnp.mean(vmrH2_profile)
+            vmrHe = jnp.mean(vmrHe_profile)
+            mmw = jnp.mean(mmw_profile)
 
             return CompositionState(
                 vmr_mols=vmr_mols_scalar,
@@ -1915,126 +1907,12 @@ class COMetallicity:
                 mmw=mmw,
                 mmr_mols=mmr_mols,
                 mmr_atoms=mmr_atoms,
-                vmrH2_prof=vmrH2_prof,
-                vmrHe_prof=vmrHe_prof,
-                mmw_prof=mmw_prof,
+                vmrH2_profile=vmrH2_profile,
+                vmrHe_profile=vmrHe_profile,
+                mmw_profile=mmw_profile,
             )
 
-        # Fallback to simple partitioning (for backwards compatibility)
-        Z = metallicity
-
-        # Total C and O abundances (scaled from solar)
-        O_solar = 4.90e-4
-        C_solar = 2.69e-4
-        O_total = O_solar * Z
-        C_total = co_ratio * O_total  # Set C based on desired C/O
-
-        # Derive molecular VMRs using partitioning rules
-        vmr_mols_scalar = []
-        for mol in mol_names:
-            mol_upper = mol.upper()
-            if mol_upper == "H2O":
-                vmr = jnp.where(co_ratio < 1.0, O_total - C_total, O_total * 0.01)
-            elif mol_upper == "CO":
-                vmr = jnp.minimum(C_total, O_total)
-            elif mol_upper == "CO2":
-                excess_O = jnp.maximum(O_total - C_total, 0.0)
-                vmr = excess_O * 0.01
-            elif mol_upper == "CH4":
-                vmr = jnp.where(co_ratio > 1.0, C_total - O_total, C_total * 0.001)
-            elif mol_upper == "HCN":
-                vmr = jnp.where(co_ratio > 1.0, C_total * 0.01, C_total * 1e-4)
-            elif mol_upper == "C2H2":
-                vmr = jnp.where(co_ratio > 1.5, C_total * 0.01, C_total * 1e-5)
-            elif mol_upper == "NH3":
-                N_total = 6.76e-5 * Z
-                vmr = N_total * 0.1
-            elif mol_upper == "H2S":
-                S_total = 1.5e-5 * Z
-                vmr = S_total
-            elif mol_upper in ("TIO", "TIOXIDE"):
-                vmr = 8.91e-8 * Z
-            elif mol_upper in ("VO", "VANADIUMOXIDE"):
-                vmr = 1.0e-8 * Z
-            elif mol_upper == "SIO":
-                vmr = 3.24e-5 * Z * 0.1
-            elif mol_upper == "FEH":
-                vmr = 3.16e-5 * Z * 0.01
-            else:
-                solar = SOLAR_ABUNDANCES.get(mol, 1e-10)
-                vmr = solar * Z
-            vmr_mols_scalar.append(vmr)
-
-        # Atomic VMRs scale with metallicity
-        vmr_atoms_scalar = []
-        for atom in atom_names:
-            solar = SOLAR_ABUNDANCES.get(atom, 1e-10)
-            vmr = solar * Z
-            vmr_atoms_scalar.append(vmr)
-
-        n_mols = len(vmr_mols_scalar)
-        n_atoms = len(vmr_atoms_scalar)
-
-        # Renormalize if total exceeds 1
-        if n_mols + n_atoms > 0:
-            vmr_trace_arr = jnp.array(vmr_mols_scalar + vmr_atoms_scalar)
-            sum_trace = jnp.sum(vmr_trace_arr)
-            scale = jnp.where(sum_trace > 0.5, 0.5 / sum_trace, 1.0)
-            vmr_trace_arr = vmr_trace_arr * scale
-            vmr_mols_scalar = [vmr_trace_arr[i] for i in range(n_mols)]
-            vmr_atoms_scalar = [vmr_trace_arr[n_mols + i] for i in range(n_atoms)]
-            vmr_trace_tot = jnp.sum(vmr_trace_arr)
-        else:
-            vmr_trace_tot = jnp.array(0.0)
-
-        # Fill with H2/He
-        h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
-        he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2 = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe = (1.0 - vmr_trace_tot) * he_frac
-
-        # Mean molecular weight
-        mass_H2 = molinfo.molmass_isotope("H2")
-        mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw = mass_H2 * vmrH2 + mass_He * vmrHe
-        for m, v in zip(mol_masses, vmr_mols_scalar):
-            mmw = mmw + m * v
-        for m, v in zip(atom_masses, vmr_atoms_scalar):
-            mmw = mmw + m * v
-
-        # Create constant profiles
-        if n_mols > 0:
-            mmr_mols = jnp.array([
-                art.constant_mmr_profile(vmr * (mass / mmw))
-                for vmr, mass in zip(vmr_mols_scalar, mol_masses)
-            ])
-        else:
-            mmr_mols = jnp.zeros((0, art.pressure.size))
-
-        if n_atoms > 0:
-            mmr_atoms = jnp.array([
-                art.constant_mmr_profile(vmr * (mass / mmw))
-                for vmr, mass in zip(vmr_atoms_scalar, atom_masses)
-            ])
-        else:
-            mmr_atoms = jnp.zeros((0, art.pressure.size))
-
-        vmrH2_prof = art.constant_mmr_profile(vmrH2)
-        vmrHe_prof = art.constant_mmr_profile(vmrHe)
-        mmw_prof = art.constant_mmr_profile(mmw)
-
-        return CompositionState(
-            vmr_mols=vmr_mols_scalar,
-            vmr_atoms=vmr_atoms_scalar,
-            vmrH2=vmrH2,
-            vmrHe=vmrHe,
-            mmw=mmw,
-            mmr_mols=mmr_mols,
-            mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
-        )
+        raise ValueError("Non-Gibbs fallback has been removed from COMetallicity.")
 
 
 class GPChemistry:
@@ -2156,22 +2034,22 @@ class GPChemistry:
         # Fill with H2/He
         h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
         he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe_prof = (1.0 - vmr_trace_tot) * he_frac
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 
         # Mean molecular weight profile
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -2179,7 +2057,7 @@ class GPChemistry:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -2188,9 +2066,9 @@ class GPChemistry:
         # Scalar outputs
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -2200,9 +2078,9 @@ class GPChemistry:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -2322,7 +2200,7 @@ class RainoutChemistry:
         self.cold_trap = cold_trap
 
         # Use equilibrium solver for base abundances
-        self.eq_solver = EquilibriumChemistry(
+        self.eq_solver = ParametricMetallicityCOChemistry(
             metallicity_range=metallicity_range,
             co_ratio_range=co_ratio_range,
             h2_he_ratio=h2_he_ratio,
@@ -2466,22 +2344,22 @@ class RainoutChemistry:
         # Fill with H2/He
         h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
         he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe_prof = (1.0 - vmr_trace_tot) * he_frac
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 
         # Compute MMW
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -2489,7 +2367,7 @@ class RainoutChemistry:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -2498,9 +2376,9 @@ class RainoutChemistry:
         # Scalar outputs
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -2510,9 +2388,9 @@ class RainoutChemistry:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -2551,7 +2429,7 @@ class KzzDisequilibrium:
         self.co_ratio_range = co_ratio_range
         self.h2_he_ratio = h2_he_ratio
 
-        self.eq_solver = EquilibriumChemistry(
+        self.eq_solver = ParametricMetallicityCOChemistry(
             metallicity_range=metallicity_range,
             co_ratio_range=co_ratio_range,
             h2_he_ratio=h2_he_ratio,
@@ -2777,22 +2655,22 @@ class KzzDisequilibrium:
         # Fill with H2/He
         h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
         he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe_prof = (1.0 - vmr_trace_tot) * he_frac
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 
         # Compute MMW
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -2800,7 +2678,7 @@ class KzzDisequilibrium:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -2808,9 +2686,9 @@ class KzzDisequilibrium:
 
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -2820,9 +2698,9 @@ class KzzDisequilibrium:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -2861,7 +2739,7 @@ class ThermalIonization:
         self.h2_he_ratio = h2_he_ratio
         self.include_h_minus = include_h_minus
 
-        self.eq_solver = EquilibriumChemistry(
+        self.eq_solver = ParametricMetallicityCOChemistry(
             metallicity_range=metallicity_range,
             co_ratio_range=co_ratio_range,
             h2_he_ratio=h2_he_ratio,
@@ -2943,7 +2821,7 @@ class ThermalIonization:
 
         for element, chi in IONIZATION_POTENTIALS.items():
             # Get total abundance of this element
-            solar = SOLAR_ABUNDANCES.get(element, SOLAR_ABUNDANCES.get(f"{element} I", 1e-10))
+            solar = _solar_abundance_for_species(element)
             vmr_total = solar * metallicity
 
             # Get ionization fraction
@@ -3040,22 +2918,22 @@ class ThermalIonization:
         # Fill with H2/He
         h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
         he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe_prof = (1.0 - vmr_trace_tot) * he_frac
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 
         # Compute MMW
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -3063,7 +2941,7 @@ class ThermalIonization:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -3071,9 +2949,9 @@ class ThermalIonization:
 
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -3083,9 +2961,9 @@ class ThermalIonization:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -3288,7 +3166,7 @@ class FastChemSolver:
     Requires pyfastchem to be installed:
         pip install pyfastchem
 
-    If FastChem is not available, falls back to EquilibriumChemistry.
+    If FastChem is not available, falls back to ParametricMetallicityCOChemistry.
     """
 
     def __init__(
@@ -3451,8 +3329,8 @@ class FastChemSolver:
         n_atoms = len(vmr_atoms_profiles)
 
         # Get H2 and He from FastChem
-        vmrH2_prof = vmr_dict.get("H2", jnp.full(n_layers, 0.85))
-        vmrHe_prof = vmr_dict.get("He", jnp.full(n_layers, 0.15))
+        vmrH2_profile = vmr_dict.get("H2", jnp.full(n_layers, 0.85))
+        vmrHe_profile = vmr_dict.get("He", jnp.full(n_layers, 0.15))
 
         # Compute total trace
         if n_mols + n_atoms > 0:
@@ -3464,16 +3342,16 @@ class FastChemSolver:
         # Compute MMW
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -3481,7 +3359,7 @@ class FastChemSolver:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -3489,9 +3367,9 @@ class FastChemSolver:
 
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -3501,9 +3379,9 @@ class FastChemSolver:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -3547,7 +3425,7 @@ class PhotochemicalSteadyState:
         self.a_planet = a_planet
         self.log_kzz_range = log_kzz_range
 
-        self.eq_solver = EquilibriumChemistry(
+        self.eq_solver = ParametricMetallicityCOChemistry(
             metallicity_range=metallicity_range,
             co_ratio_range=co_ratio_range,
             h2_he_ratio=h2_he_ratio,
@@ -3798,22 +3676,22 @@ class PhotochemicalSteadyState:
         # Fill with H2/He
         h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
         he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe_prof = (1.0 - vmr_trace_tot) * he_frac
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 
         # Compute MMW
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -3821,7 +3699,7 @@ class PhotochemicalSteadyState:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -3829,9 +3707,9 @@ class PhotochemicalSteadyState:
 
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -3841,9 +3719,9 @@ class PhotochemicalSteadyState:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -4087,8 +3965,8 @@ class VULCANSolver:
         n_atoms = len(vmr_atoms_profiles)
 
         # Get H2 and He
-        vmrH2_prof = vmr_dict.get("H2", jnp.full(n_layers, 0.85))
-        vmrHe_prof = vmr_dict.get("He", jnp.full(n_layers, 0.15))
+        vmrH2_profile = vmr_dict.get("H2", jnp.full(n_layers, 0.85))
+        vmrHe_profile = vmr_dict.get("He", jnp.full(n_layers, 0.15))
 
         # Compute trace total
         if n_mols + n_atoms > 0:
@@ -4100,16 +3978,16 @@ class VULCANSolver:
         # Compute MMW
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -4117,7 +3995,7 @@ class VULCANSolver:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -4125,9 +4003,9 @@ class VULCANSolver:
 
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -4137,9 +4015,9 @@ class VULCANSolver:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -4400,8 +4278,8 @@ class NonLTEChemistry:
         he_frac = 1.0 / (self.h2_he_ratio + 1.0)
 
         vmr_h2_he = 1.0 - vmr_trace_tot
-        vmrH2_prof = vmr_h2_he * h2_frac * (1.0 - alpha_h2)
-        vmrHe_prof = vmr_h2_he * he_frac
+        vmrH2_profile = vmr_h2_he * h2_frac * (1.0 - alpha_h2)
+        vmrHe_profile = vmr_h2_he * he_frac
         vmrH_prof = vmr_h2_he * h2_frac * alpha_h2 * 2  # 2 H atoms per H2
 
         # Compute MMW (include atomic H)
@@ -4409,16 +4287,16 @@ class NonLTEChemistry:
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
         mass_H = 1.008
 
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof + mass_H * vmrH_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile + mass_H * vmrH_prof
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -4426,7 +4304,7 @@ class NonLTEChemistry:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -4434,9 +4312,9 @@ class NonLTEChemistry:
 
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -4446,9 +4324,9 @@ class NonLTEChemistry:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -4500,7 +4378,7 @@ class HorizontalMixing:
         self.log_tau_horiz_range = log_tau_horiz_range
         self.terminator_fraction = terminator_fraction
 
-        self.eq_solver = EquilibriumChemistry(
+        self.eq_solver = ParametricMetallicityCOChemistry(
             metallicity_range=metallicity_range,
             co_ratio_range=co_ratio_range,
             h2_he_ratio=h2_he_ratio,
@@ -4656,22 +4534,22 @@ class HorizontalMixing:
         # Fill with H2/He
         h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
         he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe_prof = (1.0 - vmr_trace_tot) * he_frac
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
+        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 
         # Compute MMW
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -4679,7 +4557,7 @@ class HorizontalMixing:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -4687,9 +4565,9 @@ class HorizontalMixing:
 
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -4699,9 +4577,9 @@ class HorizontalMixing:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -4755,7 +4633,7 @@ class EscapeFractionation:
         self.T_star = T_star
         self.a_planet = a_planet
 
-        self.eq_solver = EquilibriumChemistry(
+        self.eq_solver = ParametricMetallicityCOChemistry(
             metallicity_range=metallicity_range,
             co_ratio_range=co_ratio_range,
             h2_he_ratio=h2_he_ratio,
@@ -4940,22 +4818,22 @@ class EscapeFractionation:
             1.0,
         )
 
-        vmrH2_prof = (1.0 - vmr_trace_tot) * h2_frac / (1.0 + he_enhancement * he_frac / h2_frac)
-        vmrHe_prof = (1.0 - vmr_trace_tot) - vmrH2_prof
+        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac / (1.0 + he_enhancement * he_frac / h2_frac)
+        vmrHe_profile = (1.0 - vmr_trace_tot) - vmrH2_profile
 
         # Compute MMW
         mass_H2 = molinfo.molmass_isotope("H2")
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -4963,7 +4841,7 @@ class EscapeFractionation:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -4971,9 +4849,9 @@ class EscapeFractionation:
 
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -4983,9 +4861,9 @@ class EscapeFractionation:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
 
@@ -5220,7 +5098,7 @@ class CombinedChemistrySolver:
     def _init_solvers(self) -> None:
         """Initialize component solvers."""
         # Base equilibrium solver (always needed)
-        self.eq_solver = EquilibriumChemistry(
+        self.eq_solver = ParametricMetallicityCOChemistry(
             metallicity_range=self.metallicity_range,
             co_ratio_range=self.co_ratio_range,
             h2_he_ratio=self.h2_he_ratio,
@@ -5731,8 +5609,8 @@ class CombinedChemistrySolver:
             alpha_h2 = jnp.zeros_like(Tarr)
 
         vmr_h2_he = 1.0 - vmr_trace_tot
-        vmrH2_prof = vmr_h2_he * h2_frac * (1.0 - alpha_h2)
-        vmrHe_prof = vmr_h2_he * he_frac
+        vmrH2_profile = vmr_h2_he * h2_frac * (1.0 - alpha_h2)
+        vmrHe_profile = vmr_h2_he * he_frac
         vmrH_prof = vmr_h2_he * h2_frac * alpha_h2 * 2
 
         # Compute mean molecular weight
@@ -5740,16 +5618,16 @@ class CombinedChemistrySolver:
         mass_He = molinfo.molmass_isotope("He", db_HIT=False)
         mass_H = 1.008
 
-        mmw_prof = mass_H2 * vmrH2_prof + mass_He * vmrHe_prof + mass_H * vmrH_prof
+        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile + mass_H * vmrH_prof
         for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_prof = mmw_prof + mass * vmr_prof
+            mmw_profile = mmw_profile + mass * vmr_prof
 
         # Convert to MMR
         if n_mols > 0:
             mmr_mols = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
             ])
         else:
@@ -5757,7 +5635,7 @@ class CombinedChemistrySolver:
 
         if n_atoms > 0:
             mmr_atoms = jnp.array([
-                vmr_prof * (mass / mmw_prof)
+                vmr_prof * (mass / mmw_profile)
                 for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
             ])
         else:
@@ -5766,9 +5644,9 @@ class CombinedChemistrySolver:
         # Scalar outputs
         vmr_mols_scalar = [jnp.mean(p) for p in vmr_mols_profiles]
         vmr_atoms_scalar = [jnp.mean(p) for p in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_prof)
-        vmrHe = jnp.mean(vmrHe_prof)
-        mmw = jnp.mean(mmw_prof)
+        vmrH2 = jnp.mean(vmrH2_profile)
+        vmrHe = jnp.mean(vmrHe_profile)
+        mmw = jnp.mean(mmw_profile)
 
         return CompositionState(
             vmr_mols=vmr_mols_scalar,
@@ -5778,9 +5656,9 @@ class CombinedChemistrySolver:
             mmw=mmw,
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
-            vmrH2_prof=vmrH2_prof,
-            vmrHe_prof=vmrHe_prof,
-            mmw_prof=mmw_prof,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
         )
 
     def describe(self) -> str:
@@ -5821,7 +5699,7 @@ def get_chemistry_solver(
             Individual solvers:
             - "constant": ConstantVMR (vertically constant, uniform prior)
             - "free": FreeVMR (vertically varying, node interpolation)
-            - "equilibrium": EquilibriumChemistry ([M/H] + C/O with Gibbs)
+            - "equilibrium": ParametricMetallicityCOChemistry ([M/H] + C/O with Gibbs)
             - "quench": QuenchChemistry (equilibrium + quench pressure)
             - "co_metallicity": COMetallicity (C/O partitioning with Gibbs)
             - "gp": GPChemistry (GP-smoothed vertical profiles)
@@ -5871,7 +5749,7 @@ def get_chemistry_solver(
     solvers = {
         "constant": ConstantVMR,
         "free": FreeVMR,
-        "equilibrium": EquilibriumChemistry,
+        "equilibrium": ParametricMetallicityCOChemistry,
         "quench": QuenchChemistry,
         "co_metallicity": COMetallicity,
         "gp": GPChemistry,

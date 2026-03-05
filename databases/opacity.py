@@ -172,9 +172,6 @@ def _patch_radis_download():
             base_dir = pathlib.Path(self.local_databases).expanduser().resolve()
             base_dir.mkdir(parents=True, exist_ok=True)
             target_path = base_dir / temp_file_name
-            legacy_path = pathlib.Path(temp_file_name).resolve()
-            if legacy_path.exists() and not target_path.exists():
-                legacy_path.rename(target_path)
             temp_file_path = str(target_path)
 
             with open(temp_file_path, "wb") as f:
@@ -257,21 +254,18 @@ def _opa_grid_matches(opa: OpaPremodit, nu_grid: np.ndarray) -> bool:
     return np.isclose(opa_grid[0], nu_grid[0]) and np.isclose(opa_grid[-1], nu_grid[-1])
 
 
-def _resolve_cutwing(ndiv: int, cutwing: float | None) -> float:
+def _resolve_cutwing(cutwing: float | None) -> float:
     """Resolve line-wing truncation parameter for preMODIT."""
     if cutwing is None:
-        return 1.0 / (2 * max(int(ndiv), 1))
+        return 0.5
     return float(cutwing)
 
 
 def _opa_settings_match(
-    opa: OpaPremodit, ndiv: int, diffmode: int, cutwing: float
+    opa: OpaPremodit, diffmode: int, cutwing: float
 ) -> bool:
-    """Check whether cached opacity settings match stitching parameters."""
+    """Check whether cached opacity settings match runtime parameters."""
     aux = getattr(opa, "aux", {}) or {}
-    nstitch = aux.get("nstitch")
-    if nstitch is None or int(nstitch) != int(ndiv):
-        return False
     dm = aux.get("diffmode")
     if dm is None or int(dm) != int(diffmode):
         return False
@@ -286,23 +280,17 @@ def build_premodit_from_snapshot(
     molmass: float,
     mol: str,
     nu_grid: np.ndarray,
-    ndiv: int,
     diffmode: int,
     T_low: float,
     T_high: float,
     cutwing: float | None = None,
 ) -> OpaPremodit:
     """Create preMODIT opacity from database snapshot and save it."""
-    cutwing_val = _resolve_cutwing(ndiv, cutwing)
-    if ndiv > 1 and diffmode not in (0,):
-        print(
-            f"  Warning: stitching (ndiv={ndiv}) is recommended with forward-mode "
-            f"differentiation (diffmode=0). Current diffmode={diffmode}."
-        )
+    cutwing_val = _resolve_cutwing(cutwing)
     opa = OpaPremodit.from_snapshot(
         snapshot,
         nu_grid,
-        nstitch=ndiv,
+        1,
         diffmode=diffmode,
         auto_trange=[T_low, T_high],
         dit_grid_resolution=1,
@@ -316,7 +304,6 @@ def build_premodit_from_snapshot(
         format="zarr",
         aux={
             "molmass": molmass,
-            "nstitch": int(ndiv),
             "cutwing": float(cutwing_val),
             "diffmode": int(diffmode),
         },
@@ -330,7 +317,6 @@ def load_or_build_opacity(
     mdb_factory: Callable[[str], object],
     opa_load: bool,
     nu_grid: np.ndarray,
-    ndiv: int,
     diffmode: int,
     T_low: float,
     T_high: float,
@@ -340,18 +326,14 @@ def load_or_build_opacity(
     """Load saved opacity or build from database snapshot."""
     path = str(pathlib.Path(path).expanduser().resolve())
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
-    cutwing_val = _resolve_cutwing(ndiv, cutwing)
+    cutwing_val = _resolve_cutwing(cutwing)
     if opa_load:
         opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
-        legacy_opa_path = PROJECT_ROOT / f"opa_{mol}.zarr"
-        if legacy_opa_path.exists() and not opa_path.exists():
-            opa_path.parent.mkdir(parents=True, exist_ok=True)
-            legacy_opa_path.rename(opa_path)
         opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
         if not _opa_grid_matches(opa, nu_grid):
             raise ValueError("Cached opacity grid mismatch.")
-        if not _opa_settings_match(opa, ndiv, diffmode, cutwing_val):
-            raise ValueError("Cached opacity stitching settings mismatch.")
+        if not _opa_settings_match(opa, diffmode, cutwing_val):
+            raise ValueError("Cached opacity settings mismatch.")
         return opa, opa.aux["molmass"]
     elif load_only:
         print(f"  Warning: OPA_LOAD disabled; skipping {mol} (load-only).")
@@ -364,7 +346,6 @@ def load_or_build_opacity(
         molmass,
         mol,
         nu_grid,
-        ndiv,
         diffmode,
         T_low,
         T_high,
@@ -379,7 +360,6 @@ def load_molecular_opacities(
     molpath_exomol: dict[str, str],
     nu_grid: np.ndarray,
     opa_load: bool,
-    ndiv: int,
     diffmode: int,
     T_low: float,
     T_high: float,
@@ -403,7 +383,6 @@ def load_molecular_opacities(
             mdb_factory,
             opa_load,
             nu_grid,
-            ndiv,
             diffmode,
             T_low,
             T_high,
@@ -427,7 +406,6 @@ def load_molecular_opacities(
             mdb_factory,
             opa_load,
             nu_grid,
-            ndiv,
             diffmode,
             T_low,
             T_high,
@@ -448,7 +426,6 @@ def load_atomic_opacities(
     atomic_species: dict[str, dict],
     nu_grid: np.ndarray,
     opa_load: bool,
-    ndiv: int,
     diffmode: int,
     T_low: float,
     T_high: float,
@@ -491,7 +468,7 @@ def load_atomic_opacities(
         print("  Warning: Both USE_KURUCZ and USE_VALD are False, skipping atomic opacities")
         return opa_atoms, jnp.array(atommass_list)
 
-    cutwing_val = _resolve_cutwing(ndiv, cutwing)
+    cutwing_val = _resolve_cutwing(cutwing)
 
     if db_kurucz is None:
         db_kurucz = DB_KURUCZ
@@ -512,8 +489,8 @@ def load_atomic_opacities(
             opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
             if not _opa_grid_matches(opa, nu_grid):
                 raise ValueError("Cached opacity grid mismatch.")
-            if not _opa_settings_match(opa, ndiv, diffmode, cutwing_val):
-                raise ValueError("Cached opacity stitching settings mismatch.")
+            if not _opa_settings_match(opa, diffmode, cutwing_val):
+                raise ValueError("Cached opacity settings mismatch.")
             molmass = opa.aux.get("molmass", None)
             if molmass is None:
                 raise KeyError("Missing molmass in cached opacity.")
@@ -552,7 +529,6 @@ def load_atomic_opacities(
             molmass,
             cache_name,
             nu_grid,
-            ndiv,
             diffmode,
             T_low,
             T_high,
