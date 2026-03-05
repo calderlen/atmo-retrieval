@@ -30,3 +30,35 @@
     - Need values for: Lund17, Singh24, WASP-76b, KELT-9b, WASP-12b, WASP-33b, WASP-18b, WASP-189b, MASCARA-1b, TOI-1431b, TOI-1518b
     - Sources: ExoFOP, discovery papers, or fit from TESS lightcurves
 
+- TODO:
+    - attempt full run tonight of pipeline; need to scrutinize config before doing so
+    - shouldn't the N_VMR_NODES in config/chemistry---config just match the number of P-T layers?
+    - read horus.py*
+        - median-subtracted?
+        - mean-subtracted?
+    - need to combine spectra to construct a full-transit spectrum before passing to exoJAX
+    - and normalize! with np.std
+    - memory_profile in pipeline should not exist?
+    - explore possibility of 4D FastChem grid w/ [M/H], C/O as rescaling abundances -- ocmputing FastChem on this 4D (T, P, [M/H], C/O) grid
+    - go through config and try setting up a run of atmo-retrieval
+    - missing CUDA on home desktop---figure out why
+    - maybe run some HPC usage analysis on this code?
+    - need to upload data to the HPC environment w rclone before run
+    - see about distributed GPU run of code to avoid OOM
+        - is this what "sharding" is?
+    - implement a cominbe_observations-type function for atmo-retrieval
+    - flatten_spectra in atmo_analysis subtracts off the median flux and works with residuals
+    - should attempt a run as follows
+         - Guillot PT profile
+         - 2D atmospheric layers
+         - 1e-8-1e0 bar
+         - 1500K-4500K
+         - FastChem Cond
+         - on KELT-20b 2019 transmission data since lower resolution
+         - 50K wavelength resolution grid? probably should be larger
+    - because compute nodes are not directly accessible, must login to one of the login nodes, then allow VNC client to tunnel through ssh to compute node
+    - get VNC client
+    - MPI for Python that supports GPUs?
+    - time runs w/ usr/bin/time in cluster
+    - profile the scripts a lot before running on OSC
+
