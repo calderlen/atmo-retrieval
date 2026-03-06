@@ -14,6 +14,16 @@ pip install jax numpyro exojax astropy matplotlib corner
 python -m atmo_retrieval --planet KELT-20b --mode transmission --epoch 20250601
 ```
 
+## standalone tess_proc
+
+```bash
+# uses jaxoplanet orbit + numpyro NUTS
+python -m pipeline.tess_proc --planet KELT-20b --ephemeris Duck24
+
+# override eclipse depth manually (ppm)
+python -m pipeline.tess_proc --eclipse-depth-ppm 139 --eclipse-err-ppm 8
+```
+
 ## code structure
 
 ```mermaid

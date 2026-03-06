@@ -1,4 +1,5 @@
 import os
+import importlib
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -10,6 +11,8 @@ from numpyro.infer import MCMC, NUTS, init_to_median
 
 from exojax.rt import ArtTransPure, ArtEmisPure
 from exojax.utils.grids import wav2nu
+from exojax.utils.astrofunc import gravity_jupiter as gravity_surface
+from exojax.utils.constants import RJ, Rs
 
 import config
 from dataio.load import load_observed_spectrum, ResolutionInterpolator
@@ -17,13 +20,23 @@ from plotting.aliasing import check_aliasing_with_fe, generate_aliasing_report
 from physics.chemistry import ConstantVMR, FastChemHybridChemistry
 from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from databases.opacity import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
-from physics.model import create_retrieval_model, PhaseMode, compute_atmospheric_state_from_posterior
-from pipeline.inference import run_svi, run_mcmc, generate_predictions
+from physics.model import (
+    create_retrieval_model,
+    PhaseMode,
+    compute_atmospheric_state_from_posterior,
+    planet_rv_kms,
+    sysrem_filter_model,
+)
+from pipeline.inference import run_svi
 from plotting.plot import (
-    create_transmission_plots,
+    plot_svi_loss,
+    plot_transmission_spectrum,
+    plot_emission_spectrum,
+    plot_temperature_profile,
     plot_contribution_function,
     plot_contribution_per_species,
     plot_contribution_combined,
+    save_retrieval_corner_plots,
 )
 
 
@@ -268,6 +281,177 @@ def _preflight_grid_checks(inst_nus: np.ndarray, nu_grid: np.ndarray) -> None:
             f"inst_nus={inst_min:.4g}..{inst_max:.4g}, "
             f"nu_grid={nu_min:.4g}..{nu_max:.4g}"
         )
+
+
+def _sample_svi_posterior(
+    guide: object | None,
+    params: dict | None,
+    rng_key: jax.Array,
+    num_samples: int,
+) -> dict[str, np.ndarray] | None:
+    if guide is None or params is None or num_samples <= 0:
+        return None
+
+    try:
+        svi_draws = guide.sample_posterior(
+            rng_key,
+            params,
+            sample_shape=(num_samples,),
+        )
+    except Exception as exc:
+        print(f"  Warning: failed to sample SVI posterior for corner plots: {exc}")
+        return None
+
+    return {
+        name: np.asarray(jax.device_get(values))
+        for name, values in svi_draws.items()
+    }
+
+
+def _get_piBarr():
+    mod = importlib.import_module("exojax.spec.planck")
+    return mod.piBarr
+
+
+def _summarize_observed_spectrum(
+    data: np.ndarray,
+    sigma: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    data_arr = np.asarray(data)
+    sigma_arr = np.asarray(sigma)
+
+    if data_arr.ndim == 1:
+        return data_arr, sigma_arr
+
+    obs_mean = np.mean(data_arr, axis=0)
+    obs_err = np.sqrt(np.mean(np.square(sigma_arr), axis=0))
+    return obs_mean, obs_err
+
+
+def _phase_dependent_drv(params: dict[str, float], phase: np.ndarray) -> jnp.ndarray:
+    if "dRV_0" in params and "dRV_slope" in params:
+        return jnp.asarray(params["dRV_0"] + params["dRV_slope"] * np.asarray(phase))
+    return jnp.asarray(params.get("dRV", 0.0))
+
+
+def _synthesize_timeseries_from_atmospheric_state(
+    atmo_state: dict,
+    mode: str,
+    model_params: dict,
+    art: object,
+    sop_rot: object,
+    sop_inst: object,
+    inst_nus: np.ndarray,
+    nu_grid: np.ndarray,
+    phase: np.ndarray,
+    instrument_resolution: float,
+    apply_sysrem: bool,
+    U_sysrem: np.ndarray | None,
+    invvar_spec: np.ndarray | None,
+) -> np.ndarray:
+    params = atmo_state["params"]
+
+    Rp_rj = float(params.get("Rp", config.DEFAULT_POSTERIOR_RP))
+    Mp_mj = float(params.get("Mp", config.DEFAULT_POSTERIOR_MP))
+    Rstar_rs = float(params.get("Rstar", model_params["R_star"]))
+    Kp_kms = float(params.get("Kp", model_params["Kp"]))
+    Vsys_kms = float(params.get("Vsys", model_params["RV_abs"]))
+
+    Rp_cm = Rp_rj * RJ
+    Rstar_cm = Rstar_rs * Rs
+    g_ref = gravity_surface(Rp_rj, Mp_mj)
+
+    dtau = jnp.asarray(atmo_state["dtau"])
+    Tarr = jnp.asarray(atmo_state["Tarr"])
+    mmw_profile = jnp.asarray(atmo_state["mmw"])
+
+    rt = art.run(dtau, Tarr, mmw_profile, Rp_cm, g_ref)
+
+    vsini = 2.0 * np.pi * Rp_cm / (float(model_params["period"]) * 86400.0) / 1.0e5
+    beta_inst = 1.0 / (instrument_resolution * 2.3548200450309493)
+    rt = sop_rot.rigid_rotation(rt, vsini, 0.0, 0.0)
+    rt = sop_inst.ipgauss(rt, beta_inst)
+
+    dRV = _phase_dependent_drv(params, phase)
+    rv = planet_rv_kms(jnp.asarray(phase), Kp_kms, Vsys_kms, dRV)
+    planet_ts = jax.vmap(lambda v: sop_inst.sampling(rt, v, inst_nus))(rv)
+
+    if mode == "transmission":
+        model_ts = jnp.sqrt(planet_ts) * (Rp_cm / Rstar_cm)
+    else:
+        Tstar = model_params.get("T_star")
+        if Tstar is None:
+            raise ValueError("T_star is required for emission spectrum plotting.")
+        piBarr = _get_piBarr()
+        Fs = piBarr(nu_grid, Tstar)
+        Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
+        model_ts = planet_ts / jnp.clip(Fs_ts, 1.0e-30, None) * (Rp_cm / Rstar_cm) ** 2
+
+    if config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT:
+        model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
+
+    if apply_sysrem and U_sysrem is not None and invvar_spec is not None:
+        model_ts = sysrem_filter_model(
+            model_ts,
+            jnp.asarray(U_sysrem),
+            jnp.asarray(invvar_spec),
+        )
+
+    return np.asarray(jax.device_get(model_ts))
+
+
+def _compute_model_timeseries_for_plot(
+    posterior_samples: dict[str, np.ndarray],
+    mode: str,
+    model_params: dict,
+    art: object,
+    opa_mols: dict,
+    opa_atoms: dict,
+    opa_cias: dict,
+    nu_grid: np.ndarray,
+    pt_profile: str,
+    sop_rot: object,
+    sop_inst: object,
+    inst_nus: np.ndarray,
+    phase: np.ndarray,
+    instrument_resolution: float,
+    apply_sysrem: bool,
+    U_sysrem: np.ndarray | None,
+    invvar_spec: np.ndarray | None,
+    atmo_state: dict | None = None,
+) -> tuple[np.ndarray | None, dict | None]:
+    try:
+        if atmo_state is None:
+            atmo_state = compute_atmospheric_state_from_posterior(
+                posterior_samples=posterior_samples,
+                art=art,
+                opa_mols=opa_mols,
+                opa_atoms=opa_atoms,
+                opa_cias=opa_cias,
+                nu_grid=nu_grid,
+                pt_profile=pt_profile,
+                use_median=True,
+            )
+
+        model_ts = _synthesize_timeseries_from_atmospheric_state(
+            atmo_state=atmo_state,
+            mode=mode,
+            model_params=model_params,
+            art=art,
+            sop_rot=sop_rot,
+            sop_inst=sop_inst,
+            inst_nus=inst_nus,
+            nu_grid=nu_grid,
+            phase=phase,
+            instrument_resolution=instrument_resolution,
+            apply_sysrem=apply_sysrem,
+            U_sysrem=U_sysrem,
+            invvar_spec=invvar_spec,
+        )
+        return model_ts, atmo_state
+    except Exception as exc:
+        print(f"  Warning: failed to build diagnostic spectrum plot data: {exc}")
+        return None, atmo_state
 
 
 def run_retrieval(
@@ -569,10 +753,14 @@ def run_retrieval(
         raise ValueError("Cannot set svi_only=True when skip_svi=True")
 
     init_strategy = init_to_median(num_samples=config.INIT_TO_MEDIAN_SAMPLES)
+    svi_params: dict | None = None
+    svi_guide: object | None = None
+    svi_losses: np.ndarray | None = None
+
     if not skip_svi:
         print(f"  SVI warm-up: {config.SVI_NUM_STEPS} steps, LR={config.SVI_LEARNING_RATE}")
         rng_key, rng_key_ = random.split(rng_key)
-        _, _, init_strategy, _, _ = run_svi(
+        svi_params, svi_losses, init_strategy, _, svi_guide = run_svi(
             model_c,
             rng_key_,
             data=data_jnp,
@@ -590,6 +778,85 @@ def run_retrieval(
         )
 
         if svi_only:
+            if not no_plots:
+                print("  Generating corner plots from SVI posterior...")
+                rng_key, rng_key_plot = random.split(rng_key)
+                svi_samples_for_plots = _sample_svi_posterior(
+                    guide=svi_guide,
+                    params=svi_params,
+                    rng_key=rng_key_plot,
+                    num_samples=max(100, int(config.MCMC_NUM_SAMPLES)),
+                )
+                save_retrieval_corner_plots(
+                    output_dir=str(output_dir),
+                    svi_samples=svi_samples_for_plots,
+                )
+
+                if svi_losses is not None:
+                    plot_svi_loss(
+                        np.asarray(jax.device_get(svi_losses)),
+                        os.path.join(output_dir, "svi_loss.png"),
+                    )
+
+                if svi_samples_for_plots is not None:
+                    if (
+                        "T0" in svi_samples_for_plots
+                        or ("T_btm" in svi_samples_for_plots and "T_top" in svi_samples_for_plots)
+                    ):
+                        plot_temperature_profile(
+                            posterior_samples=svi_samples_for_plots,
+                            art=art,
+                            save_path=os.path.join(output_dir, "temperature_profile.png"),
+                        )
+                    else:
+                        print(
+                            "  Skipping temperature profile plot: no supported temperature "
+                            "parameterization in SVI samples."
+                        )
+
+                    obs_mean, obs_err = _summarize_observed_spectrum(data, sigma)
+                    wav_obs_nm = np.asarray(wav_obs) / 10.0
+
+                    svi_model_ts, _ = _compute_model_timeseries_for_plot(
+                        posterior_samples=svi_samples_for_plots,
+                        mode=mode,
+                        model_params=model_params,
+                        art=art,
+                        opa_mols=opa_mols,
+                        opa_atoms=opa_atoms,
+                        opa_cias=opa_cias,
+                        nu_grid=np.asarray(nu_grid),
+                        pt_profile=pt_profile,
+                        sop_rot=sop_rot,
+                        sop_inst=sop_inst,
+                        inst_nus=np.asarray(inst_nus),
+                        phase=np.asarray(phase),
+                        instrument_resolution=Rinst,
+                        apply_sysrem=apply_sysrem,
+                        U_sysrem=U_sysrem,
+                        invvar_spec=invvar_spec,
+                    )
+
+                    if svi_model_ts is not None:
+                        svi_line = np.mean(np.asarray(svi_model_ts), axis=0)
+                        if mode == "transmission":
+                            plot_transmission_spectrum(
+                                wavelength_nm=wav_obs_nm,
+                                rp_obs=obs_mean,
+                                rp_err=obs_err,
+                                rp_hmc=np.atleast_2d(svi_line),
+                                rp_svi=svi_line,
+                                save_path=os.path.join(output_dir, "transmission_spectrum.png"),
+                            )
+                        else:
+                            plot_emission_spectrum(
+                                wavelength_nm=wav_obs_nm,
+                                fp_obs=obs_mean,
+                                fp_err=obs_err,
+                                fp_hmc=np.atleast_2d(svi_line),
+                                fp_svi=svi_line,
+                                save_path=os.path.join(output_dir, "emission_spectrum.png"),
+                            )
             print("  SVI complete (svi_only=True); skipping MCMC.")
             return
 
@@ -630,25 +897,159 @@ def run_retrieval(
     
     posterior_sample = mcmc.get_samples()
     jnp.savez(os.path.join(output_dir, "posterior_sample"), **posterior_sample)
-    
-    # Compute contribution function from posterior
-    if compute_contribution:
-        print("\n  Computing contribution function from posterior...")
 
-        # Convert posterior samples from JAX to numpy
-        posterior_np = {k: np.array(v) for k, v in posterior_sample.items()}
+    posterior_np: dict[str, np.ndarray] | None = None
+    svi_samples_for_plots: dict[str, np.ndarray] | None = None
 
-        atmo_state = compute_atmospheric_state_from_posterior(
+    if not no_plots:
+        print("\n  Generating corner plots...")
+        posterior_np = {
+            name: np.asarray(jax.device_get(values))
+            for name, values in posterior_sample.items()
+        }
+
+        if svi_params is not None and svi_guide is not None:
+            n_hmc_samples = max(100, int(config.MCMC_NUM_SAMPLES))
+            if posterior_np:
+                first_site = next(iter(posterior_np))
+                n_hmc_samples = int(np.asarray(posterior_np[first_site]).shape[0])
+
+            rng_key, rng_key_plot = random.split(rng_key)
+            svi_samples_for_plots = _sample_svi_posterior(
+                guide=svi_guide,
+                params=svi_params,
+                rng_key=rng_key_plot,
+                num_samples=n_hmc_samples,
+            )
+
+        save_retrieval_corner_plots(
+            output_dir=str(output_dir),
+            hmc_samples=posterior_np,
+            svi_samples=svi_samples_for_plots,
+        )
+
+        if svi_losses is not None:
+            plot_svi_loss(
+                np.asarray(jax.device_get(svi_losses)),
+                os.path.join(output_dir, "svi_loss.png"),
+            )
+
+        if "T0" in posterior_np or ("T_btm" in posterior_np and "T_top" in posterior_np):
+            plot_temperature_profile(
+                posterior_samples=posterior_np,
+                art=art,
+                save_path=os.path.join(output_dir, "temperature_profile.png"),
+            )
+        else:
+            print(
+                "  Skipping temperature profile plot: no supported temperature "
+                "parameterization in HMC samples."
+            )
+
+    atmo_state = None
+    if compute_contribution or not no_plots:
+        print("\n  Computing atmospheric state from posterior...")
+
+        if posterior_np is None:
+            posterior_np = {
+                name: np.asarray(jax.device_get(values))
+                for name, values in posterior_sample.items()
+            }
+
+        try:
+            atmo_state = compute_atmospheric_state_from_posterior(
+                posterior_samples=posterior_np,
+                art=art,
+                opa_mols=opa_mols,
+                opa_atoms=opa_atoms,
+                opa_cias=opa_cias,
+                nu_grid=nu_grid,
+                pt_profile=pt_profile,
+                use_median=True,
+            )
+        except Exception:
+            if compute_contribution:
+                raise
+            print("  Warning: unable to compute atmospheric state; skipping spectrum diagnostics.")
+
+    if not no_plots and atmo_state is not None:
+        print("  Plotting fitted spectrum diagnostics...")
+        wav_obs_nm = np.asarray(wav_obs) / 10.0
+        obs_mean, obs_err = _summarize_observed_spectrum(data, sigma)
+
+        hmc_model_ts, atmo_state = _compute_model_timeseries_for_plot(
             posterior_samples=posterior_np,
+            mode=mode,
+            model_params=model_params,
             art=art,
             opa_mols=opa_mols,
             opa_atoms=opa_atoms,
             opa_cias=opa_cias,
-            nu_grid=nu_grid,
+            nu_grid=np.asarray(nu_grid),
             pt_profile=pt_profile,
-            use_median=True,
+            sop_rot=sop_rot,
+            sop_inst=sop_inst,
+            inst_nus=np.asarray(inst_nus),
+            phase=np.asarray(phase),
+            instrument_resolution=Rinst,
+            apply_sysrem=apply_sysrem,
+            U_sysrem=U_sysrem,
+            invvar_spec=invvar_spec,
+            atmo_state=atmo_state,
         )
 
+        svi_model_ts = None
+        if svi_samples_for_plots is not None:
+            svi_model_ts, _ = _compute_model_timeseries_for_plot(
+                posterior_samples=svi_samples_for_plots,
+                mode=mode,
+                model_params=model_params,
+                art=art,
+                opa_mols=opa_mols,
+                opa_atoms=opa_atoms,
+                opa_cias=opa_cias,
+                nu_grid=np.asarray(nu_grid),
+                pt_profile=pt_profile,
+                sop_rot=sop_rot,
+                sop_inst=sop_inst,
+                inst_nus=np.asarray(inst_nus),
+                phase=np.asarray(phase),
+                instrument_resolution=Rinst,
+                apply_sysrem=apply_sysrem,
+                U_sysrem=U_sysrem,
+                invvar_spec=invvar_spec,
+            )
+
+        if hmc_model_ts is not None or svi_model_ts is not None:
+            hmc_plot = hmc_model_ts
+            if hmc_plot is None and svi_model_ts is not None:
+                hmc_plot = np.atleast_2d(np.mean(np.asarray(svi_model_ts), axis=0))
+
+            if hmc_plot is not None:
+                svi_line = np.mean(np.asarray(hmc_plot), axis=0)
+                if svi_model_ts is not None:
+                    svi_line = np.mean(np.asarray(svi_model_ts), axis=0)
+
+                if mode == "transmission":
+                    plot_transmission_spectrum(
+                        wavelength_nm=wav_obs_nm,
+                        rp_obs=obs_mean,
+                        rp_err=obs_err,
+                        rp_hmc=np.asarray(hmc_plot),
+                        rp_svi=np.asarray(svi_line),
+                        save_path=os.path.join(output_dir, "transmission_spectrum.png"),
+                    )
+                else:
+                    plot_emission_spectrum(
+                        wavelength_nm=wav_obs_nm,
+                        fp_obs=obs_mean,
+                        fp_err=obs_err,
+                        fp_hmc=np.asarray(hmc_plot),
+                        fp_svi=np.asarray(svi_line),
+                        save_path=os.path.join(output_dir, "emission_spectrum.png"),
+                    )
+
+    if compute_contribution and atmo_state is not None:
         # Save atmospheric state
         np.savez(
             os.path.join(output_dir, "atmospheric_state.npz"),

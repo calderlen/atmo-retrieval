@@ -138,8 +138,11 @@ def plot_temperature_profile(
 
 def _corner_data(
     sample_dict: dict,
-    variables: list[str],
+    variables: list[str] | None,
 ) -> tuple[np.ndarray | None, list[str] | None]:
+    if variables is None:
+        variables = list(sample_dict.keys())
+
     cols = []
     labels = []
     available = [v for v in variables if v in sample_dict]
@@ -154,6 +157,52 @@ def _corner_data(
     return np.column_stack(cols), labels
 
 
+def _is_corner_friendly(arr: np.ndarray, max_components: int = 6) -> bool:
+    if arr.ndim == 0:
+        return False
+    if arr.shape[0] < 2:
+        return False
+    n_components = 1 if arr.ndim == 1 else int(np.prod(arr.shape[1:]))
+    return n_components <= max_components
+
+
+def _default_corner_variables(sample_dict: dict) -> list[str]:
+    if not sample_dict:
+        return []
+
+    priority = [
+        "Kp", "Vsys", "dRV", "dRV_0", "dRV_slope",
+        "Rp", "Mp", "Rstar",
+        "T0", "T_btm", "T_top", "Tirr", "kappa_ir_cgs", "gamma",
+    ]
+    skip_names = {
+        "dRV_mean", "dRV_std", "dRV_at_ingress", "dRV_at_egress",
+    }
+
+    corner_ready = {
+        name: np.asarray(values)
+        for name, values in sample_dict.items()
+        if _is_corner_friendly(np.asarray(values))
+    }
+
+    selected: list[str] = []
+
+    for name in priority:
+        if name in corner_ready:
+            selected.append(name)
+
+    for name in sorted(corner_ready):
+        if name.startswith("logVMR_") and name not in selected:
+            selected.append(name)
+
+    for name in sorted(corner_ready):
+        if name in selected or name in skip_names or name.endswith("_kms"):
+            continue
+        selected.append(name)
+
+    return selected[:16]
+
+
 def plot_corner(
     hmc_samples: dict | None = None,
     svi_samples: dict | None = None,
@@ -164,16 +213,19 @@ def plot_corner(
     labels = None
 
     if hmc_samples is not None:
-        hmc_data, labels = _corner_data(hmc_samples, variables)
+        hmc_data, labels_hmc = _corner_data(hmc_samples, variables)
         if hmc_data is not None:
+            labels = labels_hmc
             datasets.append((hmc_data, "C0", {}))
 
     if svi_samples is not None:
         svi_data, labels_svi = _corner_data(svi_samples, variables)
         if labels is None:
             labels = labels_svi
-        if svi_data is not None:
+        if svi_data is not None and labels_svi == labels:
             datasets.append((svi_data, "C3", {"hist_kwargs": {"linestyle": "--"}}))
+        elif svi_data is not None:
+            print("SVI/HMC corner labels do not match; skipping overlay dataset.")
 
     if not datasets or labels is None:
         print("No data for corner plot; skipping.")
@@ -186,9 +238,71 @@ def plot_corner(
             fig=fig, show_titles=True, **extra_kwargs,
         )
 
+    if fig is None:
+        print("No corner figure was generated; skipping save.")
+        return
+
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
     print(f"Corner plot saved to {save_path}")
+
+
+def save_retrieval_corner_plots(
+    output_dir: str,
+    hmc_samples: dict | None = None,
+    svi_samples: dict | None = None,
+    variables: list[str] | None = None,
+) -> None:
+    if hmc_samples is None and svi_samples is None:
+        print("No posterior samples available for corner plots; skipping.")
+        return
+
+    if variables is None:
+        merged_samples = {}
+        if hmc_samples is not None:
+            merged_samples.update(hmc_samples)
+        if svi_samples is not None:
+            for key, value in svi_samples.items():
+                merged_samples.setdefault(key, value)
+        variables = _default_corner_variables(merged_samples)
+
+    if not variables:
+        print("No suitable variables for corner plots; skipping.")
+        return
+
+    if svi_samples is not None:
+        svi_vars = [v for v in variables if v in svi_samples]
+        if svi_vars:
+            plot_corner(
+                svi_samples=svi_samples,
+                variables=svi_vars,
+                save_path=os.path.join(output_dir, "corner_plot_svi.png"),
+            )
+        else:
+            print("No SVI variables available for corner_plot_svi.png; skipping.")
+
+    if hmc_samples is not None:
+        hmc_vars = [v for v in variables if v in hmc_samples]
+        if hmc_vars:
+            plot_corner(
+                hmc_samples=hmc_samples,
+                variables=hmc_vars,
+                save_path=os.path.join(output_dir, "corner_plot_hmc.png"),
+            )
+        else:
+            print("No HMC variables available for corner_plot_hmc.png; skipping.")
+
+    if hmc_samples is not None and svi_samples is not None:
+        overlay_vars = [v for v in variables if v in hmc_samples and v in svi_samples]
+        if overlay_vars:
+            plot_corner(
+                hmc_samples=hmc_samples,
+                svi_samples=svi_samples,
+                variables=overlay_vars,
+                save_path=os.path.join(output_dir, "corner_plot_overlay.png"),
+            )
+        else:
+            print("No overlapping HMC/SVI variables for corner_plot_overlay.png; skipping.")
 
 
 def create_transmission_plots(
@@ -217,22 +331,10 @@ def create_transmission_plots(
         posterior_sample, art, os.path.join(output_dir, "temperature_profile.png")
     )
 
-    corner_vars = ["Radius_btm", "T0", "logP_cloud", "RV"]
-    corner_vars += [f"logVMR_{mol}" for mol in list(opa_mols.keys())]
-
-    plot_corner(
-        svi_samples=svi_samples, variables=corner_vars,
-        save_path=os.path.join(output_dir, "corner_plot_svi.png")
-    )
-
-    plot_corner(
-        hmc_samples=posterior_sample, variables=corner_vars,
-        save_path=os.path.join(output_dir, "corner_plot_hmc.png")
-    )
-
-    plot_corner(
-        hmc_samples=posterior_sample, svi_samples=svi_samples, variables=corner_vars,
-        save_path=os.path.join(output_dir, "corner_plot_overlay.png")
+    save_retrieval_corner_plots(
+        output_dir=output_dir,
+        hmc_samples=posterior_sample,
+        svi_samples=svi_samples,
     )
 
 

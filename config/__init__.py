@@ -8,6 +8,7 @@ Configuration is split into logical modules:
 - model: RT parameters, spectral grid settings
 - paths: Database paths, data paths, output configuration
 - inference: SVI and MCMC sampling parameters
+- tess_proc: standalone TESS processing defaults and constants
 """
 
 import os
@@ -170,6 +171,36 @@ from .data_config import (
     DEFAULT_SYSREM_STOP_TOL,
     DEFAULT_BIN_INFO_COUNT,
     DEFAULT_TRACKER_MAX_USED,
+)
+
+from .tess_proc_config import (
+    TESS_BANDPASS_URL,
+    TESS_BANDPASS_PATH,
+    TESS_DEFAULT_ECLIPSE_TBL,
+    TESS_OUTPUT_SUBDIR,
+    TESS_TARGET_WAVELENGTH_ANGSTROM,
+    R_SUN_M,
+    AU_M,
+    RJUP_M,
+    H_PLANCK,
+    C_LIGHT,
+    K_BOLTZMANN,
+    NUMERIC_EPS,
+    TESS_DEFAULT_IMPACT_PARAM,
+    TESS_DEFAULT_GAMMA1,
+    TESS_DEFAULT_GAMMA2,
+    TESS_RADIUS_RATIO_FALLBACK_FRAC,
+    TESS_RADIUS_RATIO_SIGMA_MIN,
+    TESS_DEFAULT_TDAY_MIN_K,
+    TESS_DEFAULT_TDAY_MAX_K,
+    TESS_DEFAULT_ALBEDO_MIN,
+    TESS_DEFAULT_ALBEDO_MAX,
+    TESS_DEFAULT_ECLIPSE_MODEL_SIGMA_PPM,
+    TESS_DEFAULT_NUM_WARMUP,
+    TESS_DEFAULT_NUM_SAMPLES,
+    TESS_DEFAULT_NUM_CHAINS,
+    TESS_DEFAULT_MAX_TREE_DEPTH,
+    TESS_DEFAULT_SEED,
 )
 
 from .tellurics_config import (
