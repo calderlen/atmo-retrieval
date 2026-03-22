@@ -2,6 +2,7 @@ import os
 import importlib
 from contextlib import redirect_stdout
 from pathlib import Path
+from time import perf_counter
 
 import jax
 from jax import random
@@ -454,6 +455,22 @@ def _compute_model_timeseries_for_plot(
         return None, atmo_state
 
 
+class _StepTimer:
+    def __init__(self, label: str):
+        self.label = label
+        self.start = 0.0
+
+    def __enter__(self):
+        self.start = perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        elapsed = perf_counter() - self.start
+        status = "failed after" if exc_type is not None else "completed in"
+        print(f"  {self.label} {status} {elapsed:.2f}s")
+        return False
+
+
 def run_retrieval(
     mode: str = "transmission",
     epoch: str | None = None,
@@ -476,6 +493,8 @@ def run_retrieval(
     U: np.ndarray | None = None,
     invvar_spec: np.ndarray | None = None,
 ) -> None:
+    retrieval_start = perf_counter()
+
     # Create timestamped output directory
     base_dir = config.DIR_SAVE or config.get_output_dir()
     output_dir = config.create_timestamped_dir(base_dir)
@@ -501,242 +520,243 @@ def run_retrieval(
     invvar_spec: np.ndarray | None = None
     
     print("\n[1/7] Loading time-series data...")
-    if epoch:
-        print(f"  Using epoch: {epoch}")
-    if any(val is not None for val in (wav_obs, data, sigma, phase)):
-        if any(val is None for val in (wav_obs, data, sigma, phase)):
-            raise ValueError("Must provide wav_obs, data, sigma, and phase together.")
-        phase = _normalize_phase(phase)
-        print(f"  Using provided data: {data.shape[0]} exposures x {data.shape[1]} wavelengths")
-        print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
-        if apply_sysrem:
-            if U is None or invvar_spec is None:
-                raise ValueError(
-                    "apply_sysrem=True requires U and invvar_spec when providing "
-                    "wav_obs/data/sigma/phase directly."
-                )
-            U_sysrem, invvar_spec = _validate_sysrem_inputs(
-                U, invvar_spec, n_exp=data.shape[0]
-            )
-            print(
-                f"  Using provided SYSREM auxiliaries: U shape={U_sysrem.shape}, "
-                f"invvar_spec shape={invvar_spec.shape}"
-            )
-    else:
-        if data_format not in {"auto", "timeseries", "spectrum"}:
-            raise ValueError(f"Unknown data_format: {data_format}")
-
-        resolved_data_dir = Path(data_dir) if data_dir is not None else config.get_data_dir(epoch=epoch)
-
-        if data_dir is not None:
-            suffix = "transmission" if mode == "transmission" else "emission"
-            data_paths = {
-                "wavelength": Path(data_dir) / f"wavelength_{suffix}.npy",
-                "spectrum": Path(data_dir) / f"spectrum_{suffix}.npy",
-                "uncertainty": Path(data_dir) / f"uncertainty_{suffix}.npy",
-            }
-        else:
-            data_paths = (
-                config.get_transmission_paths(epoch=epoch) if mode == "transmission"
-                else config.get_emission_paths(epoch=epoch)
-            )
-
-        if data_format == "timeseries":
-            wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
+    with _StepTimer("Step 1/7"):
+        if epoch:
+            print(f"  Using epoch: {epoch}")
+        if any(val is not None for val in (wav_obs, data, sigma, phase)):
+            if any(val is None for val in (wav_obs, data, sigma, phase)):
+                raise ValueError("Must provide wav_obs, data, sigma, and phase together.")
             phase = _normalize_phase(phase)
-            print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
+            print(f"  Using provided data: {data.shape[0]} exposures x {data.shape[1]} wavelengths")
             print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
             if apply_sysrem:
-                U_raw, invvar_raw = _load_sysrem_inputs(resolved_data_dir)
+                if U is None or invvar_spec is None:
+                    raise ValueError(
+                        "apply_sysrem=True requires U and invvar_spec when providing "
+                        "wav_obs/data/sigma/phase directly."
+                    )
                 U_sysrem, invvar_spec = _validate_sysrem_inputs(
-                    U_raw, invvar_raw, n_exp=data.shape[0]
+                    U, invvar_spec, n_exp=data.shape[0]
                 )
                 print(
-                    f"  Loaded SYSREM auxiliaries: U shape={U_sysrem.shape}, "
+                    f"  Using provided SYSREM auxiliaries: U shape={U_sysrem.shape}, "
                     f"invvar_spec shape={invvar_spec.shape}"
                 )
-        elif data_format == "spectrum":
-            wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
-                str(data_paths["wavelength"]),
-                str(data_paths["spectrum"]),
-                str(data_paths["uncertainty"]),
-            )
-            data = spectrum[np.newaxis, :]
-            sigma = uncertainty[np.newaxis, :]
-            phase = np.array([0.0])
-            print(f"  Loaded single spectrum with {len(wav_obs)} points")
-            if apply_sysrem:
-                raise ValueError(
-                    "apply_sysrem=True with data_format='spectrum' requires SYSREM "
-                    "auxiliaries tied to time-series exposures, which are unavailable "
-                    "for single-spectrum input. Use data_format='timeseries' or set "
-                    "APPLY_SYSREM_DEFAULT=False."
-                )
         else:
-            wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
-            phase = _normalize_phase(phase)
-            print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
-            print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
-            if apply_sysrem:
-                U_raw, invvar_raw = _load_sysrem_inputs(resolved_data_dir)
-                U_sysrem, invvar_spec = _validate_sysrem_inputs(
-                    U_raw, invvar_raw, n_exp=data.shape[0]
-                )
-                print(
-                    f"  Loaded SYSREM auxiliaries: U shape={U_sysrem.shape}, "
-                    f"invvar_spec shape={invvar_spec.shape}"
-                )
-    
-    print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
+            if data_format not in {"auto", "timeseries", "spectrum"}:
+                raise ValueError(f"Unknown data_format: {data_format}")
 
-    # Convert to wavenumber
-    inst_nus = wav2nu(wav_obs, "AA")
-    # Ensure wavenumber grid and data are in ascending order
-    if inst_nus.size > 1 and np.any(np.diff(inst_nus) <= 0):
-        sort_idx = np.argsort(inst_nus)
-        inst_nus = inst_nus[sort_idx]
-        wav_obs = wav_obs[sort_idx]
-        if data.ndim == 2:
-            data = data[:, sort_idx]
-            sigma = sigma[:, sort_idx]
-        else:
-            data = data[sort_idx]
-            sigma = sigma[sort_idx]
+            resolved_data_dir = Path(data_dir) if data_dir is not None else config.get_data_dir(epoch=epoch)
 
-    _preflight_spectrum_checks(wav_obs, data, sigma, phase, inst_nus)
+            if data_dir is not None:
+                suffix = "transmission" if mode == "transmission" else "emission"
+                data_paths = {
+                    "wavelength": Path(data_dir) / f"wavelength_{suffix}.npy",
+                    "spectrum": Path(data_dir) / f"spectrum_{suffix}.npy",
+                    "uncertainty": Path(data_dir) / f"uncertainty_{suffix}.npy",
+                }
+            else:
+                data_paths = (
+                    config.get_transmission_paths(epoch=epoch) if mode == "transmission"
+                    else config.get_emission_paths(epoch=epoch)
+                )
+
+            if data_format == "timeseries":
+                wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
+                phase = _normalize_phase(phase)
+                print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
+                print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
+                if apply_sysrem:
+                    U_raw, invvar_raw = _load_sysrem_inputs(resolved_data_dir)
+                    U_sysrem, invvar_spec = _validate_sysrem_inputs(
+                        U_raw, invvar_raw, n_exp=data.shape[0]
+                    )
+                    print(
+                        f"  Loaded SYSREM auxiliaries: U shape={U_sysrem.shape}, "
+                        f"invvar_spec shape={invvar_spec.shape}"
+                    )
+            elif data_format == "spectrum":
+                wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
+                    str(data_paths["wavelength"]),
+                    str(data_paths["spectrum"]),
+                    str(data_paths["uncertainty"]),
+                )
+                data = spectrum[np.newaxis, :]
+                sigma = uncertainty[np.newaxis, :]
+                phase = np.array([0.0])
+                print(f"  Loaded single spectrum with {len(wav_obs)} points")
+                if apply_sysrem:
+                    raise ValueError(
+                        "apply_sysrem=True with data_format='spectrum' requires SYSREM "
+                        "auxiliaries tied to time-series exposures, which are unavailable "
+                        "for single-spectrum input. Use data_format='timeseries' or set "
+                        "APPLY_SYSREM_DEFAULT=False."
+                    )
+            else:
+                wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
+                phase = _normalize_phase(phase)
+                print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
+                print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
+                if apply_sysrem:
+                    U_raw, invvar_raw = _load_sysrem_inputs(resolved_data_dir)
+                    U_sysrem, invvar_spec = _validate_sysrem_inputs(
+                        U_raw, invvar_raw, n_exp=data.shape[0]
+                    )
+                    print(
+                        f"  Loaded SYSREM auxiliaries: U shape={U_sysrem.shape}, "
+                        f"invvar_spec shape={invvar_spec.shape}"
+                    )
+
+        print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
+
+        # Convert to wavenumber
+        inst_nus = wav2nu(wav_obs, "AA")
+        # Ensure wavenumber grid and data are in ascending order
+        if inst_nus.size > 1 and np.any(np.diff(inst_nus) <= 0):
+            sort_idx = np.argsort(inst_nus)
+            inst_nus = inst_nus[sort_idx]
+            wav_obs = wav_obs[sort_idx]
+            if data.ndim == 2:
+                data = data[:, sort_idx]
+                sigma = sigma[:, sort_idx]
+            else:
+                data = data[sort_idx]
+                sigma = sigma[sort_idx]
+
+        _preflight_spectrum_checks(wav_obs, data, sigma, phase, inst_nus)
 
     # Setup instrumental resolution
     print("\n[2/7] Setting up instrumental resolution...")
-    Rinst = config.get_resolution()
-    print(f"  Instrument resolving power: R = {Rinst:.0f}")
+    with _StepTimer("Step 2/7"):
+        Rinst = config.get_resolution()
+        print(f"  Instrument resolving power: R = {Rinst:.0f}")
 
     # Setup wavenumber grid
     print("\n[3/7] Building wavenumber grid...")
-    wav_min, wav_max = config.get_wavelength_range()
-    nu_grid, wav_grid, res_high = setup_wavenumber_grid(
-        wav_min - config.WAV_MIN_OFFSET,
-        wav_max + config.WAV_MAX_OFFSET,
-        config.N_SPECTRAL_POINTS,
-        unit="AA",
-    )
-    _preflight_grid_checks(inst_nus, nu_grid)
+    with _StepTimer("Step 3/7"):
+        wav_min, wav_max = config.get_wavelength_range()
+        nu_grid, wav_grid, res_high = setup_wavenumber_grid(
+            wav_min - config.WAV_MIN_OFFSET,
+            wav_max + config.WAV_MAX_OFFSET,
+            config.N_SPECTRAL_POINTS,
+            unit="AA",
+        )
+        _preflight_grid_checks(inst_nus, nu_grid)
 
-    sop_rot, sop_inst, _ = setup_spectral_operators(nu_grid, Rinst)
-    print("  Spectral operators initialized")
+        sop_rot, sop_inst, _ = setup_spectral_operators(nu_grid, Rinst)
+        print("  Spectral operators initialized")
 
     # Setup atmospheric RT
     print("\n[4/7] Initializing atmospheric RT...")
-    if mode == "transmission":
-        art = ArtTransPure(
-            pressure_top=config.PRESSURE_TOP,
-            pressure_btm=config.PRESSURE_BTM,
-            nlayer=config.NLAYER,
-        )
-    else:
-        art = ArtEmisPure(
-            pressure_top=config.PRESSURE_TOP,
-            pressure_btm=config.PRESSURE_BTM,
-            nlayer=config.NLAYER,
-        )
-    art.change_temperature_range(config.T_LOW, config.T_HIGH)
-    print(f"  {config.NLAYER} atmospheric layers")
-    print(f"  Pressure range: {config.PRESSURE_TOP:.1e} - {config.PRESSURE_BTM:.1e} bar")
-    print(f"  Temperature range: {config.T_LOW:.0f} - {config.T_HIGH:.0f} K")
+    with _StepTimer("Step 4/7"):
+        if mode == "transmission":
+            art = ArtTransPure(
+                pressure_top=config.PRESSURE_TOP,
+                pressure_btm=config.PRESSURE_BTM,
+                nlayer=config.NLAYER,
+            )
+        else:
+            art = ArtEmisPure(
+                pressure_top=config.PRESSURE_TOP,
+                pressure_btm=config.PRESSURE_BTM,
+                nlayer=config.NLAYER,
+            )
+        art.change_temperature_range(config.T_LOW, config.T_HIGH)
+        print(f"  {config.NLAYER} atmospheric layers")
+        print(f"  Pressure range: {config.PRESSURE_TOP:.1e} - {config.PRESSURE_BTM:.1e} bar")
+        print(f"  Temperature range: {config.T_LOW:.0f} - {config.T_HIGH:.0f} K")
 
     # Load opacities
     print("\n[5/7] Loading opacities...")
+    with _StepTimer("Step 5/7"):
+        opa_cias = setup_cia_opacities(config.CIA_PATHS, nu_grid)
+        n_cia = sum(1 for cia in opa_cias.values() if not getattr(cia, "_is_dummy", False))
+        if n_cia == 0:
+            print("  Loaded 0 CIA sources (no overlap with nu_grid)")
+        else:
+            print(f"  Loaded {n_cia} CIA sources")
 
-    opa_cias = setup_cia_opacities(config.CIA_PATHS, nu_grid)
-    n_cia = sum(1 for cia in opa_cias.values() if not getattr(cia, "_is_dummy", False))
-    if n_cia == 0:
-        print("  Loaded 0 CIA sources (no overlap with nu_grid)")
-    else:
-        print(f"  Loaded {n_cia} CIA sources")
+        opa_mols, molmass_arr = load_molecular_opacities(
+            config.MOLPATH_HITEMP,
+            config.MOLPATH_EXOMOL,
+            nu_grid,
+            config.OPA_LOAD,
+            config.DIFFMODE,
+            config.T_LOW,
+            config.T_HIGH,
+            cutwing=config.PREMODIT_CUTWING,
+        )
+        print(f"  Loaded {len(opa_mols)} molecular species: {list(opa_mols.keys())}")
 
-    opa_mols, molmass_arr = load_molecular_opacities(
-        config.MOLPATH_HITEMP,
-        config.MOLPATH_EXOMOL,
-        nu_grid,
-        config.OPA_LOAD,
-        config.DIFFMODE,
-        config.T_LOW,
-        config.T_HIGH,
-        cutwing=config.PREMODIT_CUTWING,
-    )
-    print(f"  Loaded {len(opa_mols)} molecular species: {list(opa_mols.keys())}")
+        # Load atomic opacities (optional, uses Kurucz with auto-download)
+        opa_atoms, atommass_arr = load_atomic_opacities(
+            config.ATOMIC_SPECIES,
+            nu_grid,
+            config.OPA_LOAD,
+            config.DIFFMODE,
+            config.T_LOW,
+            config.T_HIGH,
+            cutwing=config.PREMODIT_CUTWING,
+        )
+        if opa_atoms:
+            print(f"  Loaded {len(opa_atoms)} atomic species: {list(opa_atoms.keys())}")
 
-    # Load atomic opacities (optional, uses Kurucz with auto-download)
-    opa_atoms, atommass_arr = load_atomic_opacities(
-        config.ATOMIC_SPECIES,
-        nu_grid,
-        config.OPA_LOAD,
-        config.DIFFMODE,
-        config.T_LOW,
-        config.T_HIGH,
-        cutwing=config.PREMODIT_CUTWING,
-    )
-    if opa_atoms:
-        print(f"  Loaded {len(opa_atoms)} atomic species: {list(opa_atoms.keys())}")
-
-    # Run aliasing diagnostics if requested
-    if check_aliasing:
-        print("\n  Running species aliasing diagnostics...")
-        # Build templates from opacity objects
-        # For now, just print a warning - full implementation would generate 
-        # model spectra for each species
-        aliasing_dir = os.path.join(output_dir, "aliasing")
-        os.makedirs(aliasing_dir, exist_ok=True)
-        
-        all_species = list(opa_mols.keys()) + list(opa_atoms.keys())
-        print(f"  Species to check: {', '.join(all_species)}")
-        print(f"  (Full aliasing analysis requires template generation - see aliasing.py)")
-        print(f"  Aliasing directory: {aliasing_dir}")
+        # Run aliasing diagnostics if requested
+        if check_aliasing:
+            print("\n  Running species aliasing diagnostics...")
+            aliasing_dir = os.path.join(output_dir, "aliasing")
+            os.makedirs(aliasing_dir, exist_ok=True)
+            
+            all_species = list(opa_mols.keys()) + list(opa_atoms.keys())
+            print(f"  Species to check: {', '.join(all_species)}")
+            print(f"  (Full aliasing analysis requires template generation - see aliasing.py)")
+            print(f"  Aliasing directory: {aliasing_dir}")
 
     print(f"\n[6/7] Building {mode} forward model ({pt_profile} P-T)...")
     print(f"  Chemistry model: {chemistry_model}")
-
-    composition_solver = _build_composition_solver(
-        chemistry_model=chemistry_model,
-        fastchem_parameter_file=fastchem_parameter_file,
-    )
-    
-    # Convert params to format expected by create_retrieval_model
-    model_params = {
-        "Kp": params.get("Kp", config.DEFAULT_KP),
-        "Kp_err": params.get("Kp_err", config.DEFAULT_KP_ERR),
-        "RV_abs": params.get("RV_abs", config.DEFAULT_RV_ABS),
-        "RV_abs_err": params.get("RV_abs_err", config.DEFAULT_RV_ABS_ERR),
-        "R_p": params["R_p"].nominal_value if hasattr(params["R_p"], "nominal_value") else params["R_p"],
-        "R_p_err": params["R_p"].std_dev if hasattr(params["R_p"], "std_dev") else config.DEFAULT_RP_ERR,
-        "M_p": params["M_p"].nominal_value if hasattr(params["M_p"], "nominal_value") else params["M_p"],
-        "M_p_err": params["M_p"].std_dev if hasattr(params["M_p"], "std_dev") else config.DEFAULT_MP_ERR,
-        "R_star": params["R_star"].nominal_value if hasattr(params["R_star"], "nominal_value") else params["R_star"],
-        "R_star_err": params["R_star"].std_dev if hasattr(params["R_star"], "std_dev") else config.DEFAULT_RSTAR_ERR,
-        "T_star": params.get("T_star", config.DEFAULT_TSTAR),
-        "T_eq": params.get("T_eq"),
-        "period": params["period"].nominal_value if hasattr(params["period"], "nominal_value") else params["period"],
-    }
-    
-    model_c = create_retrieval_model(
-        mode=mode,
-        params=model_params,
-        art=art,
-        opa_mols=opa_mols,
-        opa_atoms=opa_atoms,  # Pass {} if empty
-        opa_cias=opa_cias,
-        nu_grid=nu_grid,
-        sop_rot=sop_rot,
-        sop_inst=sop_inst,
-        instrument_resolution=Rinst,
-        inst_nus=inst_nus,
-        pt_profile=pt_profile,
-        T_low=config.T_LOW,
-        T_high=config.T_HIGH,
-        phase_mode=phase_mode,
-        apply_sysrem=apply_sysrem,
-        composition_solver=composition_solver,
-    )
-    print(f"  Model created (phase_mode={phase_mode})")
+    with _StepTimer("Step 6/7"):
+        composition_solver = _build_composition_solver(
+            chemistry_model=chemistry_model,
+            fastchem_parameter_file=fastchem_parameter_file,
+        )
+        
+        # Convert params to format expected by create_retrieval_model
+        model_params = {
+            "Kp": params.get("Kp", config.DEFAULT_KP),
+            "Kp_err": params.get("Kp_err", config.DEFAULT_KP_ERR),
+            "RV_abs": params.get("RV_abs", config.DEFAULT_RV_ABS),
+            "RV_abs_err": params.get("RV_abs_err", config.DEFAULT_RV_ABS_ERR),
+            "R_p": params["R_p"].nominal_value if hasattr(params["R_p"], "nominal_value") else params["R_p"],
+            "R_p_err": params["R_p"].std_dev if hasattr(params["R_p"], "std_dev") else config.DEFAULT_RP_ERR,
+            "M_p": params["M_p"].nominal_value if hasattr(params["M_p"], "nominal_value") else params["M_p"],
+            "M_p_err": params["M_p"].std_dev if hasattr(params["M_p"], "std_dev") else config.DEFAULT_MP_ERR,
+            "R_star": params["R_star"].nominal_value if hasattr(params["R_star"], "nominal_value") else params["R_star"],
+            "R_star_err": params["R_star"].std_dev if hasattr(params["R_star"], "std_dev") else config.DEFAULT_RSTAR_ERR,
+            "T_star": params.get("T_star", config.DEFAULT_TSTAR),
+            "T_eq": params.get("T_eq"),
+            "period": params["period"].nominal_value if hasattr(params["period"], "nominal_value") else params["period"],
+        }
+        
+        model_c = create_retrieval_model(
+            mode=mode,
+            params=model_params,
+            art=art,
+            opa_mols=opa_mols,
+            opa_atoms=opa_atoms,  # Pass {} if empty
+            opa_cias=opa_cias,
+            nu_grid=nu_grid,
+            sop_rot=sop_rot,
+            sop_inst=sop_inst,
+            instrument_resolution=Rinst,
+            inst_nus=inst_nus,
+            pt_profile=pt_profile,
+            T_low=config.T_LOW,
+            T_high=config.T_HIGH,
+            phase_mode=phase_mode,
+            apply_sysrem=apply_sysrem,
+            composition_solver=composition_solver,
+        )
+        print(f"  Model created (phase_mode={phase_mode})")
 
     # Convert data to JAX arrays
     data_jnp = jnp.array(data)
@@ -757,136 +777,135 @@ def run_retrieval(
     svi_guide: object | None = None
     svi_losses: np.ndarray | None = None
 
-    if not skip_svi:
-        print(f"  SVI warm-up: {config.SVI_NUM_STEPS} steps, LR={config.SVI_LEARNING_RATE}")
-        rng_key, rng_key_ = random.split(rng_key)
-        svi_params, svi_losses, init_strategy, _, svi_guide = run_svi(
+    with _StepTimer("Step 7/7"):
+        if not skip_svi:
+            print(f"  SVI warm-up: {config.SVI_NUM_STEPS} steps, LR={config.SVI_LEARNING_RATE}")
+            rng_key, rng_key_ = random.split(rng_key)
+            svi_params, svi_losses, init_strategy, _, svi_guide = run_svi(
+                model_c,
+                rng_key_,
+                data=data_jnp,
+                sigma=sigma_jnp,
+                phase=phase_jnp,
+                U=U_jnp,
+                invvar_spec=invvar_spec_jnp,
+                Mp_mean=model_params["M_p"],
+                Mp_std=model_params["M_p_err"],
+                Rstar_mean=model_params["R_star"],
+                Rstar_std=model_params["R_star_err"],
+                output_dir=str(output_dir),
+                num_steps=config.SVI_NUM_STEPS,
+                lr=config.SVI_LEARNING_RATE,
+            )
+
+            if svi_only:
+                if not no_plots:
+                    print("  Generating corner plots from SVI posterior...")
+                    rng_key, rng_key_plot = random.split(rng_key)
+                    svi_samples_for_plots = _sample_svi_posterior(
+                        guide=svi_guide,
+                        params=svi_params,
+                        rng_key=rng_key_plot,
+                        num_samples=max(100, int(config.MCMC_NUM_SAMPLES)),
+                    )
+                    save_retrieval_corner_plots(
+                        output_dir=str(output_dir),
+                        svi_samples=svi_samples_for_plots,
+                    )
+
+                    if svi_losses is not None:
+                        plot_svi_loss(
+                            np.asarray(jax.device_get(svi_losses)),
+                            os.path.join(output_dir, "svi_loss.png"),
+                        )
+
+                    if svi_samples_for_plots is not None:
+                        if (
+                            "T0" in svi_samples_for_plots
+                            or ("T_btm" in svi_samples_for_plots and "T_top" in svi_samples_for_plots)
+                        ):
+                            plot_temperature_profile(
+                                posterior_samples=svi_samples_for_plots,
+                                art=art,
+                                save_path=os.path.join(output_dir, "temperature_profile.png"),
+                            )
+                        else:
+                            print(
+                                "  Skipping temperature profile plot: no supported temperature "
+                                "parameterization in SVI samples."
+                            )
+
+                        obs_mean, obs_err = _summarize_observed_spectrum(data, sigma)
+                        wav_obs_nm = np.asarray(wav_obs) / 10.0
+
+                        svi_model_ts, _ = _compute_model_timeseries_for_plot(
+                            posterior_samples=svi_samples_for_plots,
+                            mode=mode,
+                            model_params=model_params,
+                            art=art,
+                            opa_mols=opa_mols,
+                            opa_atoms=opa_atoms,
+                            opa_cias=opa_cias,
+                            nu_grid=np.asarray(nu_grid),
+                            pt_profile=pt_profile,
+                            sop_rot=sop_rot,
+                            sop_inst=sop_inst,
+                            inst_nus=np.asarray(inst_nus),
+                            phase=np.asarray(phase),
+                            instrument_resolution=Rinst,
+                            apply_sysrem=apply_sysrem,
+                            U_sysrem=U_sysrem,
+                            invvar_spec=invvar_spec,
+                        )
+
+                        if svi_model_ts is not None:
+                            svi_line = np.mean(np.asarray(svi_model_ts), axis=0)
+                            if mode == "transmission":
+                                plot_transmission_spectrum(
+                                    wavelength_nm=wav_obs_nm,
+                                    rp_obs=obs_mean,
+                                    rp_err=obs_err,
+                                    rp_hmc=np.atleast_2d(svi_line),
+                                    rp_svi=svi_line,
+                                    save_path=os.path.join(output_dir, "transmission_spectrum.png"),
+                                )
+                            else:
+                                plot_emission_spectrum(
+                                    wavelength_nm=wav_obs_nm,
+                                    fp_obs=obs_mean,
+                                    fp_err=obs_err,
+                                    fp_hmc=np.atleast_2d(svi_line),
+                                    fp_svi=svi_line,
+                                    save_path=os.path.join(output_dir, "emission_spectrum.png"),
+                                )
+                print("  SVI complete (svi_only=True); skipping MCMC.")
+                return
+
+        print(f"\n  Running HMC-NUTS sampling...")
+        print(f"  Warmup: {config.MCMC_NUM_WARMUP}, Samples: {config.MCMC_NUM_SAMPLES}")
+        print(f"  Chains: {config.MCMC_NUM_CHAINS}")
+
+        kernel = NUTS(
             model_c,
+            max_tree_depth=config.MCMC_MAX_TREE_DEPTH,
+            init_strategy=init_strategy,
+        )
+        mcmc = MCMC(
+            kernel,
+            num_warmup=config.MCMC_NUM_WARMUP,
+            num_samples=config.MCMC_NUM_SAMPLES,
+            num_chains=config.MCMC_NUM_CHAINS
+        )
+
+        rng_key, rng_key_ = random.split(rng_key)
+        mcmc.run(
             rng_key_,
             data=data_jnp,
             sigma=sigma_jnp,
             phase=phase_jnp,
             U=U_jnp,
             invvar_spec=invvar_spec_jnp,
-            Mp_mean=model_params["M_p"],
-            Mp_std=model_params["M_p_err"],
-            Rstar_mean=model_params["R_star"],
-            Rstar_std=model_params["R_star_err"],
-            output_dir=str(output_dir),
-            num_steps=config.SVI_NUM_STEPS,
-            lr=config.SVI_LEARNING_RATE,
         )
-
-        if svi_only:
-            if not no_plots:
-                print("  Generating corner plots from SVI posterior...")
-                rng_key, rng_key_plot = random.split(rng_key)
-                svi_samples_for_plots = _sample_svi_posterior(
-                    guide=svi_guide,
-                    params=svi_params,
-                    rng_key=rng_key_plot,
-                    num_samples=max(100, int(config.MCMC_NUM_SAMPLES)),
-                )
-                save_retrieval_corner_plots(
-                    output_dir=str(output_dir),
-                    svi_samples=svi_samples_for_plots,
-                )
-
-                if svi_losses is not None:
-                    plot_svi_loss(
-                        np.asarray(jax.device_get(svi_losses)),
-                        os.path.join(output_dir, "svi_loss.png"),
-                    )
-
-                if svi_samples_for_plots is not None:
-                    if (
-                        "T0" in svi_samples_for_plots
-                        or ("T_btm" in svi_samples_for_plots and "T_top" in svi_samples_for_plots)
-                    ):
-                        plot_temperature_profile(
-                            posterior_samples=svi_samples_for_plots,
-                            art=art,
-                            save_path=os.path.join(output_dir, "temperature_profile.png"),
-                        )
-                    else:
-                        print(
-                            "  Skipping temperature profile plot: no supported temperature "
-                            "parameterization in SVI samples."
-                        )
-
-                    obs_mean, obs_err = _summarize_observed_spectrum(data, sigma)
-                    wav_obs_nm = np.asarray(wav_obs) / 10.0
-
-                    svi_model_ts, _ = _compute_model_timeseries_for_plot(
-                        posterior_samples=svi_samples_for_plots,
-                        mode=mode,
-                        model_params=model_params,
-                        art=art,
-                        opa_mols=opa_mols,
-                        opa_atoms=opa_atoms,
-                        opa_cias=opa_cias,
-                        nu_grid=np.asarray(nu_grid),
-                        pt_profile=pt_profile,
-                        sop_rot=sop_rot,
-                        sop_inst=sop_inst,
-                        inst_nus=np.asarray(inst_nus),
-                        phase=np.asarray(phase),
-                        instrument_resolution=Rinst,
-                        apply_sysrem=apply_sysrem,
-                        U_sysrem=U_sysrem,
-                        invvar_spec=invvar_spec,
-                    )
-
-                    if svi_model_ts is not None:
-                        svi_line = np.mean(np.asarray(svi_model_ts), axis=0)
-                        if mode == "transmission":
-                            plot_transmission_spectrum(
-                                wavelength_nm=wav_obs_nm,
-                                rp_obs=obs_mean,
-                                rp_err=obs_err,
-                                rp_hmc=np.atleast_2d(svi_line),
-                                rp_svi=svi_line,
-                                save_path=os.path.join(output_dir, "transmission_spectrum.png"),
-                            )
-                        else:
-                            plot_emission_spectrum(
-                                wavelength_nm=wav_obs_nm,
-                                fp_obs=obs_mean,
-                                fp_err=obs_err,
-                                fp_hmc=np.atleast_2d(svi_line),
-                                fp_svi=svi_line,
-                                save_path=os.path.join(output_dir, "emission_spectrum.png"),
-                            )
-            print("  SVI complete (svi_only=True); skipping MCMC.")
-            return
-
-    # Run MCMC directly
-    print(f"\n  Running HMC-NUTS sampling...")
-    print(f"  Warmup: {config.MCMC_NUM_WARMUP}, Samples: {config.MCMC_NUM_SAMPLES}")
-    print(f"  Chains: {config.MCMC_NUM_CHAINS}")
-
-    # Use median initialization or SVI-derived init values
-    kernel = NUTS(
-        model_c,
-        max_tree_depth=config.MCMC_MAX_TREE_DEPTH,
-        init_strategy=init_strategy,
-    )
-    mcmc = MCMC(
-        kernel,
-        num_warmup=config.MCMC_NUM_WARMUP,
-        num_samples=config.MCMC_NUM_SAMPLES,
-        num_chains=config.MCMC_NUM_CHAINS
-    )
-
-    rng_key, rng_key_ = random.split(rng_key)
-    mcmc.run(
-        rng_key_,
-        data=data_jnp,
-        sigma=sigma_jnp,
-        phase=phase_jnp,
-        U=U_jnp,
-        invvar_spec=invvar_spec_jnp,
-    )
     
     mcmc.print_summary()
     
@@ -1111,6 +1130,7 @@ def run_retrieval(
     print("\n" + "="*70)
     print("RETRIEVAL COMPLETE")
     print(f"Results saved to: {output_dir}/")
+    print(f"Total runtime: {perf_counter() - retrieval_start:.2f}s")
     print("="*70)
 
 

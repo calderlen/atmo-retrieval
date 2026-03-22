@@ -737,6 +737,7 @@ def create_retrieval_model(
             norm_i = jnp.sum(jnp.log((2.0 * jnp.pi) / w_i))
             return -0.5 * (chi2_i + norm_i)
 
+        # lnL = sum_i lnL_i
         lnL = jnp.sum(jax.vmap(_lnL_exposure)(data, model_ts, w_ij))
         numpyro.factor("logL", lnL)
 

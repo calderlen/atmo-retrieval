@@ -1,62 +1,58 @@
-- TODO: implement sysrem
-
-
-
-- TODO: need to subtract off the stellar spectrum and stuff, so look how atmo-analysis does it
-- TODO: i guess molecfit was already run on the tellurics so you don't need to model them out? check the do_molecfit logic in old code
 - TODO: determine what sort of atmospheric chemistry model you're going to use
-    - free chemistry: sample log Xi directly as parameters and run NUTS/HCM/nested sampling
-        - obtain species-specific constraints
-        - don't assume equilibrium; cases against equilibrium include UHJ ionization, day/night chemistry, vertical mixing
-        - minimal assumptions
-    - equilibrium chemistry retrieval inside JAX
-        - ExoGibbs to recover elemental ratios in a physically-coupled way
-        - FastChem2/3 to be used as a comparator or to precompute a grid interpolated in JAX
+    - decide when to use free chemistry vs the existing FastChem-based equilibrium / hybrid models
+    - extend to disequilibrium chemistry as needed
+        - ionization for UHJ conditions
+        - day/night chemistry
+        - vertical mixing / quenching
+        - photochemistry
 - TODO: remaining retrieval parameters
     - log P_0 (reference pressure)
     - gray opacity/haze amplitude
 - TODO: model secondary retrieval parameters
-    - ionization partiiton, retrieving the ions and neutral species separately OR ionization fraciton OR retrieve them separately, moving this up to core retrieval parameters
+    - ionization partition: retrieve ions and neutrals separately or via an ionization fraction model
     - MMW/metallicity/(C/O)?
 - TODO: what not to try to retrieve, make sure to avoid this
-     - free T-P profile
-     - log g?
+    - free T-P profile?
+    - log g?
 
-- TODO: add joint retreival?
+- TODO: add joint retrieval?
 
-- TODO: look up `tau` (ingress/egress duration) values for planet ephemerides
-    - Currently only KELT-20b Duck24 has a real value (tau = 0.02007 days)
-    - All others have tau = NaN and will error until filled in
-    - Need values for: Lund17, Singh24, WASP-76b, KELT-9b, WASP-12b, WASP-33b, WASP-18b, WASP-189b, MASCARA-1b, TOI-1431b, TOI-1518b
-    - Sources: ExoFOP, discovery papers, or fit from TESS lightcurves
+- TODO: fill missing ephemeris / Doppler-shadow parameters in `config/planets_config.py`
+    - only KELT-20b Duck24 currently has a non-NaN `tau`
+    - the following still need `tau`, `lambda_angle`, `gamma1`, `gamma2`, `a_rs`, `b`, and `rp_rs`
+        - KELT-20b / Singh24
+        - KELT-20b / Lund17
+        - WASP-76b / West16
+        - KELT-9b / Gaudi17
+        - WASP-12b / Ivshina22
+        - WASP-33b / Ivshina22
+        - WASP-18b / Cortes-Zuleta20
+        - WASP-189b / Anderson18
+        - MASCARA-1b / Talens17
+        - TOI-1431b / Addison21
+        - TOI-1518b / Cabot21
 
 - TODO:
-    - attempt full run tonight of pipeline; need to scrutinize config before doing so
-    - shouldn't the N_VMR_NODES in config/chemistry---config just match the number of P-T layers?
-    - read horus.py*
-        - median-subtracted?
-        - mean-subtracted?
-    - need to combine spectra to construct a full-transit spectrum before passing to exoJAX
-    - and normalize! with np.std
-    - explore possibility of 4D FastChem grid w/ [M/H], C/O as rescaling abundances -- ocmputing FastChem on this 4D (T, P, [M/H], C/O) grid
-    - go through config and try setting up a run of atmo-retrieval
-    - missing CUDA on home desktop---figure out why
+    - attempt a full end-to-end retrieval run after a config sanity check
+    - decide whether `N_VMR_NODES` should match the number of P-T layers
+    - decide whether to combine exposures into a full-transit spectrum before retrieval
+    - decide whether additional normalization is needed after preprocessing
+    - go through config and set up a representative retrieval run
+    - fix missing CUDA on the home desktop
     - maybe run some HPC usage analysis on this code?
     - need to upload data to the HPC environment w rclone before run
     - see about distributed GPU run of code to avoid OOM
-        - is this what "sharding" is?
-    - implement a cominbe_observations-type function for atmo-retrieval
-    - flatten_spectra in atmo_analysis subtracts off the median flux and works with residuals
+        - is sharding the right approach here?
+    - implement a `combine_observations`-type function for atmo-retrieval if multi-observation workflows need it
     - should attempt a run as follows
-         - Guillot PT profile
-         - 2D atmospheric layers
-         - 1e-8-1e0 bar
-         - 1500K-4500K
-         - FastChem Cond
-         - on KELT-20b 2019 transmission data since lower resolution
-         - 50K wavelength resolution grid? probably should be larger
-    - because compute nodes are not directly accessible, must login to one of the login nodes, then allow VNC client to tunnel through ssh to compute node
-    - get VNC client
+        - Guillot PT profile
+        - 2D atmospheric layers
+        - 1e-8-1e0 bar
+        - 1500K-4500K
+        - FastChem condensation
+        - KELT-20b 2019 transmission data since it is lower resolution
+        - 50k wavelength resolution grid, unless a larger grid proves necessary
+    - cluster access / VNC workflow still needs to be set up cleanly
     - MPI for Python that supports GPUs?
-    - time runs w/ usr/bin/time in cluster
+    - time runs with `/usr/bin/time` on cluster
     - profile the scripts a lot before running on OSC

@@ -414,7 +414,8 @@ class FreeVMR:
             mmw_profile=mmw_profile,
         )
 
-# TODO: equilibrium chemistry solver might be a good prior/baseline. but really going to need to either keep VMRs free or use a hybrid of quench + equilibrum + disequilibrium + photochemistry + ... for realistic modeling
+# TODO: extend the current equilibrium / hybrid baseline with quenching,
+# disequilibrium chemistry, and photochemistry when the free-VMR model is not sufficient
 # TODO: partial ionization (Saha)
 # TODO: H- continuum affecting line-to-continuum ratio
 # TODO: vertical transport parameterized by K_zz and then like tchem and t_dyn or more simply the pestimate of quench level
