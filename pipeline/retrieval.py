@@ -1,8 +1,10 @@
 import os
 import importlib
 from contextlib import redirect_stdout
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
+from typing import Any
 
 import jax
 from jax import random
@@ -16,19 +18,30 @@ from exojax.utils.astrofunc import gravity_jupiter as gravity_surface
 from exojax.utils.constants import RJ, Rs
 
 import config
-from dataio.load import load_observed_spectrum, ResolutionInterpolator
+from dataio.load import (
+    load_nasa_archive_spectrum,
+    load_observed_spectrum,
+    ResolutionInterpolator,
+)
 from plotting.aliasing import check_aliasing_with_fe, generate_aliasing_report
 from physics.chemistry import ConstantVMR, FastChemHybridChemistry
 from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from databases.opacity import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
 from physics.model import (
-    create_retrieval_model,
+    BandpassObservationInputs,
+    SpectroscopicObservationInputs,
     PhaseMode,
     compute_model_timeseries,
     compute_atmospheric_state_from_posterior,
     apply_model_pipeline_corrections,
+    build_atmosphere_region_config,
+    build_bandpass_observation_config,
+    build_shared_system_config,
+    build_spectroscopic_observation_config,
+    create_joint_retrieval_model,
 )
 from pipeline.inference import run_svi
+from pipeline.tess_proc import load_tess_bandpass
 from plotting.plot import (
     plot_svi_loss,
     plot_transmission_spectrum,
@@ -453,6 +466,410 @@ def _compute_model_timeseries_for_plot(
         return None, atmo_state
 
 
+@dataclass(frozen=True)
+class SpectroscopicComponentBundle:
+    name: str
+    wav_obs: np.ndarray
+    data: np.ndarray
+    sigma: np.ndarray
+    phase: np.ndarray
+    U_sysrem: np.ndarray | None
+    invvar_spec: np.ndarray | None
+    inst_nus: np.ndarray
+    nu_grid: np.ndarray
+    sop_rot: object
+    sop_inst: object
+    instrument_resolution: float
+    opa_cias: dict
+    opa_mols: dict
+    opa_atoms: dict
+    observation_config: object
+    observation_inputs: SpectroscopicObservationInputs
+
+
+@dataclass(frozen=True)
+class BandpassConstraintBundle:
+    name: str
+    observation_config: object
+    observation_inputs: BandpassObservationInputs
+
+
+def _coerce_model_params(params: dict) -> dict[str, float | None]:
+    return {
+        "Kp": params.get("Kp", config.DEFAULT_KP),
+        "Kp_err": params.get("Kp_err", config.DEFAULT_KP_ERR),
+        "RV_abs": params.get("RV_abs", config.DEFAULT_RV_ABS),
+        "RV_abs_err": params.get("RV_abs_err", config.DEFAULT_RV_ABS_ERR),
+        "R_p": params["R_p"].nominal_value if hasattr(params["R_p"], "nominal_value") else params["R_p"],
+        "R_p_err": params["R_p"].std_dev if hasattr(params["R_p"], "std_dev") else config.DEFAULT_RP_ERR,
+        "M_p": params["M_p"].nominal_value if hasattr(params["M_p"], "nominal_value") else params["M_p"],
+        "M_p_err": params["M_p"].std_dev if hasattr(params["M_p"], "std_dev") else config.DEFAULT_MP_ERR,
+        "R_star": params["R_star"].nominal_value if hasattr(params["R_star"], "nominal_value") else params["R_star"],
+        "R_star_err": params["R_star"].std_dev if hasattr(params["R_star"], "std_dev") else config.DEFAULT_RSTAR_ERR,
+        "T_star": params.get("T_star", config.DEFAULT_TSTAR),
+        "T_eq": params.get("T_eq"),
+        "period": params["period"].nominal_value if hasattr(params["period"], "nominal_value") else params["period"],
+    }
+
+
+def _prepare_observed_spectrum_arrays(
+    wav_obs: np.ndarray,
+    data: np.ndarray,
+    sigma: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    wav_obs = np.asarray(wav_obs)
+    data = np.asarray(data)
+    sigma = np.asarray(sigma)
+
+    inst_nus = wav2nu(wav_obs, "AA")
+    if inst_nus.size > 1 and np.any(np.diff(inst_nus) <= 0):
+        sort_idx = np.argsort(inst_nus)
+        inst_nus = inst_nus[sort_idx]
+        wav_obs = wav_obs[sort_idx]
+        if data.ndim == 2:
+            data = data[:, sort_idx]
+            sigma = sigma[:, sort_idx]
+        else:
+            data = data[sort_idx]
+            sigma = sigma[sort_idx]
+
+    return wav_obs, data, sigma, inst_nus
+
+
+def _build_component_grid_and_ops(
+    wav_obs: np.ndarray,
+    instrument_resolution: float,
+) -> tuple[np.ndarray, np.ndarray, object, object]:
+    inst_nus = wav2nu(wav_obs, "AA")
+    nu_grid, _wav_grid, _res_high = setup_wavenumber_grid(
+        float(np.min(wav_obs)) - config.WAV_MIN_OFFSET,
+        float(np.max(wav_obs)) + config.WAV_MAX_OFFSET,
+        config.N_SPECTRAL_POINTS,
+        unit="AA",
+    )
+    _preflight_grid_checks(inst_nus, nu_grid)
+    sop_rot, sop_inst, _ = setup_spectral_operators(nu_grid, instrument_resolution)
+    return inst_nus, nu_grid, sop_rot, sop_inst
+
+
+def _load_opacity_bundle(
+    nu_grid: np.ndarray,
+) -> tuple[dict, dict, dict]:
+    opa_cias = setup_cia_opacities(config.CIA_PATHS, nu_grid)
+    opa_mols, _ = load_molecular_opacities(
+        config.MOLPATH_HITEMP,
+        config.MOLPATH_EXOMOL,
+        nu_grid,
+        config.OPA_LOAD,
+        config.DIFFMODE,
+        config.T_LOW,
+        config.T_HIGH,
+        cutwing=config.PREMODIT_CUTWING,
+    )
+    opa_atoms, _ = load_atomic_opacities(
+        config.ATOMIC_SPECIES,
+        nu_grid,
+        config.OPA_LOAD,
+        config.DIFFMODE,
+        config.T_LOW,
+        config.T_HIGH,
+        cutwing=config.PREMODIT_CUTWING,
+    )
+    return opa_cias, opa_mols, opa_atoms
+
+
+def _bind_observations_to_model(
+    model_c,
+    observations_payload: dict[str, object],
+):
+    def model_adapter(
+        data: jnp.ndarray,
+        sigma: jnp.ndarray,
+        phase: jnp.ndarray,
+        U: jnp.ndarray | None = None,
+        invvar_spec: jnp.ndarray | None = None,
+    ) -> None:
+        del data, sigma, phase, U, invvar_spec
+        return model_c(observations=observations_payload)
+
+    return model_adapter
+
+
+def _build_primary_spectroscopic_component(
+    *,
+    name: str,
+    mode: str,
+    wav_obs: np.ndarray,
+    data: np.ndarray,
+    sigma: np.ndarray,
+    phase: np.ndarray,
+    U_sysrem: np.ndarray | None,
+    invvar_spec: np.ndarray | None,
+    instrument_resolution: float,
+    nu_grid: np.ndarray,
+    inst_nus: np.ndarray,
+    sop_rot: object,
+    sop_inst: object,
+    opa_cias: dict,
+    opa_mols: dict,
+    opa_atoms: dict,
+    region_name: str,
+    Tstar: float | None,
+    phase_mode: PhaseMode,
+    apply_sysrem: bool,
+    radial_velocity_mode: str,
+    likelihood_kind: str,
+    subtract_per_exposure_mean: bool,
+) -> SpectroscopicComponentBundle:
+    observation_config = build_spectroscopic_observation_config(
+        name=name,
+        region_name=region_name,
+        mode=mode,
+        opa_mols=opa_mols,
+        opa_atoms=opa_atoms,
+        opa_cias=opa_cias,
+        nu_grid=nu_grid,
+        sop_rot=sop_rot,
+        sop_inst=sop_inst,
+        instrument_resolution=instrument_resolution,
+        inst_nus=inst_nus,
+        Tstar=Tstar,
+        radial_velocity_mode=radial_velocity_mode,
+        phase_mode=phase_mode,
+        likelihood_kind=likelihood_kind,
+        subtract_per_exposure_mean=subtract_per_exposure_mean,
+        apply_sysrem=apply_sysrem,
+        sample_prefix=None,
+    )
+    observation_inputs = SpectroscopicObservationInputs(
+        data=jnp.asarray(data),
+        sigma=jnp.asarray(sigma),
+        phase=jnp.asarray(phase),
+        U=None if U_sysrem is None else jnp.asarray(U_sysrem),
+        invvar_spec=None if invvar_spec is None else jnp.asarray(invvar_spec),
+    )
+    return SpectroscopicComponentBundle(
+        name=name,
+        wav_obs=np.asarray(wav_obs),
+        data=np.asarray(data),
+        sigma=np.asarray(sigma),
+        phase=np.asarray(phase),
+        U_sysrem=None if U_sysrem is None else np.asarray(U_sysrem),
+        invvar_spec=None if invvar_spec is None else np.asarray(invvar_spec),
+        inst_nus=np.asarray(inst_nus),
+        nu_grid=np.asarray(nu_grid),
+        sop_rot=sop_rot,
+        sop_inst=sop_inst,
+        instrument_resolution=float(instrument_resolution),
+        opa_cias=opa_cias,
+        opa_mols=opa_mols,
+        opa_atoms=opa_atoms,
+        observation_config=observation_config,
+        observation_inputs=observation_inputs,
+    )
+
+
+def _load_joint_spectroscopic_component(
+    spec: dict[str, Any],
+    *,
+    mode: str,
+    region_name: str,
+    default_tstar: float | None,
+) -> SpectroscopicComponentBundle:
+    name = str(spec.get("name", f"{mode}_component"))
+    data_format = str(spec.get("data_format", "spectrum")).lower().strip()
+    instrument_resolution = float(spec.get("instrument_resolution", config.get_resolution()))
+    radial_velocity_mode = str(spec.get("radial_velocity_mode", "orbital" if data_format == "timeseries" else "none"))
+    likelihood_kind = str(spec.get("likelihood_kind", "matched_filter" if data_format == "timeseries" else "gaussian"))
+    phase_mode = spec.get("phase_mode", config.DEFAULT_PHASE_MODE if radial_velocity_mode == "orbital" else None)
+    apply_sysrem = bool(spec.get("apply_sysrem", data_format == "timeseries" and config.APPLY_SYSREM_DEFAULT))
+    subtract_per_exposure_mean = bool(
+        spec.get(
+            "subtract_per_exposure_mean",
+            data_format == "timeseries" and config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT,
+        )
+    )
+    Tstar = spec.get("Tstar", default_tstar)
+
+    if "tbl_path" in spec:
+        wav_obs, spectrum, uncertainty, _meta = load_nasa_archive_spectrum(
+            spec["tbl_path"],
+            mode=mode,
+        )
+        data = spectrum[np.newaxis, :]
+        sigma = uncertainty[np.newaxis, :]
+        phase = np.zeros((1,), dtype=float)
+        U_sysrem = None
+        invvar_spec = None
+    elif all(key in spec for key in ("wav_obs", "data", "sigma")):
+        wav_obs = np.asarray(spec["wav_obs"])
+        data = np.asarray(spec["data"])
+        sigma = np.asarray(spec["sigma"])
+        phase = np.asarray(spec.get("phase", np.zeros((1 if data.ndim == 1 else data.shape[0],), dtype=float)))
+        U_sysrem = None if spec.get("U") is None else np.asarray(spec["U"])
+        invvar_spec = None if spec.get("invvar_spec") is None else np.asarray(spec["invvar_spec"])
+    elif "data_dir" in spec:
+        data_dir = Path(spec["data_dir"])
+        if data_format == "timeseries":
+            wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
+            phase = _normalize_phase(phase)
+            if apply_sysrem:
+                U_raw, invvar_raw = _load_sysrem_inputs(data_dir)
+                U_sysrem, invvar_spec = _validate_sysrem_inputs(U_raw, invvar_raw, n_exp=data.shape[0])
+            else:
+                U_sysrem = None
+                invvar_spec = None
+        elif data_format == "spectrum":
+            suffix = "transmission" if mode == "transmission" else "emission"
+            wav_obs, spectrum, uncertainty, _ = load_observed_spectrum(
+                str(data_dir / f"wavelength_{suffix}.npy"),
+                str(data_dir / f"spectrum_{suffix}.npy"),
+                str(data_dir / f"uncertainty_{suffix}.npy"),
+            )
+            data = spectrum[np.newaxis, :]
+            sigma = uncertainty[np.newaxis, :]
+            phase = np.zeros((1,), dtype=float)
+            U_sysrem = None
+            invvar_spec = None
+        else:
+            raise ValueError(f"Unsupported auxiliary data_format: {data_format}")
+    else:
+        raise ValueError(
+            "Joint spectroscopic component must provide one of: "
+            "{tbl_path}, {data_dir}, or {wav_obs,data,sigma}."
+        )
+
+    if apply_sysrem and (U_sysrem is None or invvar_spec is None):
+        raise ValueError(
+            f"Joint spectroscopic component '{name}' requested SYSREM but no valid "
+            "U/invvar_spec inputs were provided."
+        )
+
+    wav_obs, data, sigma, inst_nus = _prepare_observed_spectrum_arrays(wav_obs, data, sigma)
+    if phase.ndim == 0:
+        phase = np.asarray([float(phase)])
+    if data_format == "timeseries":
+        phase = _normalize_phase(phase)
+    elif phase.size == 0:
+        phase = np.zeros((1,), dtype=float)
+    _preflight_spectrum_checks(wav_obs, data, sigma, phase, inst_nus)
+
+    inst_nus_component, nu_grid, sop_rot, sop_inst = _build_component_grid_and_ops(
+        wav_obs,
+        instrument_resolution,
+    )
+    opa_cias, opa_mols, opa_atoms = _load_opacity_bundle(nu_grid)
+
+    observation_config = build_spectroscopic_observation_config(
+        name=name,
+        region_name=region_name,
+        mode=mode,
+        opa_mols=opa_mols,
+        opa_atoms=opa_atoms,
+        opa_cias=opa_cias,
+        nu_grid=nu_grid,
+        sop_rot=sop_rot,
+        sop_inst=sop_inst,
+        instrument_resolution=instrument_resolution,
+        inst_nus=inst_nus_component,
+        Tstar=Tstar,
+        radial_velocity_mode=radial_velocity_mode,
+        phase_mode=phase_mode,
+        likelihood_kind=likelihood_kind,
+        subtract_per_exposure_mean=subtract_per_exposure_mean,
+        apply_sysrem=apply_sysrem,
+        sample_prefix=name,
+    )
+    observation_inputs = SpectroscopicObservationInputs(
+        data=jnp.asarray(data),
+        sigma=jnp.asarray(sigma),
+        phase=jnp.asarray(phase),
+        U=None if U_sysrem is None else jnp.asarray(U_sysrem),
+        invvar_spec=None if invvar_spec is None else jnp.asarray(invvar_spec),
+    )
+    return SpectroscopicComponentBundle(
+        name=name,
+        wav_obs=np.asarray(wav_obs),
+        data=np.asarray(data),
+        sigma=np.asarray(sigma),
+        phase=np.asarray(phase),
+        U_sysrem=None if U_sysrem is None else np.asarray(U_sysrem),
+        invvar_spec=None if invvar_spec is None else np.asarray(invvar_spec),
+        inst_nus=np.asarray(inst_nus_component),
+        nu_grid=np.asarray(nu_grid),
+        sop_rot=sop_rot,
+        sop_inst=sop_inst,
+        instrument_resolution=float(instrument_resolution),
+        opa_cias=opa_cias,
+        opa_mols=opa_mols,
+        opa_atoms=opa_atoms,
+        observation_config=observation_config,
+        observation_inputs=observation_inputs,
+    )
+
+
+def _load_bandpass_constraint(
+    spec: dict[str, Any],
+    *,
+    mode: str,
+    region_name: str,
+    default_tstar: float | None,
+) -> BandpassConstraintBundle:
+    name = str(spec.get("name", f"{mode}_bandpass"))
+    observable = str(spec["observable"])
+    value = float(spec["value"])
+    sigma = float(spec["sigma"])
+    photon_weighted = bool(spec.get("photon_weighted", False))
+    Tstar = spec.get("Tstar", default_tstar)
+
+    if "wavelength_m" in spec and "response" in spec:
+        wavelength_m = np.asarray(spec["wavelength_m"], dtype=float)
+        response = np.asarray(spec["response"], dtype=float)
+    else:
+        bandpass_path = spec.get("bandpass_path")
+        wavelength_m, response, _used_path = load_tess_bandpass(
+            bandpass_path,
+            download_if_missing=bool(spec.get("download_bandpass", True)),
+        )
+
+    wavelength_angstrom = np.asarray(wavelength_m, dtype=float) * 1.0e10
+    if "nu_grid" in spec:
+        nu_grid = np.asarray(spec["nu_grid"], dtype=float)
+    else:
+        nu_grid, _wav_grid, _res_high = setup_wavenumber_grid(
+            float(np.min(wavelength_angstrom)) - config.WAV_MIN_OFFSET,
+            float(np.max(wavelength_angstrom)) + config.WAV_MAX_OFFSET,
+            config.N_SPECTRAL_POINTS,
+            unit="AA",
+        )
+
+    opa_cias, opa_mols, opa_atoms = _load_opacity_bundle(nu_grid)
+    observation_config = build_bandpass_observation_config(
+        name=name,
+        region_name=region_name,
+        mode=mode,
+        opa_mols=opa_mols,
+        opa_atoms=opa_atoms,
+        opa_cias=opa_cias,
+        nu_grid=nu_grid,
+        wavelength_m=wavelength_m,
+        response=response,
+        observable=observable,
+        photon_weighted=photon_weighted,
+        Tstar=Tstar,
+        sample_prefix=name,
+    )
+    observation_inputs = BandpassObservationInputs(
+        value=jnp.asarray(value),
+        sigma=jnp.asarray(sigma),
+    )
+    return BandpassConstraintBundle(
+        name=name,
+        observation_config=observation_config,
+        observation_inputs=observation_inputs,
+    )
+
+
 class _StepTimer:
     def __init__(self, label: str):
         self.label = label
@@ -490,6 +907,8 @@ def run_retrieval(
     phase: np.ndarray | None = None,
     U: np.ndarray | None = None,
     invvar_spec: np.ndarray | None = None,
+    joint_spectra: list[dict[str, Any]] | None = None,
+    bandpass_constraints: list[dict[str, Any]] | None = None,
 ) -> None:
     retrieval_start = perf_counter()
 
@@ -717,51 +1136,106 @@ def run_retrieval(
             chemistry_model=chemistry_model,
             fastchem_parameter_file=fastchem_parameter_file,
         )
-        
-        # Convert params to format expected by create_retrieval_model
-        model_params = {
-            "Kp": params.get("Kp", config.DEFAULT_KP),
-            "Kp_err": params.get("Kp_err", config.DEFAULT_KP_ERR),
-            "RV_abs": params.get("RV_abs", config.DEFAULT_RV_ABS),
-            "RV_abs_err": params.get("RV_abs_err", config.DEFAULT_RV_ABS_ERR),
-            "R_p": params["R_p"].nominal_value if hasattr(params["R_p"], "nominal_value") else params["R_p"],
-            "R_p_err": params["R_p"].std_dev if hasattr(params["R_p"], "std_dev") else config.DEFAULT_RP_ERR,
-            "M_p": params["M_p"].nominal_value if hasattr(params["M_p"], "nominal_value") else params["M_p"],
-            "M_p_err": params["M_p"].std_dev if hasattr(params["M_p"], "std_dev") else config.DEFAULT_MP_ERR,
-            "R_star": params["R_star"].nominal_value if hasattr(params["R_star"], "nominal_value") else params["R_star"],
-            "R_star_err": params["R_star"].std_dev if hasattr(params["R_star"], "std_dev") else config.DEFAULT_RSTAR_ERR,
-            "T_star": params.get("T_star", config.DEFAULT_TSTAR),
-            "T_eq": params.get("T_eq"),
-            "period": params["period"].nominal_value if hasattr(params["period"], "nominal_value") else params["period"],
-        }
-        
-        model_c = create_retrieval_model(
+
+        model_params = _coerce_model_params(params)
+        region_name = "terminator" if mode == "transmission" else "dayside"
+
+        shared_system = build_shared_system_config(params=model_params)
+        atmosphere_region = build_atmosphere_region_config(
             mode=mode,
             params=model_params,
             art=art,
             opa_mols=opa_mols,
-            opa_atoms=opa_atoms,  # Pass {} if empty
-            opa_cias=opa_cias,
-            nu_grid=nu_grid,
-            sop_rot=sop_rot,
-            sop_inst=sop_inst,
-            instrument_resolution=Rinst,
-            inst_nus=inst_nus,
+            opa_atoms=opa_atoms,
             pt_profile=pt_profile,
             T_low=config.T_LOW,
             T_high=config.T_HIGH,
-            phase_mode=phase_mode,
-            apply_sysrem=apply_sysrem,
             composition_solver=composition_solver,
         )
-        print(f"  Model created (phase_mode={phase_mode})")
 
-    # Convert data to JAX arrays
-    data_jnp = jnp.array(data)
-    sigma_jnp = jnp.array(sigma)
-    phase_jnp = jnp.array(phase)
-    U_jnp = None if U_sysrem is None else jnp.array(U_sysrem)
-    invvar_spec_jnp = None if invvar_spec is None else jnp.array(invvar_spec)
+        primary_is_timeseries = (
+            np.asarray(phase).size > 1
+            or bool(apply_sysrem)
+            or (np.asarray(data).ndim == 2 and np.asarray(data).shape[0] > 1)
+        )
+        primary_radial_velocity_mode = "orbital" if primary_is_timeseries else "none"
+        primary_likelihood_kind = "matched_filter" if primary_is_timeseries else "gaussian"
+        primary_subtract_mean = config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT if primary_is_timeseries else False
+
+        primary_component = _build_primary_spectroscopic_component(
+            name="spectroscopy",
+            mode=mode,
+            wav_obs=wav_obs,
+            data=data,
+            sigma=sigma,
+            phase=phase,
+            U_sysrem=U_sysrem,
+            invvar_spec=invvar_spec,
+            instrument_resolution=Rinst,
+            nu_grid=nu_grid,
+            inst_nus=inst_nus,
+            sop_rot=sop_rot,
+            sop_inst=sop_inst,
+            opa_cias=opa_cias,
+            opa_mols=opa_mols,
+            opa_atoms=opa_atoms,
+            region_name=region_name,
+            Tstar=model_params["T_star"],
+            phase_mode=phase_mode,
+            apply_sysrem=apply_sysrem,
+            radial_velocity_mode=primary_radial_velocity_mode,
+            likelihood_kind=primary_likelihood_kind,
+            subtract_per_exposure_mean=primary_subtract_mean,
+        )
+        observation_configs: list[object] = [primary_component.observation_config]
+        observations_payload: dict[str, object] = {
+            primary_component.name: primary_component.observation_inputs
+        }
+
+        auxiliary_components: list[SpectroscopicComponentBundle] = []
+        if joint_spectra:
+            for spec in joint_spectra:
+                component = _load_joint_spectroscopic_component(
+                    spec,
+                    mode=mode,
+                    region_name=region_name,
+                    default_tstar=model_params["T_star"],
+                )
+                if component.name in observations_payload:
+                    raise ValueError(f"Duplicate joint component name: {component.name}")
+                auxiliary_components.append(component)
+                observation_configs.append(component.observation_config)
+                observations_payload[component.name] = component.observation_inputs
+
+        scalar_constraints: list[BandpassConstraintBundle] = []
+        if bandpass_constraints:
+            for spec in bandpass_constraints:
+                component = _load_bandpass_constraint(
+                    spec,
+                    mode=mode,
+                    region_name=region_name,
+                    default_tstar=model_params["T_star"],
+                )
+                if component.name in observations_payload:
+                    raise ValueError(f"Duplicate joint component name: {component.name}")
+                scalar_constraints.append(component)
+                observation_configs.append(component.observation_config)
+                observations_payload[component.name] = component.observation_inputs
+
+        joint_model = create_joint_retrieval_model(
+            shared_system=shared_system,
+            atmosphere_regions=(atmosphere_region,),
+            observations=tuple(observation_configs),
+        )
+        model_c = _bind_observations_to_model(joint_model, observations_payload)
+
+        component_names = [primary_component.name]
+        component_names.extend(component.name for component in auxiliary_components)
+        component_names.extend(component.name for component in scalar_constraints)
+        print(
+            f"  Joint model created with {len(component_names)} component(s): "
+            f"{', '.join(component_names)}"
+        )
 
     # Run inference
     print("\n[7/7] Running Bayesian inference...")
@@ -782,11 +1256,11 @@ def run_retrieval(
             svi_params, svi_losses, init_strategy, _, svi_guide = run_svi(
                 model_c,
                 rng_key_,
-                data=data_jnp,
-                sigma=sigma_jnp,
-                phase=phase_jnp,
-                U=U_jnp,
-                invvar_spec=invvar_spec_jnp,
+                data=jnp.array(data),
+                sigma=jnp.array(sigma),
+                phase=jnp.array(phase),
+                U=None if U_sysrem is None else jnp.array(U_sysrem),
+                invvar_spec=None if invvar_spec is None else jnp.array(invvar_spec),
                 Mp_mean=model_params["M_p"],
                 Mp_std=model_params["M_p_err"],
                 Rstar_mean=model_params["R_star"],
@@ -898,11 +1372,11 @@ def run_retrieval(
         rng_key, rng_key_ = random.split(rng_key)
         mcmc.run(
             rng_key_,
-            data=data_jnp,
-            sigma=sigma_jnp,
-            phase=phase_jnp,
-            U=U_jnp,
-            invvar_spec=invvar_spec_jnp,
+            data=jnp.array(data),
+            sigma=jnp.array(sigma),
+            phase=jnp.array(phase),
+            U=None if U_sysrem is None else jnp.array(U_sysrem),
+            invvar_spec=None if invvar_spec is None else jnp.array(invvar_spec),
         )
     
     mcmc.print_summary()

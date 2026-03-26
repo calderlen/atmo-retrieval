@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import importlib
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Literal
+from typing import Callable, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +18,10 @@ PhaseMode = Literal["global", "per_exposure", "linear"]
 PTProfileMode = Literal[
     "guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline", "gp"
 ]
+AtmosphereRegionName = Literal["terminator", "dayside"]
+RVBehavior = Literal["orbital", "none"]
+SpectroscopicLikelihood = Literal["matched_filter", "gaussian"]
+BandpassObservable = Literal["flux_ratio", "eclipse_depth", "radius_ratio", "transit_depth"]
 
 import config
 
@@ -46,32 +51,7 @@ CIA_COLLISION_PAIRS: tuple[tuple[str, str, str], ...] = (
 
 
 @dataclass(frozen=True)
-class RetrievalModelConfig:
-    mode: RetrievalMode
-    art: object
-    opa_mols: dict[str, OpaPremodit]
-    opa_atoms: dict[str, OpaPremodit]
-    opa_cias: dict[str, OpaCIA]
-    nu_grid: jnp.ndarray
-    sop_rot: SopRotation
-    sop_inst: SopInstProfile
-    inst_nus: jnp.ndarray
-    pt_profile: PTProfileMode
-    T_low: float
-    T_high: float
-    Tirr_std: float | None
-    Tint_fixed: float
-    kappa_ir_cgs_bounds: tuple[float, float]
-    gamma_bounds: tuple[float, float]
-    phase_mode: PhaseMode
-    subtract_per_exposure_mean: bool
-    apply_sysrem: bool
-    composition_solver: CompositionSolver
-    beta_inst: float
-    mol_names: tuple[str, ...]
-    atom_names: tuple[str, ...]
-    mol_masses: jnp.ndarray
-    atom_masses: jnp.ndarray
+class SharedSystemConfig:
     Kp_mean: float
     Kp_std: float
     Vsys_mean: float
@@ -82,9 +62,126 @@ class RetrievalModelConfig:
     Mp_std: float
     Rstar_mean: float
     Rstar_std: float
-    Tstar: float | None
-    Tirr_mean: float | None
     period_day: float
+
+
+@dataclass(frozen=True)
+class AtmosphereRegionConfig:
+    name: str
+    art: object
+    pt_profile: PTProfileMode
+    T_low: float
+    T_high: float
+    Tirr_std: float | None
+    Tint_fixed: float
+    kappa_ir_cgs_bounds: tuple[float, float]
+    gamma_bounds: tuple[float, float]
+    composition_solver: CompositionSolver
+    mol_names: tuple[str, ...]
+    atom_names: tuple[str, ...]
+    mol_masses: jnp.ndarray
+    atom_masses: jnp.ndarray
+    Tirr_mean: float | None
+    sample_prefix: str | None = None
+
+
+@dataclass(frozen=True)
+class SpectroscopicObservationConfig:
+    name: str
+    region_name: str
+    mode: RetrievalMode
+    opa_mols: dict[str, OpaPremodit]
+    opa_atoms: dict[str, OpaPremodit]
+    opa_cias: dict[str, OpaCIA]
+    nu_grid: jnp.ndarray
+    sop_rot: SopRotation
+    sop_inst: SopInstProfile
+    inst_nus: jnp.ndarray
+    beta_inst: float
+    radial_velocity_mode: RVBehavior
+    phase_mode: PhaseMode | None
+    likelihood_kind: SpectroscopicLikelihood
+    subtract_per_exposure_mean: bool
+    apply_sysrem: bool
+    Tstar: float | None
+    sample_prefix: str | None = None
+
+
+@dataclass(frozen=True)
+class BandpassObservationConfig:
+    name: str
+    region_name: str
+    mode: RetrievalMode
+    opa_mols: dict[str, OpaPremodit]
+    opa_atoms: dict[str, OpaPremodit]
+    opa_cias: dict[str, OpaCIA]
+    nu_grid: jnp.ndarray
+    wavelength_m: jnp.ndarray
+    response: jnp.ndarray
+    observable: BandpassObservable
+    photon_weighted: bool
+    Tstar: float | None
+    sample_prefix: str | None = None
+
+
+ObservationConfig = SpectroscopicObservationConfig | BandpassObservationConfig
+
+
+@dataclass(frozen=True)
+class JointRetrievalModelConfig:
+    shared_system: SharedSystemConfig
+    atmosphere_regions: tuple[AtmosphereRegionConfig, ...]
+    observations: tuple[ObservationConfig, ...]
+
+
+@dataclass(frozen=True)
+class RetrievalModelConfig:
+    shared_system: SharedSystemConfig
+    atmosphere_region: AtmosphereRegionConfig
+    observation: SpectroscopicObservationConfig
+
+    def as_joint_config(self) -> JointRetrievalModelConfig:
+        return JointRetrievalModelConfig(
+            shared_system=self.shared_system,
+            atmosphere_regions=(self.atmosphere_region,),
+            observations=(self.observation,),
+        )
+
+
+class SharedSystemState(NamedTuple):
+    Kp: jnp.ndarray
+    Vsys: jnp.ndarray
+    Mp: jnp.ndarray
+    Rstar: jnp.ndarray
+    Rp: jnp.ndarray
+    g_ref: jnp.ndarray
+
+
+class AtmosphereState(NamedTuple):
+    art: object
+    Tarr: jnp.ndarray
+    g_profile: jnp.ndarray
+    mmw_profile: jnp.ndarray
+    mmr_mols: dict[str, jnp.ndarray]
+    mmr_atoms: dict[str, jnp.ndarray]
+    vmrH2_profile: jnp.ndarray
+    vmrHe_profile: jnp.ndarray
+
+
+class SpectroscopicObservationInputs(NamedTuple):
+    data: jnp.ndarray
+    sigma: jnp.ndarray
+    phase: jnp.ndarray | None = None
+    U: jnp.ndarray | None = None
+    invvar_spec: jnp.ndarray | None = None
+
+
+class BandpassObservationInputs(NamedTuple):
+    value: jnp.ndarray
+    sigma: jnp.ndarray
+
+
+ObservationInputs = SpectroscopicObservationInputs | BandpassObservationInputs
 
 
 def _get_piBarr():
@@ -94,6 +191,42 @@ def _get_piBarr():
 
 def _element_from_species(species_name: str) -> str:
     return species_name.split()[0]
+
+
+def _numpyro_scope(prefix: str | None):
+    if prefix is None:
+        return nullcontext()
+    return numpyro.handlers.scope(prefix=prefix)
+
+
+def _sanitize_site_name(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in name)
+    cleaned = cleaned.strip("_")
+    return cleaned or "component"
+
+
+def _default_region_name_for_mode(mode: RetrievalMode) -> AtmosphereRegionName:
+    if mode == "transmission":
+        return "terminator"
+    return "dayside"
+
+
+def _effective_scope_prefix(
+    explicit_prefix: str | None,
+    fallback_name: str,
+    *,
+    enable_fallback: bool,
+) -> str | None:
+    if explicit_prefix is not None:
+        return explicit_prefix
+    if enable_fallback:
+        return _sanitize_site_name(fallback_name)
+    return None
+
+
+def _trapz_jax(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+    dx = x[1:] - x[:-1]
+    return jnp.sum(0.5 * (y[1:] + y[:-1]) * dx)
 
 
 def planet_rv_kms(
@@ -254,6 +387,7 @@ def _sum_opacity_terms(
     for dtau_term in opacity_terms.values():
         dtau = dtau + dtau_term
     return dtau
+
 
 def compute_opacity(
     art: object,
@@ -561,66 +695,66 @@ def _sample_phase_dependent_velocity_offset(
 
 
 def _sample_temperature_profile(
-    model_config: RetrievalModelConfig,
+    region_config: AtmosphereRegionConfig,
     g_ref: float | jnp.ndarray,
 ) -> jnp.ndarray:
-    art = model_config.art
-    pt_profile = model_config.pt_profile
+    art = region_config.art
+    pt_profile = region_config.pt_profile
 
     if pt_profile == "guillot":
-        if (model_config.Tirr_mean is not None) and (model_config.Tirr_std is not None):
+        if (region_config.Tirr_mean is not None) and (region_config.Tirr_std is not None):
             Tirr = numpyro.sample(
                 "Tirr",
-                dist.TruncatedNormal(model_config.Tirr_mean, model_config.Tirr_std, low=0.0),
+                dist.TruncatedNormal(region_config.Tirr_mean, region_config.Tirr_std, low=0.0),
             )
         else:
-            Tirr = numpyro.sample("Tirr", dist.Uniform(model_config.T_low, model_config.T_high))
+            Tirr = numpyro.sample("Tirr", dist.Uniform(region_config.T_low, region_config.T_high))
 
         kappa_ir_cgs = numpyro.sample(
             "kappa_ir_cgs",
-            dist.LogUniform(*model_config.kappa_ir_cgs_bounds),
+            dist.LogUniform(*region_config.kappa_ir_cgs_bounds),
         )
-        gamma = numpyro.sample("gamma", dist.LogUniform(*model_config.gamma_bounds))
+        gamma = numpyro.sample("gamma", dist.LogUniform(*region_config.gamma_bounds))
 
         return guillot_profile(
             pressure_bar=art.pressure,
             g_cgs=g_ref,
             Tirr=Tirr,
-            Tint=model_config.Tint_fixed,
+            Tint=region_config.Tint_fixed,
             kappa_ir_cgs=kappa_ir_cgs,
             gamma=gamma,
         )
 
     if pt_profile == "isothermal":
-        T0 = numpyro.sample("T0", dist.Uniform(model_config.T_low, model_config.T_high))
+        T0 = numpyro.sample("T0", dist.Uniform(region_config.T_low, region_config.T_high))
         return T0 * jnp.ones_like(art.pressure)
 
     if pt_profile == "gradient":
-        return numpyro_gradient(art, model_config.T_low, model_config.T_high)
+        return numpyro_gradient(art, region_config.T_low, region_config.T_high)
 
     if pt_profile == "madhu_seager":
-        return numpyro_madhu_seager(art, model_config.T_low, model_config.T_high)
+        return numpyro_madhu_seager(art, region_config.T_low, region_config.T_high)
 
     if pt_profile == "free":
         return numpyro_free_temperature(
             art,
             n_layers=5,
-            T_low=model_config.T_low,
-            T_high=model_config.T_high,
+            T_low=region_config.T_low,
+            T_high=region_config.T_high,
         )
 
     if pt_profile == "pspline":
         return numpyro_pspline_knots_on_art_grid(
             art,
-            T_low=model_config.T_low,
-            T_high=model_config.T_high,
+            T_low=region_config.T_low,
+            T_high=region_config.T_high,
         )
 
     if pt_profile == "gp":
         return numpyro_gp_temperature(
             art,
-            T_low=model_config.T_low,
-            T_high=model_config.T_high,
+            T_low=region_config.T_low,
+            T_high=region_config.T_high,
         )
 
     raise ValueError(f"Unknown P-T profile: {pt_profile}")
@@ -706,6 +840,427 @@ def _lnL_exposure(
     return -0.5 * (chi2_i + norm_i)
 
 
+def _normalize_spectroscopic_observation_inputs(
+    inputs: SpectroscopicObservationInputs,
+) -> SpectroscopicObservationInputs:
+    data = jnp.asarray(inputs.data)
+    sigma = jnp.asarray(inputs.sigma)
+    phase = None if inputs.phase is None else jnp.asarray(inputs.phase)
+    U = None if inputs.U is None else jnp.asarray(inputs.U)
+    invvar_spec = None if inputs.invvar_spec is None else jnp.asarray(inputs.invvar_spec)
+
+    if data.ndim == 1:
+        data = data[None, :]
+        sigma = sigma[None, :]
+
+    if sigma.shape != data.shape:
+        raise ValueError(f"sigma shape {sigma.shape} does not match data shape {data.shape}")
+    if phase is None:
+        phase = jnp.zeros((data.shape[0],), dtype=data.dtype)
+    if phase.ndim != 1:
+        raise ValueError(f"phase has invalid ndim={phase.ndim} (expected 1)")
+    if phase.shape[0] != data.shape[0]:
+        raise ValueError(
+            f"phase length {phase.shape[0]} does not match number of exposures {data.shape[0]}"
+        )
+
+    return SpectroscopicObservationInputs(
+        data=data,
+        sigma=sigma,
+        phase=phase,
+        U=U,
+        invvar_spec=invvar_spec,
+    )
+
+
+def _normalize_bandpass_observation_inputs(
+    inputs: BandpassObservationInputs,
+) -> BandpassObservationInputs:
+    value = jnp.asarray(inputs.value)
+    sigma = jnp.asarray(inputs.sigma)
+    if value.ndim != 0:
+        raise ValueError(f"bandpass value must be scalar; got shape {value.shape}")
+    if sigma.ndim != 0:
+        raise ValueError(f"bandpass sigma must be scalar; got shape {sigma.shape}")
+    return BandpassObservationInputs(value=value, sigma=sigma)
+
+
+def _sample_shared_system_state(
+    shared_config: SharedSystemConfig,
+) -> SharedSystemState:
+    Kp = numpyro.sample("Kp", dist.TruncatedNormal(shared_config.Kp_mean, shared_config.Kp_std, low=0.0))
+    Vsys = numpyro.sample("Vsys", dist.Normal(shared_config.Vsys_mean, shared_config.Vsys_std))
+    Mp = numpyro.sample("Mp", dist.TruncatedNormal(shared_config.Mp_mean, shared_config.Mp_std, low=0.0)) * MJ
+    Rstar = numpyro.sample(
+        "Rstar",
+        dist.TruncatedNormal(shared_config.Rstar_mean, shared_config.Rstar_std, low=0.0),
+    ) * Rs
+    Rp = numpyro.sample("Rp", dist.TruncatedNormal(shared_config.Rp_mean, shared_config.Rp_std, low=0.0)) * RJ
+    g_ref = gravity_surface(Rp / RJ, Mp / MJ)
+
+    return SharedSystemState(
+        Kp=Kp,
+        Vsys=Vsys,
+        Mp=Mp,
+        Rstar=Rstar,
+        Rp=Rp,
+        g_ref=g_ref,
+    )
+
+
+def _sample_atmosphere_state(
+    region_config: AtmosphereRegionConfig,
+    shared_state: SharedSystemState,
+    *,
+    scope_prefix: str | None = None,
+) -> AtmosphereState:
+    with _numpyro_scope(scope_prefix):
+        Tarr = _sample_temperature_profile(region_config, shared_state.g_ref)
+        comp = region_config.composition_solver.sample(
+            region_config.mol_names,
+            region_config.mol_masses,
+            region_config.atom_names,
+            region_config.atom_masses,
+            region_config.art,
+            Tarr=Tarr,
+        )
+
+    g_profile = region_config.art.gravity_profile(
+        Tarr,
+        comp.mmw_profile,
+        shared_state.Rp,
+        shared_state.g_ref,
+    )
+    mmr_mols = {
+        mol: comp.mmr_mols[i] for i, mol in enumerate(region_config.mol_names)
+    }
+    mmr_atoms = {
+        atom: comp.mmr_atoms[i] for i, atom in enumerate(region_config.atom_names)
+    }
+
+    return AtmosphereState(
+        art=region_config.art,
+        Tarr=Tarr,
+        g_profile=g_profile,
+        mmw_profile=comp.mmw_profile,
+        mmr_mols=mmr_mols,
+        mmr_atoms=mmr_atoms,
+        vmrH2_profile=comp.vmrH2_profile,
+        vmrHe_profile=comp.vmrHe_profile,
+    )
+
+
+def _compute_component_dtau(
+    component_config: ObservationConfig,
+    atmosphere_state: AtmosphereState,
+) -> jnp.ndarray:
+    return compute_opacity(
+        art=atmosphere_state.art,
+        opa_mols=component_config.opa_mols,
+        opa_atoms=component_config.opa_atoms,
+        opa_cias=component_config.opa_cias,
+        nu_grid=component_config.nu_grid,
+        Tarr=atmosphere_state.Tarr,
+        mmr_mols=atmosphere_state.mmr_mols,
+        mmr_atoms=atmosphere_state.mmr_atoms,
+        vmrH2_profile=atmosphere_state.vmrH2_profile,
+        vmrHe_profile=atmosphere_state.vmrHe_profile,
+        mmw_profile=atmosphere_state.mmw_profile,
+        g=atmosphere_state.g_profile,
+    )
+
+
+def _sample_component_velocity_offset(
+    component_config: SpectroscopicObservationConfig,
+    phase: jnp.ndarray,
+    *,
+    scope_prefix: str | None = None,
+) -> jnp.ndarray:
+    if component_config.radial_velocity_mode == "none":
+        return jnp.zeros_like(phase)
+    if component_config.phase_mode is None:
+        return jnp.zeros_like(phase)
+
+    with _numpyro_scope(scope_prefix):
+        dRV = _sample_phase_dependent_velocity_offset(
+            component_config.phase_mode,
+            phase,
+        )
+        numpyro.deterministic("dRV_kms", dRV)
+        return dRV
+
+
+def _compute_native_observable_spectrum(
+    *,
+    mode: RetrievalMode,
+    art: object,
+    dtau: jnp.ndarray,
+    Tarr: jnp.ndarray,
+    mmw_profile: jnp.ndarray,
+    Rp: float | jnp.ndarray,
+    Rstar: float | jnp.ndarray,
+    g_ref: float | jnp.ndarray,
+    nu_grid: jnp.ndarray,
+    Tstar: float | None = None,
+) -> jnp.ndarray:
+    rt = art.run(dtau, Tarr, mmw_profile, Rp, g_ref)
+
+    if mode == "transmission":
+        return jnp.sqrt(rt) * (Rp / Rstar)
+
+    if Tstar is None:
+        raise ValueError("Tstar is required for emission mode.")
+
+    piBarr = _get_piBarr()
+    Fs = piBarr(nu_grid, Tstar)
+    return rt / jnp.clip(Fs, EPS, None) * (Rp / Rstar) ** 2
+
+
+def _gaussian_log_likelihood(
+    data: jnp.ndarray,
+    model: jnp.ndarray,
+    sigma: jnp.ndarray,
+) -> jnp.ndarray:
+    var = jnp.clip(sigma, EPS, None) ** 2
+    return -0.5 * jnp.sum(((data - model) ** 2) / var + jnp.log(2.0 * jnp.pi * var))
+
+
+def _bandpass_weighted_mean(
+    spectrum: jnp.ndarray,
+    nu_grid: jnp.ndarray,
+    wavelength_m: jnp.ndarray,
+    response: jnp.ndarray,
+    *,
+    photon_weighted: bool,
+) -> jnp.ndarray:
+    model_wavelength_m = 1.0e-2 / jnp.clip(nu_grid, EPS, None)
+
+    model_sort_idx = jnp.argsort(model_wavelength_m)
+    wl_model = model_wavelength_m[model_sort_idx]
+    spec_sorted = spectrum[model_sort_idx]
+
+    band_sort_idx = jnp.argsort(wavelength_m)
+    wl_band = wavelength_m[band_sort_idx]
+    rsp_band = response[band_sort_idx]
+
+    rsp_interp = jnp.interp(wl_model, wl_band, rsp_band, left=0.0, right=0.0)
+    weights = rsp_interp * wl_model if photon_weighted else rsp_interp
+    norm = _trapz_jax(wl_model, weights)
+    return _trapz_jax(wl_model, spec_sorted * weights) / jnp.clip(norm, EPS, None)
+
+
+def _transform_bandpass_observable(
+    spectrum: jnp.ndarray,
+    observable: BandpassObservable,
+) -> jnp.ndarray:
+    if observable in {"flux_ratio", "eclipse_depth", "radius_ratio"}:
+        return spectrum
+    if observable == "transit_depth":
+        return spectrum**2
+    raise ValueError(f"Unknown bandpass observable: {observable}")
+
+
+def _evaluate_spectroscopic_component(
+    component_config: SpectroscopicObservationConfig,
+    observation_inputs: SpectroscopicObservationInputs,
+    shared_config: SharedSystemConfig,
+    shared_state: SharedSystemState,
+    atmosphere_state: AtmosphereState,
+    *,
+    scope_prefix: str | None = None,
+) -> jnp.ndarray:
+    dtau = _compute_component_dtau(component_config, atmosphere_state)
+    dRV = _sample_component_velocity_offset(
+        component_config,
+        observation_inputs.phase,
+        scope_prefix=scope_prefix,
+    )
+
+    if component_config.radial_velocity_mode == "none":
+        phase = jnp.zeros_like(observation_inputs.phase)
+        Kp = jnp.asarray(0.0)
+        Vsys = jnp.asarray(0.0)
+    else:
+        phase = observation_inputs.phase
+        Kp = shared_state.Kp
+        Vsys = shared_state.Vsys
+
+    model_ts = compute_model_timeseries(
+        mode=component_config.mode,
+        art=atmosphere_state.art,
+        dtau=dtau,
+        Tarr=atmosphere_state.Tarr,
+        mmw_profile=atmosphere_state.mmw_profile,
+        Rp=shared_state.Rp,
+        Rstar=shared_state.Rstar,
+        g_ref=shared_state.g_ref,
+        phase=phase,
+        Kp=Kp,
+        Vsys=Vsys,
+        dRV=dRV,
+        sop_rot=component_config.sop_rot,
+        sop_inst=component_config.sop_inst,
+        inst_nus=component_config.inst_nus,
+        nu_grid=component_config.nu_grid,
+        beta_inst=component_config.beta_inst,
+        period_day=shared_config.period_day,
+        Tstar=component_config.Tstar,
+    )
+    model_ts = apply_model_pipeline_corrections(
+        model_ts,
+        subtract_per_exposure_mean=component_config.subtract_per_exposure_mean,
+        apply_sysrem=component_config.apply_sysrem,
+        U=observation_inputs.U,
+        invvar_spec=observation_inputs.invvar_spec,
+    )
+
+    if component_config.likelihood_kind == "gaussian":
+        return _gaussian_log_likelihood(
+            observation_inputs.data,
+            model_ts,
+            observation_inputs.sigma,
+        )
+    if component_config.likelihood_kind != "matched_filter":
+        raise ValueError(f"Unknown spectroscopic likelihood kind: {component_config.likelihood_kind}")
+
+    w_ij = 1.0 / jnp.clip(observation_inputs.sigma, EPS, None) ** 2
+    return jnp.sum(jax.vmap(_lnL_exposure)(observation_inputs.data, model_ts, w_ij))
+
+
+def _evaluate_bandpass_component(
+    component_config: BandpassObservationConfig,
+    observation_inputs: BandpassObservationInputs,
+    shared_state: SharedSystemState,
+    atmosphere_state: AtmosphereState,
+) -> jnp.ndarray:
+    dtau = _compute_component_dtau(component_config, atmosphere_state)
+    spectrum = _compute_native_observable_spectrum(
+        mode=component_config.mode,
+        art=atmosphere_state.art,
+        dtau=dtau,
+        Tarr=atmosphere_state.Tarr,
+        mmw_profile=atmosphere_state.mmw_profile,
+        Rp=shared_state.Rp,
+        Rstar=shared_state.Rstar,
+        g_ref=shared_state.g_ref,
+        nu_grid=component_config.nu_grid,
+        Tstar=component_config.Tstar,
+    )
+    observable_spectrum = _transform_bandpass_observable(
+        spectrum,
+        component_config.observable,
+    )
+    model_value = _bandpass_weighted_mean(
+        observable_spectrum,
+        component_config.nu_grid,
+        component_config.wavelength_m,
+        component_config.response,
+        photon_weighted=component_config.photon_weighted,
+    )
+    numpyro.deterministic(
+        f"{_sanitize_site_name(component_config.name)}_model",
+        model_value,
+    )
+    return _gaussian_log_likelihood(
+        observation_inputs.value,
+        model_value,
+        observation_inputs.sigma,
+    )
+
+
+def joint_retrieval_model(
+    model_config: JointRetrievalModelConfig,
+    observations: dict[str, ObservationInputs],
+) -> None:
+    multi_region = len(model_config.atmosphere_regions) > 1
+    multi_observation = len(model_config.observations) > 1
+    shared_state = _sample_shared_system_state(model_config.shared_system)
+    region_states = {
+        region_config.name: _sample_atmosphere_state(
+            region_config,
+            shared_state,
+            scope_prefix=_effective_scope_prefix(
+                region_config.sample_prefix,
+                region_config.name,
+                enable_fallback=multi_region,
+            ),
+        )
+        for region_config in model_config.atmosphere_regions
+    }
+
+    total_lnL = 0.0
+    for component_config in model_config.observations:
+        if component_config.name not in observations:
+            raise KeyError(f"Missing observation inputs for component '{component_config.name}'")
+        if component_config.region_name not in region_states:
+            raise KeyError(
+                f"Observation component '{component_config.name}' references unknown "
+                f"atmosphere region '{component_config.region_name}'"
+            )
+
+        component_input = observations[component_config.name]
+        if isinstance(component_config, SpectroscopicObservationConfig):
+            if not isinstance(component_input, SpectroscopicObservationInputs):
+                raise TypeError(
+                    f"Observation '{component_config.name}' expects SpectroscopicObservationInputs."
+                )
+            component_inputs = _normalize_spectroscopic_observation_inputs(component_input)
+            component_lnL = _evaluate_spectroscopic_component(
+                component_config,
+                component_inputs,
+                model_config.shared_system,
+                shared_state,
+                region_states[component_config.region_name],
+                scope_prefix=_effective_scope_prefix(
+                    component_config.sample_prefix,
+                    component_config.name,
+                    enable_fallback=multi_observation,
+                ),
+            )
+        elif isinstance(component_config, BandpassObservationConfig):
+            if not isinstance(component_input, BandpassObservationInputs):
+                raise TypeError(
+                    f"Observation '{component_config.name}' expects BandpassObservationInputs."
+                )
+            component_inputs = _normalize_bandpass_observation_inputs(component_input)
+            component_lnL = _evaluate_bandpass_component(
+                component_config,
+                component_inputs,
+                shared_state,
+                region_states[component_config.region_name],
+            )
+        else:
+            raise TypeError(f"Unsupported observation config type: {type(component_config)!r}")
+
+        total_lnL = total_lnL + component_lnL
+
+        if multi_observation:
+            numpyro.deterministic(
+                f"logL_{_sanitize_site_name(component_config.name)}",
+                component_lnL,
+            )
+
+    numpyro.factor("logL", total_lnL)
+    numpyro.deterministic("Kp_kms", shared_state.Kp)
+    numpyro.deterministic("Vsys_kms", shared_state.Vsys)
+    numpyro.deterministic("vsini_kms", 2.0 * jnp.pi * shared_state.Rp / (model_config.shared_system.period_day * 86400.0) / 1.0e5,
+    )
+
+
+def create_joint_retrieval_model(
+    *,
+    shared_system: SharedSystemConfig,
+    atmosphere_regions: tuple[AtmosphereRegionConfig, ...],
+    observations: tuple[ObservationConfig, ...],
+) -> Callable:
+    model_config = JointRetrievalModelConfig(
+        shared_system=shared_system,
+        atmosphere_regions=tuple(atmosphere_regions),
+        observations=tuple(observations),
+    )
+    return partial(joint_retrieval_model, model_config)
+
+
 def retrieval_model(
     model_config: RetrievalModelConfig,
     data: jnp.ndarray,
@@ -714,114 +1269,235 @@ def retrieval_model(
     U: jnp.ndarray | None = None,
     invvar_spec: jnp.ndarray | None = None,
 ) -> None:
-    data = jnp.asarray(data)
-    sigma = jnp.asarray(sigma)
-    phase = jnp.asarray(phase)
-    U = None if U is None else jnp.asarray(U)
-    invvar_spec = None if invvar_spec is None else jnp.asarray(invvar_spec)
-
-    # 1. System parameters
-    Kp = numpyro.sample("Kp", dist.TruncatedNormal(model_config.Kp_mean, model_config.Kp_std, low=0.0))
-    Vsys = numpyro.sample("Vsys", dist.Normal(model_config.Vsys_mean, model_config.Vsys_std))
-    dRV = _sample_phase_dependent_velocity_offset(model_config.phase_mode, phase)
-
-    Mp = numpyro.sample("Mp", dist.TruncatedNormal(model_config.Mp_mean, model_config.Mp_std, low=0.0)) * MJ
-    Rstar = numpyro.sample(
-        "Rstar",
-        dist.TruncatedNormal(model_config.Rstar_mean, model_config.Rstar_std, low=0.0),
-    ) * Rs
-    Rp = numpyro.sample("Rp", dist.TruncatedNormal(model_config.Rp_mean, model_config.Rp_std, low=0.0)) * RJ
-
-    # 2. Gravity and temperature
-    g_ref = gravity_surface(Rp / RJ, Mp / MJ)
-    Tarr = _sample_temperature_profile(model_config, g_ref)
-
-    # 3. Composition (sample VMR, convert to MMR for opacity calculations)
-    comp = model_config.composition_solver.sample(
-        model_config.mol_names,
-        model_config.mol_masses,
-        model_config.atom_names,
-        model_config.atom_masses,
-        model_config.art,
-        Tarr=Tarr,
-    )
-    mmr_mols = comp.mmr_mols
-    mmr_atoms = comp.mmr_atoms
-    vmrH2_profile = comp.vmrH2_profile
-    vmrHe_profile = comp.vmrHe_profile
-    mmw_profile = comp.mmw_profile
-
-    g = model_config.art.gravity_profile(Tarr, mmw_profile, Rp, g_ref)
-
-    # 4. Opacity calculation
-    if data.ndim == 1:
-        data = data[None, :]
-        sigma = sigma[None, :]
-
-    mmr_mol_profiles = {
-        mol: mmr_mols[i] for i, mol in enumerate(model_config.mol_names)
+    observation_inputs = {
+        model_config.observation.name: SpectroscopicObservationInputs(
+            data=jnp.asarray(data),
+            sigma=jnp.asarray(sigma),
+            phase=jnp.asarray(phase),
+            U=None if U is None else jnp.asarray(U),
+            invvar_spec=None if invvar_spec is None else jnp.asarray(invvar_spec),
+        )
     }
-    mmr_atom_profiles = {
-        atom: mmr_atoms[i] for i, atom in enumerate(model_config.atom_names)
-    }
-
-    dtau = compute_opacity(
-        art=model_config.art,
-        opa_mols=model_config.opa_mols,
-        opa_atoms=model_config.opa_atoms,
-        opa_cias=model_config.opa_cias,
-        nu_grid=model_config.nu_grid,
-        Tarr=Tarr,
-        mmr_mols=mmr_mol_profiles,
-        mmr_atoms=mmr_atom_profiles,
-        vmrH2_profile=vmrH2_profile,
-        vmrHe_profile=vmrHe_profile,
-        mmw_profile=mmw_profile,
-        g=g,
+    joint_retrieval_model(
+        model_config.as_joint_config(),
+        observation_inputs,
     )
 
-    # 5. Generate model observable
-    model_ts = compute_model_timeseries(
-        mode=model_config.mode,
-        art=model_config.art,
-        dtau=dtau,
-        Tarr=Tarr,
-        mmw_profile=mmw_profile,
-        Rp=Rp,
-        Rstar=Rstar,
-        g_ref=g_ref,
-        phase=phase,
-        Kp=Kp,
-        Vsys=Vsys,
-        dRV=dRV,
-        sop_rot=model_config.sop_rot,
-        sop_inst=model_config.sop_inst,
-        inst_nus=model_config.inst_nus,
-        nu_grid=model_config.nu_grid,
-        beta_inst=model_config.beta_inst,
-        period_day=model_config.period_day,
-        Tstar=model_config.Tstar,
-    )
-    model_ts = apply_model_pipeline_corrections(
-        model_ts,
-        subtract_per_exposure_mean=model_config.subtract_per_exposure_mean,
-        apply_sysrem=model_config.apply_sysrem,
-        U=U,
-        invvar_spec=invvar_spec,
+
+def build_shared_system_config(
+    *,
+    params: dict,
+) -> SharedSystemConfig:
+    return SharedSystemConfig(
+        Kp_mean=params["Kp"],
+        Kp_std=params["Kp_err"],
+        Vsys_mean=params["RV_abs"],
+        Vsys_std=params["RV_abs_err"],
+        Rp_mean=params["R_p"],
+        Rp_std=params["R_p_err"],
+        Mp_mean=params["M_p"],
+        Mp_std=params["M_p_err"],
+        Rstar_mean=params["R_star"],
+        Rstar_std=params["R_star_err"],
+        period_day=params["period"],
     )
 
-    # 6. Log-likelihood (CCF-equivalent matched filter)
-    w_ij = 1.0 / jnp.clip(sigma, EPS, None) ** 2
-    lnL = jnp.sum(jax.vmap(_lnL_exposure)(data, model_ts, w_ij))
-    numpyro.factor("logL", lnL)
 
-    # Deterministics for tracking
-    numpyro.deterministic("Kp_kms", Kp)
-    numpyro.deterministic("Vsys_kms", Vsys)
-    numpyro.deterministic("dRV_kms", dRV)
-    numpyro.deterministic(
-        "vsini_kms",
-        2.0 * jnp.pi * Rp / (model_config.period_day * 86400.0) / 1.0e5,
+def _build_species_metadata(
+    opa_mols: dict[str, OpaPremodit],
+    opa_atoms: dict[str, OpaPremodit],
+) -> tuple[tuple[str, ...], tuple[str, ...], jnp.ndarray, jnp.ndarray]:
+    mol_names = tuple(opa_mols.keys())
+    atom_names = tuple(opa_atoms.keys())
+    mol_masses = jnp.array(
+        [molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names]
+    )
+    if atom_names:
+        atom_masses = jnp.array(
+            [molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names]
+        )
+    else:
+        atom_masses = jnp.zeros((0,))
+    return mol_names, atom_names, mol_masses, atom_masses
+
+
+def build_atmosphere_region_config(
+    *,
+    mode: RetrievalMode,
+    params: dict,
+    art: object,
+    opa_mols: dict[str, OpaPremodit],
+    opa_atoms: dict[str, OpaPremodit],
+    pt_profile: PTProfileMode = config.PT_PROFILE_DEFAULT,
+    T_low: float | None = None,
+    T_high: float | None = None,
+    Tirr_std: float | None = None,
+    Tint_fixed: float | None = None,
+    kappa_ir_cgs_bounds: tuple[float, float] | None = None,
+    gamma_bounds: tuple[float, float] | None = None,
+    composition_solver: CompositionSolver | None = None,
+    name: str | None = None,
+    sample_prefix: str | None = None,
+) -> AtmosphereRegionConfig:
+    if T_low is None:
+        T_low = config.T_LOW
+    if T_high is None:
+        T_high = config.T_HIGH
+    if Tint_fixed is None:
+        Tint_fixed = config.TINT_FIXED
+    if kappa_ir_cgs_bounds is None:
+        kappa_ir_cgs_bounds = tuple(
+            float(10.0**bound) for bound in config.LOG_KAPPA_IR_BOUNDS
+        )
+    if gamma_bounds is None:
+        gamma_bounds = tuple(float(10.0**bound) for bound in config.LOG_GAMMA_BOUNDS)
+    if composition_solver is None:
+        composition_solver = ConstantVMR()
+
+    Tirr_mean = params.get("T_eq")
+    if Tirr_mean is not None and (Tirr_mean != Tirr_mean):
+        Tirr_mean = None
+
+    mol_names, atom_names, mol_masses, atom_masses = _build_species_metadata(
+        opa_mols,
+        opa_atoms,
+    )
+    region_name = name or _default_region_name_for_mode(mode)
+
+    return AtmosphereRegionConfig(
+        name=region_name,
+        art=art,
+        pt_profile=pt_profile,
+        T_low=T_low,
+        T_high=T_high,
+        Tirr_std=Tirr_std,
+        Tint_fixed=Tint_fixed,
+        kappa_ir_cgs_bounds=kappa_ir_cgs_bounds,
+        gamma_bounds=gamma_bounds,
+        composition_solver=composition_solver,
+        mol_names=mol_names,
+        atom_names=atom_names,
+        mol_masses=mol_masses,
+        atom_masses=atom_masses,
+        Tirr_mean=Tirr_mean,
+        sample_prefix=sample_prefix,
+    )
+
+
+def build_spectroscopic_observation_config(
+    *,
+    name: str,
+    region_name: str,
+    mode: RetrievalMode,
+    opa_mols: dict[str, OpaPremodit],
+    opa_atoms: dict[str, OpaPremodit],
+    opa_cias: dict[str, OpaCIA],
+    nu_grid: jnp.ndarray,
+    sop_rot: SopRotation,
+    sop_inst: SopInstProfile,
+    instrument_resolution: float,
+    inst_nus: jnp.ndarray,
+    Tstar: float | None = None,
+    radial_velocity_mode: RVBehavior = "orbital",
+    phase_mode: PhaseMode | None = config.DEFAULT_PHASE_MODE,
+    likelihood_kind: SpectroscopicLikelihood = "matched_filter",
+    subtract_per_exposure_mean: bool | None = None,
+    apply_sysrem: bool | None = None,
+    sample_prefix: str | None = None,
+) -> SpectroscopicObservationConfig:
+    if subtract_per_exposure_mean is None:
+        subtract_per_exposure_mean = config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT
+    if apply_sysrem is None:
+        apply_sysrem = config.APPLY_SYSREM_DEFAULT
+
+    nu_grid = jnp.asarray(nu_grid)
+    inst_nus = jnp.asarray(inst_nus)
+    check_grid_resolution(nu_grid, instrument_resolution)
+    beta_inst = 1.0 / (instrument_resolution * 2.3548200450309493)
+
+    if (mode == "emission") and (Tstar is None):
+        raise ValueError("Tstar is required for emission mode.")
+    if radial_velocity_mode == "none":
+        phase_mode = None
+
+    return SpectroscopicObservationConfig(
+        name=name,
+        region_name=region_name,
+        mode=mode,
+        opa_mols=opa_mols,
+        opa_atoms=opa_atoms,
+        opa_cias=opa_cias,
+        nu_grid=nu_grid,
+        sop_rot=sop_rot,
+        sop_inst=sop_inst,
+        inst_nus=inst_nus,
+        beta_inst=beta_inst,
+        radial_velocity_mode=radial_velocity_mode,
+        phase_mode=phase_mode,
+        likelihood_kind=likelihood_kind,
+        subtract_per_exposure_mean=subtract_per_exposure_mean,
+        apply_sysrem=apply_sysrem,
+        Tstar=Tstar,
+        sample_prefix=sample_prefix,
+    )
+
+
+def _validate_bandpass_observable(
+    mode: RetrievalMode,
+    observable: BandpassObservable,
+) -> None:
+    if mode == "transmission" and observable not in {"radius_ratio", "transit_depth"}:
+        raise ValueError(
+            "Transmission bandpass observations must use 'radius_ratio' or 'transit_depth'."
+        )
+    if mode == "emission" and observable not in {"flux_ratio", "eclipse_depth"}:
+        raise ValueError(
+            "Emission bandpass observations must use 'flux_ratio' or 'eclipse_depth'."
+        )
+
+
+def build_bandpass_observation_config(
+    *,
+    name: str,
+    region_name: str,
+    mode: RetrievalMode,
+    opa_mols: dict[str, OpaPremodit],
+    opa_atoms: dict[str, OpaPremodit],
+    opa_cias: dict[str, OpaCIA],
+    nu_grid: jnp.ndarray,
+    wavelength_m: jnp.ndarray,
+    response: jnp.ndarray,
+    observable: BandpassObservable,
+    photon_weighted: bool = False,
+    Tstar: float | None = None,
+    sample_prefix: str | None = None,
+) -> BandpassObservationConfig:
+    _validate_bandpass_observable(mode, observable)
+    if (mode == "emission") and (Tstar is None):
+        raise ValueError("Tstar is required for emission bandpass observations.")
+
+    nu_grid = jnp.asarray(nu_grid)
+    wavelength_m = jnp.asarray(wavelength_m)
+    response = jnp.asarray(response)
+    if wavelength_m.shape != response.shape:
+        raise ValueError(
+            f"wavelength_m shape {wavelength_m.shape} does not match response shape {response.shape}"
+        )
+
+    return BandpassObservationConfig(
+        name=name,
+        region_name=region_name,
+        mode=mode,
+        opa_mols=opa_mols,
+        opa_atoms=opa_atoms,
+        opa_cias=opa_cias,
+        nu_grid=nu_grid,
+        wavelength_m=wavelength_m,
+        response=response,
+        observable=observable,
+        photon_weighted=photon_weighted,
+        Tstar=Tstar,
+        sample_prefix=sample_prefix,
     )
 
 
@@ -850,96 +1526,47 @@ def build_retrieval_model_config(
     apply_sysrem: bool | None = None,
     composition_solver: CompositionSolver | None = None,
 ) -> RetrievalModelConfig:
-    if T_low is None:
-        T_low = config.T_LOW
-    if T_high is None:
-        T_high = config.T_HIGH
-    if Tint_fixed is None:
-        Tint_fixed = config.TINT_FIXED
-    if kappa_ir_cgs_bounds is None:
-        kappa_ir_cgs_bounds = tuple(
-            float(10.0**bound) for bound in config.LOG_KAPPA_IR_BOUNDS
-        )
-    if gamma_bounds is None:
-        gamma_bounds = tuple(float(10.0**bound) for bound in config.LOG_GAMMA_BOUNDS)
-    if subtract_per_exposure_mean is None:
-        subtract_per_exposure_mean = config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT
-    if apply_sysrem is None:
-        apply_sysrem = config.APPLY_SYSREM_DEFAULT
-    if composition_solver is None:
-        composition_solver = ConstantVMR()
-
-    Kp_mean, Kp_std = params["Kp"], params["Kp_err"]
-    Vsys_mean, Vsys_std = params["RV_abs"], params["RV_abs_err"]
-    Rp_mean, Rp_std = params["R_p"], params["R_p_err"]
-    Mp_mean, Mp_std = params["M_p"], params["M_p_err"]
-    Rstar_mean, Rstar_std = params["R_star"], params["R_star_err"]
-    Tstar = params["T_star"]
-    Tirr_mean = params.get("T_eq")
-    period_day = params["period"]
-
-    if Tirr_mean is not None and (Tirr_mean != Tirr_mean):
-        Tirr_mean = None
-
-    nu_grid = jnp.asarray(nu_grid)
-    inst_nus = jnp.asarray(inst_nus)
-    check_grid_resolution(nu_grid, instrument_resolution)
-    beta_inst = 1.0 / (instrument_resolution * 2.3548200450309493)
-
-    mol_names = tuple(opa_mols.keys())
-    atom_names = tuple(opa_atoms.keys())
-    mol_masses = jnp.array(
-        [molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names]
-    )
-    if atom_names:
-        atom_masses = jnp.array(
-            [molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names]
-        )
-    else:
-        atom_masses = jnp.zeros((0,))
-
-    if (mode == "emission") and (Tstar is None):
-        raise ValueError("Tstar is required for emission mode.")
-
     return RetrievalModelConfig(
-        mode=mode,
-        art=art,
-        opa_mols=opa_mols,
-        opa_atoms=opa_atoms,
-        opa_cias=opa_cias,
-        nu_grid=nu_grid,
-        sop_rot=sop_rot,
-        sop_inst=sop_inst,
-        inst_nus=inst_nus,
-        pt_profile=pt_profile,
-        T_low=T_low,
-        T_high=T_high,
-        Tirr_std=Tirr_std,
-        Tint_fixed=Tint_fixed,
-        kappa_ir_cgs_bounds=kappa_ir_cgs_bounds,
-        gamma_bounds=gamma_bounds,
-        phase_mode=phase_mode,
-        subtract_per_exposure_mean=subtract_per_exposure_mean,
-        apply_sysrem=apply_sysrem,
-        composition_solver=composition_solver,
-        beta_inst=beta_inst,
-        mol_names=mol_names,
-        atom_names=atom_names,
-        mol_masses=mol_masses,
-        atom_masses=atom_masses,
-        Kp_mean=Kp_mean,
-        Kp_std=Kp_std,
-        Vsys_mean=Vsys_mean,
-        Vsys_std=Vsys_std,
-        Rp_mean=Rp_mean,
-        Rp_std=Rp_std,
-        Mp_mean=Mp_mean,
-        Mp_std=Mp_std,
-        Rstar_mean=Rstar_mean,
-        Rstar_std=Rstar_std,
-        Tstar=Tstar,
-        Tirr_mean=Tirr_mean,
-        period_day=period_day,
+        shared_system=build_shared_system_config(
+            params=params,
+        ),
+        atmosphere_region=build_atmosphere_region_config(
+            mode=mode,
+            params=params,
+            art=art,
+            opa_mols=opa_mols,
+            opa_atoms=opa_atoms,
+            pt_profile=pt_profile,
+            T_low=T_low,
+            T_high=T_high,
+            Tirr_std=Tirr_std,
+            Tint_fixed=Tint_fixed,
+            kappa_ir_cgs_bounds=kappa_ir_cgs_bounds,
+            gamma_bounds=gamma_bounds,
+            composition_solver=composition_solver,
+            name=None,
+            sample_prefix=None,
+        ),
+        observation=build_spectroscopic_observation_config(
+            name="spectroscopy",
+            region_name=_default_region_name_for_mode(mode),
+            mode=mode,
+            opa_mols=opa_mols,
+            opa_atoms=opa_atoms,
+            opa_cias=opa_cias,
+            nu_grid=nu_grid,
+            sop_rot=sop_rot,
+            sop_inst=sop_inst,
+            instrument_resolution=instrument_resolution,
+            inst_nus=inst_nus,
+            Tstar=params["T_star"],
+            radial_velocity_mode="orbital",
+            phase_mode=phase_mode,
+            likelihood_kind="matched_filter",
+            subtract_per_exposure_mean=subtract_per_exposure_mean,
+            apply_sysrem=apply_sysrem,
+            sample_prefix=None,
+        ),
     )
 
 
