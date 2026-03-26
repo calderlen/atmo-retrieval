@@ -24,9 +24,9 @@ from databases.opacity import setup_cia_opacities, load_molecular_opacities, loa
 from physics.model import (
     create_retrieval_model,
     PhaseMode,
+    compute_model_timeseries,
     compute_atmospheric_state_from_posterior,
-    planet_rv_kms,
-    sysrem_filter_model,
+    apply_model_pipeline_corrections,
 )
 from pipeline.inference import run_svi
 from plotting.plot import (
@@ -365,38 +365,36 @@ def _synthesize_timeseries_from_atmospheric_state(
     dtau = jnp.asarray(atmo_state["dtau"])
     Tarr = jnp.asarray(atmo_state["Tarr"])
     mmw_profile = jnp.asarray(atmo_state["mmw"])
-
-    rt = art.run(dtau, Tarr, mmw_profile, Rp_cm, g_ref)
-
-    vsini = 2.0 * np.pi * Rp_cm / (float(model_params["period"]) * 86400.0) / 1.0e5
     beta_inst = 1.0 / (instrument_resolution * 2.3548200450309493)
-    rt = sop_rot.rigid_rotation(rt, vsini, 0.0, 0.0)
-    rt = sop_inst.ipgauss(rt, beta_inst)
-
     dRV = _phase_dependent_drv(params, phase)
-    rv = planet_rv_kms(jnp.asarray(phase), Kp_kms, Vsys_kms, dRV)
-    planet_ts = jax.vmap(lambda v: sop_inst.sampling(rt, v, inst_nus))(rv)
-
-    if mode == "transmission":
-        model_ts = jnp.sqrt(planet_ts) * (Rp_cm / Rstar_cm)
-    else:
-        Tstar = model_params.get("T_star")
-        if Tstar is None:
-            raise ValueError("T_star is required for emission spectrum plotting.")
-        piBarr = _get_piBarr()
-        Fs = piBarr(nu_grid, Tstar)
-        Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
-        model_ts = planet_ts / jnp.clip(Fs_ts, 1.0e-30, None) * (Rp_cm / Rstar_cm) ** 2
-
-    if config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT:
-        model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
-
-    if apply_sysrem and U_sysrem is not None and invvar_spec is not None:
-        model_ts = sysrem_filter_model(
-            model_ts,
-            jnp.asarray(U_sysrem),
-            jnp.asarray(invvar_spec),
-        )
+    model_ts = compute_model_timeseries(
+        mode=mode,
+        art=art,
+        dtau=dtau,
+        Tarr=Tarr,
+        mmw_profile=mmw_profile,
+        Rp=Rp_cm,
+        Rstar=Rstar_cm,
+        g_ref=g_ref,
+        phase=jnp.asarray(phase),
+        Kp=Kp_kms,
+        Vsys=Vsys_kms,
+        dRV=dRV,
+        sop_rot=sop_rot,
+        sop_inst=sop_inst,
+        inst_nus=jnp.asarray(inst_nus),
+        nu_grid=jnp.asarray(nu_grid),
+        beta_inst=beta_inst,
+        period_day=float(model_params["period"]),
+        Tstar=model_params.get("T_star"),
+    )
+    model_ts = apply_model_pipeline_corrections(
+        model_ts,
+        subtract_per_exposure_mean=config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT,
+        apply_sysrem=apply_sysrem,
+        U=None if U_sysrem is None else jnp.asarray(U_sysrem),
+        invvar_spec=None if invvar_spec is None else jnp.asarray(invvar_spec),
+    )
 
     return np.asarray(jax.device_get(model_ts))
 
