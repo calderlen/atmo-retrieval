@@ -1,5 +1,4 @@
 import os
-import importlib
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,9 +20,7 @@ import config
 from dataio.load import (
     load_nasa_archive_spectrum,
     load_observed_spectrum,
-    ResolutionInterpolator,
 )
-from plotting.aliasing import check_aliasing_with_fe, generate_aliasing_report
 from physics.chemistry import ConstantVMR, FastChemHybridChemistry
 from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from databases.opacity import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
@@ -322,11 +319,6 @@ def _sample_svi_posterior(
     }
 
 
-def _get_piBarr():
-    mod = importlib.import_module("exojax.spec.planck")
-    return mod.piBarr
-
-
 def _summarize_observed_spectrum(
     data: np.ndarray,
     sigma: np.ndarray,
@@ -343,33 +335,50 @@ def _summarize_observed_spectrum(
 
 
 def _phase_dependent_drv(params: dict[str, float], phase: np.ndarray) -> jnp.ndarray:
-    if "dRV_0" in params and "dRV_slope" in params:
-        return jnp.asarray(params["dRV_0"] + params["dRV_slope"] * np.asarray(phase))
     return jnp.asarray(params.get("dRV", 0.0))
 
 
+def _resolve_scope_prefix(
+    explicit_prefix: str | None,
+    fallback_name: str,
+    *,
+    enable_fallback: bool,
+) -> str | None:
+    if explicit_prefix is not None:
+        return explicit_prefix
+    if enable_fallback:
+        return fallback_name
+    return None
+
+
+def _posterior_site_value(
+    params: dict[str, float],
+    site_name: str,
+    *,
+    sample_prefix: str | None = None,
+    default: float | None = None,
+):
+    if sample_prefix is not None:
+        scoped_name = f"{sample_prefix}/{site_name}"
+        if scoped_name in params:
+            return params[scoped_name]
+    return params.get(site_name, default)
+
+
 def _synthesize_timeseries_from_atmospheric_state(
+    *,
     atmo_state: dict,
-    mode: str,
     model_params: dict,
-    art: object,
-    sop_rot: object,
-    sop_inst: object,
-    inst_nus: np.ndarray,
-    nu_grid: np.ndarray,
-    phase: np.ndarray,
-    instrument_resolution: float,
-    apply_sysrem: bool,
-    U_sysrem: np.ndarray | None,
-    invvar_spec: np.ndarray | None,
+    region_config: object,
+    component: "SpectroscopicComponentBundle",
+    component_sample_prefix: str | None,
 ) -> np.ndarray:
     params = atmo_state["params"]
+    observation_config = component.observation_config
 
     Rp_rj = float(params.get("Rp", config.DEFAULT_POSTERIOR_RP))
     Mp_mj = float(params.get("Mp", config.DEFAULT_POSTERIOR_MP))
     Rstar_rs = float(params.get("Rstar", model_params["R_star"]))
-    Kp_kms = float(params.get("Kp", model_params["Kp"]))
-    Vsys_kms = float(params.get("Vsys", model_params["RV_abs"]))
 
     Rp_cm = Rp_rj * RJ
     Rstar_cm = Rstar_rs * Rs
@@ -378,11 +387,42 @@ def _synthesize_timeseries_from_atmospheric_state(
     dtau = jnp.asarray(atmo_state["dtau"])
     Tarr = jnp.asarray(atmo_state["Tarr"])
     mmw_profile = jnp.asarray(atmo_state["mmw"])
-    beta_inst = 1.0 / (instrument_resolution * 2.3548200450309493)
-    dRV = _phase_dependent_drv(params, phase)
+    phase = np.asarray(component.phase)
+    if observation_config.radial_velocity_mode == "none":
+        phase = np.zeros_like(phase)
+        Kp_kms = 0.0
+        Vsys_kms = 0.0
+        dRV = jnp.zeros_like(jnp.asarray(phase))
+    else:
+        Kp_kms = float(params.get("Kp", model_params["Kp"]))
+        Vsys_kms = float(params.get("Vsys", model_params["RV_abs"]))
+        dRV_0 = _posterior_site_value(
+            params,
+            "dRV_0",
+            sample_prefix=component_sample_prefix,
+        )
+        dRV_slope = _posterior_site_value(
+            params,
+            "dRV_slope",
+            sample_prefix=component_sample_prefix,
+        )
+        if dRV_0 is not None and dRV_slope is not None:
+            dRV = jnp.asarray(dRV_0 + dRV_slope * phase)
+        else:
+            dRV = _phase_dependent_drv(
+                {
+                    "dRV": _posterior_site_value(
+                        params,
+                        "dRV",
+                        sample_prefix=component_sample_prefix,
+                        default=0.0,
+                    )
+                },
+                phase,
+            )
     model_ts = compute_model_timeseries(
-        mode=mode,
-        art=art,
+        mode=observation_config.mode,
+        art=region_config.art,
         dtau=dtau,
         Tarr=Tarr,
         mmw_profile=mmw_profile,
@@ -393,72 +433,54 @@ def _synthesize_timeseries_from_atmospheric_state(
         Kp=Kp_kms,
         Vsys=Vsys_kms,
         dRV=dRV,
-        sop_rot=sop_rot,
-        sop_inst=sop_inst,
-        inst_nus=jnp.asarray(inst_nus),
-        nu_grid=jnp.asarray(nu_grid),
-        beta_inst=beta_inst,
+        sop_rot=component.sop_rot,
+        sop_inst=component.sop_inst,
+        inst_nus=jnp.asarray(component.inst_nus),
+        nu_grid=jnp.asarray(component.nu_grid),
+        beta_inst=observation_config.beta_inst,
         period_day=float(model_params["period"]),
-        Tstar=model_params.get("T_star"),
+        Tstar=observation_config.Tstar,
     )
     model_ts = apply_model_pipeline_corrections(
         model_ts,
-        subtract_per_exposure_mean=config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT,
-        apply_sysrem=apply_sysrem,
-        U=None if U_sysrem is None else jnp.asarray(U_sysrem),
-        invvar_spec=None if invvar_spec is None else jnp.asarray(invvar_spec),
+        subtract_per_exposure_mean=observation_config.subtract_per_exposure_mean,
+        apply_sysrem=observation_config.apply_sysrem,
+        U=None if component.U_sysrem is None else jnp.asarray(component.U_sysrem),
+        invvar_spec=None if component.invvar_spec is None else jnp.asarray(component.invvar_spec),
     )
 
     return np.asarray(jax.device_get(model_ts))
 
 
 def _compute_model_timeseries_for_plot(
+    *,
     posterior_samples: dict[str, np.ndarray],
-    mode: str,
     model_params: dict,
-    art: object,
-    opa_mols: dict,
-    opa_atoms: dict,
-    opa_cias: dict,
-    nu_grid: np.ndarray,
-    pt_profile: str,
-    sop_rot: object,
-    sop_inst: object,
-    inst_nus: np.ndarray,
-    phase: np.ndarray,
-    instrument_resolution: float,
-    apply_sysrem: bool,
-    U_sysrem: np.ndarray | None,
-    invvar_spec: np.ndarray | None,
+    region_config: object,
+    component: "SpectroscopicComponentBundle",
+    region_sample_prefix: str | None,
+    component_sample_prefix: str | None,
     atmo_state: dict | None = None,
 ) -> tuple[np.ndarray | None, dict | None]:
     try:
         if atmo_state is None:
             atmo_state = compute_atmospheric_state_from_posterior(
                 posterior_samples=posterior_samples,
-                art=art,
-                opa_mols=opa_mols,
-                opa_atoms=opa_atoms,
-                opa_cias=opa_cias,
-                nu_grid=nu_grid,
-                pt_profile=pt_profile,
+                region_config=region_config,
+                opa_mols=component.opa_mols,
+                opa_atoms=component.opa_atoms,
+                opa_cias=component.opa_cias,
+                nu_grid=component.nu_grid,
                 use_median=True,
+                sample_prefix=region_sample_prefix,
             )
 
         model_ts = _synthesize_timeseries_from_atmospheric_state(
             atmo_state=atmo_state,
-            mode=mode,
             model_params=model_params,
-            art=art,
-            sop_rot=sop_rot,
-            sop_inst=sop_inst,
-            inst_nus=inst_nus,
-            nu_grid=nu_grid,
-            phase=phase,
-            instrument_resolution=instrument_resolution,
-            apply_sysrem=apply_sysrem,
-            U_sysrem=U_sysrem,
-            invvar_spec=invvar_spec,
+            region_config=region_config,
+            component=component,
+            component_sample_prefix=component_sample_prefix,
         )
         return model_ts, atmo_state
     except Exception as exc:
@@ -510,6 +532,44 @@ def _coerce_model_params(params: dict) -> dict[str, float | None]:
         "T_eq": params.get("T_eq"),
         "period": params["period"].nominal_value if hasattr(params["period"], "nominal_value") else params["period"],
     }
+
+
+def _normalize_retrieval_mode(mode: str) -> str:
+    normalized = str(mode).lower().strip()
+    if normalized not in {"transmission", "emission"}:
+        raise ValueError(f"Unsupported retrieval mode: {mode}")
+    return normalized
+
+
+def _default_region_name_for_mode(mode: str) -> str:
+    return "terminator" if mode == "transmission" else "dayside"
+
+
+def _build_art_for_mode(mode: str) -> object:
+    mode = _normalize_retrieval_mode(mode)
+    if mode == "transmission":
+        art = ArtTransPure(
+            pressure_top=config.PRESSURE_TOP,
+            pressure_btm=config.PRESSURE_BTM,
+            nlayer=config.NLAYER,
+        )
+    else:
+        art = ArtEmisPure(
+            pressure_top=config.PRESSURE_TOP,
+            pressure_btm=config.PRESSURE_BTM,
+            nlayer=config.NLAYER,
+        )
+    art.change_temperature_range(config.T_LOW, config.T_HIGH)
+    return art
+
+
+def _normalize_region_name(region_name: str | None, mode: str) -> str:
+    if region_name is None:
+        return _default_region_name_for_mode(mode)
+    normalized = str(region_name).strip()
+    if not normalized:
+        raise ValueError("region_name must be a non-empty string.")
+    return normalized
 
 
 def _prepare_observed_spectrum_arrays(
@@ -578,23 +638,6 @@ def _load_opacity_bundle(
     return opa_cias, opa_mols, opa_atoms
 
 
-def _bind_observations_to_model(
-    model_c,
-    observations_payload: dict[str, object],
-):
-    def model_adapter(
-        data: jnp.ndarray,
-        sigma: jnp.ndarray,
-        phase: jnp.ndarray,
-        U: jnp.ndarray | None = None,
-        invvar_spec: jnp.ndarray | None = None,
-    ) -> None:
-        del data, sigma, phase, U, invvar_spec
-        return model_c(observations=observations_payload)
-
-    return model_adapter
-
-
 def _build_primary_spectroscopic_component(
     *,
     name: str,
@@ -621,6 +664,7 @@ def _build_primary_spectroscopic_component(
     likelihood_kind: str,
     subtract_per_exposure_mean: bool,
 ) -> SpectroscopicComponentBundle:
+    mode = _normalize_retrieval_mode(mode)
     observation_config = build_spectroscopic_observation_config(
         name=name,
         region_name=region_name,
@@ -669,14 +713,114 @@ def _build_primary_spectroscopic_component(
     )
 
 
+def _build_atmosphere_regions(
+    *,
+    model_params: dict[str, float | None],
+    primary_mode: str,
+    primary_region_name: str,
+    primary_art: object,
+    observation_configs: list[object],
+    default_pt_profile: str,
+    default_chemistry_model: str,
+    default_fastchem_parameter_file: str | None,
+    atmosphere_regions: list[dict[str, Any]] | None,
+) -> tuple[tuple[object, ...], dict[str, object]]:
+    explicit_specs: dict[str, dict[str, Any]] = {}
+    if atmosphere_regions:
+        for raw_spec in atmosphere_regions:
+            spec = dict(raw_spec)
+            name = str(spec.get("name", "")).strip()
+            if not name:
+                raise ValueError("Each atmosphere_regions entry must provide a non-empty 'name'.")
+            if name in explicit_specs:
+                raise ValueError(f"Duplicate atmosphere region specification: {name}")
+            if "mode" in spec and spec["mode"] is not None:
+                spec["mode"] = _normalize_retrieval_mode(spec["mode"])
+            explicit_specs[name] = spec
+
+    component_modes: dict[str, str] = {}
+    region_mol_names: dict[str, set[str]] = {}
+    region_atom_names: dict[str, set[str]] = {}
+    for observation_config in observation_configs:
+        region_name = str(observation_config.region_name)
+        region_mode = _normalize_retrieval_mode(observation_config.mode)
+        if region_name in component_modes and component_modes[region_name] != region_mode:
+            raise ValueError(
+                f"Atmosphere region '{region_name}' is referenced by mixed modes "
+                f"({component_modes[region_name]} and {region_mode}). Split them into "
+                "separate region_name values."
+            )
+        component_modes[region_name] = region_mode
+        region_mol_names.setdefault(region_name, set()).update(observation_config.opa_mols.keys())
+        region_atom_names.setdefault(region_name, set()).update(observation_config.opa_atoms.keys())
+
+    if explicit_specs.keys() - component_modes.keys():
+        unused = ", ".join(sorted(explicit_specs.keys() - component_modes.keys()))
+        raise ValueError(
+            "Unused atmosphere_regions entries with no linked observation component(s): "
+            f"{unused}"
+        )
+
+    region_configs = []
+    region_lookup: dict[str, object] = {}
+    for region_name in component_modes:
+        region_mode = component_modes[region_name]
+        spec = explicit_specs.get(region_name, {})
+        if spec.get("mode") is not None and spec["mode"] != region_mode:
+            raise ValueError(
+                f"Atmosphere region '{region_name}' is configured as mode='{spec['mode']}' "
+                f"but observation components require mode='{region_mode}'."
+            )
+
+        chemistry_name = str(spec.get("chemistry_model", default_chemistry_model))
+        chemistry_param_file = spec.get(
+            "fastchem_parameter_file",
+            default_fastchem_parameter_file,
+        )
+        composition_solver = _build_composition_solver(
+            chemistry_model=chemistry_name,
+            fastchem_parameter_file=chemistry_param_file,
+        )
+        kappa_bounds = spec.get("kappa_ir_cgs_bounds")
+        gamma_bounds = spec.get("gamma_bounds")
+
+        art = (
+            primary_art
+            if region_name == primary_region_name and region_mode == primary_mode
+            else _build_art_for_mode(region_mode)
+        )
+        region_config = build_atmosphere_region_config(
+            mode=region_mode,
+            art=art,
+            mol_names=tuple(sorted(region_mol_names[region_name])),
+            atom_names=tuple(sorted(region_atom_names[region_name])),
+            pt_profile=str(spec.get("pt_profile", default_pt_profile)),
+            T_low=spec.get("T_low"),
+            T_high=spec.get("T_high"),
+            Tirr_mean=spec.get("Tirr_mean", model_params.get("T_eq")),
+            Tirr_std=spec.get("Tirr_std"),
+            Tint_fixed=spec.get("Tint_fixed"),
+            kappa_ir_cgs_bounds=None if kappa_bounds is None else tuple(kappa_bounds),
+            gamma_bounds=None if gamma_bounds is None else tuple(gamma_bounds),
+            composition_solver=composition_solver,
+            name=region_name,
+            sample_prefix=spec.get("sample_prefix"),
+        )
+        region_configs.append(region_config)
+        region_lookup[region_name] = region_config
+
+    return tuple(region_configs), region_lookup
+
+
 def _load_joint_spectroscopic_component(
     spec: dict[str, Any],
     *,
-    mode: str,
-    region_name: str,
+    default_mode: str,
     default_tstar: float | None,
 ) -> SpectroscopicComponentBundle:
-    name = str(spec.get("name", f"{mode}_component"))
+    component_mode = _normalize_retrieval_mode(spec.get("mode", default_mode))
+    region_name = _normalize_region_name(spec.get("region_name"), component_mode)
+    name = str(spec.get("name", f"{component_mode}_component"))
     data_format = str(spec.get("data_format", "spectrum")).lower().strip()
     instrument_resolution = float(spec.get("instrument_resolution", config.get_resolution()))
     radial_velocity_mode = str(spec.get("radial_velocity_mode", "orbital" if data_format == "timeseries" else "none"))
@@ -694,7 +838,7 @@ def _load_joint_spectroscopic_component(
     if "tbl_path" in spec:
         wav_obs, spectrum, uncertainty, _meta = load_nasa_archive_spectrum(
             spec["tbl_path"],
-            mode=mode,
+            mode=component_mode,
         )
         data = spectrum[np.newaxis, :]
         sigma = uncertainty[np.newaxis, :]
@@ -720,7 +864,7 @@ def _load_joint_spectroscopic_component(
                 U_sysrem = None
                 invvar_spec = None
         elif data_format == "spectrum":
-            suffix = "transmission" if mode == "transmission" else "emission"
+            suffix = "transmission" if component_mode == "transmission" else "emission"
             wav_obs, spectrum, uncertainty, _ = load_observed_spectrum(
                 str(data_dir / f"wavelength_{suffix}.npy"),
                 str(data_dir / f"spectrum_{suffix}.npy"),
@@ -763,7 +907,7 @@ def _load_joint_spectroscopic_component(
     observation_config = build_spectroscopic_observation_config(
         name=name,
         region_name=region_name,
-        mode=mode,
+        mode=component_mode,
         opa_mols=opa_mols,
         opa_atoms=opa_atoms,
         opa_cias=opa_cias,
@@ -811,11 +955,12 @@ def _load_joint_spectroscopic_component(
 def _load_bandpass_constraint(
     spec: dict[str, Any],
     *,
-    mode: str,
-    region_name: str,
+    default_mode: str,
     default_tstar: float | None,
 ) -> BandpassConstraintBundle:
-    name = str(spec.get("name", f"{mode}_bandpass"))
+    component_mode = _normalize_retrieval_mode(spec.get("mode", default_mode))
+    region_name = _normalize_region_name(spec.get("region_name"), component_mode)
+    name = str(spec.get("name", f"{component_mode}_bandpass"))
     observable = str(spec["observable"])
     value = float(spec["value"])
     sigma = float(spec["sigma"])
@@ -847,7 +992,7 @@ def _load_bandpass_constraint(
     observation_config = build_bandpass_observation_config(
         name=name,
         region_name=region_name,
-        mode=mode,
+        mode=component_mode,
         opa_mols=opa_mols,
         opa_atoms=opa_atoms,
         opa_cias=opa_cias,
@@ -909,8 +1054,10 @@ def run_retrieval(
     invvar_spec: np.ndarray | None = None,
     joint_spectra: list[dict[str, Any]] | None = None,
     bandpass_constraints: list[dict[str, Any]] | None = None,
+    atmosphere_regions: list[dict[str, Any]] | None = None,
 ) -> None:
     retrieval_start = perf_counter()
+    mode = _normalize_retrieval_mode(mode)
 
     # Create timestamped output directory
     base_dir = config.DIR_SAVE or config.get_output_dir()
@@ -1052,7 +1199,7 @@ def run_retrieval(
     print("\n[3/7] Building wavenumber grid...")
     with _StepTimer("Step 3/7"):
         wav_min, wav_max = config.get_wavelength_range()
-        nu_grid, wav_grid, res_high = setup_wavenumber_grid(
+        nu_grid, _wav_grid, _res_high = setup_wavenumber_grid(
             wav_min - config.WAV_MIN_OFFSET,
             wav_max + config.WAV_MAX_OFFSET,
             config.N_SPECTRAL_POINTS,
@@ -1063,22 +1210,10 @@ def run_retrieval(
         sop_rot, sop_inst, _ = setup_spectral_operators(nu_grid, Rinst)
         print("  Spectral operators initialized")
 
-    # Setup atmospheric RT
-    print("\n[4/7] Initializing atmospheric RT...")
+    # Setup primary atmospheric RT geometry
+    print("\n[4/7] Initializing primary atmospheric RT...")
     with _StepTimer("Step 4/7"):
-        if mode == "transmission":
-            art = ArtTransPure(
-                pressure_top=config.PRESSURE_TOP,
-                pressure_btm=config.PRESSURE_BTM,
-                nlayer=config.NLAYER,
-            )
-        else:
-            art = ArtEmisPure(
-                pressure_top=config.PRESSURE_TOP,
-                pressure_btm=config.PRESSURE_BTM,
-                nlayer=config.NLAYER,
-            )
-        art.change_temperature_range(config.T_LOW, config.T_HIGH)
+        primary_art = _build_art_for_mode(mode)
         print(f"  {config.NLAYER} atmospheric layers")
         print(f"  Pressure range: {config.PRESSURE_TOP:.1e} - {config.PRESSURE_BTM:.1e} bar")
         print(f"  Temperature range: {config.T_LOW:.0f} - {config.T_HIGH:.0f} K")
@@ -1093,7 +1228,7 @@ def run_retrieval(
         else:
             print(f"  Loaded {n_cia} CIA sources")
 
-        opa_mols, molmass_arr = load_molecular_opacities(
+        opa_mols, _molmass_arr = load_molecular_opacities(
             config.MOLPATH_HITEMP,
             config.MOLPATH_EXOMOL,
             nu_grid,
@@ -1106,7 +1241,7 @@ def run_retrieval(
         print(f"  Loaded {len(opa_mols)} molecular species: {list(opa_mols.keys())}")
 
         # Load atomic opacities (optional, uses Kurucz with auto-download)
-        opa_atoms, atommass_arr = load_atomic_opacities(
+        opa_atoms, _atommass_arr = load_atomic_opacities(
             config.ATOMIC_SPECIES,
             nu_grid,
             config.OPA_LOAD,
@@ -1129,29 +1264,13 @@ def run_retrieval(
             print(f"  (Full aliasing analysis requires template generation - see aliasing.py)")
             print(f"  Aliasing directory: {aliasing_dir}")
 
-    print(f"\n[6/7] Building {mode} forward model ({pt_profile} P-T)...")
+    print(f"\n[6/7] Building retrieval model (primary={mode}, default P-T={pt_profile})...")
     print(f"  Chemistry model: {chemistry_model}")
     with _StepTimer("Step 6/7"):
-        composition_solver = _build_composition_solver(
-            chemistry_model=chemistry_model,
-            fastchem_parameter_file=fastchem_parameter_file,
-        )
-
         model_params = _coerce_model_params(params)
-        region_name = "terminator" if mode == "transmission" else "dayside"
+        primary_region_name = _default_region_name_for_mode(mode)
 
         shared_system = build_shared_system_config(params=model_params)
-        atmosphere_region = build_atmosphere_region_config(
-            mode=mode,
-            params=model_params,
-            art=art,
-            opa_mols=opa_mols,
-            opa_atoms=opa_atoms,
-            pt_profile=pt_profile,
-            T_low=config.T_LOW,
-            T_high=config.T_HIGH,
-            composition_solver=composition_solver,
-        )
 
         primary_is_timeseries = (
             np.asarray(phase).size > 1
@@ -1179,7 +1298,7 @@ def run_retrieval(
             opa_cias=opa_cias,
             opa_mols=opa_mols,
             opa_atoms=opa_atoms,
-            region_name=region_name,
+            region_name=primary_region_name,
             Tstar=model_params["T_star"],
             phase_mode=phase_mode,
             apply_sysrem=apply_sysrem,
@@ -1197,8 +1316,7 @@ def run_retrieval(
             for spec in joint_spectra:
                 component = _load_joint_spectroscopic_component(
                     spec,
-                    mode=mode,
-                    region_name=region_name,
+                    default_mode=mode,
                     default_tstar=model_params["T_star"],
                 )
                 if component.name in observations_payload:
@@ -1212,8 +1330,7 @@ def run_retrieval(
             for spec in bandpass_constraints:
                 component = _load_bandpass_constraint(
                     spec,
-                    mode=mode,
-                    region_name=region_name,
+                    default_mode=mode,
                     default_tstar=model_params["T_star"],
                 )
                 if component.name in observations_payload:
@@ -1222,12 +1339,37 @@ def run_retrieval(
                 observation_configs.append(component.observation_config)
                 observations_payload[component.name] = component.observation_inputs
 
+        atmosphere_region_configs, atmosphere_region_lookup = _build_atmosphere_regions(
+            model_params=model_params,
+            primary_mode=mode,
+            primary_region_name=primary_region_name,
+            primary_art=primary_art,
+            observation_configs=observation_configs,
+            default_pt_profile=pt_profile,
+            default_chemistry_model=chemistry_model,
+            default_fastchem_parameter_file=fastchem_parameter_file,
+            atmosphere_regions=atmosphere_regions,
+        )
         joint_model = create_joint_retrieval_model(
             shared_system=shared_system,
-            atmosphere_regions=(atmosphere_region,),
+            atmosphere_regions=atmosphere_region_configs,
             observations=tuple(observation_configs),
         )
-        model_c = _bind_observations_to_model(joint_model, observations_payload)
+        model_c = joint_model
+        model_inputs = {"observations": observations_payload}
+        primary_region_config = atmosphere_region_lookup[primary_region_name]
+        primary_pt_profile = primary_region_config.pt_profile
+        primary_component_config = primary_component.observation_config
+        primary_region_sample_prefix = _resolve_scope_prefix(
+            primary_region_config.sample_prefix,
+            primary_region_config.name,
+            enable_fallback=len(atmosphere_region_configs) > 1,
+        )
+        primary_component_sample_prefix = _resolve_scope_prefix(
+            primary_component_config.sample_prefix,
+            primary_component.name,
+            enable_fallback=len(observation_configs) > 1,
+        )
 
         component_names = [primary_component.name]
         component_names.extend(component.name for component in auxiliary_components)
@@ -1235,6 +1377,14 @@ def run_retrieval(
         print(
             f"  Joint model created with {len(component_names)} component(s): "
             f"{', '.join(component_names)}"
+        )
+        print(
+            "  Atmosphere regions: "
+            + ", ".join(
+                f"{region_config.name} "
+                f"[{next(cfg.mode for cfg in observation_configs if cfg.region_name == region_config.name)}]"
+                for region_config in atmosphere_region_configs
+            )
         )
 
     # Run inference
@@ -1256,11 +1406,7 @@ def run_retrieval(
             svi_params, svi_losses, init_strategy, _, svi_guide = run_svi(
                 model_c,
                 rng_key_,
-                data=jnp.array(data),
-                sigma=jnp.array(sigma),
-                phase=jnp.array(phase),
-                U=None if U_sysrem is None else jnp.array(U_sysrem),
-                invvar_spec=None if invvar_spec is None else jnp.array(invvar_spec),
+                model_inputs=model_inputs,
                 Mp_mean=model_params["M_p"],
                 Mp_std=model_params["M_p_err"],
                 Rstar_mean=model_params["R_star"],
@@ -1292,19 +1438,19 @@ def run_retrieval(
                         )
 
                     if svi_samples_for_plots is not None:
-                        if (
-                            "T0" in svi_samples_for_plots
-                            or ("T_btm" in svi_samples_for_plots and "T_top" in svi_samples_for_plots)
-                        ):
+                        try:
                             plot_temperature_profile(
                                 posterior_samples=svi_samples_for_plots,
-                                art=art,
+                                art=primary_region_config.art,
                                 save_path=os.path.join(output_dir, "temperature_profile.png"),
+                                pt_profile=primary_pt_profile,
+                                sample_prefix=primary_region_sample_prefix,
+                                Tint_fixed=primary_region_config.Tint_fixed,
                             )
-                        else:
+                        except Exception as exc:
                             print(
-                                "  Skipping temperature profile plot: no supported temperature "
-                                "parameterization in SVI samples."
+                                "  Skipping temperature profile plot for SVI samples: "
+                                f"{exc}"
                             )
 
                         obs_mean, obs_err = _summarize_observed_spectrum(data, sigma)
@@ -1312,22 +1458,11 @@ def run_retrieval(
 
                         svi_model_ts, _ = _compute_model_timeseries_for_plot(
                             posterior_samples=svi_samples_for_plots,
-                            mode=mode,
                             model_params=model_params,
-                            art=art,
-                            opa_mols=opa_mols,
-                            opa_atoms=opa_atoms,
-                            opa_cias=opa_cias,
-                            nu_grid=np.asarray(nu_grid),
-                            pt_profile=pt_profile,
-                            sop_rot=sop_rot,
-                            sop_inst=sop_inst,
-                            inst_nus=np.asarray(inst_nus),
-                            phase=np.asarray(phase),
-                            instrument_resolution=Rinst,
-                            apply_sysrem=apply_sysrem,
-                            U_sysrem=U_sysrem,
-                            invvar_spec=invvar_spec,
+                            region_config=primary_region_config,
+                            component=primary_component,
+                            region_sample_prefix=primary_region_sample_prefix,
+                            component_sample_prefix=primary_component_sample_prefix,
                         )
 
                         if svi_model_ts is not None:
@@ -1372,11 +1507,7 @@ def run_retrieval(
         rng_key, rng_key_ = random.split(rng_key)
         mcmc.run(
             rng_key_,
-            data=jnp.array(data),
-            sigma=jnp.array(sigma),
-            phase=jnp.array(phase),
-            U=None if U_sysrem is None else jnp.array(U_sysrem),
-            invvar_spec=None if invvar_spec is None else jnp.array(invvar_spec),
+            **model_inputs,
         )
     
     mcmc.print_summary()
@@ -1425,16 +1556,19 @@ def run_retrieval(
                 os.path.join(output_dir, "svi_loss.png"),
             )
 
-        if "T0" in posterior_np or ("T_btm" in posterior_np and "T_top" in posterior_np):
+        try:
             plot_temperature_profile(
                 posterior_samples=posterior_np,
-                art=art,
+                art=primary_region_config.art,
                 save_path=os.path.join(output_dir, "temperature_profile.png"),
+                pt_profile=primary_pt_profile,
+                sample_prefix=primary_region_sample_prefix,
+                Tint_fixed=primary_region_config.Tint_fixed,
             )
-        else:
+        except Exception as exc:
             print(
-                "  Skipping temperature profile plot: no supported temperature "
-                "parameterization in HMC samples."
+                "  Skipping temperature profile plot for HMC samples: "
+                f"{exc}"
             )
 
     atmo_state = None
@@ -1450,18 +1584,21 @@ def run_retrieval(
         try:
             atmo_state = compute_atmospheric_state_from_posterior(
                 posterior_samples=posterior_np,
-                art=art,
-                opa_mols=opa_mols,
-                opa_atoms=opa_atoms,
-                opa_cias=opa_cias,
-                nu_grid=nu_grid,
-                pt_profile=pt_profile,
+                region_config=primary_region_config,
+                opa_mols=primary_component.opa_mols,
+                opa_atoms=primary_component.opa_atoms,
+                opa_cias=primary_component.opa_cias,
+                nu_grid=primary_component.nu_grid,
                 use_median=True,
+                sample_prefix=primary_region_sample_prefix,
             )
-        except Exception:
+        except Exception as exc:
             if compute_contribution:
                 raise
-            print("  Warning: unable to compute atmospheric state; skipping spectrum diagnostics.")
+            print(
+                "  Warning: unable to compute atmospheric state; "
+                f"skipping spectrum diagnostics. ({exc})"
+            )
 
     if not no_plots and atmo_state is not None:
         print("  Plotting fitted spectrum diagnostics...")
@@ -1470,22 +1607,11 @@ def run_retrieval(
 
         hmc_model_ts, atmo_state = _compute_model_timeseries_for_plot(
             posterior_samples=posterior_np,
-            mode=mode,
             model_params=model_params,
-            art=art,
-            opa_mols=opa_mols,
-            opa_atoms=opa_atoms,
-            opa_cias=opa_cias,
-            nu_grid=np.asarray(nu_grid),
-            pt_profile=pt_profile,
-            sop_rot=sop_rot,
-            sop_inst=sop_inst,
-            inst_nus=np.asarray(inst_nus),
-            phase=np.asarray(phase),
-            instrument_resolution=Rinst,
-            apply_sysrem=apply_sysrem,
-            U_sysrem=U_sysrem,
-            invvar_spec=invvar_spec,
+            region_config=primary_region_config,
+            component=primary_component,
+            region_sample_prefix=primary_region_sample_prefix,
+            component_sample_prefix=primary_component_sample_prefix,
             atmo_state=atmo_state,
         )
 
@@ -1493,22 +1619,11 @@ def run_retrieval(
         if svi_samples_for_plots is not None:
             svi_model_ts, _ = _compute_model_timeseries_for_plot(
                 posterior_samples=svi_samples_for_plots,
-                mode=mode,
                 model_params=model_params,
-                art=art,
-                opa_mols=opa_mols,
-                opa_atoms=opa_atoms,
-                opa_cias=opa_cias,
-                nu_grid=np.asarray(nu_grid),
-                pt_profile=pt_profile,
-                sop_rot=sop_rot,
-                sop_inst=sop_inst,
-                inst_nus=np.asarray(inst_nus),
-                phase=np.asarray(phase),
-                instrument_resolution=Rinst,
-                apply_sysrem=apply_sysrem,
-                U_sysrem=U_sysrem,
-                invvar_spec=invvar_spec,
+                region_config=primary_region_config,
+                component=primary_component,
+                region_sample_prefix=primary_region_sample_prefix,
+                component_sample_prefix=primary_component_sample_prefix,
             )
 
         if hmc_model_ts is not None or svi_model_ts is not None:
@@ -1559,7 +1674,7 @@ def run_retrieval(
 
             # Total contribution function
             plot_contribution_function(
-                nu_grid=np.array(nu_grid),
+                nu_grid=np.array(primary_component.nu_grid),
                 dtau=np.array(atmo_state['dtau']),
                 Tarr=np.array(atmo_state['Tarr']),
                 pressure=np.array(atmo_state['pressure']),
@@ -1576,7 +1691,7 @@ def run_retrieval(
                 }
 
                 plot_contribution_per_species(
-                    nu_grid=np.array(nu_grid),
+                    nu_grid=np.array(primary_component.nu_grid),
                     dtau_per_species=dtau_per_species_np,
                     Tarr=np.array(atmo_state['Tarr']),
                     pressure=np.array(atmo_state['pressure']),
@@ -1587,7 +1702,7 @@ def run_retrieval(
 
                 # Combined plot
                 plot_contribution_combined(
-                    nu_grid=np.array(nu_grid),
+                    nu_grid=np.array(primary_component.nu_grid),
                     dtau=np.array(atmo_state['dtau']),
                     dtau_per_species=dtau_per_species_np,
                     Tarr=np.array(atmo_state['Tarr']),

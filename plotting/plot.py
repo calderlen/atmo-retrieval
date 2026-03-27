@@ -5,6 +5,7 @@ from matplotlib.lines import Line2D
 import corner
 
 from exojax.plot.atmplot import plotcf
+from physics.model import reconstruct_temperature_profile
 
 
 def plot_svi_loss(loss_values: np.ndarray, save_path: str) -> None:
@@ -89,39 +90,50 @@ def plot_temperature_profile(
     posterior_samples: dict,
     art: object,
     save_path: str,
+    pt_profile: str = "guillot",
+    sample_prefix: str | None = None,
+    Tint_fixed: float = 100.0,
     Ncurve: int = 100,
 ) -> None:
     fig, ax = plt.subplots(figsize=(6, 7))
+    sample_sizes = [
+        np.asarray(values).shape[0]
+        for values in posterior_samples.values()
+        if np.asarray(values).ndim > 0
+    ]
+    if not sample_sizes:
+        raise ValueError("posterior_samples does not contain any sample arrays.")
 
-    if "T0" in posterior_samples:
-        T0_samples = np.asarray(posterior_samples["T0"])
-        for i in np.random.choice(len(T0_samples), min(Ncurve, len(T0_samples)), replace=False):
-            Tarr = T0_samples[i] * np.ones_like(art.pressure)
-            ax.plot(Tarr, art.pressure, "C0-", alpha=0.05)
+    n_samples = min(sample_sizes)
+    draw_count = min(Ncurve, n_samples)
+    draw_indices = np.random.choice(n_samples, draw_count, replace=False)
 
-        T0_median = np.median(T0_samples)
-        Tarr_median = T0_median * np.ones_like(art.pressure)
-        ax.plot(Tarr_median, art.pressure, "C0-", lw=2, label="Median (isothermal)")
+    for idx in draw_indices:
+        sample_params = {}
+        for key, values in posterior_samples.items():
+            arr = np.asarray(values)
+            sample_params[key] = arr if arr.ndim == 0 else arr[idx]
+        Tarr = reconstruct_temperature_profile(
+            sample_params,
+            art,
+            pt_profile=pt_profile,
+            Tint_fixed=Tint_fixed,
+            sample_prefix=sample_prefix,
+        )
+        ax.plot(np.asarray(Tarr), art.pressure, "C0-", alpha=0.05)
 
-    elif "T_btm" in posterior_samples:
-        T_btm_samples = np.asarray(posterior_samples["T_btm"])
-        T_top_samples = np.asarray(posterior_samples["T_top"])
-
-        for i in np.random.choice(len(T_btm_samples), min(Ncurve, len(T_btm_samples)), replace=False):
-            log_p = np.log10(art.pressure)
-            log_p_btm = np.log10(art.pressure[-1])
-            log_p_top = np.log10(art.pressure[0])
-            Tarr = T_top_samples[i] + (T_btm_samples[i] - T_top_samples[i]) * \
-                   (log_p - log_p_top) / (log_p_btm - log_p_top)
-            ax.plot(Tarr, art.pressure, "C0-", alpha=0.05)
-
-        T_btm_med = np.median(T_btm_samples)
-        T_top_med = np.median(T_top_samples)
-        log_p = np.log10(art.pressure)
-        log_p_btm = np.log10(art.pressure[-1])
-        log_p_top = np.log10(art.pressure[0])
-        Tarr_median = T_top_med + (T_btm_med - T_top_med) * (log_p - log_p_top) / (log_p_btm - log_p_top)
-        ax.plot(Tarr_median, art.pressure, "C0-", lw=2, label="Median (gradient)")
+    median_params = {}
+    for key, values in posterior_samples.items():
+        arr = np.asarray(values)
+        median_params[key] = arr if arr.ndim == 0 else np.median(arr, axis=0)
+    Tarr_median = reconstruct_temperature_profile(
+        median_params,
+        art,
+        pt_profile=pt_profile,
+        Tint_fixed=Tint_fixed,
+        sample_prefix=sample_prefix,
+    )
+    ax.plot(np.asarray(Tarr_median), art.pressure, "C0-", lw=2, label=f"Median ({pt_profile})")
 
     ax.set_xlabel("Temperature [K]", fontsize=12)
     ax.set_ylabel("Pressure [bar]", fontsize=12)
@@ -170,10 +182,15 @@ def _default_corner_variables(sample_dict: dict) -> list[str]:
     if not sample_dict:
         return []
 
+    def _basename(name: str) -> str:
+        return name.split("/")[-1]
+
     priority = [
         "Kp", "Vsys", "dRV", "dRV_0", "dRV_slope",
         "Rp", "Mp", "Rstar",
-        "T0", "T_btm", "T_top", "Tirr", "kappa_ir_cgs", "gamma",
+        "T0", "T_bottom", "T_top", "Tirr", "kappa_ir_cgs", "gamma",
+        "T_deep", "log_P_trans", "delta_P",
+        "log_metallicity", "C_O_ratio",
     ]
     skip_names = {
         "dRV_mean", "dRV_std", "dRV_at_ingress", "dRV_at_egress",
@@ -188,15 +205,17 @@ def _default_corner_variables(sample_dict: dict) -> list[str]:
     selected: list[str] = []
 
     for name in priority:
-        if name in corner_ready:
+        for key in sorted(corner_ready):
+            if _basename(key) == name and key not in selected:
+                selected.append(key)
+
+    for name in sorted(corner_ready):
+        if _basename(name).startswith("logVMR_") and name not in selected:
             selected.append(name)
 
     for name in sorted(corner_ready):
-        if name.startswith("logVMR_") and name not in selected:
-            selected.append(name)
-
-    for name in sorted(corner_ready):
-        if name in selected or name in skip_names or name.endswith("_kms"):
+        base = _basename(name)
+        if name in selected or base in skip_names or base.endswith("_kms"):
             continue
         selected.append(name)
 

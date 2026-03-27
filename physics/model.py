@@ -33,12 +33,15 @@ from exojax.utils.astrofunc import gravity_jupiter as gravity_surface
 from exojax.utils.constants import MJ, RJ, Rs
 
 from physics.pt import (
+    gradient_profile,
     guillot_profile,
+    madhu_seager_profile,
     numpyro_free_temperature,
     numpyro_gradient,
     numpyro_madhu_seager,
     numpyro_pspline_knots_on_art_grid,
     numpyro_gp_temperature,
+    pspline_knots_profile_on_grid,
 )
 from physics.chemistry import CompositionSolver, ConstantVMR
 
@@ -132,20 +135,6 @@ class JointRetrievalModelConfig:
     shared_system: SharedSystemConfig
     atmosphere_regions: tuple[AtmosphereRegionConfig, ...]
     observations: tuple[ObservationConfig, ...]
-
-
-@dataclass(frozen=True)
-class RetrievalModelConfig:
-    shared_system: SharedSystemConfig
-    atmosphere_region: AtmosphereRegionConfig
-    observation: SpectroscopicObservationConfig
-
-    def as_joint_config(self) -> JointRetrievalModelConfig:
-        return JointRetrievalModelConfig(
-            shared_system=self.shared_system,
-            atmosphere_regions=(self.atmosphere_region,),
-            observations=(self.observation,),
-        )
 
 
 class SharedSystemState(NamedTuple):
@@ -447,26 +436,120 @@ def compute_opacity_per_species(
     )
 
 
+_MISSING = object()
+
+
+def _extract_scoped_site_params(
+    posterior_params: dict,
+    sample_prefix: str | None,
+) -> dict:
+    if sample_prefix is None:
+        return {
+            key: value
+            for key, value in posterior_params.items()
+            if "/" not in key
+        }
+
+    prefix = f"{sample_prefix}/"
+    scoped = {
+        key[len(prefix):]: value
+        for key, value in posterior_params.items()
+        if key.startswith(prefix)
+    }
+    if scoped:
+        return scoped
+    return {
+        key: value
+        for key, value in posterior_params.items()
+        if "/" not in key
+    }
+
+
+def _posterior_site_value(
+    posterior_params: dict,
+    site_name: str,
+    *,
+    local_params: dict | None = None,
+    default: object = _MISSING,
+):
+    if local_params is not None and site_name in local_params:
+        return local_params[site_name]
+    if site_name in posterior_params:
+        return posterior_params[site_name]
+    if default is not _MISSING:
+        return default
+    raise KeyError(f"Posterior parameter '{site_name}' was not found.")
+
+
+def _collect_indexed_site_values(
+    local_params: dict,
+    *,
+    prefix: str,
+) -> list[object]:
+    indexed_values: list[tuple[int, object]] = []
+    for key, value in local_params.items():
+        if not key.startswith(prefix):
+            continue
+        suffix = key[len(prefix):]
+        if not suffix.isdigit():
+            continue
+        indexed_values.append((int(suffix), value))
+    return [value for _, value in sorted(indexed_values)]
+
+
+def _summarize_posterior_samples(
+    posterior_samples: dict,
+    *,
+    use_median: bool,
+) -> dict:
+    reducer = np.median if use_median else np.mean
+    summary = {}
+    for key, values in posterior_samples.items():
+        if key.startswith("_"):
+            continue
+        arr = np.asarray(values)
+        if arr.ndim == 0:
+            reduced = arr
+        else:
+            reduced = reducer(arr, axis=0)
+        if np.ndim(reduced) == 0:
+            summary[key] = float(reduced)
+        else:
+            summary[key] = np.asarray(reduced)
+    return summary
+
+
 def reconstruct_temperature_profile(
     posterior_params: dict,
     art: object,
     pt_profile: str = "gp",
     Tint_fixed: float = 100.0,
+    sample_prefix: str | None = None,
 ) -> jnp.ndarray:
-    # posterior_params: parameter values
-    # art: ExoJAX art object
-    # pt_profile: P-T profile name
-    # Tint_fixed: internal temperature for Guillot profile
+    local_params = _extract_scoped_site_params(posterior_params, sample_prefix)
+
     if pt_profile == "guillot":
-        Tirr = posterior_params["Tirr"]
-        kappa_ir_cgs = posterior_params["kappa_ir_cgs"]
-        gamma = posterior_params["gamma"]
-        
-        Rp = posterior_params["Rp"]
-        Mp = posterior_params["Mp"]
+        Tirr = _posterior_site_value(posterior_params, "Tirr", local_params=local_params)
+        kappa_ir_cgs = _posterior_site_value(
+            posterior_params,
+            "kappa_ir_cgs",
+            local_params=local_params,
+        )
+        gamma = _posterior_site_value(posterior_params, "gamma", local_params=local_params)
+
+        Rp = _posterior_site_value(
+            posterior_params,
+            "Rp",
+            default=config.DEFAULT_POSTERIOR_RP,
+        )
+        Mp = _posterior_site_value(
+            posterior_params,
+            "Mp",
+            default=config.DEFAULT_POSTERIOR_MP,
+        )
         g_ref = gravity_surface(Rp, Mp)
-        
-        Tarr = guillot_profile(
+
+        return guillot_profile(
             pressure_bar=art.pressure,
             g_cgs=g_ref,
             Tirr=Tirr,
@@ -474,46 +557,94 @@ def reconstruct_temperature_profile(
             kappa_ir_cgs=kappa_ir_cgs,
             gamma=gamma,
         )
-        
-    elif pt_profile == "isothermal":
-        T0 = posterior_params["T0"]
-        Tarr = T0 * jnp.ones_like(art.pressure)
 
-    elif pt_profile == "gradient":
-        # Linear gradient in log-pressure
-        T_btm = posterior_params["T_btm"]
-        T_top = posterior_params["T_top"]
+    if pt_profile == "isothermal":
+        T0 = _posterior_site_value(posterior_params, "T0", local_params=local_params)
+        return jnp.asarray(T0) * jnp.ones_like(art.pressure)
+
+    if pt_profile == "gradient":
+        T_bottom = _posterior_site_value(
+            posterior_params,
+            "T_bottom",
+            local_params=local_params,
+            default=None,
+        )
+        if T_bottom is None:
+            T_bottom = _posterior_site_value(
+                posterior_params,
+                "T_btm",
+                local_params=local_params,
+            )
+        T_top = _posterior_site_value(posterior_params, "T_top", local_params=local_params)
+        return gradient_profile(art, T_bottom, T_top)
+
+    if pt_profile == "madhu_seager":
+        T_deep = _posterior_site_value(posterior_params, "T_deep", local_params=local_params)
+        T_high = _posterior_site_value(posterior_params, "T_high", local_params=local_params)
+        log_P_trans = _posterior_site_value(
+            posterior_params,
+            "log_P_trans",
+            local_params=local_params,
+        )
+        delta_P = _posterior_site_value(posterior_params, "delta_P", local_params=local_params)
+        return madhu_seager_profile(
+            art,
+            T_deep,
+            T_high,
+            jnp.power(10.0, log_P_trans),
+            delta_P,
+        )
+
+    if pt_profile == "free":
+        node_values = _collect_indexed_site_values(local_params, prefix="T_node_")
+        if not node_values:
+            raise KeyError("No T_node_* posterior sites available for free P-T reconstruction.")
         log_p = jnp.log10(art.pressure)
-        log_p_btm = jnp.log10(art.pressure[-1])
-        log_p_top = jnp.log10(art.pressure[0])
-        Tarr = T_top + (T_btm - T_top) * (log_p - log_p_top) / (log_p_btm - log_p_top)
+        log_p_nodes = jnp.linspace(log_p.min(), log_p.max(), len(node_values))
+        return jnp.interp(log_p, log_p_nodes, jnp.asarray(node_values))
 
-    else:
-        raise ValueError(f"Temperature reconstruction not implemented for profile: {pt_profile}")
-    
-    return Tarr
+    if pt_profile == "pspline":
+        knot_values = _collect_indexed_site_values(local_params, prefix="T_")
+        if not knot_values:
+            raise KeyError("No T_* knot posterior sites available for pspline reconstruction.")
+        return pspline_knots_profile_on_grid(
+            pressure_bar=art.pressure,
+            T_knots=jnp.asarray(knot_values),
+            pressure_eval_bar=art.pressure,
+        )
+
+    if pt_profile == "gp":
+        Tarr = _posterior_site_value(posterior_params, "Tarr", local_params=local_params)
+        Tarr = jnp.asarray(Tarr)
+        if Tarr.shape != art.pressure.shape:
+            raise ValueError(
+                f"GP temperature sample shape {Tarr.shape} does not match "
+                f"art.pressure shape {art.pressure.shape}."
+            )
+        return Tarr
+
+    raise ValueError(f"Temperature reconstruction not implemented for profile: {pt_profile}")
 
 
 def reconstruct_vmr_scalars(
     posterior_params: dict,
     mol_names: list[str],
     atom_names: list[str],
+    sample_prefix: str | None = None,
 ) -> tuple[dict[str, float], dict[str, float]]:
-    # posterior_params: parameter values
-    # mol_names: molecule names
-    # atom_names: atom names
+    local_params = _extract_scoped_site_params(posterior_params, sample_prefix)
     vmr_mols = {}
     for mol in mol_names:
         key = f"logVMR_{mol}"
-        if key in posterior_params:
-            logVMR = posterior_params[key]
+        if key in local_params:
+            logVMR = local_params[key]
             vmr_mols[mol] = float(jnp.power(10.0, logVMR))
 
     vmr_atoms = {}
     for atom in atom_names:
         key = f"logVMR_{atom}"
-        if key in posterior_params:
-            logVMR = posterior_params[key]
+        if key in local_params:
+            logVMR = local_params[key]
             vmr_atoms[atom] = float(jnp.power(10.0, logVMR))
 
     return vmr_mols, vmr_atoms
@@ -524,25 +655,21 @@ def compute_mmw_and_h2he_from_vmr(
     vmr_atoms: dict[str, float],
     mol_names: list[str],
     atom_names: list[str],
+    h2_he_ratio: float = config.H2_HE_RATIO,
 ) -> tuple[float, float, float]:
-    # vmr_mols: scalar VMR per molecule
-    # vmr_atoms: scalar VMR per atom
-    # mol_names: molecule names
-    # atom_names: atom names
-    # Compute molecular masses
     mol_masses = {m: molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names}
     atom_masses = {
         a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names
     }
 
-    # Sum VMRs
     vmr_trace_tot = sum(vmr_mols.values()) + sum(vmr_atoms.values())
     vmr_trace_tot = min(max(vmr_trace_tot, 0.0), 1.0)
 
-    vmrH2 = (1.0 - vmr_trace_tot) * (6.0 / 7.0)
-    vmrHe = (1.0 - vmr_trace_tot) * (1.0 / 7.0)
+    h2_frac = h2_he_ratio / (h2_he_ratio + 1.0)
+    he_frac = 1.0 / (h2_he_ratio + 1.0)
+    vmrH2 = (1.0 - vmr_trace_tot) * h2_frac
+    vmrHe = (1.0 - vmr_trace_tot) * he_frac
 
-    # Mean molecular weight from VMRs
     mass_H2 = molinfo.molmass_isotope("H2")
     mass_He = molinfo.molmass_isotope("He", db_HIT=False)
     mmw = mass_H2 * vmrH2 + mass_He * vmrHe
@@ -582,27 +709,46 @@ def convert_vmr_to_mmr_profiles(
 
 def compute_atmospheric_state_from_posterior(
     posterior_samples: dict,
-    art: object,
+    region_config: AtmosphereRegionConfig,
     opa_mols: dict[str, OpaPremodit],
     opa_atoms: dict[str, OpaPremodit],
     opa_cias: dict[str, OpaCIA],
     nu_grid: jnp.ndarray,
-    pt_profile: str = "guillot",
     use_median: bool = True,
+    sample_prefix: str | None = None,
 ) -> dict:
-    if use_median:
-        params = {k: float(np.median(v)) for k, v in posterior_samples.items() 
-                  if not k.startswith("_")}
-    else:
-        params = {k: float(np.mean(v)) for k, v in posterior_samples.items()
-                  if not k.startswith("_")}
+    art = region_config.art
+    params = _summarize_posterior_samples(
+        posterior_samples,
+        use_median=use_median,
+    )
+    if not isinstance(region_config.composition_solver, ConstantVMR):
+        raise NotImplementedError(
+            "Atmospheric-state reconstruction is only implemented for ConstantVMR "
+            "chemistry. Skip contribution diagnostics for other chemistry solvers."
+        )
+    local_params = _extract_scoped_site_params(params, sample_prefix)
 
-    mol_names = list(opa_mols.keys())
-    atom_names = list(opa_atoms.keys())
-    Tarr = reconstruct_temperature_profile(params, art, pt_profile)
-    vmr_mols, vmr_atoms = reconstruct_vmr_scalars(params, mol_names, atom_names)
+    mol_names = list(region_config.mol_names)
+    atom_names = list(region_config.atom_names)
+    Tarr = reconstruct_temperature_profile(
+        params,
+        art,
+        region_config.pt_profile,
+        Tint_fixed=region_config.Tint_fixed,
+        sample_prefix=sample_prefix,
+    )
+    vmr_mols, vmr_atoms = reconstruct_vmr_scalars(
+        params,
+        mol_names,
+        atom_names,
+        sample_prefix=sample_prefix,
+    )
     mmw, vmrH2, vmrHe = compute_mmw_and_h2he_from_vmr(
-        vmr_mols, vmr_atoms, mol_names, atom_names
+        vmr_mols,
+        vmr_atoms,
+        mol_names,
+        atom_names,
     )
     mmr_mols, mmr_atoms = convert_vmr_to_mmr_profiles(
         vmr_mols, vmr_atoms, mol_names, atom_names, mmw, art
@@ -1261,29 +1407,6 @@ def create_joint_retrieval_model(
     return partial(joint_retrieval_model, model_config)
 
 
-def retrieval_model(
-    model_config: RetrievalModelConfig,
-    data: jnp.ndarray,
-    sigma: jnp.ndarray,
-    phase: jnp.ndarray,
-    U: jnp.ndarray | None = None,
-    invvar_spec: jnp.ndarray | None = None,
-) -> None:
-    observation_inputs = {
-        model_config.observation.name: SpectroscopicObservationInputs(
-            data=jnp.asarray(data),
-            sigma=jnp.asarray(sigma),
-            phase=jnp.asarray(phase),
-            U=None if U is None else jnp.asarray(U),
-            invvar_spec=None if invvar_spec is None else jnp.asarray(invvar_spec),
-        )
-    }
-    joint_retrieval_model(
-        model_config.as_joint_config(),
-        observation_inputs,
-    )
-
-
 def build_shared_system_config(
     *,
     params: dict,
@@ -1304,11 +1427,9 @@ def build_shared_system_config(
 
 
 def _build_species_metadata(
-    opa_mols: dict[str, OpaPremodit],
-    opa_atoms: dict[str, OpaPremodit],
+    mol_names: tuple[str, ...],
+    atom_names: tuple[str, ...],
 ) -> tuple[tuple[str, ...], tuple[str, ...], jnp.ndarray, jnp.ndarray]:
-    mol_names = tuple(opa_mols.keys())
-    atom_names = tuple(opa_atoms.keys())
     mol_masses = jnp.array(
         [molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names]
     )
@@ -1324,13 +1445,13 @@ def _build_species_metadata(
 def build_atmosphere_region_config(
     *,
     mode: RetrievalMode,
-    params: dict,
     art: object,
-    opa_mols: dict[str, OpaPremodit],
-    opa_atoms: dict[str, OpaPremodit],
+    mol_names: tuple[str, ...],
+    atom_names: tuple[str, ...],
     pt_profile: PTProfileMode = config.PT_PROFILE_DEFAULT,
     T_low: float | None = None,
     T_high: float | None = None,
+    Tirr_mean: float | None = None,
     Tirr_std: float | None = None,
     Tint_fixed: float | None = None,
     kappa_ir_cgs_bounds: tuple[float, float] | None = None,
@@ -1354,13 +1475,12 @@ def build_atmosphere_region_config(
     if composition_solver is None:
         composition_solver = ConstantVMR()
 
-    Tirr_mean = params.get("T_eq")
     if Tirr_mean is not None and (Tirr_mean != Tirr_mean):
         Tirr_mean = None
 
     mol_names, atom_names, mol_masses, atom_masses = _build_species_metadata(
-        opa_mols,
-        opa_atoms,
+        mol_names,
+        atom_names,
     )
     region_name = name or _default_region_name_for_mode(mode)
 
@@ -1499,128 +1619,3 @@ def build_bandpass_observation_config(
         Tstar=Tstar,
         sample_prefix=sample_prefix,
     )
-
-
-def build_retrieval_model_config(
-    *,
-    mode: RetrievalMode,
-    params: dict,
-    art: object,
-    opa_mols: dict[str, OpaPremodit],
-    opa_atoms: dict[str, OpaPremodit],
-    opa_cias: dict[str, OpaCIA],
-    nu_grid: jnp.ndarray,
-    sop_rot: SopRotation,
-    sop_inst: SopInstProfile,
-    instrument_resolution: float,
-    inst_nus: jnp.ndarray,
-    pt_profile: PTProfileMode = config.PT_PROFILE_DEFAULT,
-    T_low: float | None = None,
-    T_high: float | None = None,
-    Tirr_std: float | None = None,
-    Tint_fixed: float | None = None,
-    kappa_ir_cgs_bounds: tuple[float, float] | None = None,
-    gamma_bounds: tuple[float, float] | None = None,
-    phase_mode: PhaseMode = config.DEFAULT_PHASE_MODE,
-    subtract_per_exposure_mean: bool | None = None,
-    apply_sysrem: bool | None = None,
-    composition_solver: CompositionSolver | None = None,
-) -> RetrievalModelConfig:
-    return RetrievalModelConfig(
-        shared_system=build_shared_system_config(
-            params=params,
-        ),
-        atmosphere_region=build_atmosphere_region_config(
-            mode=mode,
-            params=params,
-            art=art,
-            opa_mols=opa_mols,
-            opa_atoms=opa_atoms,
-            pt_profile=pt_profile,
-            T_low=T_low,
-            T_high=T_high,
-            Tirr_std=Tirr_std,
-            Tint_fixed=Tint_fixed,
-            kappa_ir_cgs_bounds=kappa_ir_cgs_bounds,
-            gamma_bounds=gamma_bounds,
-            composition_solver=composition_solver,
-            name=None,
-            sample_prefix=None,
-        ),
-        observation=build_spectroscopic_observation_config(
-            name="spectroscopy",
-            region_name=_default_region_name_for_mode(mode),
-            mode=mode,
-            opa_mols=opa_mols,
-            opa_atoms=opa_atoms,
-            opa_cias=opa_cias,
-            nu_grid=nu_grid,
-            sop_rot=sop_rot,
-            sop_inst=sop_inst,
-            instrument_resolution=instrument_resolution,
-            inst_nus=inst_nus,
-            Tstar=params["T_star"],
-            radial_velocity_mode="orbital",
-            phase_mode=phase_mode,
-            likelihood_kind="matched_filter",
-            subtract_per_exposure_mean=subtract_per_exposure_mean,
-            apply_sysrem=apply_sysrem,
-            sample_prefix=None,
-        ),
-    )
-
-
-def create_retrieval_model(
-    *,
-    mode: RetrievalMode,
-    params: dict,  # from config.get_params()
-    art: object,
-    opa_mols: dict[str, OpaPremodit],
-    opa_atoms: dict[str, OpaPremodit],  # Mandatory: pass {} if empty
-    opa_cias: dict[str, OpaCIA],
-    nu_grid: jnp.ndarray,
-    sop_rot: SopRotation,
-    sop_inst: SopInstProfile,
-    instrument_resolution: float,  # Replaced beta_inst. Provide R (e.g. 130000)
-    inst_nus: jnp.ndarray,
-    # P-T profile (Default: pspline)
-    pt_profile: PTProfileMode = config.PT_PROFILE_DEFAULT,
-    T_low: float | None = None,
-    T_high: float | None = None,
-    Tirr_std: float | None = None,  # If None, uses uniform prior on Tirr
-    Tint_fixed: float | None = None,
-    kappa_ir_cgs_bounds: tuple[float, float] | None = None,
-    gamma_bounds: tuple[float, float] | None = None,
-    # Phase-dependent velocity modeling
-    phase_mode: PhaseMode = config.DEFAULT_PHASE_MODE,
-    # Pipeline options
-    subtract_per_exposure_mean: bool | None = None,
-    apply_sysrem: bool | None = None,
-    # Chemistry/composition solver
-    composition_solver: CompositionSolver | None = None,
-) -> Callable:
-    model_config = build_retrieval_model_config(
-        mode=mode,
-        params=params,
-        art=art,
-        opa_mols=opa_mols,
-        opa_atoms=opa_atoms,
-        opa_cias=opa_cias,
-        nu_grid=nu_grid,
-        sop_rot=sop_rot,
-        sop_inst=sop_inst,
-        instrument_resolution=instrument_resolution,
-        inst_nus=inst_nus,
-        pt_profile=pt_profile,
-        T_low=T_low,
-        T_high=T_high,
-        Tirr_std=Tirr_std,
-        Tint_fixed=Tint_fixed,
-        kappa_ir_cgs_bounds=kappa_ir_cgs_bounds,
-        gamma_bounds=gamma_bounds,
-        phase_mode=phase_mode,
-        subtract_per_exposure_mean=subtract_per_exposure_mean,
-        apply_sysrem=apply_sysrem,
-        composition_solver=composition_solver,
-    )
-    return partial(retrieval_model, model_config)

@@ -1,11 +1,10 @@
 import os
 from typing import Callable
-from contextlib import redirect_stdout
 import numpy as np
 import jax
 import jax.numpy as jnp
 
-from numpyro.infer import Predictive, MCMC, NUTS, SVI, Trace_ELBO
+from numpyro.infer import SVI, Trace_ELBO
 import numpyro
 import numpyro.distributions as dist
 import numpyro.optim as optim
@@ -20,7 +19,8 @@ def create_prior_guide(
     Rstar_mean: float,
     Rstar_std: float,
 ) -> Callable:
-    def prior_guide(data: jnp.ndarray, sigma: jnp.ndarray, phase: jnp.ndarray, **kwargs) -> dict:
+    def prior_guide(*args, **kwargs) -> dict:
+        del args, kwargs
         Mp = numpyro.sample("Mp", dist.TruncatedNormal(Mp_mean, Mp_std, low=0.0))
         Rstar = numpyro.sample("Rstar", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0))
         return {"Mp": Mp, "Rstar": Rstar}
@@ -74,11 +74,7 @@ def save_svi_outputs(
 def run_svi(
     model_c: Callable,
     rng_key: jax.Array,
-    data: jnp.ndarray,
-    sigma: jnp.ndarray,
-    phase: jnp.ndarray,
-    U: jnp.ndarray | None,
-    invvar_spec: jnp.ndarray | None,
+    model_inputs: dict[str, object],
     Mp_mean: float,
     Mp_std: float,
     Rstar_mean: float,
@@ -94,11 +90,7 @@ def run_svi(
     svi_result = svi.run(
         rng_key,
         num_steps,
-        data=data,
-        sigma=sigma,
-        phase=phase,
-        U=U,
-        invvar_spec=invvar_spec,
+        **model_inputs,
     )
 
     params = svi_result.params
@@ -111,53 +103,3 @@ def run_svi(
     save_svi_outputs(params, losses, svi_median, output_dir)
 
     return params, losses, init_strategy, svi_median, guide
-
-
-def run_mcmc(
-    model_c: Callable,
-    rng_key: jax.Array,
-    data: jnp.ndarray,
-    sigma: jnp.ndarray,
-    phase: jnp.ndarray,
-    init_strategy: Callable,
-    output_dir: str,
-    num_warmup: int = 1000,
-    num_samples: int = 1000,
-    max_tree_depth: int = 5,
-    num_chains: int = 1,
-) -> tuple[MCMC, dict]:
-    kernel = NUTS(
-        model_c,
-        max_tree_depth=max_tree_depth,
-        init_strategy=init_strategy,
-    )
-
-    mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, num_chains=num_chains)
-    mcmc.run(rng_key, data=data, sigma=sigma, phase=phase)
-
-    mcmc.print_summary()
-    with open(os.path.join(output_dir, "mcmc_summary.txt"), "w") as f:
-        with redirect_stdout(f):
-            mcmc.print_summary()
-
-    posterior_sample = mcmc.get_samples()
-    jnp.savez(os.path.join(output_dir, "posterior_sample"), **posterior_sample)
-
-    return mcmc, posterior_sample
-
-
-def generate_predictions(
-    model_c: Callable,
-    rng_key: jax.Array,
-    posterior_sample: dict,
-    data: jnp.ndarray,
-    sigma: jnp.ndarray,
-    phase: jnp.ndarray,
-    output_dir: str,
-) -> dict:
-    pred = Predictive(model_c, posterior_sample, return_sites=["Rp"])
-    predictions = pred(rng_key, data=data, sigma=sigma, phase=phase)
-
-    jnp.save(os.path.join(output_dir, "rp_pred"), predictions["Rp"])
-
-    return predictions
