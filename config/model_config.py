@@ -49,7 +49,7 @@ DEFAULT_POSTERIOR_MP = 1.0 # Maximum Mp/Ms for posterior reconstruction
 
 # Pipeline behavior defaults
 SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT = True # Whether to subtract per-exposure mean from model and data before computing likelihood. Should be True for CCF-like likelihoods, but can be False for full-spectrum Gaussian likelihoods.
-APPLY_SYSREM_DEFAULT = True # Whether to apply SysRem-like filtering to model and data before computing likelihood. Should be True for CCF-like likelihoods, but can be False for full-spectrum Gaussian likelihoods. Requires U and invvar_spec from data preprocessing.
+APPLY_SYSREM_DEFAULT = True # Whether to apply SysRem-like filtering to model and data before computing likelihood. Should be True for CCF-like likelihoods, but can be False for full-spectrum Gaussian likelihoods. Requires U and V from data preprocessing.
 
 # Phase modeling defaults
 DEFAULT_PHASE_MODE = "global" 

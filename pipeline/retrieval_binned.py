@@ -48,15 +48,15 @@ def run_phase_binned_retrieval(
     apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT)
 
     U_sysrem = None
-    invvar_spec = None
+    V = None
     if apply_sysrem:
-        U_raw, invvar_raw = _load_sysrem_inputs(resolved_data_dir)
-        U_sysrem, invvar_spec = _validate_sysrem_inputs(
-            U_raw, invvar_raw, n_exp=data.shape[0]
+        U_raw, V_raw = _load_sysrem_inputs(resolved_data_dir)
+        U_sysrem, V = _validate_sysrem_inputs(
+            U_raw, V_raw, n_exp=data.shape[0]
         )
         print(
             f"Loaded SYSREM auxiliaries for phase-binned retrieval: "
-            f"U shape={U_sysrem.shape}, invvar_spec shape={invvar_spec.shape}"
+            f"U shape={U_sysrem.shape}, V shape={V.shape}"
         )
     
     # Validate phase bins
@@ -102,7 +102,7 @@ def run_phase_binned_retrieval(
         phase_bin = phase[indices]
 
         U_bin = None if U_sysrem is None else U_sysrem[indices]
-        invvar_bin = None if invvar_spec is None else invvar_spec[indices]
+        V_bin = None if V is None else V[np.ix_(indices, indices)]
         
         print(f"Filtered to {len(phase_bin)} exposures")
         
@@ -122,7 +122,7 @@ def run_phase_binned_retrieval(
                 sigma=sigma_bin,
                 phase=phase_bin,
                 U=U_bin,
-                invvar_spec=invvar_bin,
+                V=V_bin,
                 **retrieval_kwargs,
             )
             results[bin_name] = {"output_dir": str(bin_output_dir)}

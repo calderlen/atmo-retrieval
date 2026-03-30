@@ -58,11 +58,6 @@ def _sanitize_planet_name(planet: str) -> str:
     return planet.lower().replace("-", "")
 
 
-def _trapz_jax(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    dx = x[1:] - x[:-1]
-    return jnp.sum(0.5 * (y[1:] + y[:-1]) * dx)
-
-
 def _download_tess_bandpass(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     text = urlopen(config.TESS_BANDPASS_URL).read().decode("utf-8")
@@ -158,7 +153,7 @@ def bandpass_integrated_planck(
     """Integrate the Planck function over bandpass response."""
     weights = response * wavelength_m if photon_weighted else response
     spectral = planck_lambda(wavelength_m, temperature_k)
-    return _trapz_jax(wavelength_m, spectral * weights)
+    return jnp.trapezoid(spectral * weights, wavelength_m)
 
 
 def _eclipse_components(

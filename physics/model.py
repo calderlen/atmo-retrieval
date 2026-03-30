@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import importlib
 import warnings
-from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Literal, NamedTuple
@@ -13,6 +11,8 @@ import numpy as np
 import numpyro
 import numpyro.distributions as dist
 
+
+# string literals for the various model configurations
 RetrievalMode = Literal["transmission", "emission"]
 PhaseMode = Literal["global", "per_exposure", "linear"]
 PTProfileMode = Literal[
@@ -29,9 +29,11 @@ from exojax.database import molinfo
 from exojax.opacity.opacont import OpaCIA
 from exojax.opacity.premodit.api import OpaPremodit
 from exojax.postproc.specop import SopInstProfile, SopRotation
+from exojax.spec.planck import piBarr
 from exojax.utils.astrofunc import gravity_jupiter as gravity_surface
 from exojax.utils.constants import MJ, RJ, Rs
 
+# P-T profiles
 from physics.pt import (
     gradient_profile,
     guillot_profile,
@@ -43,16 +45,19 @@ from physics.pt import (
     numpyro_gp_temperature,
     pspline_knots_profile_on_grid,
 )
+
+# chemistry models
 from physics.chemistry import CompositionSolver, ConstantVMR
 
 
-EPS = 1.0e-30
+EPS = 1.0e-30 # prevent divide by zero
 CIA_COLLISION_PAIRS: tuple[tuple[str, str, str], ...] = (
     ("H2H2", "H2", "H2"),
     ("H2He", "H2", "He"),
 )
 
-
+# the below dataclasses are all configuration objects, they describe how to build and sample the model
+# system paramaters that are shared across all atmospheric regions and observation types in a joint retrieval
 @dataclass(frozen=True)
 class SharedSystemConfig:
     Kp_mean: float
@@ -67,7 +72,8 @@ class SharedSystemConfig:
     Rstar_std: float
     period_day: float
 
-
+# TODO: ensure these region-specific data-ignorant params in the dataclass shold be region-specific, or if some of these should be shared between atmopsheric regions
+# paramaters that are region-specific (so emission vs. transmission), but shared across all observation types in a joint retrieval.
 @dataclass(frozen=True)
 class AtmosphereRegionConfig:
     name: str
@@ -87,7 +93,8 @@ class AtmosphereRegionConfig:
     Tirr_mean: float | None
     sample_prefix: str | None = None
 
-
+# TODO: vice versa from above, ensure these observation-specific data-ignorant params in the dataclass should be observation-specific, or if some of these should be shared between observation types
+# parameters that are specific to an observation type (e.g. high-res spectroscopy vs. broadband photometry) for a given atmospheric region
 @dataclass(frozen=True)
 class SpectroscopicObservationConfig:
     name: str
@@ -110,6 +117,7 @@ class SpectroscopicObservationConfig:
     sample_prefix: str | None = None
 
 
+# paramaters for bandpass observation
 @dataclass(frozen=True)
 class BandpassObservationConfig:
     name: str
@@ -126,17 +134,19 @@ class BandpassObservationConfig:
     Tstar: float | None
     sample_prefix: str | None = None
 
-
+# allows for joint configuration of spectroscopic and bandpass observations in the same retrieval
 ObservationConfig = SpectroscopicObservationConfig | BandpassObservationConfig
 
-
+# the full configuration for a joint retrieval, including shared system parameters, region-specific atmospheric parameters, and observation-specific parameters for all observations included in the retrieval
 @dataclass(frozen=True)
 class JointRetrievalModelConfig:
     shared_system: SharedSystemConfig
     atmosphere_regions: tuple[AtmosphereRegionConfig, ...]
     observations: tuple[ObservationConfig, ...]
 
+# the below observation input clases are state objects, holding the realized values for a retrieval sample after the configs have been used
 
+# the computed atmospheric state for a given atmospheric region, reconstructed from the posterior samples, and the shared system state for a given retrieval sample
 class SharedSystemState(NamedTuple):
     Kp: jnp.ndarray
     Vsys: jnp.ndarray
@@ -144,7 +154,6 @@ class SharedSystemState(NamedTuple):
     Rstar: jnp.ndarray
     Rp: jnp.ndarray
     g_ref: jnp.ndarray
-
 
 class AtmosphereState(NamedTuple):
     art: object
@@ -162,7 +171,7 @@ class SpectroscopicObservationInputs(NamedTuple):
     sigma: jnp.ndarray
     phase: jnp.ndarray | None = None
     U: jnp.ndarray | None = None
-    invvar_spec: jnp.ndarray | None = None
+    V: jnp.ndarray | None = None
 
 
 class BandpassObservationInputs(NamedTuple):
@@ -172,52 +181,26 @@ class BandpassObservationInputs(NamedTuple):
 
 ObservationInputs = SpectroscopicObservationInputs | BandpassObservationInputs
 
-
-def _get_piBarr():
-    mod = importlib.import_module("exojax.spec.planck")
-    return mod.piBarr
-
-
+# "Fe I" -> "Fe"
 def _element_from_species(species_name: str) -> str:
     return species_name.split()[0]
 
 
-def _numpyro_scope(prefix: str | None):
-    if prefix is None:
-        return nullcontext()
-    return numpyro.handlers.scope(prefix=prefix)
-
-
+# converts e.g. "PEPSI/LBT HRS" -> "PEPSI_LBT_HRS"
 def _sanitize_site_name(name: str) -> str:
     cleaned = "".join(ch if ch.isalnum() else "_" for ch in name)
     cleaned = cleaned.strip("_")
     return cleaned or "component"
 
-
+# given a retrieval mode, return the default atmospheric region name to use if not specified in the configs
 def _default_region_name_for_mode(mode: RetrievalMode) -> AtmosphereRegionName:
     if mode == "transmission":
         return "terminator"
-    return "dayside"
+    if mode == "emission":
+        return "dayside"
+    raise ValueError(f"Unsupported retrieval mode: {mode}")
 
-
-def _effective_scope_prefix(
-    explicit_prefix: str | None,
-    fallback_name: str,
-    *,
-    enable_fallback: bool,
-) -> str | None:
-    if explicit_prefix is not None:
-        return explicit_prefix
-    if enable_fallback:
-        return _sanitize_site_name(fallback_name)
-    return None
-
-
-def _trapz_jax(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    dx = x[1:] - x[:-1]
-    return jnp.sum(0.5 * (y[1:] + y[:-1]) * dx)
-
-
+# compute the planet radial velocity in km/s for a given phase array, Kp, Vsys, and optional additional RV offset
 def planet_rv_kms(
     phase: jnp.ndarray,
     Kp_kms: float,
@@ -226,15 +209,34 @@ def planet_rv_kms(
 ) -> jnp.ndarray:
     return Kp_kms * jnp.sin(2.0 * jnp.pi * phase) + Vsys_kms + dRV_kms
 
-
-def sysrem_filter_model(
-    model_matrix: jnp.ndarray,
+# "Applying SYSREM not only removes the static-stellar and telluric signals in the data, but also distorts the underlying planetary spectrum. This effect must be accounted for in order to retrieve accurate parameters from the planetary spectra. We follow the methodology of N. P. Gibson et al. (2022) to apply a corresponding distortion to the model spectra. The corrected model is, from Equation (7) of N. P. Gibson et al."
+def sysrem_model_distortion(
+    M: jnp.ndarray,
     U: jnp.ndarray,
-    invvar_spec: jnp.ndarray,
+    V: jnp.ndarray,
 ) -> jnp.ndarray:
-    UTW = U.T * invvar_spec[None, :]
-    U_dag = jnp.linalg.solve(UTW @ U, UTW)
-    return model_matrix - U @ (U_dag @ model_matrix)
+    """Apply the SYSREM-induced distortion to the model matrix.
+
+    Parameters
+    ----------
+    M : jnp.ndarray
+        Model matrix with shape (n_exposures, n_wavelengths).
+    U : jnp.ndarray
+        SYSREM basis matrix with shape (n_exposures, n_basis). A constant
+        offset term is represented by a column of ones.
+    V : jnp.ndarray
+        Diagonal whitening matrix with entries 1 / sigma and shape
+        (n_exposures, n_exposures).
+
+    The filtered model is computed from the SYSREM projection
+
+        M_fit = U ((V U)^T (V U))^-1 (V U)^T (V M)
+        M_filtered = M - M_fit
+
+    so the effective least-squares weights are V^T V = diag(1 / sigma^2).
+    """
+    M_fit = U @ jnp.linalg.solve((V @ U).T @ (V @ U), (V @ U).T @ (V @ M))
+    return M - M_fit
 
 
 def check_grid_resolution(
@@ -944,7 +946,6 @@ def compute_model_timeseries(
     if Tstar is None:
         raise ValueError("Tstar is required for emission mode.")
 
-    piBarr = _get_piBarr()
     Fs = piBarr(nu_grid, Tstar)
     Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
     return planet_ts / jnp.clip(Fs_ts, EPS, None) * (Rp / Rstar) ** 2
@@ -956,7 +957,7 @@ def apply_model_pipeline_corrections(
     subtract_per_exposure_mean: bool,
     apply_sysrem: bool,
     U: jnp.ndarray | None = None,
-    invvar_spec: jnp.ndarray | None = None,
+    V: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     if model_ts.ndim == 1:
         model_ts = model_ts[None, :]
@@ -967,9 +968,9 @@ def apply_model_pipeline_corrections(
         model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
 
     if apply_sysrem:
-        if (U is None) or (invvar_spec is None):
-            raise ValueError("apply_sysrem=True requires both U and invvar_spec inputs.")
-        model_ts = sysrem_filter_model(model_ts, U, invvar_spec)
+        if (U is None) or (V is None):
+            raise ValueError("apply_sysrem=True requires both U and V inputs.")
+        model_ts = sysrem_model_distortion(model_ts, U, V)
 
     return model_ts
 
@@ -993,7 +994,7 @@ def _normalize_spectroscopic_observation_inputs(
     sigma = jnp.asarray(inputs.sigma)
     phase = None if inputs.phase is None else jnp.asarray(inputs.phase)
     U = None if inputs.U is None else jnp.asarray(inputs.U)
-    invvar_spec = None if inputs.invvar_spec is None else jnp.asarray(inputs.invvar_spec)
+    V = None if inputs.V is None else jnp.asarray(inputs.V)
 
     if data.ndim == 1:
         data = data[None, :]
@@ -1009,13 +1010,19 @@ def _normalize_spectroscopic_observation_inputs(
         raise ValueError(
             f"phase length {phase.shape[0]} does not match number of exposures {data.shape[0]}"
         )
+    if V is not None:
+        expected_shape = (data.shape[0], data.shape[0])
+        if V.ndim != 2:
+            raise ValueError(f"V must be 2D; got ndim={V.ndim}")
+        if V.shape != expected_shape:
+            raise ValueError(f"V shape {V.shape} does not match expected {expected_shape}")
 
     return SpectroscopicObservationInputs(
         data=data,
         sigma=sigma,
         phase=phase,
         U=U,
-        invvar_spec=invvar_spec,
+        V=V,
     )
 
 
@@ -1060,7 +1067,7 @@ def _sample_atmosphere_state(
     *,
     scope_prefix: str | None = None,
 ) -> AtmosphereState:
-    with _numpyro_scope(scope_prefix):
+    if scope_prefix is None:
         Tarr = _sample_temperature_profile(region_config, shared_state.g_ref)
         comp = region_config.composition_solver.sample(
             region_config.mol_names,
@@ -1070,6 +1077,17 @@ def _sample_atmosphere_state(
             region_config.art,
             Tarr=Tarr,
         )
+    else:
+        with numpyro.handlers.scope(prefix=scope_prefix):
+            Tarr = _sample_temperature_profile(region_config, shared_state.g_ref)
+            comp = region_config.composition_solver.sample(
+                region_config.mol_names,
+                region_config.mol_masses,
+                region_config.atom_names,
+                region_config.atom_masses,
+                region_config.art,
+                Tarr=Tarr,
+            )
 
     g_profile = region_config.art.gravity_profile(
         Tarr,
@@ -1116,6 +1134,30 @@ def _compute_component_dtau(
     )
 
 
+def _validate_unique_sample_prefixes(
+    items: tuple[object, ...],
+    *,
+    label: str,
+) -> None:
+    if len(items) <= 1:
+        return
+
+    missing = [getattr(item, "name", "<unnamed>") for item in items if getattr(item, "sample_prefix", None) is None]
+    if missing:
+        raise ValueError(
+            f"Multiple {label} require explicit sample_prefix values. Missing sample_prefix for: "
+            + ", ".join(missing)
+        )
+
+    prefixes = [str(getattr(item, "sample_prefix")) for item in items]
+    duplicates = sorted({prefix for prefix in prefixes if prefixes.count(prefix) > 1})
+    if duplicates:
+        raise ValueError(
+            f"{label.capitalize()} sample_prefix values must be unique. Duplicates: "
+            + ", ".join(duplicates)
+        )
+
+
 def _sample_component_velocity_offset(
     component_config: SpectroscopicObservationConfig,
     phase: jnp.ndarray,
@@ -1127,7 +1169,15 @@ def _sample_component_velocity_offset(
     if component_config.phase_mode is None:
         return jnp.zeros_like(phase)
 
-    with _numpyro_scope(scope_prefix):
+    if scope_prefix is None:
+        dRV = _sample_phase_dependent_velocity_offset(
+            component_config.phase_mode,
+            phase,
+        )
+        numpyro.deterministic("dRV_kms", dRV)
+        return dRV
+
+    with numpyro.handlers.scope(prefix=scope_prefix):
         dRV = _sample_phase_dependent_velocity_offset(
             component_config.phase_mode,
             phase,
@@ -1157,7 +1207,6 @@ def _compute_native_observable_spectrum(
     if Tstar is None:
         raise ValueError("Tstar is required for emission mode.")
 
-    piBarr = _get_piBarr()
     Fs = piBarr(nu_grid, Tstar)
     return rt / jnp.clip(Fs, EPS, None) * (Rp / Rstar) ** 2
 
@@ -1191,8 +1240,8 @@ def _bandpass_weighted_mean(
 
     rsp_interp = jnp.interp(wl_model, wl_band, rsp_band, left=0.0, right=0.0)
     weights = rsp_interp * wl_model if photon_weighted else rsp_interp
-    norm = _trapz_jax(wl_model, weights)
-    return _trapz_jax(wl_model, spec_sorted * weights) / jnp.clip(norm, EPS, None)
+    norm = jnp.trapezoid(weights, wl_model)
+    return jnp.trapezoid(spec_sorted * weights, wl_model) / jnp.clip(norm, EPS, None)
 
 
 def _transform_bandpass_observable(
@@ -1257,7 +1306,7 @@ def _evaluate_spectroscopic_component(
         subtract_per_exposure_mean=component_config.subtract_per_exposure_mean,
         apply_sysrem=component_config.apply_sysrem,
         U=observation_inputs.U,
-        invvar_spec=observation_inputs.invvar_spec,
+        V=observation_inputs.V,
     )
 
     if component_config.likelihood_kind == "gaussian":
@@ -1318,18 +1367,13 @@ def joint_retrieval_model(
     model_config: JointRetrievalModelConfig,
     observations: dict[str, ObservationInputs],
 ) -> None:
-    multi_region = len(model_config.atmosphere_regions) > 1
     multi_observation = len(model_config.observations) > 1
     shared_state = _sample_shared_system_state(model_config.shared_system)
     region_states = {
         region_config.name: _sample_atmosphere_state(
             region_config,
             shared_state,
-            scope_prefix=_effective_scope_prefix(
-                region_config.sample_prefix,
-                region_config.name,
-                enable_fallback=multi_region,
-            ),
+            scope_prefix=region_config.sample_prefix,
         )
         for region_config in model_config.atmosphere_regions
     }
@@ -1357,11 +1401,7 @@ def joint_retrieval_model(
                 model_config.shared_system,
                 shared_state,
                 region_states[component_config.region_name],
-                scope_prefix=_effective_scope_prefix(
-                    component_config.sample_prefix,
-                    component_config.name,
-                    enable_fallback=multi_observation,
-                ),
+                scope_prefix=component_config.sample_prefix,
             )
         elif isinstance(component_config, BandpassObservationConfig):
             if not isinstance(component_input, BandpassObservationInputs):
@@ -1399,6 +1439,8 @@ def create_joint_retrieval_model(
     atmosphere_regions: tuple[AtmosphereRegionConfig, ...],
     observations: tuple[ObservationConfig, ...],
 ) -> Callable:
+    _validate_unique_sample_prefixes(tuple(atmosphere_regions), label="atmosphere regions")
+    _validate_unique_sample_prefixes(tuple(observations), label="observations")
     model_config = JointRetrievalModelConfig(
         shared_system=shared_system,
         atmosphere_regions=tuple(atmosphere_regions),

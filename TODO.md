@@ -15,8 +15,6 @@
     - free T-P profile?
     - log g?
 
-- TODO: add joint retrieval?
-
 - TODO: fill missing ephemeris / Doppler-shadow parameters in `config/planets_config.py`
     - only KELT-20b Duck24 currently has a non-NaN `tau`
     - the following still need `tau`, `lambda_angle`, `gamma1`, `gamma2`, `a_rs`, `b`, and `rp_rs`

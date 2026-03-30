@@ -78,19 +78,22 @@ def _load_sysrem_inputs(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray]:
         data_dir / "U_sysrem.npy",
         data_dir / "U_sysrem.npz",
     ]
-    invvar_candidates = [
-        data_dir / "invvar_spec.npy",
-        data_dir / "invvar.npy",
+    v_candidates = [
+        data_dir / "V.npy",
+        data_dir / "V_diag.npy",
+        data_dir / "inv_sigma.npy",
+        data_dir / "invsigma.npy",
     ]
 
     u_path = next((p for p in u_candidates if p.exists()), None)
-    invvar_path = next((p for p in invvar_candidates if p.exists()), None)
+    v_path = next((p for p in v_candidates if p.exists()), None)
 
-    if u_path is None or invvar_path is None:
+    if u_path is None or v_path is None:
         raise FileNotFoundError(
             "apply_sysrem=True requires SYSREM auxiliaries in data directory. "
             "Expected one of {U.npy, U_sysrem.npy, U_sysrem.npz} and one of "
-            "{invvar_spec.npy, invvar.npy} in "
+            "{V.npy, V_diag.npy, inv_sigma.npy, invsigma.npy} containing "
+            "diag(1 / sigma) in "
             f"{data_dir}."
         )
 
@@ -107,17 +110,17 @@ def _load_sysrem_inputs(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray]:
     else:
         U = np.load(u_path)
 
-    invvar_spec = np.load(invvar_path)
-    return U, invvar_spec
+    V_raw = np.load(v_path)
+    return U, V_raw
 
 
 def _validate_sysrem_inputs(
     U: np.ndarray,
-    invvar_spec: np.ndarray,
+    V: np.ndarray,
     n_exp: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     U = np.asarray(U)
-    invvar_spec = np.asarray(invvar_spec)
+    V = np.asarray(V)
 
     if U.ndim == 3:
         if U.shape[2] != 1:
@@ -129,28 +132,39 @@ def _validate_sysrem_inputs(
 
     if U.ndim != 2:
         raise ValueError(f"SYSREM basis U must be 2D; got shape {U.shape}.")
-    if invvar_spec.ndim != 1:
-        raise ValueError(
-            f"invvar_spec must be 1D over exposures; got shape {invvar_spec.shape}."
-        )
 
     if U.shape[0] != n_exp:
         raise ValueError(
             f"U exposure axis mismatch: U.shape[0]={U.shape[0]} but n_exp={n_exp}."
         )
-    if invvar_spec.size != n_exp:
-        raise ValueError(
-            "invvar_spec exposure axis mismatch: "
-            f"invvar_spec.size={invvar_spec.size} but n_exp={n_exp}."
-        )
     if not np.all(np.isfinite(U)):
         raise ValueError("SYSREM basis U contains non-finite values.")
-    if not np.all(np.isfinite(invvar_spec)):
-        raise ValueError("invvar_spec contains non-finite values.")
-    if np.any(invvar_spec <= 0):
-        raise ValueError("invvar_spec must be strictly positive.")
+    if V.ndim == 1:
+        if V.size != n_exp:
+            raise ValueError(
+                f"V exposure axis mismatch: V.size={V.size} but n_exp={n_exp}."
+            )
+        if not np.all(np.isfinite(V)):
+            raise ValueError("V contains non-finite values.")
+        if np.any(V <= 0):
+            raise ValueError("V must be strictly positive.")
+        V = np.diag(V)
+    elif V.ndim == 2:
+        expected_shape = (n_exp, n_exp)
+        if V.shape != expected_shape:
+            raise ValueError(
+                f"V shape mismatch: V.shape={V.shape} but expected {expected_shape}."
+            )
+        if not np.all(np.isfinite(V)):
+            raise ValueError("V contains non-finite values.")
+        if not np.allclose(V, np.diag(np.diag(V))):
+            raise ValueError("V must be diagonal.")
+        if np.any(np.diag(V) <= 0):
+            raise ValueError("V must have strictly positive diagonal entries.")
+    else:
+        raise ValueError(f"V must be 1D or 2D; got ndim={V.ndim}.")
 
-    return U, invvar_spec
+    return U, V
 
 
 def _normalize_phase(phase: np.ndarray) -> np.ndarray:
@@ -338,19 +352,6 @@ def _phase_dependent_drv(params: dict[str, float], phase: np.ndarray) -> jnp.nda
     return jnp.asarray(params.get("dRV", 0.0))
 
 
-def _resolve_scope_prefix(
-    explicit_prefix: str | None,
-    fallback_name: str,
-    *,
-    enable_fallback: bool,
-) -> str | None:
-    if explicit_prefix is not None:
-        return explicit_prefix
-    if enable_fallback:
-        return fallback_name
-    return None
-
-
 def _posterior_site_value(
     params: dict[str, float],
     site_name: str,
@@ -446,7 +447,7 @@ def _synthesize_timeseries_from_atmospheric_state(
         subtract_per_exposure_mean=observation_config.subtract_per_exposure_mean,
         apply_sysrem=observation_config.apply_sysrem,
         U=None if component.U_sysrem is None else jnp.asarray(component.U_sysrem),
-        invvar_spec=None if component.invvar_spec is None else jnp.asarray(component.invvar_spec),
+        V=None if component.V is None else jnp.asarray(component.V),
     )
 
     return np.asarray(jax.device_get(model_ts))
@@ -496,7 +497,7 @@ class SpectroscopicComponentBundle:
     sigma: np.ndarray
     phase: np.ndarray
     U_sysrem: np.ndarray | None
-    invvar_spec: np.ndarray | None
+    V: np.ndarray | None
     inst_nus: np.ndarray
     nu_grid: np.ndarray
     sop_rot: object
@@ -542,7 +543,11 @@ def _normalize_retrieval_mode(mode: str) -> str:
 
 
 def _default_region_name_for_mode(mode: str) -> str:
-    return "terminator" if mode == "transmission" else "dayside"
+    if mode == "transmission":
+        return "terminator"
+    if mode == "emission":
+        return "dayside"
+    raise ValueError(f"Unsupported retrieval mode: {mode}")
 
 
 def _build_art_for_mode(mode: str) -> object:
@@ -647,7 +652,7 @@ def _build_primary_spectroscopic_component(
     sigma: np.ndarray,
     phase: np.ndarray,
     U_sysrem: np.ndarray | None,
-    invvar_spec: np.ndarray | None,
+    V: np.ndarray | None,
     instrument_resolution: float,
     nu_grid: np.ndarray,
     inst_nus: np.ndarray,
@@ -663,6 +668,7 @@ def _build_primary_spectroscopic_component(
     radial_velocity_mode: str,
     likelihood_kind: str,
     subtract_per_exposure_mean: bool,
+    sample_prefix: str | None = None,
 ) -> SpectroscopicComponentBundle:
     mode = _normalize_retrieval_mode(mode)
     observation_config = build_spectroscopic_observation_config(
@@ -683,14 +689,14 @@ def _build_primary_spectroscopic_component(
         likelihood_kind=likelihood_kind,
         subtract_per_exposure_mean=subtract_per_exposure_mean,
         apply_sysrem=apply_sysrem,
-        sample_prefix=None,
+        sample_prefix=sample_prefix,
     )
     observation_inputs = SpectroscopicObservationInputs(
         data=jnp.asarray(data),
         sigma=jnp.asarray(sigma),
         phase=jnp.asarray(phase),
         U=None if U_sysrem is None else jnp.asarray(U_sysrem),
-        invvar_spec=None if invvar_spec is None else jnp.asarray(invvar_spec),
+        V=None if V is None else jnp.asarray(V),
     )
     return SpectroscopicComponentBundle(
         name=name,
@@ -699,7 +705,7 @@ def _build_primary_spectroscopic_component(
         sigma=np.asarray(sigma),
         phase=np.asarray(phase),
         U_sysrem=None if U_sysrem is None else np.asarray(U_sysrem),
-        invvar_spec=None if invvar_spec is None else np.asarray(invvar_spec),
+        V=None if V is None else np.asarray(V),
         inst_nus=np.asarray(inst_nus),
         nu_grid=np.asarray(nu_grid),
         sop_rot=sop_rot,
@@ -844,25 +850,25 @@ def _load_joint_spectroscopic_component(
         sigma = uncertainty[np.newaxis, :]
         phase = np.zeros((1,), dtype=float)
         U_sysrem = None
-        invvar_spec = None
+        V = None
     elif all(key in spec for key in ("wav_obs", "data", "sigma")):
         wav_obs = np.asarray(spec["wav_obs"])
         data = np.asarray(spec["data"])
         sigma = np.asarray(spec["sigma"])
         phase = np.asarray(spec.get("phase", np.zeros((1 if data.ndim == 1 else data.shape[0],), dtype=float)))
         U_sysrem = None if spec.get("U") is None else np.asarray(spec["U"])
-        invvar_spec = None if spec.get("invvar_spec") is None else np.asarray(spec["invvar_spec"])
+        V = None if spec.get("V") is None else np.asarray(spec["V"])
     elif "data_dir" in spec:
         data_dir = Path(spec["data_dir"])
         if data_format == "timeseries":
             wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
             phase = _normalize_phase(phase)
             if apply_sysrem:
-                U_raw, invvar_raw = _load_sysrem_inputs(data_dir)
-                U_sysrem, invvar_spec = _validate_sysrem_inputs(U_raw, invvar_raw, n_exp=data.shape[0])
+                U_raw, V_raw = _load_sysrem_inputs(data_dir)
+                U_sysrem, V = _validate_sysrem_inputs(U_raw, V_raw, n_exp=data.shape[0])
             else:
                 U_sysrem = None
-                invvar_spec = None
+                V = None
         elif data_format == "spectrum":
             suffix = "transmission" if component_mode == "transmission" else "emission"
             wav_obs, spectrum, uncertainty, _ = load_observed_spectrum(
@@ -874,7 +880,7 @@ def _load_joint_spectroscopic_component(
             sigma = uncertainty[np.newaxis, :]
             phase = np.zeros((1,), dtype=float)
             U_sysrem = None
-            invvar_spec = None
+            V = None
         else:
             raise ValueError(f"Unsupported auxiliary data_format: {data_format}")
     else:
@@ -883,10 +889,10 @@ def _load_joint_spectroscopic_component(
             "{tbl_path}, {data_dir}, or {wav_obs,data,sigma}."
         )
 
-    if apply_sysrem and (U_sysrem is None or invvar_spec is None):
+    if apply_sysrem and (U_sysrem is None or V is None):
         raise ValueError(
             f"Joint spectroscopic component '{name}' requested SYSREM but no valid "
-            "U/invvar_spec inputs were provided."
+            "U/V inputs were provided."
         )
 
     wav_obs, data, sigma, inst_nus = _prepare_observed_spectrum_arrays(wav_obs, data, sigma)
@@ -929,7 +935,7 @@ def _load_joint_spectroscopic_component(
         sigma=jnp.asarray(sigma),
         phase=jnp.asarray(phase),
         U=None if U_sysrem is None else jnp.asarray(U_sysrem),
-        invvar_spec=None if invvar_spec is None else jnp.asarray(invvar_spec),
+        V=None if V is None else jnp.asarray(V),
     )
     return SpectroscopicComponentBundle(
         name=name,
@@ -938,7 +944,7 @@ def _load_joint_spectroscopic_component(
         sigma=np.asarray(sigma),
         phase=np.asarray(phase),
         U_sysrem=None if U_sysrem is None else np.asarray(U_sysrem),
-        invvar_spec=None if invvar_spec is None else np.asarray(invvar_spec),
+        V=None if V is None else np.asarray(V),
         inst_nus=np.asarray(inst_nus_component),
         nu_grid=np.asarray(nu_grid),
         sop_rot=sop_rot,
@@ -1051,7 +1057,7 @@ def run_retrieval(
     sigma: np.ndarray | None = None,
     phase: np.ndarray | None = None,
     U: np.ndarray | None = None,
-    invvar_spec: np.ndarray | None = None,
+    V: np.ndarray | None = None,
     joint_spectra: list[dict[str, Any]] | None = None,
     bandpass_constraints: list[dict[str, Any]] | None = None,
     atmosphere_regions: list[dict[str, Any]] | None = None,
@@ -1081,7 +1087,7 @@ def run_retrieval(
     apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT)
 
     U_sysrem: np.ndarray | None = None
-    invvar_spec: np.ndarray | None = None
+    V_sysrem: np.ndarray | None = None
     
     print("\n[1/7] Loading time-series data...")
     with _StepTimer("Step 1/7"):
@@ -1094,17 +1100,17 @@ def run_retrieval(
             print(f"  Using provided data: {data.shape[0]} exposures x {data.shape[1]} wavelengths")
             print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
             if apply_sysrem:
-                if U is None or invvar_spec is None:
+                if U is None or V is None:
                     raise ValueError(
-                        "apply_sysrem=True requires U and invvar_spec when providing "
+                        "apply_sysrem=True requires U and V when providing "
                         "wav_obs/data/sigma/phase directly."
                     )
-                U_sysrem, invvar_spec = _validate_sysrem_inputs(
-                    U, invvar_spec, n_exp=data.shape[0]
+                U_sysrem, V_sysrem = _validate_sysrem_inputs(
+                    U, V, n_exp=data.shape[0]
                 )
                 print(
                     f"  Using provided SYSREM auxiliaries: U shape={U_sysrem.shape}, "
-                    f"invvar_spec shape={invvar_spec.shape}"
+                    f"V shape={V_sysrem.shape}"
                 )
         else:
             if data_format not in {"auto", "timeseries", "spectrum"}:
@@ -1131,13 +1137,13 @@ def run_retrieval(
                 print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
                 print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
                 if apply_sysrem:
-                    U_raw, invvar_raw = _load_sysrem_inputs(resolved_data_dir)
-                    U_sysrem, invvar_spec = _validate_sysrem_inputs(
-                        U_raw, invvar_raw, n_exp=data.shape[0]
+                    U_raw, V_raw = _load_sysrem_inputs(resolved_data_dir)
+                    U_sysrem, V_sysrem = _validate_sysrem_inputs(
+                        U_raw, V_raw, n_exp=data.shape[0]
                     )
                     print(
                         f"  Loaded SYSREM auxiliaries: U shape={U_sysrem.shape}, "
-                        f"invvar_spec shape={invvar_spec.shape}"
+                        f"V shape={V_sysrem.shape}"
                     )
             elif data_format == "spectrum":
                 wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
@@ -1162,13 +1168,13 @@ def run_retrieval(
                 print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
                 print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
                 if apply_sysrem:
-                    U_raw, invvar_raw = _load_sysrem_inputs(resolved_data_dir)
-                    U_sysrem, invvar_spec = _validate_sysrem_inputs(
-                        U_raw, invvar_raw, n_exp=data.shape[0]
+                    U_raw, V_raw = _load_sysrem_inputs(resolved_data_dir)
+                    U_sysrem, V_sysrem = _validate_sysrem_inputs(
+                        U_raw, V_raw, n_exp=data.shape[0]
                     )
                     print(
                         f"  Loaded SYSREM auxiliaries: U shape={U_sysrem.shape}, "
-                        f"invvar_spec shape={invvar_spec.shape}"
+                        f"V shape={V_sysrem.shape}"
                     )
 
         print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
@@ -1280,6 +1286,11 @@ def run_retrieval(
         primary_radial_velocity_mode = "orbital" if primary_is_timeseries else "none"
         primary_likelihood_kind = "matched_filter" if primary_is_timeseries else "gaussian"
         primary_subtract_mean = config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT if primary_is_timeseries else False
+        primary_sample_prefix = (
+            "spectroscopy"
+            if (joint_spectra or bandpass_constraints)
+            else None
+        )
 
         primary_component = _build_primary_spectroscopic_component(
             name="spectroscopy",
@@ -1289,7 +1300,7 @@ def run_retrieval(
             sigma=sigma,
             phase=phase,
             U_sysrem=U_sysrem,
-            invvar_spec=invvar_spec,
+            V=V_sysrem,
             instrument_resolution=Rinst,
             nu_grid=nu_grid,
             inst_nus=inst_nus,
@@ -1305,6 +1316,7 @@ def run_retrieval(
             radial_velocity_mode=primary_radial_velocity_mode,
             likelihood_kind=primary_likelihood_kind,
             subtract_per_exposure_mean=primary_subtract_mean,
+            sample_prefix=primary_sample_prefix,
         )
         observation_configs: list[object] = [primary_component.observation_config]
         observations_payload: dict[str, object] = {
@@ -1360,16 +1372,8 @@ def run_retrieval(
         primary_region_config = atmosphere_region_lookup[primary_region_name]
         primary_pt_profile = primary_region_config.pt_profile
         primary_component_config = primary_component.observation_config
-        primary_region_sample_prefix = _resolve_scope_prefix(
-            primary_region_config.sample_prefix,
-            primary_region_config.name,
-            enable_fallback=len(atmosphere_region_configs) > 1,
-        )
-        primary_component_sample_prefix = _resolve_scope_prefix(
-            primary_component_config.sample_prefix,
-            primary_component.name,
-            enable_fallback=len(observation_configs) > 1,
-        )
+        primary_region_sample_prefix = primary_region_config.sample_prefix
+        primary_component_sample_prefix = primary_component_config.sample_prefix
 
         component_names = [primary_component.name]
         component_names.extend(component.name for component in auxiliary_components)
