@@ -31,9 +31,12 @@ Low-resolution inputs are passed explicitly:
 ```mermaid
 flowchart TD
     A[atmo_retrieval.py<br/>CLI entrypoint] --> B[pipeline/retrieval.py<br/>orchestration]
+    A --> M[pipeline/retrieval_binned.py<br/>phase-binned wrapper]
+    M --> B
 
     B --> C[config/*<br/>runtime settings]
     B --> D[dataio/load.py<br/>observed data loading]
+    B --> D2[dataio/bandpass.py<br/>bandpass response loading]
     B --> E[physics/grid_setup.py<br/>nu grid + operators]
     B --> F[databases/opacity.py<br/>CIA/molecular/atomic opacities]
     F --> G[databases/atomic.py<br/>Kurucz/VALD helpers]
@@ -43,11 +46,14 @@ flowchart TD
     B --> K[pipeline/inference.py<br/>SVI + NUTS]
     B --> L[plotting/plot.py<br/>figures]
 
-    A --> M[pipeline/retrieval_binned.py<br/>phase-binned wrapper]
-    M --> B
+    N[input/hrs/{epoch}_{planet}<br/>raw HRS exposures] --> O[dataio/collapse_transmission_timeseries_to_1d.py<br/>collapse timeseries to 1D]
+    N --> P[dataio/collapse_emission_timeseries_to_1d.py<br/>collapse timeseries to 1D]
+    O -. writes .-> Q[input/hrs/{planet}/{epoch}/{arm}<br/>1D HRS .npy products]
+    P -. writes .-> Q
+    Q -. optional spectrum input .-> B
 
-    N[dataio/collapse_transmission_timeseries_to_1d.py<br/>preprocessing utility] -. writes .-> O[input/hrs/.../*.npy]
-    O -. read by .-> B
+    R[input/lrs/{planet}/*.tbl<br/>explicit low-res inputs] --> S[dataio/import_nasa_archive.py<br/>NASA archive utility]
+    R -. passed via --joint-spectrum-tbl / --bandpass-tbl .-> B
 ```
 
 modules:
