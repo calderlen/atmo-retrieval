@@ -30,31 +30,74 @@ Low-resolution inputs are passed explicitly:
 
 ```mermaid
 flowchart TD
-    A[atmo_retrieval.py<br/>CLI entrypoint] --> B[pipeline/retrieval.py<br/>orchestration]
-    A --> M[pipeline/retrieval_binned.py<br/>phase-binned wrapper]
+    subgraph EP[Entry points]
+        A[atmo_retrieval.py<br/>CLI]
+        M[pipeline/retrieval_binned.py<br/>phase-binned wrapper]
+    end
+
+    subgraph DS[Data sources]
+        T1[input/hrs time-series products]
+        T2[input/hrs collapsed 1D spectrum products]
+        T3[input/lrs explicit low-res .tbl files]
+        T4[direct Python arrays and component dicts]
+    end
+
+    subgraph UT[Optional utilities]
+        U1[dataio/collapse_transmission_timeseries_to_1d.py<br/>derive 1D transmission spectrum]
+        U2[dataio/collapse_emission_timeseries_to_1d.py<br/>derive 1D emission spectrum]
+        U3[dataio/import_nasa_archive.py<br/>NASA archive import helper]
+        X[pipeline.retrieval helpers<br/>convert .tbl to joint_spectra or bandpass_constraints]
+    end
+
+    subgraph RT[Runtime retrieval path]
+        B[pipeline/retrieval.py<br/>orchestration]
+        C[config runtime settings]
+        D[dataio/load.py<br/>time-series and 1D spectrum loaders]
+        D2[dataio/bandpass.py<br/>bandpass response loader]
+        E[physics/grid_setup.py<br/>spectral grid and operators]
+        F[databases/opacity.py<br/>CIA molecular and atomic opacity loaders]
+        G[databases/atomic.py<br/>Kurucz and VALD helpers]
+        H[physics/model.py<br/>joint forward model]
+        I[physics/pt.py<br/>P-T profiles]
+        J[physics/chemistry.py<br/>composition]
+        K[pipeline/inference.py<br/>SVI and NUTS]
+        L[plotting/plot.py<br/>figures and summaries]
+    end
+
+    A --> B
+    A --> M
+    M --> D
     M --> B
 
-    B --> C[config/*<br/>runtime settings]
-    B --> D[dataio/load.py<br/>observed data loading]
-    B --> D2[dataio/bandpass.py<br/>bandpass response loading]
-    B --> E[physics/grid_setup.py<br/>nu grid + operators]
-    B --> F[databases/opacity.py<br/>CIA/molecular/atomic opacities]
-    F --> G[databases/atomic.py<br/>Kurucz/VALD helpers]
-    B --> H[physics/model.py<br/>forward model]
-    H --> I[physics/pt.py<br/>P-T profiles]
-    H --> J[physics/chemistry.py<br/>composition]
-    B --> K[pipeline/inference.py<br/>SVI + NUTS]
-    B --> L[plotting/plot.py<br/>figures]
+    B --> C
+    B --> D
+    B --> D2
+    B --> E
+    B --> F
+    F --> G
+    B --> H
+    H --> I
+    H --> J
+    B --> K
+    B --> L
 
-    N[input/hrs raw HRS exposures] --> O[dataio/collapse_transmission_timeseries_to_1d.py<br/>collapse timeseries to 1D]
-    N --> P[dataio/collapse_emission_timeseries_to_1d.py<br/>collapse timeseries to 1D]
-    O -. writes .-> Q[input/hrs processed 1D HRS .npy products]
-    P -. writes .-> Q
-    Q -. optional spectrum input .-> B
+    T1 -. used directly when data_format is timeseries .-> D
+    T1 -. timeseries only .-> M
+    T2 -. optional input when data_format is spectrum .-> D
+    T3 -. passed via joint-spectrum-tbl or bandpass-tbl .-> X
+    X --> B
+    T4 -. optional programmatic entry .-> B
 
-    R[input/lrs explicit low-res .tbl inputs] --> S[dataio/import_nasa_archive.py<br/>NASA archive utility]
-    R -. passed via --joint-spectrum-tbl / --bandpass-tbl .-> B
+    T1 --> U1
+    T1 --> U2
+    U1 -. writes derived 1D npy products .-> T2
+    U2 -. writes derived 1D npy products .-> T2
+    U3 -. writes imported archive files .-> T3
 ```
+
+- Solid arrows: normal code dependencies or execution flow.
+- Dashed arrows: optional inputs, helper conversions, or derived products.
+- The collapse-to-1D scripts are utilities for the `spectrum` path only; they are not required for the principal `timeseries` path.
 
 modules:
 
