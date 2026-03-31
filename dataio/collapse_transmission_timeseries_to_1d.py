@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Prepare spectroscopic data for retrieval.
+"""Collapse high-resolution transmission time series to a 1D spectrum.
 
 This script:
 1. Loads raw FITS files from the configured instrument
@@ -8,7 +8,7 @@ This script:
 4. Saves wavelength, spectrum, and uncertainty as .npy files
 
 Usage:
-    python -m dataio.make_transmission --epoch 20250601 --planet KELT-20b --arm full
+    python -m dataio.collapse_transmission_timeseries_to_1d --epoch 20250601 --planet KELT-20b --arm full
 """
 
 import argparse
@@ -888,7 +888,6 @@ def main():
     parser.add_argument('--arm', type=str, choices=['red', 'blue', 'full'], default=config.DEFAULT_DATA_ARM, help='Spectrograph arm')
     parser.add_argument('--molecfit', action='store_true', default=config.DEFAULT_USE_MOLECFIT, help='Use molecfit-corrected data')
     parser.add_argument('--no-molecfit', action='store_false', dest='molecfit', help='Use uncorrected data')
-    parser.add_argument('--data-dir', type=str, default=config.DEFAULT_RAW_DATA_DIR, help='Raw data directory')
     parser.add_argument('--barycorr', action='store_true', default=config.DEFAULT_BARYCORR,
                         help='Apply barycentric correction to wavelength grid')
     parser.add_argument('--no-barycorr', action='store_false', dest='barycorr',
@@ -897,7 +896,7 @@ def main():
                         help='Apply epoch-specific Molecfit shift (default)')
     parser.add_argument('--no-introduced-shift', action='store_false', dest='introduced_shift',
                         help='Disable epoch-specific Molecfit shift')
-    parser.add_argument('--output-dir', type=str, default=None, help='Output directory (default: input/spectra/{planet}/{epoch}/{arm})')
+    parser.add_argument('--output-dir', type=str, default=None, help='Output directory (default: input/hrs/{planet}/{epoch}/{arm})')
     parser.add_argument('--bin-size', type=int, default=config.DEFAULT_BIN_SIZE, help='Spectral binning (pixels)')
 
     args = parser.parse_args()
@@ -908,7 +907,7 @@ def main():
             args.epoch,
             args.planet,
             prefer_molecfit,
-            args.data_dir,
+            config.DEFAULT_RAW_DATA_DIR,
             barycentric_correction=args.barycorr,
             apply_introduced_shift=args.introduced_shift if prefer_molecfit else False,
         )
@@ -919,7 +918,7 @@ def main():
                 args.epoch,
                 args.planet,
                 False,
-                args.data_dir,
+                config.DEFAULT_RAW_DATA_DIR,
                 barycentric_correction=args.barycorr,
                 apply_introduced_shift=False,
             )
@@ -1010,7 +1009,7 @@ def main():
     # Setup output directory
     if args.output_dir is None:
         planet_dir = args.planet.lower().replace('-', '')
-        args.output_dir = f'input/spectra/{planet_dir}/{args.epoch}/{args.arm}'
+        args.output_dir = f'input/hrs/{planet_dir}/{args.epoch}/{args.arm}'
 
     os.makedirs(args.output_dir, exist_ok=True)
 

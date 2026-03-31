@@ -10,7 +10,7 @@ from scipy import stats
 
 import config
 from config.planets_config import PHASE_BINS, get_params
-from dataio.make_transmission import summarize_phase_coverage
+from dataio.collapse_transmission_timeseries_to_1d import summarize_phase_coverage
 from pipeline.retrieval import (
     _load_sysrem_inputs,
     _normalize_phase,
@@ -25,7 +25,6 @@ def run_phase_binned_retrieval(
     base_output_dir: str | Path | None = None,
     mode: str = config.RETRIEVAL_MODE,
     epoch: str | None = None,
-    data_dir: str | Path | None = None,
     data_format: str = config.DEFAULT_DATA_FORMAT,
     **retrieval_kwargs,
 ) -> dict[str, dict]:
@@ -39,7 +38,7 @@ def run_phase_binned_retrieval(
     if data_format == "spectrum":
         raise ValueError("Phase-binned retrieval requires time-series data.")
 
-    resolved_data_dir = Path(data_dir) if data_dir is not None else config.get_data_dir(epoch=epoch)
+    resolved_data_dir = config.get_data_dir(epoch=epoch)
 
     wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
 

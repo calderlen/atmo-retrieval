@@ -140,13 +140,19 @@ from .model_config import RETRIEVAL_MODE
 
 
 def get_data_dir(planet: str | None = None, arm: str | None = None, epoch: str | None = None) -> Path:
-    """Get data directory for a planet, arm, and optional epoch."""
+    """Get processed high-resolution data directory for a planet, arm, and optional epoch."""
     planet = planet or PLANET
     arm = arm or OBSERVING_MODE
-    base = INPUT_DIR / "spectra" / planet.lower().replace("-", "")
+    base = INPUT_DIR / "hrs" / planet.lower().replace("-", "")
     if epoch:
         return base / epoch / arm
     return base / arm
+
+
+def get_lowres_dir(planet: str | None = None) -> Path:
+    """Get low-resolution data directory for a planet."""
+    planet = planet or PLANET
+    return INPUT_DIR / "lrs" / planet.lower().replace("-", "")
 
 
 def get_transmission_paths(planet: str | None = None, arm: str | None = None, epoch: str | None = None) -> dict[str, Path]:
@@ -170,6 +176,7 @@ def get_emission_paths(planet: str | None = None, arm: str | None = None, epoch:
 
 
 DATA_DIR = get_data_dir()
+LOWRES_DIR = get_lowres_dir()
 TRANSMISSION_DATA = get_transmission_paths()
 EMISSION_DATA = get_emission_paths()
 

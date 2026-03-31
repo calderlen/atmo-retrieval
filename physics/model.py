@@ -132,6 +132,11 @@ class BandpassObservationConfig:
     observable: BandpassObservable
     photon_weighted: bool
     Tstar: float | None
+    include_reflection: bool = False
+    semi_major_axis_au: float | None = None
+    geometric_albedo_bounds: tuple[float, float] | None = None
+    model_sigma: float | None = None
+    model_sigma_bounds: tuple[float, float] | None = None
     sample_prefix: str | None = None
 
 # allows for joint configuration of spectroscopic and bandpass observations in the same retrieval
@@ -198,7 +203,6 @@ def _default_region_name_for_mode(mode: RetrievalMode) -> AtmosphereRegionName:
         return "terminator"
     if mode == "emission":
         return "dayside"
-    raise ValueError(f"Unsupported retrieval mode: {mode}")
 
 # compute the planet radial velocity in km/s for a given phase array, Kp, Vsys, and optional additional RV offset
 def planet_rv_kms(
@@ -480,7 +484,7 @@ def _posterior_site_value(
         return posterior_params[site_name]
     if default is not _MISSING:
         return default
-    raise KeyError(f"Posterior parameter '{site_name}' was not found.")
+    return posterior_params[site_name]
 
 
 def _collect_indexed_site_values(
@@ -599,16 +603,12 @@ def reconstruct_temperature_profile(
 
     if pt_profile == "free":
         node_values = _collect_indexed_site_values(local_params, prefix="T_node_")
-        if not node_values:
-            raise KeyError("No T_node_* posterior sites available for free P-T reconstruction.")
         log_p = jnp.log10(art.pressure)
         log_p_nodes = jnp.linspace(log_p.min(), log_p.max(), len(node_values))
         return jnp.interp(log_p, log_p_nodes, jnp.asarray(node_values))
 
     if pt_profile == "pspline":
         knot_values = _collect_indexed_site_values(local_params, prefix="T_")
-        if not knot_values:
-            raise KeyError("No T_* knot posterior sites available for pspline reconstruction.")
         return pspline_knots_profile_on_grid(
             pressure_bar=art.pressure,
             T_knots=jnp.asarray(knot_values),
@@ -625,7 +625,7 @@ def reconstruct_temperature_profile(
             )
         return Tarr
 
-    raise ValueError(f"Temperature reconstruction not implemented for profile: {pt_profile}")
+    return None
 
 
 def reconstruct_vmr_scalars(
@@ -961,8 +961,6 @@ def apply_model_pipeline_corrections(
 ) -> jnp.ndarray:
     if model_ts.ndim == 1:
         model_ts = model_ts[None, :]
-    if model_ts.shape[1] == 0:
-        raise ValueError("model_ts has zero spectral points; check inst_nus/nu_grid")
 
     if subtract_per_exposure_mean:
         model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
@@ -1004,16 +1002,12 @@ def _normalize_spectroscopic_observation_inputs(
         raise ValueError(f"sigma shape {sigma.shape} does not match data shape {data.shape}")
     if phase is None:
         phase = jnp.zeros((data.shape[0],), dtype=data.dtype)
-    if phase.ndim != 1:
-        raise ValueError(f"phase has invalid ndim={phase.ndim} (expected 1)")
     if phase.shape[0] != data.shape[0]:
         raise ValueError(
             f"phase length {phase.shape[0]} does not match number of exposures {data.shape[0]}"
         )
     if V is not None:
         expected_shape = (data.shape[0], data.shape[0])
-        if V.ndim != 2:
-            raise ValueError(f"V must be 2D; got ndim={V.ndim}")
         if V.shape != expected_shape:
             raise ValueError(f"V shape {V.shape} does not match expected {expected_shape}")
 
@@ -1031,10 +1025,6 @@ def _normalize_bandpass_observation_inputs(
 ) -> BandpassObservationInputs:
     value = jnp.asarray(inputs.value)
     sigma = jnp.asarray(inputs.sigma)
-    if value.ndim != 0:
-        raise ValueError(f"bandpass value must be scalar; got shape {value.shape}")
-    if sigma.ndim != 0:
-        raise ValueError(f"bandpass sigma must be scalar; got shape {sigma.shape}")
     return BandpassObservationInputs(value=value, sigma=sigma)
 
 
@@ -1204,9 +1194,6 @@ def _compute_native_observable_spectrum(
     if mode == "transmission":
         return jnp.sqrt(rt) * (Rp / Rstar)
 
-    if Tstar is None:
-        raise ValueError("Tstar is required for emission mode.")
-
     Fs = piBarr(nu_grid, Tstar)
     return rt / jnp.clip(Fs, EPS, None) * (Rp / Rstar) ** 2
 
@@ -1253,6 +1240,83 @@ def _transform_bandpass_observable(
     if observable == "transit_depth":
         return spectrum**2
     raise ValueError(f"Unknown bandpass observable: {observable}")
+
+
+def _bandpass_site_prefix(component_config: BandpassObservationConfig) -> str:
+    return _sanitize_site_name(component_config.sample_prefix or component_config.name)
+
+
+def _sample_geometric_albedo(
+    component_config: BandpassObservationConfig,
+    *,
+    site_prefix: str,
+) -> jnp.ndarray:
+    if not component_config.include_reflection:
+        albedo = jnp.asarray(0.0)
+        numpyro.deterministic(f"{site_prefix}_geometric_albedo", albedo)
+        return albedo
+
+    albedo_low, albedo_high = component_config.geometric_albedo_bounds
+    if albedo_low == albedo_high:
+        albedo = jnp.asarray(albedo_low)
+        numpyro.deterministic(f"{site_prefix}_geometric_albedo", albedo)
+        return albedo
+
+    return numpyro.sample(
+        f"{site_prefix}_geometric_albedo",
+        dist.Uniform(albedo_low, albedo_high),
+    )
+
+
+def _compute_reflected_bandpass_component(
+    geometric_albedo: jnp.ndarray,
+    Rp_m: jnp.ndarray,
+    semi_major_axis_au: float,
+) -> jnp.ndarray:
+    semi_major_axis_m = semi_major_axis_au * config.AU_M
+    rp_over_a = Rp_m / jnp.clip(semi_major_axis_m, EPS, None)
+    return geometric_albedo * rp_over_a**2
+
+
+def _sample_bandpass_model_sigma(
+    component_config: BandpassObservationConfig,
+    *,
+    site_prefix: str,
+) -> jnp.ndarray | None:
+    if component_config.model_sigma is not None:
+        model_sigma = jnp.asarray(component_config.model_sigma)
+        numpyro.deterministic(f"{site_prefix}_model_sigma", model_sigma)
+        return model_sigma
+
+    if component_config.model_sigma_bounds is None:
+        return None
+
+    sigma_low, sigma_high = component_config.model_sigma_bounds
+    if sigma_low == sigma_high:
+        model_sigma = jnp.asarray(sigma_low)
+        numpyro.deterministic(f"{site_prefix}_model_sigma", model_sigma)
+        return model_sigma
+
+    return numpyro.sample(
+        f"{site_prefix}_model_sigma",
+        dist.Uniform(sigma_low, sigma_high),
+    )
+
+
+def _sample_effective_bandpass_value(
+    site_prefix: str,
+    model_value: jnp.ndarray,
+    model_sigma: jnp.ndarray | None,
+) -> jnp.ndarray:
+    if model_sigma is None:
+        numpyro.deterministic(f"{site_prefix}_effective_model", model_value)
+        return model_value
+
+    effective_value = numpyro.sample(
+        f"{site_prefix}_effective_model",
+        dist.TruncatedNormal(model_value, model_sigma, low=0.0),
+    )
+    return effective_value
 
 
 def _evaluate_spectroscopic_component(
@@ -1328,6 +1392,7 @@ def _evaluate_bandpass_component(
     shared_state: SharedSystemState,
     atmosphere_state: AtmosphereState,
 ) -> jnp.ndarray:
+    site_prefix = _bandpass_site_prefix(component_config)
     dtau = _compute_component_dtau(component_config, atmosphere_state)
     spectrum = _compute_native_observable_spectrum(
         mode=component_config.mode,
@@ -1352,13 +1417,37 @@ def _evaluate_bandpass_component(
         component_config.response,
         photon_weighted=component_config.photon_weighted,
     )
-    numpyro.deterministic(
-        f"{_sanitize_site_name(component_config.name)}_model",
-        model_value,
+    thermal_component = model_value
+    reflected_component = jnp.asarray(0.0)
+
+    if component_config.mode == "emission":
+        numpyro.deterministic(f"{site_prefix}_thermal_component", thermal_component)
+        geometric_albedo = _sample_geometric_albedo(
+            component_config,
+            site_prefix=site_prefix,
+        )
+        if component_config.include_reflection:
+            reflected_component = _compute_reflected_bandpass_component(
+                geometric_albedo,
+                shared_state.Rp,
+                component_config.semi_major_axis_au,
+            )
+        numpyro.deterministic(f"{site_prefix}_reflected_component", reflected_component)
+        model_value = thermal_component + reflected_component
+
+    numpyro.deterministic(f"{site_prefix}_model", model_value)
+    model_sigma = _sample_bandpass_model_sigma(
+        component_config,
+        site_prefix=site_prefix,
+    )
+    effective_value = _sample_effective_bandpass_value(
+        site_prefix=site_prefix,
+        model_value=model_value,
+        model_sigma=model_sigma,
     )
     return _gaussian_log_likelihood(
         observation_inputs.value,
-        model_value,
+        effective_value,
         observation_inputs.sigma,
     )
 
@@ -1390,10 +1479,6 @@ def joint_retrieval_model(
 
         component_input = observations[component_config.name]
         if isinstance(component_config, SpectroscopicObservationConfig):
-            if not isinstance(component_input, SpectroscopicObservationInputs):
-                raise TypeError(
-                    f"Observation '{component_config.name}' expects SpectroscopicObservationInputs."
-                )
             component_inputs = _normalize_spectroscopic_observation_inputs(component_input)
             component_lnL = _evaluate_spectroscopic_component(
                 component_config,
@@ -1404,10 +1489,6 @@ def joint_retrieval_model(
                 scope_prefix=component_config.sample_prefix,
             )
         elif isinstance(component_config, BandpassObservationConfig):
-            if not isinstance(component_input, BandpassObservationInputs):
-                raise TypeError(
-                    f"Observation '{component_config.name}' expects BandpassObservationInputs."
-                )
             component_inputs = _normalize_bandpass_observation_inputs(component_input)
             component_lnL = _evaluate_bandpass_component(
                 component_config,
@@ -1415,8 +1496,6 @@ def joint_retrieval_model(
                 shared_state,
                 region_states[component_config.region_name],
             )
-        else:
-            raise TypeError(f"Unsupported observation config type: {type(component_config)!r}")
 
         total_lnL = total_lnL + component_lnL
 
@@ -1490,7 +1569,7 @@ def build_atmosphere_region_config(
     art: object,
     mol_names: tuple[str, ...],
     atom_names: tuple[str, ...],
-    pt_profile: PTProfileMode = config.PT_PROFILE_DEFAULT,
+    pt_profile: PTProfileMode,
     T_low: float | None = None,
     T_high: float | None = None,
     Tirr_mean: float | None = None,
@@ -1498,7 +1577,7 @@ def build_atmosphere_region_config(
     Tint_fixed: float | None = None,
     kappa_ir_cgs_bounds: tuple[float, float] | None = None,
     gamma_bounds: tuple[float, float] | None = None,
-    composition_solver: CompositionSolver | None = None,
+    composition_solver: CompositionSolver,
     name: str | None = None,
     sample_prefix: str | None = None,
 ) -> AtmosphereRegionConfig:
@@ -1514,8 +1593,6 @@ def build_atmosphere_region_config(
         )
     if gamma_bounds is None:
         gamma_bounds = tuple(float(10.0**bound) for bound in config.LOG_GAMMA_BOUNDS)
-    if composition_solver is None:
-        composition_solver = ConstantVMR()
 
     if Tirr_mean is not None and (Tirr_mean != Tirr_mean):
         Tirr_mean = None
@@ -1577,8 +1654,6 @@ def build_spectroscopic_observation_config(
     check_grid_resolution(nu_grid, instrument_resolution)
     beta_inst = 1.0 / (instrument_resolution * 2.3548200450309493)
 
-    if (mode == "emission") and (Tstar is None):
-        raise ValueError("Tstar is required for emission mode.")
     if radial_velocity_mode == "none":
         phase_mode = None
 
@@ -1632,11 +1707,16 @@ def build_bandpass_observation_config(
     observable: BandpassObservable,
     photon_weighted: bool = False,
     Tstar: float | None = None,
+    include_reflection: bool = False,
+    semi_major_axis_au: float | None = None,
+    geometric_albedo_bounds: tuple[float, float] | None = None,
+    model_sigma: float | None = None,
+    model_sigma_bounds: tuple[float, float] | None = None,
     sample_prefix: str | None = None,
 ) -> BandpassObservationConfig:
     _validate_bandpass_observable(mode, observable)
-    if (mode == "emission") and (Tstar is None):
-        raise ValueError("Tstar is required for emission bandpass observations.")
+    if include_reflection and geometric_albedo_bounds is None:
+        geometric_albedo_bounds = (0.0, 1.0)
 
     nu_grid = jnp.asarray(nu_grid)
     wavelength_m = jnp.asarray(wavelength_m)
@@ -1659,5 +1739,10 @@ def build_bandpass_observation_config(
         observable=observable,
         photon_weighted=photon_weighted,
         Tstar=Tstar,
+        include_reflection=include_reflection,
+        semi_major_axis_au=semi_major_axis_au,
+        geometric_albedo_bounds=geometric_albedo_bounds,
+        model_sigma=model_sigma,
+        model_sigma_bounds=model_sigma_bounds,
         sample_prefix=sample_prefix,
     )

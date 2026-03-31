@@ -240,25 +240,16 @@ class JointRetrievalModel:
 This is an observation operator on top of a spectrum, not a new absorber term.
 
 
-## Treatment Of `tess_proc`
+## Treatment Of Bandpass Photometry
 
-Do not force `tess_proc` directly into the same abstraction unless you are sure you want a fully joint light-curve-plus-spectrum inference.
+Bandpass photometry belongs inside the joint retrieval as another observation component.
 
-Two reasonable options:
-
-### Option A: keep `tess_proc` separate
-
-- run `tess_proc` as a preprocessing or standalone inference step
-- feed its output into the retrieval as a photometric constraint
-- simplest and least disruptive
-
-### Option B: build a true photometry component
+Recommended approach:
 
 - create a `PhotometryBandComponent`
-- use `SopPhoto` and a bandpass-aware forward model
+- use a bandpass-aware forward model
 - include its likelihood directly in the joint retrieval
-
-If the immediate goal is spectral retrieval with one or two bandpass constraints, Option A is cleaner. If the goal is a general multi-observable framework, Option B is worth building.
+- keep the atmospheric state shared with the relevant emission or transmission component
 
 
 ## Relationship To Current `physics/model.py`
@@ -308,5 +299,5 @@ Once that works, generalize from "one component of each kind" to "arbitrary comp
 
 - Should transmission and emission share one atmosphere, or should there be separate `terminator` and `dayside` states?
 - Should `dRV` be global across all high-resolution datasets, or dataset-specific?
-- Should photometry enter as a direct joint component or as an external constraint from `tess_proc`?
+- Should photometry share the same atmospheric state as the associated spectrum, or allow partial coupling?
 - Will low-resolution datasets share chemistry/PT with the high-resolution datasets, or should the framework allow partial coupling?

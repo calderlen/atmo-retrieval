@@ -1,6 +1,5 @@
 import argparse
 import importlib.util
-import logging
 import re
 import sys
 import os
@@ -9,7 +8,11 @@ import warnings
 warnings.filterwarnings("once")
 
 import config
-from pipeline.retrieval import run_retrieval
+from pipeline.retrieval import (
+    make_bandpass_constraints_from_tbl,
+    make_joint_spectrum_component_from_tbl,
+    run_retrieval,
+)
 from pipeline.retrieval_binned import run_phase_binned_retrieval
 
 
@@ -25,23 +28,13 @@ def create_parser():
         "--planet",
         type=str,
         required=True,
-        help="Target planet (required). Use --list-planets to see options"
+        help="Target planet (required)"
     )
     target_group.add_argument(
         "--ephemeris",
         type=str,
         default=None,
-        help="Ephemeris source (default: Duck24). Use --list-ephemerides to see options"
-    )
-    target_group.add_argument(
-        "--list-planets",
-        action="store_true",
-        help="List available planets and exit"
-    )
-    target_group.add_argument(
-        "--list-ephemerides",
-        action="store_true",
-        help="List available ephemerides for the selected planet and exit"
+        help="Ephemeris source (default: Duck24)"
     )
 
     # Retrieval mode
@@ -55,15 +48,28 @@ def create_parser():
     # Data options
     data_group = parser.add_argument_group("Data")
     data_group.add_argument("--epoch", type=str, required=True, help="Observation epoch (YYYYMMDD) (required)")
-    data_group.add_argument("--data-dir", type=str, default=None, help="Override data directory path")
+    data_group.add_argument(
+        "--joint-spectrum-tbl",
+        type=str,
+        action="append",
+        default=None,
+        help="Explicit NASA .tbl file to include as a low-resolution spectroscopic component",
+    )
     data_group.add_argument(
         "--data-format",
         type=str,
-        choices=["auto", "timeseries", "spectrum"],
+        choices=["timeseries", "spectrum"],
         default=config.DEFAULT_DATA_FORMAT,
         help=f"Data format to load (default: {config.DEFAULT_DATA_FORMAT})",
     )
     data_group.add_argument("--wavelength-range", type=str, choices=["blue", "green", "red", "full"], default=None, help="Wavelength range mode (default: from config)")
+    data_group.add_argument(
+        "--bandpass-tbl",
+        type=str,
+        action="append",
+        default=None,
+        help="Explicit NASA .tbl file to include as one or more bandpass constraints",
+    )
 
     # Inference parameters
     inference_group = parser.add_argument_group("Inference Parameters")
@@ -156,17 +162,6 @@ def create_parser():
         default=None,
         help="Path to FastChem parameters.dat (required for fastchem_hybrid_grid)",
     )
-    model_group.add_argument(
-        "--enable-tellurics",
-        action="store_true",
-        default=None,
-        help="Enable telluric modeling"
-    )
-    model_group.add_argument(
-        "--disable-tellurics",
-        action="store_true",
-        help="Disable telluric modeling"
-    )
 
     # Phase analysis options
     phase_group = parser.add_argument_group("Phase Analysis")
@@ -188,14 +183,6 @@ def create_parser():
         "--all-phase-bins",
         action="store_true",
         help="Run separate retrievals for all phase bins (T12, T23, T34)"
-    )
-
-    # Diagnostics
-    diag_group = parser.add_argument_group("Diagnostics")
-    diag_group.add_argument(
-        "--check-aliasing",
-        action="store_true",
-        help="Compute species template cross-correlations before retrieval"
     )
 
     # Species selection (runtime overrides)
@@ -255,27 +242,6 @@ def create_parser():
         "--no-preallocate",
         action="store_true",
         help="Disable JAX GPU preallocation (slower but safer on memory)"
-    )
-
-    # Output options
-    output_group = parser.add_argument_group("Output")
-    output_group.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Verbose output"
-    )
-    output_group.add_argument(
-        "--quiet",
-        "-q",
-        action="store_true",
-        help="Quiet output (errors only)"
-    )
-    output_group.add_argument(
-        "--log-file",
-        type=str,
-        default=None,
-        help="Write output to log file"
     )
 
     # Info
@@ -340,22 +306,9 @@ def apply_cli_overrides(args):
         os.environ["HITRAN_PASSWORD"] = args.hitran_password
 
     # Data directory
-    if args.data_dir:
-        config.DATA_DIR = args.data_dir
-        config.TRANSMISSION_DATA = {
-            "wavelength": os.path.join(config.DATA_DIR, "wavelength_transmission.npy"),
-            "spectrum": os.path.join(config.DATA_DIR, "spectrum_transmission.npy"),
-            "uncertainty": os.path.join(config.DATA_DIR, "uncertainty_transmission.npy"),
-        }
-        config.EMISSION_DATA = {
-            "wavelength": os.path.join(config.DATA_DIR, "wavelength_emission.npy"),
-            "spectrum": os.path.join(config.DATA_DIR, "spectrum_emission.npy"),
-            "uncertainty": os.path.join(config.DATA_DIR, "uncertainty_emission.npy"),
-        }
-    else:
-        config.DATA_DIR = config.get_data_dir()
-        config.TRANSMISSION_DATA = config.get_transmission_paths()
-        config.EMISSION_DATA = config.get_emission_paths()
+    config.DATA_DIR = config.get_data_dir(epoch=args.epoch)
+    config.TRANSMISSION_DATA = config.get_transmission_paths(epoch=args.epoch)
+    config.EMISSION_DATA = config.get_emission_paths(epoch=args.epoch)
 
     # Wavelength range / observing mode
     if args.wavelength_range:
@@ -390,12 +343,6 @@ def apply_cli_overrides(args):
         config.OPA_LOAD = True
     if args.save_opacities:
         config.OPA_SAVE = True
-
-    # Tellurics
-    if args.enable_tellurics:
-        config.ENABLE_TELLURICS = True
-    elif args.disable_tellurics:
-        config.ENABLE_TELLURICS = False
 
     # Species selection
     def _parse_csv(value: str) -> list[str]:
@@ -453,30 +400,6 @@ def apply_cli_overrides(args):
         config.ATOMIC_SPECIES = atoms
 
     return config
-
-
-def setup_logging(args):
-    if args.quiet:
-        level = logging.ERROR
-    elif args.verbose:
-        level = logging.DEBUG
-    else:
-        level = logging.INFO
-
-    handlers = [logging.StreamHandler(sys.stdout)]
-
-    if args.log_file:
-        handlers.append(logging.FileHandler(args.log_file))
-
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=handlers
-    )
-
-    return logging.getLogger(__name__)
-
-
 def print_config_summary(config, args):
     params = config.get_params()
     
@@ -494,10 +417,10 @@ def print_config_summary(config, args):
     if args.chemistry_model == "fastchem_hybrid_grid":
         fc_file = args.fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
         print(f"FastChem parameter file: {fc_file}")
-    print(f"Phase mode: {args.phase_mode if hasattr(args, 'phase_mode') else 'global'}")
-    if hasattr(args, 'phase_bin') and args.phase_bin:
+    print(f"Phase mode: {args.phase_mode}")
+    if args.phase_bin:
         print(f"Phase bin: {args.phase_bin}")
-    if hasattr(args, 'all_phase_bins') and args.all_phase_bins:
+    if args.all_phase_bins:
         print(f"Phase bins: T12, T23, T34 (all)")
     print(f"Output directory: {config.DIR_SAVE}")
     print(f"\nObserving mode: {config.OBSERVING_MODE}")
@@ -521,9 +444,6 @@ def print_config_summary(config, args):
     for mol in list(config.MOLPATH_HITEMP.keys()) + list(config.MOLPATH_EXOMOL.keys()):
         print(f"  • {mol}")
 
-    if config.ENABLE_TELLURICS:
-        print(f"\nTelluric correction: ENABLED")
-
     print("="*70 + "\n")
 
 
@@ -536,44 +456,31 @@ def main():
         os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
         os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
-    # Handle info commands first (before loading full config)
-    if args.list_planets:
-        print("\nAvailable planets:")
-        for planet in config.list_planets():
-            ephems = config.list_ephemerides(planet)
-            print(f"  {planet}: {', '.join(ephems)}")
-        return 0
-
-    if args.list_ephemerides:
-        planet = args.planet or config.PLANET
-        print(f"\nAvailable ephemerides for {planet}:")
-        for ephem in config.list_ephemerides(planet):
-            print(f"  {ephem}")
-        return 0
-
-    # Setup logging
-    logger = setup_logging(args)
-
     # Load config
     if args.config:
-        logger.info(f"Loading custom config: {args.config}")
+        print(f"Loading custom config: {args.config}")
         custom_config = load_custom_config(args.config)
         config = apply_custom_config(custom_config)
     # Apply CLI overrides
     config = apply_cli_overrides(args)
 
     # Print configuration summary
-    if not args.quiet:
-        print_config_summary(config, args)
+    print_config_summary(config, args)
+
+    joint_spectra = []
+    for tbl_path in args.joint_spectrum_tbl or []:
+        joint_spectra.append(make_joint_spectrum_component_from_tbl(tbl_path))
+
+    bandpass_constraints = []
+    for tbl_path in args.bandpass_tbl or []:
+        bandpass_constraints.extend(make_bandpass_constraints_from_tbl(tbl_path))
 
     # Run retrieval
     if args.all_phase_bins:
-        logger.info("Starting phase-binned retrieval (all bins)...")
         run_phase_binned_retrieval(
             phase_bins=["T12", "T23", "T34"],
             mode=args.mode,
             epoch=args.epoch,
-            data_dir=args.data_dir,
             data_format=args.data_format,
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
@@ -582,17 +489,16 @@ def main():
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
-            check_aliasing=args.check_aliasing,
             seed=args.seed,
+            joint_spectra=joint_spectra or None,
+            bandpass_constraints=bandpass_constraints or None,
         )
 
     elif args.phase_bin:
-        logger.info(f"Starting retrieval for phase bin: {args.phase_bin}...")
         run_phase_binned_retrieval(
             phase_bins=[args.phase_bin],
             mode=args.mode,
             epoch=args.epoch,
-            data_dir=args.data_dir,
             data_format=args.data_format,
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
@@ -601,16 +507,15 @@ def main():
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
-            check_aliasing=args.check_aliasing,
             seed=args.seed,
+            joint_spectra=joint_spectra or None,
+            bandpass_constraints=bandpass_constraints or None,
         )
 
     elif args.mode == "transmission":
-        logger.info("Starting transmission retrieval...")
         run_retrieval(
             mode="transmission",
             epoch=args.epoch,
-            data_dir=args.data_dir,
             data_format=args.data_format,
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
@@ -619,16 +524,15 @@ def main():
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
-            check_aliasing=args.check_aliasing,
             seed=args.seed,
+            joint_spectra=joint_spectra or None,
+            bandpass_constraints=bandpass_constraints or None,
         )
 
     elif args.mode == "emission":
-        logger.info("Starting emission retrieval...")
         run_retrieval(
             mode="emission",
             epoch=args.epoch,
-            data_dir=args.data_dir,
             data_format=args.data_format,
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
@@ -637,8 +541,9 @@ def main():
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
-            check_aliasing=args.check_aliasing,
             seed=args.seed,
+            joint_spectra=joint_spectra or None,
+            bandpass_constraints=bandpass_constraints or None,
         )
 
     return 0

@@ -14,14 +14,16 @@ pip install jax numpyro exojax astropy matplotlib corner
 python -m atmo_retrieval --planet KELT-20b --mode transmission --epoch 20250601
 ```
 
-## standalone tess_proc
+Low-resolution inputs are passed explicitly:
+- use `--joint-spectrum-tbl path/to/file.tbl` for multi-bin low-res spectra
+- use `--bandpass-tbl path/to/file.tbl` for single-band / sparse broadband constraints
+- paths can be full paths or relative to `input/lrs`, e.g. `kelt20b/file.tbl`
+
+## joint retrieval bandpass constraints
 
 ```bash
-# uses jaxoplanet orbit + numpyro NUTS
-python -m pipeline.tess_proc --planet KELT-20b --ephemeris Duck24
-
-# override eclipse depth manually (ppm)
-python -m pipeline.tess_proc --eclipse-depth-ppm 139 --eclipse-err-ppm 8
+# bandpass constraints are added through pipeline.retrieval
+# using build_bandpass_observation_config / bandpass_constraints
 ```
 
 ## code structure
@@ -44,7 +46,7 @@ flowchart TD
     A --> M[pipeline/retrieval_binned.py<br/>phase-binned wrapper]
     M --> B
 
-    N[dataio/make_transmission.py<br/>preprocessing utility] -. writes .-> O[input/spectra/.../*.npy]
+    N[dataio/collapse_transmission_timeseries_to_1d.py<br/>preprocessing utility] -. writes .-> O[input/hrs/.../*.npy]
     O -. read by .-> B
 ```
 
@@ -62,15 +64,17 @@ modules:
 │   ├── model_config.py
 │   ├── paths_config.py
 │   ├── planets_config.py
+│   ├── photometry_config.py
 │   └── tellurics_config.py
 ├── databases
 │   ├── atomic.py
 │   └── opacity.py
 ├── dataio
+│   ├── bandpass.py
 │   ├── import_nasa_archive.py
 │   ├── load.py
-│   ├── make_emission.py
-│   ├── make_transmission.py
+│   ├── collapse_emission_timeseries_to_1d.py
+│   ├── collapse_transmission_timeseries_to_1d.py
 │   └── tellurics.py
 ├── environment.yml
 ├── physics
@@ -94,11 +98,18 @@ modules:
 ## expected input directory structure
 
 ```
-input/spectra/{planet}/{epoch}/{arm}/
-  wavelength.npy
-  data.npy
-  sigma.npy
-  phase.npy
+input/hrs/{planet}/{epoch}/{arm}/
+  wavelength_transmission.npy
+  spectrum_transmission.npy
+  uncertainty_transmission.npy
+
+input/hrs/{epoch}_{planet}/
+  ... raw PEPSI files ...
+
+input/lrs/{planet}/
+  *.tbl
+  *.dat
+  *.csv
 ```
 
 ## outputs

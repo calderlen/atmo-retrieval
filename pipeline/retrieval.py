@@ -20,6 +20,7 @@ import config
 from dataio.load import (
     load_nasa_archive_spectrum,
     load_observed_spectrum,
+    parse_nasa_archive_tbl,
 )
 from physics.chemistry import ConstantVMR, FastChemHybridChemistry
 from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
@@ -38,7 +39,7 @@ from physics.model import (
     create_joint_retrieval_model,
 )
 from pipeline.inference import run_svi
-from pipeline.tess_proc import load_tess_bandpass
+from dataio.bandpass import load_tess_bandpass
 from plotting.plot import (
     plot_svi_loss,
     plot_transmission_spectrum,
@@ -53,14 +54,6 @@ from plotting.plot import (
 
 def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     data_dir = Path(data_dir)
-
-    required = ["wavelength.npy", "data.npy", "sigma.npy", "phase.npy"]
-    missing = [name for name in required if not (data_dir / name).exists()]
-    if missing:
-        missing_fmt = ", ".join(missing)
-        raise FileNotFoundError(
-            f"Missing time-series files in {data_dir}: {missing_fmt}"
-        )
 
     wavelength = np.load(data_dir / "wavelength.npy")
     data = np.load(data_dir / "data.npy")
@@ -88,25 +81,9 @@ def _load_sysrem_inputs(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray]:
     u_path = next((p for p in u_candidates if p.exists()), None)
     v_path = next((p for p in v_candidates if p.exists()), None)
 
-    if u_path is None or v_path is None:
-        raise FileNotFoundError(
-            "apply_sysrem=True requires SYSREM auxiliaries in data directory. "
-            "Expected one of {U.npy, U_sysrem.npy, U_sysrem.npz} and one of "
-            "{V.npy, V_diag.npy, inv_sigma.npy, invsigma.npy} containing "
-            "diag(1 / sigma) in "
-            f"{data_dir}."
-        )
-
     if u_path.suffix == ".npz":
         with np.load(u_path) as u_data:
-            if "U" in u_data:
-                U = u_data["U"]
-            elif "U_sysrem" in u_data:
-                U = u_data["U_sysrem"]
-            else:
-                raise KeyError(
-                    f"{u_path} must contain key 'U' or 'U_sysrem'."
-                )
+            U = u_data["U"] if "U" in u_data else u_data["U_sysrem"]
     else:
         U = np.load(u_path)
 
@@ -123,31 +100,17 @@ def _validate_sysrem_inputs(
     V = np.asarray(V)
 
     if U.ndim == 3:
-        if U.shape[2] != 1:
-            raise ValueError(
-                "SYSREM basis U has multiple chunks; retrieval currently supports "
-                f"only a single chunk. Got U.shape={U.shape}."
-            )
         U = U[:, :, 0]
-
-    if U.ndim != 2:
-        raise ValueError(f"SYSREM basis U must be 2D; got shape {U.shape}.")
 
     if U.shape[0] != n_exp:
         raise ValueError(
             f"U exposure axis mismatch: U.shape[0]={U.shape[0]} but n_exp={n_exp}."
         )
-    if not np.all(np.isfinite(U)):
-        raise ValueError("SYSREM basis U contains non-finite values.")
     if V.ndim == 1:
         if V.size != n_exp:
             raise ValueError(
                 f"V exposure axis mismatch: V.size={V.size} but n_exp={n_exp}."
             )
-        if not np.all(np.isfinite(V)):
-            raise ValueError("V contains non-finite values.")
-        if np.any(V <= 0):
-            raise ValueError("V must be strictly positive.")
         V = np.diag(V)
     elif V.ndim == 2:
         expected_shape = (n_exp, n_exp)
@@ -155,14 +118,6 @@ def _validate_sysrem_inputs(
             raise ValueError(
                 f"V shape mismatch: V.shape={V.shape} but expected {expected_shape}."
             )
-        if not np.all(np.isfinite(V)):
-            raise ValueError("V contains non-finite values.")
-        if not np.allclose(V, np.diag(np.diag(V))):
-            raise ValueError("V must be diagonal.")
-        if np.any(np.diag(V) <= 0):
-            raise ValueError("V must have strictly positive diagonal entries.")
-    else:
-        raise ValueError(f"V must be 1D or 2D; got ndim={V.ndim}.")
 
     return U, V
 
@@ -182,14 +137,6 @@ def _normalize_phase(phase: np.ndarray) -> np.ndarray:
 
     if phase_min < -0.5 or phase_max > 0.5:
         phase = (phase + 0.5) % 1.0 - 0.5
-
-    phase_min = float(np.nanmin(phase))
-    phase_max = float(np.nanmax(phase))
-    if phase_min < -0.5 or phase_max > 0.5:
-        raise ValueError(
-            "Phase values must fall in [-0.5, 0.5] after normalization. "
-            f"Got range {phase_min:.4f} .. {phase_max:.4f}."
-        )
 
     return phase
 
@@ -247,12 +194,6 @@ def _preflight_spectrum_checks(
     phase = np.asarray(phase)
     inst_nus = np.asarray(inst_nus)
 
-    if wav_obs.size == 0:
-        raise ValueError("wavelength array is empty")
-    if inst_nus.size == 0:
-        raise ValueError("instrument wavenumber array is empty")
-    if data.ndim not in (1, 2):
-        raise ValueError(f"data has invalid ndim={data.ndim} (expected 1 or 2)")
     if sigma.shape != data.shape:
         raise ValueError(f"sigma shape {sigma.shape} does not match data shape {data.shape}")
 
@@ -267,33 +208,15 @@ def _preflight_spectrum_checks(
             )
         expected_exposures = data.shape[0]
 
-    if phase.ndim != 1:
-        raise ValueError(f"phase has invalid ndim={phase.ndim} (expected 1)")
     if phase.size != expected_exposures:
         raise ValueError(
             f"phase length {phase.size} != number of exposures {expected_exposures}"
         )
 
-    for name, arr in (
-        ("wavelength", wav_obs),
-        ("instrument wavenumber", inst_nus),
-        ("data", data),
-        ("sigma", sigma),
-        ("phase", phase),
-    ):
-        if not np.all(np.isfinite(arr)):
-            raise ValueError(f"{name} array contains non-finite values")
-
-    if np.any(sigma <= 0):
-        raise ValueError("sigma must be strictly positive")
-
 
 def _preflight_grid_checks(inst_nus: np.ndarray, nu_grid: np.ndarray) -> None:
     inst_nus = np.asarray(inst_nus)
     nu_grid = np.asarray(nu_grid)
-
-    if nu_grid.size == 0 or inst_nus.size == 0:
-        raise ValueError("nu_grid and inst_nus must be non-empty")
 
     inst_min = np.nanmin(inst_nus)
     inst_max = np.nanmax(inst_nus)
@@ -531,6 +454,11 @@ def _coerce_model_params(params: dict) -> dict[str, float | None]:
         "R_star_err": params["R_star"].std_dev if hasattr(params["R_star"], "std_dev") else config.DEFAULT_RSTAR_ERR,
         "T_star": params.get("T_star", config.DEFAULT_TSTAR),
         "T_eq": params.get("T_eq"),
+        "a": (
+            params["a"].nominal_value
+            if ("a" in params and hasattr(params["a"], "nominal_value"))
+            else params.get("a")
+        ),
         "period": params["period"].nominal_value if hasattr(params["period"], "nominal_value") else params["period"],
     }
 
@@ -547,7 +475,6 @@ def _default_region_name_for_mode(mode: str) -> str:
         return "terminator"
     if mode == "emission":
         return "dayside"
-    raise ValueError(f"Unsupported retrieval mode: {mode}")
 
 
 def _build_art_for_mode(mode: str) -> object:
@@ -572,8 +499,6 @@ def _normalize_region_name(region_name: str | None, mode: str) -> str:
     if region_name is None:
         return _default_region_name_for_mode(mode)
     normalized = str(region_name).strip()
-    if not normalized:
-        raise ValueError("region_name must be a non-empty string.")
     return normalized
 
 
@@ -719,6 +644,174 @@ def _build_primary_spectroscopic_component(
     )
 
 
+def _sanitize_name_for_id(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in value.lower())
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned.strip("_")
+
+
+def _infer_tbl_mode(metadata: dict[str, str]) -> str | None:
+    spec_type = metadata.get("SPEC_TYPE", "").strip().lower()
+    if "eclipse" in spec_type:
+        return "emission"
+    if "transit" in spec_type or "transmission" in spec_type:
+        return "transmission"
+    return None
+
+
+def _convert_unit_to_micron(values: np.ndarray, unit: str) -> np.ndarray:
+    unit_norm = unit.lower().strip()
+    if "angstrom" in unit_norm or unit_norm == "aa":
+        return values / 10000.0
+    if unit_norm in {"nm", "nanometer", "nanometers"}:
+        return values / 1000.0
+    return values
+
+
+def _combine_scalar_measurements(values: np.ndarray, sigma: np.ndarray) -> tuple[float, float]:
+    values = np.asarray(values, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+
+    mask = np.isfinite(values) & np.isfinite(sigma) & (sigma > 0)
+    if np.any(mask):
+        weights = 1.0 / np.square(sigma[mask])
+        value = float(np.sum(values[mask] * weights) / np.sum(weights))
+        uncertainty = float(np.sqrt(1.0 / np.sum(weights)))
+        return value, uncertainty
+
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        raise ValueError("No finite scalar measurements available to combine.")
+
+    value = float(np.mean(finite_values))
+    if finite_values.size == 1:
+        return value, float("nan")
+    return value, float(np.std(finite_values, ddof=1) / np.sqrt(finite_values.size))
+
+
+def _make_tophat_bandpass(center_micron: float, bandwidth_micron: float, n_samples: int = 64) -> tuple[np.ndarray, np.ndarray]:
+    width = float(bandwidth_micron)
+    if not np.isfinite(width) or width <= 0:
+        width = max(center_micron * 0.05, 0.02)
+
+    half = width / 2.0
+    start = max(center_micron - half, 1.0e-6)
+    stop = center_micron + half
+    wavelength_m = np.linspace(start, stop, int(n_samples), dtype=float) * 1.0e-6
+    response = np.ones_like(wavelength_m)
+    return wavelength_m, response
+
+
+def _resolve_lowres_tbl_path(tbl_path: str | Path) -> Path:
+    candidate = Path(tbl_path)
+    if candidate.exists() or candidate.is_absolute():
+        return candidate
+
+    prefixed = config.INPUT_DIR / "lrs" / candidate
+    if prefixed.exists():
+        return prefixed
+
+    return candidate
+
+
+def make_joint_spectrum_component_from_tbl(tbl_path: str | Path) -> dict[str, Any]:
+    tbl_path = _resolve_lowres_tbl_path(tbl_path)
+    metadata, _columns, _data_by_col, _units_by_col = parse_nasa_archive_tbl(tbl_path)
+    mode = _infer_tbl_mode(metadata)
+    if mode is None:
+        raise ValueError(
+            f"Could not infer low-res mode from SPEC_TYPE in {tbl_path}. "
+            "Use a NASA .tbl with SPEC_TYPE matching eclipse/transmission."
+        )
+
+    return {
+        "name": f"lrs_{_sanitize_name_for_id(tbl_path.stem)}",
+        "mode": mode,
+        "tbl_path": str(tbl_path),
+        "data_format": "spectrum",
+    }
+
+
+def make_bandpass_constraints_from_tbl(tbl_path: str | Path) -> list[dict[str, Any]]:
+    tbl_path = _resolve_lowres_tbl_path(tbl_path)
+    metadata, _columns, data_by_col, units_by_col = parse_nasa_archive_tbl(tbl_path)
+    mode = _infer_tbl_mode(metadata)
+    if mode is None:
+        raise ValueError(
+            f"Could not infer low-res mode from SPEC_TYPE in {tbl_path}. "
+            "Use a NASA .tbl with SPEC_TYPE matching eclipse/transmission."
+        )
+
+    wav_angstrom, spectrum, sigma, _meta = load_nasa_archive_spectrum(tbl_path, mode=mode)
+    unique_wav = np.unique(np.round(wav_angstrom, 6))
+    if unique_wav.size >= 5:
+        raise ValueError(
+            f"{tbl_path} has {unique_wav.size} unique wavelength bins. "
+            "Pass it via --joint-spectrum-tbl instead of --bandpass-tbl."
+        )
+
+    bandwidth_values = np.full_like(wav_angstrom, np.nan, dtype=float)
+    if "BANDWIDTH" in data_by_col:
+        raw_bandwidth = np.asarray(
+            [
+                np.nan if value is None else float(value)
+                for value in data_by_col["BANDWIDTH"]
+            ],
+            dtype=float,
+        )
+        if raw_bandwidth.size == wav_angstrom.size:
+            bandwidth_values = _convert_unit_to_micron(
+                raw_bandwidth,
+                units_by_col.get("BANDWIDTH", ""),
+            )
+
+    grouped_indices: dict[float, list[int]] = {}
+    for idx, wav in enumerate(np.round(wav_angstrom, 6)):
+        grouped_indices.setdefault(float(wav), []).append(idx)
+
+    instrument = (metadata.get("INSTRUMENT") or metadata.get("INSTRUMENT_NAME") or "").strip()
+    facility = (metadata.get("FACILITY") or metadata.get("FACILITY_NAME") or "").strip()
+    instrument_text = f"{instrument} {facility}".lower()
+    base_name = f"lrs_{_sanitize_name_for_id(tbl_path.stem)}"
+
+    constraints: list[dict[str, Any]] = []
+    for group_idx, indices in enumerate(grouped_indices.values(), start=1):
+        value, value_sigma = _combine_scalar_measurements(
+            spectrum[indices],
+            sigma[indices],
+        )
+        if not np.isfinite(value_sigma) or value_sigma <= 0:
+            continue
+
+        name = base_name if len(grouped_indices) == 1 else f"{base_name}_{group_idx}"
+        observable = "eclipse_depth" if mode == "emission" else "transit_depth"
+        constraint: dict[str, Any] = {
+            "name": name,
+            "mode": mode,
+            "observable": observable,
+            "value": value,
+            "sigma": value_sigma,
+        }
+
+        if "tess" not in instrument_text:
+            center_micron = float(np.mean(wav_angstrom[indices]) / 10000.0)
+            bandwidth = bandwidth_values[indices]
+            finite_bandwidth = bandwidth[np.isfinite(bandwidth) & (bandwidth > 0)]
+            bandwidth_micron = (
+                float(np.mean(finite_bandwidth))
+                if finite_bandwidth.size > 0
+                else float("nan")
+            )
+            wavelength_m, response = _make_tophat_bandpass(center_micron, bandwidth_micron)
+            constraint["wavelength_m"] = wavelength_m
+            constraint["response"] = response
+
+        constraints.append(constraint)
+
+    return constraints
+
+
 def _build_atmosphere_regions(
     *,
     model_params: dict[str, float | None],
@@ -736,10 +829,6 @@ def _build_atmosphere_regions(
         for raw_spec in atmosphere_regions:
             spec = dict(raw_spec)
             name = str(spec.get("name", "")).strip()
-            if not name:
-                raise ValueError("Each atmosphere_regions entry must provide a non-empty 'name'.")
-            if name in explicit_specs:
-                raise ValueError(f"Duplicate atmosphere region specification: {name}")
             if "mode" in spec and spec["mode"] is not None:
                 spec["mode"] = _normalize_retrieval_mode(spec["mode"])
             explicit_specs[name] = spec
@@ -759,13 +848,6 @@ def _build_atmosphere_regions(
         component_modes[region_name] = region_mode
         region_mol_names.setdefault(region_name, set()).update(observation_config.opa_mols.keys())
         region_atom_names.setdefault(region_name, set()).update(observation_config.opa_atoms.keys())
-
-    if explicit_specs.keys() - component_modes.keys():
-        unused = ", ".join(sorted(explicit_specs.keys() - component_modes.keys()))
-        raise ValueError(
-            "Unused atmosphere_regions entries with no linked observation component(s): "
-            f"{unused}"
-        )
 
     region_configs = []
     region_lookup: dict[str, object] = {}
@@ -882,12 +964,9 @@ def _load_joint_spectroscopic_component(
             U_sysrem = None
             V = None
         else:
-            raise ValueError(f"Unsupported auxiliary data_format: {data_format}")
-    else:
-        raise ValueError(
-            "Joint spectroscopic component must provide one of: "
-            "{tbl_path}, {data_dir}, or {wav_obs,data,sigma}."
-        )
+            wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
+            U_sysrem = None
+            V = None
 
     if apply_sysrem and (U_sysrem is None or V is None):
         raise ValueError(
@@ -963,6 +1042,7 @@ def _load_bandpass_constraint(
     *,
     default_mode: str,
     default_tstar: float | None,
+    default_semi_major_axis_au: float | None,
 ) -> BandpassConstraintBundle:
     component_mode = _normalize_retrieval_mode(spec.get("mode", default_mode))
     region_name = _normalize_region_name(spec.get("region_name"), component_mode)
@@ -972,6 +1052,24 @@ def _load_bandpass_constraint(
     sigma = float(spec["sigma"])
     photon_weighted = bool(spec.get("photon_weighted", False))
     Tstar = spec.get("Tstar", default_tstar)
+    include_reflection = bool(spec.get("include_reflection", False))
+    semi_major_axis_au = spec.get("semi_major_axis_au", default_semi_major_axis_au)
+    if semi_major_axis_au is not None:
+        semi_major_axis_au = float(semi_major_axis_au)
+    geometric_albedo_bounds_raw = spec.get("geometric_albedo_bounds")
+    geometric_albedo_bounds = (
+        None
+        if geometric_albedo_bounds_raw is None
+        else tuple(float(x) for x in geometric_albedo_bounds_raw)
+    )
+    model_sigma_raw = spec.get("model_sigma")
+    model_sigma = None if model_sigma_raw is None else float(model_sigma_raw)
+    model_sigma_bounds_raw = spec.get("model_sigma_bounds")
+    model_sigma_bounds = (
+        None
+        if model_sigma_bounds_raw is None
+        else tuple(float(x) for x in model_sigma_bounds_raw)
+    )
 
     if "wavelength_m" in spec and "response" in spec:
         wavelength_m = np.asarray(spec["wavelength_m"], dtype=float)
@@ -1008,6 +1106,11 @@ def _load_bandpass_constraint(
         observable=observable,
         photon_weighted=photon_weighted,
         Tstar=Tstar,
+        include_reflection=include_reflection,
+        semi_major_axis_au=semi_major_axis_au,
+        geometric_albedo_bounds=geometric_albedo_bounds,
+        model_sigma=model_sigma,
+        model_sigma_bounds=model_sigma_bounds,
         sample_prefix=name,
     )
     observation_inputs = BandpassObservationInputs(
@@ -1040,16 +1143,14 @@ class _StepTimer:
 def run_retrieval(
     mode: str = "transmission",
     epoch: str | None = None,
-    data_dir: str | Path | None = None,
-    data_format: str = "auto",
+    data_format: str = config.DEFAULT_DATA_FORMAT,
     skip_svi: bool = False,
     svi_only: bool = False,
     no_plots: bool = False,
-    pt_profile: str = "guillot",
+    pt_profile: str | None = None,
     phase_mode: PhaseMode = "global",
-    chemistry_model: str = config.CHEMISTRY_MODEL_DEFAULT,
+    chemistry_model: str | None = None,
     fastchem_parameter_file: str | None = None,
-    check_aliasing: bool = False,
     compute_contribution: bool = True,
     seed: int = 42,
     wav_obs: np.ndarray | None = None,
@@ -1064,6 +1165,10 @@ def run_retrieval(
 ) -> None:
     retrieval_start = perf_counter()
     mode = _normalize_retrieval_mode(mode)
+    if pt_profile is None:
+        raise ValueError("pt_profile must be passed explicitly.")
+    if chemistry_model is None:
+        raise ValueError("chemistry_model must be passed explicitly.")
 
     # Create timestamped output directory
     base_dir = config.DIR_SAVE or config.get_output_dir()
@@ -1084,7 +1189,7 @@ def run_retrieval(
     params = config.get_params()
     print(f"\nTarget: {config.PLANET} ({config.EPHEMERIS})")
 
-    apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT)
+    apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT and data_format == "timeseries")
 
     U_sysrem: np.ndarray | None = None
     V_sysrem: np.ndarray | None = None
@@ -1094,8 +1199,6 @@ def run_retrieval(
         if epoch:
             print(f"  Using epoch: {epoch}")
         if any(val is not None for val in (wav_obs, data, sigma, phase)):
-            if any(val is None for val in (wav_obs, data, sigma, phase)):
-                raise ValueError("Must provide wav_obs, data, sigma, and phase together.")
             phase = _normalize_phase(phase)
             print(f"  Using provided data: {data.shape[0]} exposures x {data.shape[1]} wavelengths")
             print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
@@ -1113,23 +1216,11 @@ def run_retrieval(
                     f"V shape={V_sysrem.shape}"
                 )
         else:
-            if data_format not in {"auto", "timeseries", "spectrum"}:
-                raise ValueError(f"Unknown data_format: {data_format}")
-
-            resolved_data_dir = Path(data_dir) if data_dir is not None else config.get_data_dir(epoch=epoch)
-
-            if data_dir is not None:
-                suffix = "transmission" if mode == "transmission" else "emission"
-                data_paths = {
-                    "wavelength": Path(data_dir) / f"wavelength_{suffix}.npy",
-                    "spectrum": Path(data_dir) / f"spectrum_{suffix}.npy",
-                    "uncertainty": Path(data_dir) / f"uncertainty_{suffix}.npy",
-                }
-            else:
-                data_paths = (
-                    config.get_transmission_paths(epoch=epoch) if mode == "transmission"
-                    else config.get_emission_paths(epoch=epoch)
-                )
+            resolved_data_dir = config.get_data_dir(epoch=epoch)
+            data_paths = (
+                config.get_transmission_paths(epoch=epoch) if mode == "transmission"
+                else config.get_emission_paths(epoch=epoch)
+            )
 
             if data_format == "timeseries":
                 wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
@@ -1163,19 +1254,10 @@ def run_retrieval(
                         "APPLY_SYSREM_DEFAULT=False."
                     )
             else:
-                wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
-                phase = _normalize_phase(phase)
-                print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
-                print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
-                if apply_sysrem:
-                    U_raw, V_raw = _load_sysrem_inputs(resolved_data_dir)
-                    U_sysrem, V_sysrem = _validate_sysrem_inputs(
-                        U_raw, V_raw, n_exp=data.shape[0]
-                    )
-                    print(
-                        f"  Loaded SYSREM auxiliaries: U shape={U_sysrem.shape}, "
-                        f"V shape={V_sysrem.shape}"
-                    )
+                raise ValueError(
+                    f"Unsupported data_format: {data_format}. "
+                    "Choose from {'timeseries', 'spectrum'}."
+                )
 
         print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
 
@@ -1259,17 +1341,6 @@ def run_retrieval(
         if opa_atoms:
             print(f"  Loaded {len(opa_atoms)} atomic species: {list(opa_atoms.keys())}")
 
-        # Run aliasing diagnostics if requested
-        if check_aliasing:
-            print("\n  Running species aliasing diagnostics...")
-            aliasing_dir = os.path.join(output_dir, "aliasing")
-            os.makedirs(aliasing_dir, exist_ok=True)
-            
-            all_species = list(opa_mols.keys()) + list(opa_atoms.keys())
-            print(f"  Species to check: {', '.join(all_species)}")
-            print(f"  (Full aliasing analysis requires template generation - see aliasing.py)")
-            print(f"  Aliasing directory: {aliasing_dir}")
-
     print(f"\n[6/7] Building retrieval model (primary={mode}, default P-T={pt_profile})...")
     print(f"  Chemistry model: {chemistry_model}")
     with _StepTimer("Step 6/7"):
@@ -1344,6 +1415,7 @@ def run_retrieval(
                     spec,
                     default_mode=mode,
                     default_tstar=model_params["T_star"],
+                    default_semi_major_axis_au=model_params["a"],
                 )
                 if component.name in observations_payload:
                     raise ValueError(f"Duplicate joint component name: {component.name}")
@@ -1394,9 +1466,6 @@ def run_retrieval(
     # Run inference
     print("\n[7/7] Running Bayesian inference...")
     rng_key = random.PRNGKey(seed)
-
-    if svi_only and skip_svi:
-        raise ValueError("Cannot set svi_only=True when skip_svi=True")
 
     init_strategy = init_to_median(num_samples=config.INIT_TO_MEDIAN_SAMPLES)
     svi_params: dict | None = None
@@ -1726,10 +1795,7 @@ def run_retrieval(
 
 
 if __name__ == "__main__":
-    print("Running with default settings.")
-    print("For more options, use: python -m atmo_retrieval --help\n")
-
-    if config.RETRIEVAL_MODE in ("transmission", "emission"):
-        run_retrieval(mode=config.RETRIEVAL_MODE)
-    else:
-        raise ValueError(f"Unknown retrieval mode: {config.RETRIEVAL_MODE}")
+    raise RuntimeError(
+        "Direct __main__ execution no longer provides a chemistry default. "
+        "Import run_retrieval(...) and pass chemistry_model explicitly."
+    )

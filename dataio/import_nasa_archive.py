@@ -33,7 +33,7 @@ def main() -> int:
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Output directory (default: input/spectra/nasa_archive/<planet>/<spec_num>)",
+        help="Output directory (default: input/lrs/<planet>/<spec_num>)",
     )
     parser.add_argument(
         "--mode",
@@ -82,7 +82,7 @@ def main() -> int:
         planet_name = metadata.get("PL_NAME", tbl_path.stem)
         spec_num = metadata.get("SPEC_NUM", tbl_path.stem)
         planet_dir = _sanitize_name(planet_name)
-        output_dir = Path("input/spectra/nasa_archive") / planet_dir / str(spec_num)
+        output_dir = Path("input/lrs") / planet_dir / str(spec_num)
     else:
         output_dir = Path(args.output_dir)
 

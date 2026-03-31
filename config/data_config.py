@@ -9,12 +9,14 @@ from .instrument_config import OBSERVING_MODE
 DEFAULT_DATA_PLANET = PLANET
 DEFAULT_DATA_ARM = OBSERVING_MODE
 DEFAULT_USE_MOLECFIT = True
-DEFAULT_RAW_DATA_DIR = "input/raw"
+DEFAULT_RAW_DATA_DIR = "input/hrs"
 DEFAULT_BARYCORR = False
 DEFAULT_INTRODUCED_SHIFT = True
 
 # Data loading defaults
-DEFAULT_DATA_FORMAT = "auto"
+# Default to time-series input so the main CLI and phase-binned path work without
+# extra flags. Use --data-format spectrum for collapsed retrieval products.
+DEFAULT_DATA_FORMAT = "timeseries"
 
 # Binning defaults
 DEFAULT_BIN_SIZE = 50
