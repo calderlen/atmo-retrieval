@@ -46,13 +46,13 @@ flowchart TD
     B --> K[pipeline/inference.py<br/>SVI + NUTS]
     B --> L[plotting/plot.py<br/>figures]
 
-    N[input/hrs/{epoch}_{planet}<br/>raw HRS exposures] --> O[dataio/collapse_transmission_timeseries_to_1d.py<br/>collapse timeseries to 1D]
+    N[input/hrs raw HRS exposures] --> O[dataio/collapse_transmission_timeseries_to_1d.py<br/>collapse timeseries to 1D]
     N --> P[dataio/collapse_emission_timeseries_to_1d.py<br/>collapse timeseries to 1D]
-    O -. writes .-> Q[input/hrs/{planet}/{epoch}/{arm}<br/>1D HRS .npy products]
+    O -. writes .-> Q[input/hrs processed 1D HRS .npy products]
     P -. writes .-> Q
     Q -. optional spectrum input .-> B
 
-    R[input/lrs/{planet}/*.tbl<br/>explicit low-res inputs] --> S[dataio/import_nasa_archive.py<br/>NASA archive utility]
+    R[input/lrs explicit low-res .tbl inputs] --> S[dataio/import_nasa_archive.py<br/>NASA archive utility]
     R -. passed via --joint-spectrum-tbl / --bandpass-tbl .-> B
 ```
 
