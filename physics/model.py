@@ -29,7 +29,7 @@ from exojax.database import molinfo
 from exojax.opacity.opacont import OpaCIA
 from exojax.opacity.premodit.api import OpaPremodit
 from exojax.postproc.specop import SopInstProfile, SopRotation
-from exojax.spec.planck import piBarr
+from exojax.rt.planck import piBarr
 from exojax.utils.astrofunc import gravity_jupiter as gravity_surface
 from exojax.utils.constants import MJ, RJ, Rs
 
