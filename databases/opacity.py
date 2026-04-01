@@ -13,6 +13,33 @@ import requests
 # RADIS uses numba cache=True in some environments where caching is unsupported.
 os.environ.setdefault("NUMBA_DISABLE_CACHE", "1")
 
+
+def _patch_numba_enable_caching():
+    try:
+        from numba.core.dispatcher import Dispatcher
+        from numba.core.caching import NullCache
+    except Exception:
+        return
+
+    orig_enable_caching = getattr(Dispatcher, "enable_caching", None)
+    if orig_enable_caching is None or getattr(orig_enable_caching, "_locator_patched", False):
+        return
+
+    def _enable_caching(self):
+        try:
+            return orig_enable_caching(self)
+        except RuntimeError as exc:
+            if "no locator available" not in str(exc):
+                raise
+            self._cache = NullCache()
+            return None
+
+    _enable_caching._locator_patched = True
+    Dispatcher.enable_caching = _enable_caching
+
+
+_patch_numba_enable_caching()
+
 from exojax.database.contdb import CdbCIA
 from exojax.opacity.opacont import OpaCIA
 from exojax.database.api import MdbHitemp, MdbExomol
@@ -25,14 +52,24 @@ from radis.api.hitempapi import login_to_hitran
 
 # Opacity cache directory (relative to project root)
 from config.paths_config import PROJECT_ROOT, DB_KURUCZ, DB_VALD, USE_KURUCZ, USE_VALD
-from databases.atomic import (
-    load_kurucz_atomic,
-    load_vald_atomic,
-    create_atomic_snapshot,
-    resolve_vald_file,
-    parse_species,
-    ATOMIC_MASSES as ATOMIC_MASSES_DB,
-)
+try:
+    from databases.atomic import (
+        load_kurucz_atomic,
+        load_vald_atomic,
+        create_atomic_snapshot,
+        resolve_vald_file,
+        parse_species,
+        ATOMIC_MASSES as ATOMIC_MASSES_DB,
+    )
+    _ATOMIC_BACKEND_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - depends on external exojax install
+    load_kurucz_atomic = None
+    load_vald_atomic = None
+    create_atomic_snapshot = None
+    resolve_vald_file = None
+    parse_species = None
+    ATOMIC_MASSES_DB = {}
+    _ATOMIC_BACKEND_IMPORT_ERROR = exc
 OPA_CACHE_DIR = PROJECT_ROOT / "input" / ".opa_cache"
 OPA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -290,7 +327,6 @@ def build_premodit_from_snapshot(
     opa = OpaPremodit.from_snapshot(
         snapshot,
         nu_grid,
-        1,
         diffmode=diffmode,
         auto_trange=[T_low, T_high],
         dit_grid_resolution=1,
@@ -298,16 +334,19 @@ def build_premodit_from_snapshot(
         cutwing=cutwing_val,
     )
     opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
-    saveopa(
-        opa,
-        str(opa_path),
-        format="zarr",
-        aux={
-            "molmass": molmass,
-            "cutwing": float(cutwing_val),
-            "diffmode": int(diffmode),
-        },
-    )
+    try:
+        saveopa(
+            opa,
+            str(opa_path),
+            format="zarr",
+            aux={
+                "molmass": molmass,
+                "cutwing": float(cutwing_val),
+                "diffmode": int(diffmode),
+            },
+        )
+    except Exception as exc:
+        print(f"    warning: failed to cache opacity for {mol}: {exc}; continuing with in-memory opacity")
     return opa
 
 
@@ -329,12 +368,15 @@ def load_or_build_opacity(
     cutwing_val = _resolve_cutwing(cutwing)
     if opa_load:
         opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
-        opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
-        if not _opa_grid_matches(opa, nu_grid):
-            raise ValueError("Cached opacity grid mismatch.")
-        if not _opa_settings_match(opa, diffmode, cutwing_val):
-            raise ValueError("Cached opacity settings mismatch.")
-        return opa, opa.aux["molmass"]
+        try:
+            opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
+            if not _opa_grid_matches(opa, nu_grid):
+                raise ValueError("Cached opacity grid mismatch.")
+            if not _opa_settings_match(opa, diffmode, cutwing_val):
+                raise ValueError("Cached opacity settings mismatch.")
+            return opa, opa.aux["molmass"]
+        except Exception as exc:
+            print(f"    cache miss for {mol}: {exc}; rebuilding opacity")
     elif load_only:
         print(f"  Warning: OPA_LOAD disabled; skipping {mol} (load-only).")
         return None, None
@@ -458,6 +500,14 @@ def load_atomic_opacities(
     if not atomic_species:
         return opa_atoms, jnp.array(atommass_list)
 
+    if _ATOMIC_BACKEND_IMPORT_ERROR is not None:
+        print(
+            "  Warning: atomic opacity backend is unavailable; skipping atomic opacities. "
+            f"Import failed with: {_ATOMIC_BACKEND_IMPORT_ERROR.__class__.__name__}: "
+            f"{_ATOMIC_BACKEND_IMPORT_ERROR}"
+        )
+        return opa_atoms, jnp.array(atommass_list)
+
     # Get defaults from config if not specified
     if use_kurucz is None:
         use_kurucz = USE_KURUCZ
@@ -486,20 +536,23 @@ def load_atomic_opacities(
 
         if opa_load:
             opa_path = OPA_CACHE_DIR / f"opa_{cache_name}.zarr"
-            opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
-            if not _opa_grid_matches(opa, nu_grid):
-                raise ValueError("Cached opacity grid mismatch.")
-            if not _opa_settings_match(opa, diffmode, cutwing_val):
-                raise ValueError("Cached opacity settings mismatch.")
-            molmass = opa.aux.get("molmass", None)
-            if molmass is None:
-                raise KeyError("Missing molmass in cached opacity.")
-            opa_atoms[atom] = opa
-            atommass_list.append(molmass)
-            print(f"  * {atom} (cached)")
-            if on_species_loaded is not None:
-                on_species_loaded(f"atom:{atom}")
-            continue
+            try:
+                opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
+                if not _opa_grid_matches(opa, nu_grid):
+                    raise ValueError("Cached opacity grid mismatch.")
+                if not _opa_settings_match(opa, diffmode, cutwing_val):
+                    raise ValueError("Cached opacity settings mismatch.")
+                molmass = opa.aux.get("molmass", None)
+                if molmass is None:
+                    raise KeyError("Missing molmass in cached opacity.")
+                opa_atoms[atom] = opa
+                atommass_list.append(molmass)
+                print(f"  * {atom} (cached)")
+                if on_species_loaded is not None:
+                    on_species_loaded(f"atom:{atom}")
+                continue
+            except Exception as exc:
+                print(f"  * {atom} cache miss: {exc}; rebuilding opacity")
         elif load_only:
             print(f"  Warning: OPA_LOAD disabled; skipping {atom} (load-only).")
             continue

@@ -1,0 +1,578 @@
+#!/usr/bin/env python
+"""Prepare retrieval-ready time-series products from PEPSI exposure folders.
+
+This module converts raw/reduced PEPSI exposure directories such as
+``input/hrs/20250601_KELT-20b`` into the `.npy` bundle consumed by the
+time-series retrieval path:
+
+- ``wavelength.npy`` (1D wavelength grid in Angstroms)
+- ``data.npy`` (2D exposure x wavelength matrix)
+- ``sigma.npy`` (2D uncertainty matrix)
+- ``phase.npy`` (1D orbital phase array, mid-transit at 0)
+
+Optional auxiliary products are also written when available, including
+``jd.npy``, ``snr.npy``, ``exptime.npy``, ``airmass.npy``, and SYSREM
+approximations compatible with the current retrieval loader.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+import config
+from config.planets_config import EPHEMERIS, PLANETS, PHASE_BINS
+from dataio.collapse_transmission_timeseries_to_1d import (
+    combine_full_arms,
+    compute_contact_phases,
+    do_sysrem,
+    get_orbital_phase,
+    get_pepsi_data,
+    get_phase_bin_mask,
+    get_sysrem_chunk_indices,
+)
+
+
+def _output_dir_for(planet: str, epoch: str, arm: str) -> Path:
+    return Path("input/hrs") / planet.lower().replace("-", "") / epoch / arm
+
+
+def _nearest_transit_midpoint(jd: np.ndarray, reference_epoch: float, period: float) -> float:
+    obs_mid = 0.5 * (float(np.min(jd)) + float(np.max(jd)))
+    n_orbits = round((obs_mid - reference_epoch) / period)
+    return float(reference_epoch + n_orbits * period)
+
+
+def _planet_config(planet: str) -> dict[str, Any]:
+    cfg = PLANETS.get(planet, {}).get(EPHEMERIS, {})
+    if not cfg:
+        available = ", ".join(sorted(PLANETS.keys()))
+        raise ValueError(
+            f"Planet '{planet}' not found in config/planets_config.py. "
+            f"Available planets: {available}"
+        )
+    return cfg
+
+
+def _unwrap_result(result: Any) -> tuple[tuple[np.ndarray, ...], dict[str, Any]]:
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
+        return result[0], result[1]
+    return result, {}
+
+
+def _load_single_arm(
+    arm: str,
+    epoch: str,
+    planet: str,
+    *,
+    prefer_molecfit: bool,
+    barycorr: bool,
+    introduced_shift: bool,
+    regrid: bool,
+    subtract_median: bool,
+    run_sysrem: bool,
+) -> tuple[tuple[np.ndarray, ...], dict[str, Any]]:
+    result = get_pepsi_data(
+        arm=arm,
+        observation_epoch=epoch,
+        planet_name=planet,
+        do_molecfit=prefer_molecfit,
+        data_dir=config.DEFAULT_RAW_DATA_DIR,
+        barycentric_correction=barycorr,
+        apply_introduced_shift=introduced_shift if prefer_molecfit else False,
+        regrid=regrid,
+        subtract_median=subtract_median,
+        run_sysrem=run_sysrem,
+    )
+    if result is None and prefer_molecfit:
+        print(f"  No molecfit files for {arm}; retrying with raw files.")
+        result = get_pepsi_data(
+            arm=arm,
+            observation_epoch=epoch,
+            planet_name=planet,
+            do_molecfit=False,
+            data_dir=config.DEFAULT_RAW_DATA_DIR,
+            barycentric_correction=barycorr,
+            apply_introduced_shift=False,
+            regrid=regrid,
+            subtract_median=subtract_median,
+            run_sysrem=run_sysrem,
+        )
+    if result is None:
+        raise FileNotFoundError(
+            f"Could not load {arm}-arm PEPSI data for {planet} {epoch} from "
+            f"{config.DEFAULT_RAW_DATA_DIR}."
+        )
+    return _unwrap_result(result)
+
+
+def _load_data(
+    *,
+    arm: str,
+    epoch: str,
+    planet: str,
+    molecfit: bool,
+    barycorr: bool,
+    introduced_shift: bool,
+    regrid: bool,
+    subtract_median: bool,
+    run_sysrem: bool,
+) -> tuple[tuple[np.ndarray, ...], dict[str, Any]]:
+    if arm == "full":
+        red_result, _ = _load_single_arm(
+            "red",
+            epoch,
+            planet,
+            prefer_molecfit=True,
+            barycorr=barycorr,
+            introduced_shift=introduced_shift,
+            regrid=regrid,
+            subtract_median=subtract_median,
+            run_sysrem=False,
+        )
+        blue_result, _ = _load_single_arm(
+            "blue",
+            epoch,
+            planet,
+            prefer_molecfit=False,
+            barycorr=barycorr,
+            introduced_shift=False,
+            regrid=regrid,
+            subtract_median=subtract_median,
+            run_sysrem=False,
+        )
+        combined = combine_full_arms(red_result, blue_result)
+
+        if not run_sysrem:
+            return combined, {}
+
+        wave, data, sigma, jd, snr, exptime, airmass, n_spectra, npix = combined
+        wave_1d = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave, dtype=float)
+        data_sysrem, sigma_sysrem, U_sysrem, no_tellurics = do_sysrem(
+            wave_1d,
+            np.asarray(data, dtype=float),
+            np.asarray(sigma, dtype=float),
+            arm="full",
+            airmass=np.asarray(airmass, dtype=float),
+            do_molecfit=molecfit,
+            stop_delta_stddev=config.DEFAULT_SYSREM_STOP_TOL,
+        )
+        extras = {
+            "U_sysrem": U_sysrem,
+            "no_tellurics": no_tellurics,
+            "n_systematics_used": [
+                int(np.sum(np.any(np.isfinite(U_sysrem[:, :, i]), axis=0)))
+                for i in range(U_sysrem.shape[2])
+            ],
+        }
+        combined = (
+            wave,
+            data_sysrem,
+            sigma_sysrem,
+            jd,
+            snr,
+            exptime,
+            airmass,
+            n_spectra,
+            npix,
+        )
+        return combined, extras
+
+    return _load_single_arm(
+        arm,
+        epoch,
+        planet,
+        prefer_molecfit=molecfit,
+        barycorr=barycorr,
+        introduced_shift=introduced_shift,
+        regrid=regrid,
+        subtract_median=subtract_median,
+        run_sysrem=run_sysrem,
+    )
+
+
+def _phase_selection_mask(
+    phase: np.ndarray,
+    *,
+    phase_bin: str,
+    planet_params: dict[str, Any],
+) -> np.ndarray:
+    if phase_bin == "all":
+        return np.ones_like(phase, dtype=bool)
+    return get_phase_bin_mask(phase, phase_bin, planet_params)
+
+
+def _sanitize_columns(
+    wavelength: np.ndarray,
+    data: np.ndarray,
+    sigma: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    wavelength = np.asarray(wavelength, dtype=float)
+    data = np.asarray(data, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+
+    if wavelength.ndim != 1:
+        raise ValueError(f"Expected 1D wavelength grid, got shape {wavelength.shape}.")
+    if data.ndim != 2 or sigma.ndim != 2:
+        raise ValueError(
+            f"Expected 2D data/sigma matrices, got {data.shape=} and {sigma.shape=}."
+        )
+    if data.shape != sigma.shape:
+        raise ValueError(f"data shape {data.shape} does not match sigma shape {sigma.shape}.")
+    if data.shape[1] != wavelength.size:
+        raise ValueError(
+            f"Spectral axis mismatch: data.shape[1]={data.shape[1]} "
+            f"but wavelength.size={wavelength.size}."
+        )
+
+    valid = np.isfinite(wavelength) & (wavelength > 0.0)
+    valid &= np.all(np.isfinite(data), axis=0)
+    valid &= np.all(np.isfinite(sigma), axis=0)
+    valid &= np.all(sigma > 0.0, axis=0)
+
+    if not np.any(valid):
+        raise ValueError("No valid spectral columns remain after masking.")
+
+    wavelength = wavelength[valid]
+    data = data[:, valid]
+    sigma = sigma[:, valid]
+
+    sort_idx = np.argsort(wavelength)
+    wavelength = wavelength[sort_idx]
+    data = data[:, sort_idx]
+    sigma = sigma[:, sort_idx]
+    return wavelength, data, sigma
+
+
+def _sysrem_vdiag_from_sigma(sigma: np.ndarray) -> np.ndarray:
+    exposure_sigma = np.sqrt(np.mean(np.square(sigma), axis=1))
+    return 1.0 / np.clip(exposure_sigma, 1.0e-30, None)
+
+
+def _chunk_labels_from_indices(
+    n_wave: int,
+    chunk_indices: tuple[np.ndarray, ...],
+) -> np.ndarray:
+    labels = np.full(n_wave, -1, dtype=int)
+    for chunk_id, indices in enumerate(chunk_indices):
+        labels[np.asarray(indices, dtype=int)] = chunk_id
+    if np.any(labels < 0):
+        missing = int(np.sum(labels < 0))
+        raise ValueError(f"{missing} wavelength columns were not assigned to any SYSREM chunk.")
+    return labels
+
+
+def _sysrem_basis_counts(U_full: np.ndarray) -> np.ndarray:
+    U_full = np.asarray(U_full, dtype=float)
+    if U_full.ndim == 2:
+        U_full = U_full[:, :, np.newaxis]
+    if U_full.ndim != 3:
+        raise ValueError(f"Unsupported U_sysrem shape: {U_full.shape}")
+
+    return np.asarray(
+        [
+            int(np.sum(np.any(np.isfinite(U_full[:, :, chunk]), axis=0)))
+            for chunk in range(U_full.shape[2])
+        ],
+        dtype=int,
+    )
+
+
+def _sysrem_chunk_vdiag_from_sigma(
+    sigma: np.ndarray,
+    chunk_indices: tuple[np.ndarray, ...],
+) -> np.ndarray:
+    sigma = np.asarray(sigma, dtype=float)
+    v_diag = []
+    for indices in chunk_indices:
+        chunk_sigma = sigma[:, np.asarray(indices, dtype=int)]
+        if chunk_sigma.shape[1] == 0:
+            v_diag.append(np.ones((sigma.shape[0],), dtype=float))
+        else:
+            v_diag.append(_sysrem_vdiag_from_sigma(chunk_sigma))
+    return np.asarray(v_diag, dtype=float)
+
+
+def _save_metadata(
+    output_dir: Path,
+    *,
+    planet: str,
+    epoch: str,
+    arm: str,
+    phase_bin: str,
+    t0: float,
+    phase: np.ndarray,
+    jd: np.ndarray,
+    contacts: dict[str, float],
+    subtract_median: bool,
+    run_sysrem: bool,
+    regrid: bool,
+) -> None:
+    metadata = {
+        "planet": planet,
+        "ephemeris": EPHEMERIS,
+        "epoch": epoch,
+        "arm": arm,
+        "phase_bin": phase_bin,
+        "t0_bjd": float(t0),
+        "n_exposures": int(phase.size),
+        "phase_min": float(np.min(phase)),
+        "phase_max": float(np.max(phase)),
+        "jd_min": float(np.min(jd)),
+        "jd_max": float(np.max(jd)),
+        "contacts": {k: float(v) for k, v in contacts.items()},
+        "regrid": bool(regrid),
+        "subtract_median": bool(subtract_median),
+        "run_sysrem": bool(run_sysrem),
+    }
+    (output_dir / "timeseries_prep.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Prepare retrieval-ready time-series products from PEPSI exposures."
+    )
+    parser.add_argument("--epoch", type=str, required=True, help="Observation epoch (YYYYMMDD)")
+    parser.add_argument(
+        "--planet",
+        type=str,
+        default=config.DEFAULT_DATA_PLANET,
+        help="Planet name",
+    )
+    parser.add_argument(
+        "--arm",
+        type=str,
+        choices=["red", "blue", "full"],
+        default=config.DEFAULT_DATA_ARM,
+        help="Spectrograph arm",
+    )
+    parser.add_argument(
+        "--phase-bin",
+        type=str,
+        choices=["all", "full", *PHASE_BINS.keys()],
+        default="full",
+        help="Which exposures to keep in the exported cube (default: full in-transit)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory (default: input/hrs/{planet}/{epoch}/{arm})",
+    )
+    parser.add_argument(
+        "--molecfit",
+        action="store_true",
+        default=config.DEFAULT_USE_MOLECFIT,
+        help="Prefer molecfit-corrected files",
+    )
+    parser.add_argument(
+        "--no-molecfit",
+        action="store_false",
+        dest="molecfit",
+        help="Use uncorrected files",
+    )
+    parser.add_argument(
+        "--barycorr",
+        action="store_true",
+        default=config.DEFAULT_BARYCORR,
+        help="Apply barycentric correction",
+    )
+    parser.add_argument(
+        "--no-barycorr",
+        action="store_false",
+        dest="barycorr",
+        help="Disable barycentric correction",
+    )
+    parser.add_argument(
+        "--introduced-shift",
+        action="store_true",
+        default=config.DEFAULT_INTRODUCED_SHIFT,
+        help="Apply epoch-specific Molecfit shift correction",
+    )
+    parser.add_argument(
+        "--no-introduced-shift",
+        action="store_false",
+        dest="introduced_shift",
+        help="Disable epoch-specific Molecfit shift correction",
+    )
+    parser.add_argument(
+        "--regrid",
+        action="store_true",
+        default=True,
+        help="Regrid all exposures to a common wavelength grid (default: on)",
+    )
+    parser.add_argument(
+        "--no-regrid",
+        action="store_false",
+        dest="regrid",
+        help="Keep native per-exposure wavelength grids (not recommended for retrieval export)",
+    )
+    parser.add_argument(
+        "--subtract-median",
+        action="store_true",
+        default=True,
+        help="Subtract the median spectrum before export (default: on)",
+    )
+    parser.add_argument(
+        "--no-subtract-median",
+        action="store_false",
+        dest="subtract_median",
+        help="Export spectra without median subtraction",
+    )
+    parser.add_argument(
+        "--run-sysrem",
+        action="store_true",
+        help="Run chunk-aware SYSREM and export retrieval SYSREM auxiliaries",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = create_parser()
+    args = parser.parse_args()
+
+    if not args.regrid:
+        raise ValueError(
+            "Retrieval-ready time-series export requires a common wavelength grid; "
+            "leave --regrid enabled."
+        )
+
+    planet_cfg = _planet_config(args.planet)
+    period = planet_cfg.get("period")
+    duration = planet_cfg.get("duration")
+    ra = planet_cfg.get("RA")
+    dec = planet_cfg.get("Dec")
+    reference_epoch = planet_cfg.get("epoch")
+    missing = [
+        name
+        for name, value in (
+            ("period", period),
+            ("duration", duration),
+            ("RA", ra),
+            ("Dec", dec),
+            ("epoch", reference_epoch),
+            ("tau", planet_cfg.get("tau")),
+        )
+        if value is None or value != value
+    ]
+    if missing:
+        raise ValueError(
+            f"Missing required planet parameters for {args.planet}: {', '.join(missing)}."
+        )
+
+    print(f"\nLoading PEPSI {args.arm} data for {args.planet} ({args.epoch})...")
+    result, extras = _load_data(
+        arm=args.arm,
+        epoch=args.epoch,
+        planet=args.planet,
+        molecfit=args.molecfit,
+        barycorr=args.barycorr,
+        introduced_shift=args.introduced_shift,
+        regrid=args.regrid,
+        subtract_median=args.subtract_median,
+        run_sysrem=args.run_sysrem,
+    )
+
+    wave, data, sigma, jd, snr, exptime, airmass, n_spectra, npix = result
+    print(f"Loaded {n_spectra} exposures with {npix} pixels each before selection.")
+
+    t0 = _nearest_transit_midpoint(np.asarray(jd), reference_epoch, period)
+    phase = get_orbital_phase(np.asarray(jd), t0, period, ra, dec)
+    selection = _phase_selection_mask(
+        phase,
+        phase_bin=args.phase_bin,
+        planet_params=planet_cfg,
+    )
+    if not np.any(selection):
+        raise ValueError(f"No exposures selected for phase_bin={args.phase_bin}.")
+
+    phase = np.asarray(phase)[selection]
+    jd = np.asarray(jd)[selection]
+    snr = np.asarray(snr)[selection]
+    exptime = np.asarray(exptime)[selection]
+    airmass = np.asarray(airmass)[selection]
+    data = np.asarray(data)[selection]
+    sigma = np.asarray(sigma)[selection]
+
+    wave_1d = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave)
+    wave_1d, data, sigma = _sanitize_columns(wave_1d, data, sigma)
+
+    output_dir = Path(args.output_dir) if args.output_dir else _output_dir_for(
+        args.planet,
+        args.epoch,
+        args.arm,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    np.save(output_dir / "wavelength.npy", wave_1d)
+    np.save(output_dir / "data.npy", data)
+    np.save(output_dir / "sigma.npy", sigma)
+    np.save(output_dir / "phase.npy", phase)
+    np.save(output_dir / "jd.npy", jd)
+    np.save(output_dir / "snr.npy", snr)
+    np.save(output_dir / "exptime.npy", exptime)
+    np.save(output_dir / "airmass.npy", airmass)
+
+    if args.run_sysrem:
+        U_full = extras.get("U_sysrem")
+        if U_full is None:
+            raise ValueError("SYSREM requested but U_sysrem was not returned by preprocessing.")
+        U_full = np.asarray(U_full)[selection]
+        chunk_names, chunk_indices, _ = get_sysrem_chunk_indices(wave_1d, args.arm)
+        chunk_labels = _chunk_labels_from_indices(wave_1d.size, chunk_indices)
+        basis_counts = _sysrem_basis_counts(U_full)
+        V_chunk_diag = _sysrem_chunk_vdiag_from_sigma(sigma, chunk_indices)
+        np.savez(
+            output_dir / "U_sysrem.npz",
+            U_sysrem=U_full,
+            chunk_labels=chunk_labels,
+            basis_counts=basis_counts,
+            V_chunk_diag=V_chunk_diag,
+            chunk_names=np.asarray(chunk_names, dtype="U32"),
+        )
+        print(
+            "  Saved chunked SYSREM bundle: "
+            f"{len(chunk_names)} chunks, basis counts={basis_counts.tolist()}"
+        )
+
+    contacts = compute_contact_phases(planet_cfg)
+    _save_metadata(
+        output_dir,
+        planet=args.planet,
+        epoch=args.epoch,
+        arm=args.arm,
+        phase_bin=args.phase_bin,
+        t0=t0,
+        phase=phase,
+        jd=jd,
+        contacts=contacts,
+        subtract_median=args.subtract_median,
+        run_sysrem=args.run_sysrem,
+        regrid=args.regrid,
+    )
+
+    print("\nSaved retrieval-ready time-series products:")
+    print(f"  Output dir: {output_dir}")
+    print(f"  wavelength.npy: {wave_1d.shape}")
+    print(f"  data.npy: {data.shape}")
+    print(f"  sigma.npy: {sigma.shape}")
+    print(f"  phase.npy: {phase.shape} ({args.phase_bin})")
+    print(
+        f"  Phase range: {float(np.min(phase)):.5f} to {float(np.max(phase)):.5f}; "
+        f"wavelength range: {float(np.min(wave_1d)):.1f} to {float(np.max(wave_1d)):.1f} A"
+    )
+    if args.run_sysrem:
+        print("  Saved chunk-aware SYSREM auxiliaries: U_sysrem.npz")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

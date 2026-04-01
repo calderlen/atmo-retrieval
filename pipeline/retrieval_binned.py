@@ -12,8 +12,10 @@ import config
 from config.planets_config import PHASE_BINS, get_params
 from dataio.collapse_transmission_timeseries_to_1d import summarize_phase_coverage
 from pipeline.retrieval import (
+    _describe_sysrem_inputs,
     _load_sysrem_inputs,
     _normalize_phase,
+    _subset_sysrem_inputs,
     _validate_sysrem_inputs,
     load_timeseries_data,
     run_retrieval,
@@ -46,16 +48,15 @@ def run_phase_binned_retrieval(
     params = retrieval_kwargs.get("params", get_params())
     apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT)
 
-    U_sysrem = None
-    V = None
+    sysrem_inputs = None
     if apply_sysrem:
-        U_raw, V_raw = _load_sysrem_inputs(resolved_data_dir)
-        U_sysrem, V = _validate_sysrem_inputs(
-            U_raw, V_raw, n_exp=data.shape[0]
+        sysrem_inputs = _validate_sysrem_inputs(
+            _load_sysrem_inputs(resolved_data_dir),
+            n_exp=data.shape[0],
         )
         print(
             f"Loaded SYSREM auxiliaries for phase-binned retrieval: "
-            f"U shape={U_sysrem.shape}, V shape={V.shape}"
+            f"{_describe_sysrem_inputs(sysrem_inputs)}"
         )
     
     # Validate phase bins
@@ -99,9 +100,7 @@ def run_phase_binned_retrieval(
         data_bin = data[indices]
         sigma_bin = sigma[indices]
         phase_bin = phase[indices]
-
-        U_bin = None if U_sysrem is None else U_sysrem[indices]
-        V_bin = None if V is None else V[np.ix_(indices, indices)]
+        sysrem_bin = _subset_sysrem_inputs(sysrem_inputs, indices)
         
         print(f"Filtered to {len(phase_bin)} exposures")
         
@@ -120,8 +119,7 @@ def run_phase_binned_retrieval(
                 data=data_bin,
                 sigma=sigma_bin,
                 phase=phase_bin,
-                U=U_bin,
-                V=V_bin,
+                sysrem_inputs=sysrem_bin,
                 **retrieval_kwargs,
             )
             results[bin_name] = {"output_dir": str(bin_output_dir)}

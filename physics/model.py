@@ -171,12 +171,19 @@ class AtmosphereState(NamedTuple):
     vmrHe_profile: jnp.ndarray
 
 
+class ChunkedSysremInputs(NamedTuple):
+    chunk_indices: tuple[jnp.ndarray, ...]
+    U_chunks: tuple[jnp.ndarray, ...]
+    V_chunks: tuple[jnp.ndarray, ...]
+
+
 class SpectroscopicObservationInputs(NamedTuple):
     data: jnp.ndarray
     sigma: jnp.ndarray
     phase: jnp.ndarray | None = None
     U: jnp.ndarray | None = None
     V: jnp.ndarray | None = None
+    chunked_sysrem: ChunkedSysremInputs | None = None
 
 
 class BandpassObservationInputs(NamedTuple):
@@ -239,8 +246,27 @@ def sysrem_model_distortion(
 
     so the effective least-squares weights are V^T V = diag(1 / sigma^2).
     """
+    if U.shape[1] == 0:
+        return M
     M_fit = U @ jnp.linalg.solve((V @ U).T @ (V @ U), (V @ U).T @ (V @ M))
     return M - M_fit
+
+
+def sysrem_model_distortion_chunked(
+    M: jnp.ndarray,
+    chunked_sysrem: ChunkedSysremInputs,
+) -> jnp.ndarray:
+    corrected = M
+    for chunk_indices, U_chunk, V_chunk in zip(
+        chunked_sysrem.chunk_indices,
+        chunked_sysrem.U_chunks,
+        chunked_sysrem.V_chunks,
+    ):
+        if chunk_indices.shape[0] == 0 or U_chunk.shape[1] == 0:
+            continue
+        corrected_chunk = sysrem_model_distortion(M[:, chunk_indices], U_chunk, V_chunk)
+        corrected = corrected.at[:, chunk_indices].set(corrected_chunk)
+    return corrected
 
 
 def check_grid_resolution(
@@ -958,6 +984,7 @@ def apply_model_pipeline_corrections(
     apply_sysrem: bool,
     U: jnp.ndarray | None = None,
     V: jnp.ndarray | None = None,
+    chunked_sysrem: ChunkedSysremInputs | None = None,
 ) -> jnp.ndarray:
     if model_ts.ndim == 1:
         model_ts = model_ts[None, :]
@@ -966,9 +993,12 @@ def apply_model_pipeline_corrections(
         model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
 
     if apply_sysrem:
-        if (U is None) or (V is None):
-            raise ValueError("apply_sysrem=True requires both U and V inputs.")
-        model_ts = sysrem_model_distortion(model_ts, U, V)
+        if chunked_sysrem is not None:
+            model_ts = sysrem_model_distortion_chunked(model_ts, chunked_sysrem)
+        else:
+            if (U is None) or (V is None):
+                raise ValueError("apply_sysrem=True requires either chunked SYSREM inputs or both U and V.")
+            model_ts = sysrem_model_distortion(model_ts, U, V)
 
     return model_ts
 
@@ -985,6 +1015,82 @@ def _lnL_exposure(
     return -0.5 * (chi2_i + norm_i)
 
 
+def _normalize_chunked_sysrem_inputs(
+    chunked_sysrem: ChunkedSysremInputs,
+    *,
+    n_exp: int,
+    n_wave: int,
+) -> ChunkedSysremInputs:
+    chunk_indices_np = tuple(np.asarray(indices, dtype=int) for indices in chunked_sysrem.chunk_indices)
+    U_chunks_np = tuple(np.asarray(U_chunk) for U_chunk in chunked_sysrem.U_chunks)
+    V_chunks_np = tuple(np.asarray(V_chunk) for V_chunk in chunked_sysrem.V_chunks)
+
+    if not (
+        len(chunk_indices_np) == len(U_chunks_np) == len(V_chunks_np)
+    ):
+        raise ValueError(
+            "chunked_sysrem must provide the same number of chunk indices, U chunks, and V chunks."
+        )
+
+    assigned = np.zeros((n_wave,), dtype=bool)
+    normalized_indices: list[jnp.ndarray] = []
+    normalized_u_chunks: list[jnp.ndarray] = []
+    normalized_v_chunks: list[jnp.ndarray] = []
+
+    for chunk_number, (indices, U_chunk, V_chunk) in enumerate(
+        zip(chunk_indices_np, U_chunks_np, V_chunks_np)
+    ):
+        if indices.ndim != 1:
+            raise ValueError(
+                f"chunk_indices[{chunk_number}] must be 1D, got shape {indices.shape}."
+            )
+        if np.any(indices < 0) or np.any(indices >= n_wave):
+            raise ValueError(
+                f"chunk_indices[{chunk_number}] contains out-of-range wavelength columns."
+            )
+        if np.unique(indices).size != indices.size:
+            raise ValueError(
+                f"chunk_indices[{chunk_number}] contains duplicate wavelength columns."
+            )
+        if np.any(assigned[indices]):
+            raise ValueError(
+                f"chunk_indices[{chunk_number}] overlaps another SYSREM chunk."
+            )
+        assigned[indices] = True
+
+        if U_chunk.ndim != 2 or U_chunk.shape[0] != n_exp:
+            raise ValueError(
+                f"U_chunks[{chunk_number}] must have shape (n_exp, n_basis), "
+                f"got {U_chunk.shape} with n_exp={n_exp}."
+            )
+        if V_chunk.ndim == 1:
+            if V_chunk.size != n_exp:
+                raise ValueError(
+                    f"V_chunks[{chunk_number}] length {V_chunk.size} does not match n_exp={n_exp}."
+                )
+            V_chunk = np.diag(V_chunk)
+        elif V_chunk.ndim != 2 or V_chunk.shape != (n_exp, n_exp):
+            raise ValueError(
+                f"V_chunks[{chunk_number}] must have shape {(n_exp, n_exp)}, got {V_chunk.shape}."
+            )
+
+        normalized_indices.append(jnp.asarray(indices, dtype=jnp.int32))
+        normalized_u_chunks.append(jnp.asarray(U_chunk))
+        normalized_v_chunks.append(jnp.asarray(V_chunk))
+
+    if not np.all(assigned):
+        missing = int(np.sum(~assigned))
+        raise ValueError(
+            f"chunked_sysrem does not cover the full wavelength axis; {missing} columns are unassigned."
+        )
+
+    return ChunkedSysremInputs(
+        chunk_indices=tuple(normalized_indices),
+        U_chunks=tuple(normalized_u_chunks),
+        V_chunks=tuple(normalized_v_chunks),
+    )
+
+
 def _normalize_spectroscopic_observation_inputs(
     inputs: SpectroscopicObservationInputs,
 ) -> SpectroscopicObservationInputs:
@@ -993,6 +1099,7 @@ def _normalize_spectroscopic_observation_inputs(
     phase = None if inputs.phase is None else jnp.asarray(inputs.phase)
     U = None if inputs.U is None else jnp.asarray(inputs.U)
     V = None if inputs.V is None else jnp.asarray(inputs.V)
+    chunked_sysrem = inputs.chunked_sysrem
 
     if data.ndim == 1:
         data = data[None, :]
@@ -1006,10 +1113,18 @@ def _normalize_spectroscopic_observation_inputs(
         raise ValueError(
             f"phase length {phase.shape[0]} does not match number of exposures {data.shape[0]}"
         )
+    if chunked_sysrem is not None and (U is not None or V is not None):
+        raise ValueError("Provide either global U/V SYSREM inputs or chunked_sysrem, not both.")
     if V is not None:
         expected_shape = (data.shape[0], data.shape[0])
         if V.shape != expected_shape:
             raise ValueError(f"V shape {V.shape} does not match expected {expected_shape}")
+    if chunked_sysrem is not None:
+        chunked_sysrem = _normalize_chunked_sysrem_inputs(
+            chunked_sysrem,
+            n_exp=data.shape[0],
+            n_wave=data.shape[1],
+        )
 
     return SpectroscopicObservationInputs(
         data=data,
@@ -1017,6 +1132,7 @@ def _normalize_spectroscopic_observation_inputs(
         phase=phase,
         U=U,
         V=V,
+        chunked_sysrem=chunked_sysrem,
     )
 
 
@@ -1371,6 +1487,7 @@ def _evaluate_spectroscopic_component(
         apply_sysrem=component_config.apply_sysrem,
         U=observation_inputs.U,
         V=observation_inputs.V,
+        chunked_sysrem=observation_inputs.chunked_sysrem,
     )
 
     if component_config.likelihood_kind == "gaussian":

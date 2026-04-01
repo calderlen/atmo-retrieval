@@ -138,6 +138,59 @@ def subtract_median_spectrum(
     return residual_flux, residual_error, median_flux
 
 
+def get_sysrem_chunk_indices(
+    wave: np.ndarray,
+    arm: str,
+) -> tuple[tuple[str, ...], tuple[np.ndarray, ...], np.ndarray]:
+    """Partition wavelength columns into SYSREM chunks.
+
+    The current scheme is:
+    - ``red`` and ``full``: two chunks, non-telluric and telluric
+    - ``blue``: one chunk, non-telluric only
+    """
+    wave = np.asarray(wave, dtype=float)
+    if wave.ndim != 1:
+        raise ValueError(f"Expected 1D wavelength grid, got shape {wave.shape}.")
+
+    telluric_arm = "red" if arm in {"red", "full"} else arm
+    telluric_config = TELLURIC_REGIONS.get(telluric_arm, {"telluric": [], "deep_mask": []})
+
+    telluric_mask = np.zeros(wave.shape[0], dtype=bool)
+    for wmin, wmax in telluric_config["telluric"]:
+        telluric_mask |= (wave > wmin) & (wave <= wmax)
+
+    no_tellurics = np.where(~telluric_mask)[0]
+    if arm in {"red", "full"}:
+        has_tellurics = np.where(telluric_mask)[0]
+        return ("non_telluric", "telluric"), (no_tellurics, has_tellurics), telluric_mask
+
+    return ("non_telluric",), (no_tellurics,), telluric_mask
+
+
+def get_sysrem_deep_mask(
+    wave: np.ndarray,
+    arm: str,
+) -> np.ndarray:
+    """Return wavelengths that should be ignored after Molecfit correction."""
+    wave = np.asarray(wave, dtype=float)
+    if wave.ndim != 1:
+        raise ValueError(f"Expected 1D wavelength grid, got shape {wave.shape}.")
+
+    telluric_arm = "red" if arm in {"red", "full"} else arm
+    telluric_config = TELLURIC_REGIONS.get(telluric_arm, {"telluric": [], "deep_mask": []})
+
+    deep_mask = np.zeros(wave.shape[0], dtype=bool)
+    for wmin, wmax in telluric_config["deep_mask"]:
+        deep_mask |= (wave >= wmin) & (wave < wmax)
+    return deep_mask
+
+
+def get_sysrem_max_systematics(arm: str) -> list[int]:
+    if arm in {"red", "full"}:
+        return list(config.DEFAULT_SYSREM_MAX_SYSTEMATICS_RED)
+    return list(config.DEFAULT_SYSREM_MAX_SYSTEMATICS_OTHER)
+
+
 def do_sysrem(
     wave: np.ndarray,
     residual_flux: np.ndarray,
@@ -176,38 +229,16 @@ def do_sysrem(
     corrected_flux = residual_flux.copy()
     corrected_error = residual_error.copy()
 
-    # Get telluric regions for this arm
-    telluric_config = TELLURIC_REGIONS.get(arm, {"telluric": [], "deep_mask": []})
+    _, chunk_indices, _telluric_mask = get_sysrem_chunk_indices(wave, arm)
+    no_tellurics = np.asarray(chunk_indices[0], dtype=int)
+    chunks = len(chunk_indices)
 
-    if arm == "red":
-        # Build telluric mask from wavelength ranges
-        telluric_mask = np.zeros(len(wave), dtype=bool)
-        for wmin, wmax in telluric_config["telluric"]:
-            telluric_mask |= (wave > wmin) & (wave <= wmax)
+    if do_molecfit:
+        deep_mask = get_sysrem_deep_mask(wave, arm)
+        corrected_flux[:, deep_mask] = 0.0
+        corrected_error[:, deep_mask] = 1.0
 
-        no_tellurics = np.where(~telluric_mask)[0]
-        has_tellurics = np.where(telluric_mask)[0]
-
-        # Deep mask: set flux to 0 and error to 1 (effectively ignore)
-        if do_molecfit:
-            for wmin, wmax in telluric_config["deep_mask"]:
-                deep_mask = (wave >= wmin) & (wave < wmax)
-                corrected_flux[:, deep_mask] = 0.0
-                corrected_error[:, deep_mask] = 1.0
-
-        chunks = 2  # Non-telluric and telluric
-        chunk_indices = [no_tellurics, has_tellurics]
-    else:
-        # Blue arm: no tellurics, single chunk
-        no_tellurics = np.arange(len(wave))
-        chunks = 1
-        chunk_indices = [no_tellurics]
-
-    max_systematics = (
-        config.DEFAULT_SYSREM_MAX_SYSTEMATICS_RED
-        if arm == "red"
-        else config.DEFAULT_SYSREM_MAX_SYSTEMATICS_OTHER
-    )
+    max_systematics = get_sysrem_max_systematics(arm)
 
     # Ensure max_systematics has correct length
     if len(max_systematics) < chunks:
@@ -684,11 +715,7 @@ def get_pepsi_data(
     no_tellurics = None
     n_systematics_used = None
     if run_sysrem:
-        sysrem_max_systematics = (
-            config.DEFAULT_SYSREM_MAX_SYSTEMATICS_RED
-            if arm == "red"
-            else config.DEFAULT_SYSREM_MAX_SYSTEMATICS_OTHER
-        )
+        sysrem_max_systematics = get_sysrem_max_systematics(arm)
         print(
             f"Running SYSREM (adaptive) with max_systematics={sysrem_max_systematics}, "
             f"stop_tol={sysrem_stop_tol:.1e}..."

@@ -27,6 +27,7 @@ from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from databases.opacity import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
 from physics.model import (
     BandpassObservationInputs,
+    ChunkedSysremInputs,
     SpectroscopicObservationInputs,
     PhaseMode,
     compute_model_timeseries,
@@ -63,13 +64,45 @@ def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, 
     return wavelength, data, sigma, phase
 
 
-def _load_sysrem_inputs(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray]:
+@dataclass(frozen=True)
+class SysremInputBundle:
+    U: np.ndarray | None = None
+    V: np.ndarray | None = None
+    chunk_indices: tuple[np.ndarray, ...] | None = None
+    U_chunks: tuple[np.ndarray, ...] | None = None
+    V_chunks: tuple[np.ndarray, ...] | None = None
+
+    @property
+    def is_chunked(self) -> bool:
+        return self.chunk_indices is not None
+
+
+def _chunk_indices_from_labels(chunk_labels: np.ndarray) -> tuple[np.ndarray, ...]:
+    chunk_labels = np.asarray(chunk_labels, dtype=int)
+    if chunk_labels.ndim != 1:
+        raise ValueError(f"chunk_labels must be 1D, got shape {chunk_labels.shape}.")
+    if chunk_labels.size == 0:
+        raise ValueError("chunk_labels is empty.")
+    if np.any(chunk_labels < 0):
+        raise ValueError("chunk_labels must be non-negative for all wavelength columns.")
+
+    labels = sorted(int(label) for label in np.unique(chunk_labels))
+    expected = list(range(len(labels)))
+    if labels != expected:
+        raise ValueError(
+            f"chunk_labels must be contiguous and start at 0; got labels {labels}."
+        )
+
+    return tuple(np.where(chunk_labels == label)[0].astype(int) for label in labels)
+
+
+def _load_sysrem_inputs(data_dir: str | Path) -> dict[str, np.ndarray]:
     data_dir = Path(data_dir)
 
     u_candidates = [
+        data_dir / "U_sysrem.npz",
         data_dir / "U.npy",
         data_dir / "U_sysrem.npy",
-        data_dir / "U_sysrem.npz",
     ]
     v_candidates = [
         data_dir / "V.npy",
@@ -81,26 +114,102 @@ def _load_sysrem_inputs(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray]:
     u_path = next((p for p in u_candidates if p.exists()), None)
     v_path = next((p for p in v_candidates if p.exists()), None)
 
+    if u_path is None:
+        raise FileNotFoundError(f"No SYSREM basis file found in {data_dir}.")
+
     if u_path.suffix == ".npz":
         with np.load(u_path) as u_data:
-            U = u_data["U"] if "U" in u_data else u_data["U_sysrem"]
-    else:
-        U = np.load(u_path)
+            raw = {name: np.asarray(u_data[name]) for name in u_data.files}
+        if "chunk_labels" in raw:
+            return raw
+        if v_path is None:
+            raise FileNotFoundError(
+                f"Legacy SYSREM bundle {u_path.name} does not include chunk metadata and no "
+                f"V file was found in {data_dir}."
+            )
+        raw["V"] = np.load(v_path)
+        return raw
 
-    V_raw = np.load(v_path)
-    return U, V_raw
+    if v_path is None:
+        raise FileNotFoundError(
+            f"No SYSREM weighting file found alongside {u_path.name} in {data_dir}."
+        )
+    return {
+        "U": np.load(u_path),
+        "V": np.load(v_path),
+    }
 
 
 def _validate_sysrem_inputs(
-    U: np.ndarray,
-    V: np.ndarray,
+    raw: dict[str, np.ndarray],
     n_exp: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    U = np.asarray(U)
-    V = np.asarray(V)
+) -> SysremInputBundle:
+    if "chunk_labels" in raw:
+        U = np.asarray(raw["U_sysrem"] if "U_sysrem" in raw else raw["U"])
+        if U.ndim == 2:
+            U = U[:, :, np.newaxis]
+        if U.ndim != 3:
+            raise ValueError(
+                f"Chunked SYSREM U must have shape (n_exp, n_basis, n_chunks); got {U.shape}."
+            )
+        if U.shape[0] != n_exp:
+            raise ValueError(
+                f"U exposure axis mismatch: U.shape[0]={U.shape[0]} but n_exp={n_exp}."
+            )
+
+        chunk_indices = _chunk_indices_from_labels(raw["chunk_labels"])
+        n_chunks = len(chunk_indices)
+        if U.shape[2] != n_chunks:
+            raise ValueError(
+                f"Chunk count mismatch: U has {U.shape[2]} chunks but chunk_labels encodes {n_chunks}."
+            )
+
+        V_chunk_diag = raw.get("V_chunk_diag")
+        if V_chunk_diag is None:
+            raise ValueError("Chunked SYSREM bundle is missing V_chunk_diag.")
+        V_chunk_diag = np.asarray(V_chunk_diag, dtype=float)
+        if V_chunk_diag.ndim == 1:
+            V_chunk_diag = V_chunk_diag[np.newaxis, :]
+        expected_chunk_shape = (n_chunks, n_exp)
+        if V_chunk_diag.shape != expected_chunk_shape:
+            raise ValueError(
+                f"V_chunk_diag shape mismatch: got {V_chunk_diag.shape}, expected {expected_chunk_shape}."
+            )
+
+        U_chunks: list[np.ndarray] = []
+        V_chunks: list[np.ndarray] = []
+        for chunk in range(n_chunks):
+            U_chunk = np.asarray(U[:, :, chunk], dtype=float)
+            keep = np.any(np.isfinite(U_chunk), axis=0)
+            U_chunk = U_chunk[:, keep]
+            if U_chunk.ndim != 2 or U_chunk.shape[0] != n_exp:
+                raise ValueError(
+                    f"Chunk {chunk} has invalid U shape {U_chunk.shape} for n_exp={n_exp}."
+                )
+
+            V_diag = np.asarray(V_chunk_diag[chunk], dtype=float)
+            if np.any(~np.isfinite(V_diag)) or np.any(V_diag <= 0):
+                raise ValueError(
+                    f"Chunk {chunk} has invalid V_chunk_diag values; all entries must be finite and > 0."
+                )
+
+            U_chunks.append(U_chunk)
+            V_chunks.append(np.diag(V_diag))
+
+        return SysremInputBundle(
+            chunk_indices=tuple(chunk_indices),
+            U_chunks=tuple(U_chunks),
+            V_chunks=tuple(V_chunks),
+        )
+
+    U = np.asarray(raw["U_sysrem"] if "U_sysrem" in raw else raw["U"])
+    V = np.asarray(raw["V"])
 
     if U.ndim == 3:
-        U = U[:, :, 0]
+        raise ValueError(
+            "3D SYSREM inputs now require an explicit chunked bundle with chunk_labels and "
+            "V_chunk_diag in U_sysrem.npz. Legacy 3D U arrays without chunk metadata are unsupported."
+        )
 
     if U.shape[0] != n_exp:
         raise ValueError(
@@ -119,7 +228,55 @@ def _validate_sysrem_inputs(
                 f"V shape mismatch: V.shape={V.shape} but expected {expected_shape}."
             )
 
-    return U, V
+    return SysremInputBundle(U=U, V=V)
+
+
+def _build_model_chunked_sysrem(
+    sysrem: SysremInputBundle | None,
+) -> ChunkedSysremInputs | None:
+    if sysrem is None or not sysrem.is_chunked:
+        return None
+
+    return ChunkedSysremInputs(
+        chunk_indices=tuple(jnp.asarray(indices, dtype=jnp.int32) for indices in sysrem.chunk_indices),
+        U_chunks=tuple(jnp.asarray(U_chunk) for U_chunk in sysrem.U_chunks),
+        V_chunks=tuple(jnp.asarray(V_chunk) for V_chunk in sysrem.V_chunks),
+    )
+
+
+def _describe_sysrem_inputs(sysrem: SysremInputBundle) -> str:
+    if sysrem.is_chunked:
+        chunk_sizes = [int(indices.size) for indices in sysrem.chunk_indices]
+        basis_counts = [int(U_chunk.shape[1]) for U_chunk in sysrem.U_chunks]
+        return (
+            f"chunked SYSREM: {len(chunk_sizes)} chunks, "
+            f"chunk_sizes={chunk_sizes}, basis_counts={basis_counts}"
+        )
+
+    return f"U shape={sysrem.U.shape}, V shape={sysrem.V.shape}"
+
+
+def _subset_sysrem_inputs(
+    sysrem: SysremInputBundle | None,
+    indices: np.ndarray,
+) -> SysremInputBundle | None:
+    if sysrem is None:
+        return None
+
+    indices = np.asarray(indices, dtype=int)
+    if sysrem.is_chunked:
+        return SysremInputBundle(
+            chunk_indices=tuple(np.asarray(chunk_indices, dtype=int) for chunk_indices in sysrem.chunk_indices),
+            U_chunks=tuple(np.asarray(U_chunk)[indices] for U_chunk in sysrem.U_chunks),
+            V_chunks=tuple(
+                np.asarray(V_chunk)[np.ix_(indices, indices)] for V_chunk in sysrem.V_chunks
+            ),
+        )
+
+    return SysremInputBundle(
+        U=np.asarray(sysrem.U)[indices],
+        V=np.asarray(sysrem.V)[np.ix_(indices, indices)],
+    )
 
 
 def _normalize_phase(phase: np.ndarray) -> np.ndarray:
@@ -369,8 +526,9 @@ def _synthesize_timeseries_from_atmospheric_state(
         model_ts,
         subtract_per_exposure_mean=observation_config.subtract_per_exposure_mean,
         apply_sysrem=observation_config.apply_sysrem,
-        U=None if component.U_sysrem is None else jnp.asarray(component.U_sysrem),
-        V=None if component.V is None else jnp.asarray(component.V),
+        U=None if component.sysrem is None or component.sysrem.U is None else jnp.asarray(component.sysrem.U),
+        V=None if component.sysrem is None or component.sysrem.V is None else jnp.asarray(component.sysrem.V),
+        chunked_sysrem=_build_model_chunked_sysrem(component.sysrem),
     )
 
     return np.asarray(jax.device_get(model_ts))
@@ -419,8 +577,7 @@ class SpectroscopicComponentBundle:
     data: np.ndarray
     sigma: np.ndarray
     phase: np.ndarray
-    U_sysrem: np.ndarray | None
-    V: np.ndarray | None
+    sysrem: SysremInputBundle | None
     inst_nus: np.ndarray
     nu_grid: np.ndarray
     sop_rot: object
@@ -438,6 +595,23 @@ class BandpassConstraintBundle:
     name: str
     observation_config: object
     observation_inputs: BandpassObservationInputs
+
+
+def _build_spectroscopic_observation_inputs(
+    *,
+    data: np.ndarray,
+    sigma: np.ndarray,
+    phase: np.ndarray,
+    sysrem: SysremInputBundle | None,
+) -> SpectroscopicObservationInputs:
+    return SpectroscopicObservationInputs(
+        data=jnp.asarray(data),
+        sigma=jnp.asarray(sigma),
+        phase=jnp.asarray(phase),
+        U=None if sysrem is None or sysrem.U is None else jnp.asarray(sysrem.U),
+        V=None if sysrem is None or sysrem.V is None else jnp.asarray(sysrem.V),
+        chunked_sysrem=_build_model_chunked_sysrem(sysrem),
+    )
 
 
 def _coerce_model_params(params: dict) -> dict[str, float | None]:
@@ -576,8 +750,7 @@ def _build_primary_spectroscopic_component(
     data: np.ndarray,
     sigma: np.ndarray,
     phase: np.ndarray,
-    U_sysrem: np.ndarray | None,
-    V: np.ndarray | None,
+    sysrem: SysremInputBundle | None,
     instrument_resolution: float,
     nu_grid: np.ndarray,
     inst_nus: np.ndarray,
@@ -616,12 +789,11 @@ def _build_primary_spectroscopic_component(
         apply_sysrem=apply_sysrem,
         sample_prefix=sample_prefix,
     )
-    observation_inputs = SpectroscopicObservationInputs(
-        data=jnp.asarray(data),
-        sigma=jnp.asarray(sigma),
-        phase=jnp.asarray(phase),
-        U=None if U_sysrem is None else jnp.asarray(U_sysrem),
-        V=None if V is None else jnp.asarray(V),
+    observation_inputs = _build_spectroscopic_observation_inputs(
+        data=data,
+        sigma=sigma,
+        phase=phase,
+        sysrem=sysrem,
     )
     return SpectroscopicComponentBundle(
         name=name,
@@ -629,8 +801,7 @@ def _build_primary_spectroscopic_component(
         data=np.asarray(data),
         sigma=np.asarray(sigma),
         phase=np.asarray(phase),
-        U_sysrem=None if U_sysrem is None else np.asarray(U_sysrem),
-        V=None if V is None else np.asarray(V),
+        sysrem=sysrem,
         inst_nus=np.asarray(inst_nus),
         nu_grid=np.asarray(nu_grid),
         sop_rot=sop_rot,
@@ -931,26 +1102,45 @@ def _load_joint_spectroscopic_component(
         data = spectrum[np.newaxis, :]
         sigma = uncertainty[np.newaxis, :]
         phase = np.zeros((1,), dtype=float)
-        U_sysrem = None
-        V = None
+        sysrem = None
     elif all(key in spec for key in ("wav_obs", "data", "sigma")):
         wav_obs = np.asarray(spec["wav_obs"])
         data = np.asarray(spec["data"])
         sigma = np.asarray(spec["sigma"])
         phase = np.asarray(spec.get("phase", np.zeros((1 if data.ndim == 1 else data.shape[0],), dtype=float)))
-        U_sysrem = None if spec.get("U") is None else np.asarray(spec["U"])
-        V = None if spec.get("V") is None else np.asarray(spec["V"])
+        if spec.get("sysrem") is not None:
+            sysrem_spec = spec["sysrem"]
+            if isinstance(sysrem_spec, SysremInputBundle):
+                sysrem = sysrem_spec
+            elif isinstance(sysrem_spec, dict):
+                sysrem = _validate_sysrem_inputs(sysrem_spec, n_exp=(1 if data.ndim == 1 else data.shape[0]))
+            else:
+                raise TypeError(
+                    f"Unsupported sysrem spec type for component '{name}': {type(sysrem_spec)!r}"
+                )
+        elif spec.get("U") is not None or spec.get("V") is not None:
+            if spec.get("U") is None or spec.get("V") is None:
+                raise ValueError(
+                    f"Joint spectroscopic component '{name}' must provide both U and V together."
+                )
+            sysrem = _validate_sysrem_inputs(
+                {"U": np.asarray(spec["U"]), "V": np.asarray(spec["V"])},
+                n_exp=(1 if data.ndim == 1 else data.shape[0]),
+            )
+        else:
+            sysrem = None
     elif "data_dir" in spec:
         data_dir = Path(spec["data_dir"])
         if data_format == "timeseries":
             wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
             phase = _normalize_phase(phase)
             if apply_sysrem:
-                U_raw, V_raw = _load_sysrem_inputs(data_dir)
-                U_sysrem, V = _validate_sysrem_inputs(U_raw, V_raw, n_exp=data.shape[0])
+                sysrem = _validate_sysrem_inputs(
+                    _load_sysrem_inputs(data_dir),
+                    n_exp=data.shape[0],
+                )
             else:
-                U_sysrem = None
-                V = None
+                sysrem = None
         elif data_format == "spectrum":
             suffix = "transmission" if component_mode == "transmission" else "emission"
             wav_obs, spectrum, uncertainty, _ = load_observed_spectrum(
@@ -961,17 +1151,15 @@ def _load_joint_spectroscopic_component(
             data = spectrum[np.newaxis, :]
             sigma = uncertainty[np.newaxis, :]
             phase = np.zeros((1,), dtype=float)
-            U_sysrem = None
-            V = None
+            sysrem = None
         else:
             wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
-            U_sysrem = None
-            V = None
+            sysrem = None
 
-    if apply_sysrem and (U_sysrem is None or V is None):
+    if apply_sysrem and sysrem is None:
         raise ValueError(
             f"Joint spectroscopic component '{name}' requested SYSREM but no valid "
-            "U/V inputs were provided."
+            "SYSREM inputs were provided."
         )
 
     wav_obs, data, sigma, inst_nus = _prepare_observed_spectrum_arrays(wav_obs, data, sigma)
@@ -1009,12 +1197,11 @@ def _load_joint_spectroscopic_component(
         apply_sysrem=apply_sysrem,
         sample_prefix=name,
     )
-    observation_inputs = SpectroscopicObservationInputs(
-        data=jnp.asarray(data),
-        sigma=jnp.asarray(sigma),
-        phase=jnp.asarray(phase),
-        U=None if U_sysrem is None else jnp.asarray(U_sysrem),
-        V=None if V is None else jnp.asarray(V),
+    observation_inputs = _build_spectroscopic_observation_inputs(
+        data=data,
+        sigma=sigma,
+        phase=phase,
+        sysrem=sysrem,
     )
     return SpectroscopicComponentBundle(
         name=name,
@@ -1022,8 +1209,7 @@ def _load_joint_spectroscopic_component(
         data=np.asarray(data),
         sigma=np.asarray(sigma),
         phase=np.asarray(phase),
-        U_sysrem=None if U_sysrem is None else np.asarray(U_sysrem),
-        V=None if V is None else np.asarray(V),
+        sysrem=sysrem,
         inst_nus=np.asarray(inst_nus_component),
         nu_grid=np.asarray(nu_grid),
         sop_rot=sop_rot,
@@ -1159,6 +1345,7 @@ def run_retrieval(
     phase: np.ndarray | None = None,
     U: np.ndarray | None = None,
     V: np.ndarray | None = None,
+    sysrem_inputs: SysremInputBundle | None = None,
     joint_spectra: list[dict[str, Any]] | None = None,
     bandpass_constraints: list[dict[str, Any]] | None = None,
     atmosphere_regions: list[dict[str, Any]] | None = None,
@@ -1191,8 +1378,7 @@ def run_retrieval(
 
     apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT and data_format == "timeseries")
 
-    U_sysrem: np.ndarray | None = None
-    V_sysrem: np.ndarray | None = None
+    primary_sysrem: SysremInputBundle | None = sysrem_inputs
     
     print("\n[1/7] Loading time-series data...")
     with _StepTimer("Step 1/7"):
@@ -1203,18 +1389,17 @@ def run_retrieval(
             print(f"  Using provided data: {data.shape[0]} exposures x {data.shape[1]} wavelengths")
             print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
             if apply_sysrem:
-                if U is None or V is None:
-                    raise ValueError(
-                        "apply_sysrem=True requires U and V when providing "
-                        "wav_obs/data/sigma/phase directly."
+                if primary_sysrem is None:
+                    if U is None or V is None:
+                        raise ValueError(
+                            "apply_sysrem=True requires either sysrem_inputs or both U and V "
+                            "when providing wav_obs/data/sigma/phase directly."
+                        )
+                    primary_sysrem = _validate_sysrem_inputs(
+                        {"U": U, "V": V},
+                        n_exp=data.shape[0],
                     )
-                U_sysrem, V_sysrem = _validate_sysrem_inputs(
-                    U, V, n_exp=data.shape[0]
-                )
-                print(
-                    f"  Using provided SYSREM auxiliaries: U shape={U_sysrem.shape}, "
-                    f"V shape={V_sysrem.shape}"
-                )
+                print(f"  Using provided SYSREM auxiliaries: {_describe_sysrem_inputs(primary_sysrem)}")
         else:
             resolved_data_dir = config.get_data_dir(epoch=epoch)
             data_paths = (
@@ -1228,14 +1413,11 @@ def run_retrieval(
                 print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
                 print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
                 if apply_sysrem:
-                    U_raw, V_raw = _load_sysrem_inputs(resolved_data_dir)
-                    U_sysrem, V_sysrem = _validate_sysrem_inputs(
-                        U_raw, V_raw, n_exp=data.shape[0]
+                    primary_sysrem = _validate_sysrem_inputs(
+                        _load_sysrem_inputs(resolved_data_dir),
+                        n_exp=data.shape[0],
                     )
-                    print(
-                        f"  Loaded SYSREM auxiliaries: U shape={U_sysrem.shape}, "
-                        f"V shape={V_sysrem.shape}"
-                    )
+                    print(f"  Loaded SYSREM auxiliaries: {_describe_sysrem_inputs(primary_sysrem)}")
             elif data_format == "spectrum":
                 wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
                     str(data_paths["wavelength"]),
@@ -1370,8 +1552,7 @@ def run_retrieval(
             data=data,
             sigma=sigma,
             phase=phase,
-            U_sysrem=U_sysrem,
-            V=V_sysrem,
+            sysrem=primary_sysrem,
             instrument_resolution=Rinst,
             nu_grid=nu_grid,
             inst_nus=inst_nus,
