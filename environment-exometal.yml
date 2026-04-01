@@ -1,0 +1,25 @@
+name: exometal
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - ipykernel
+  - ipywidgets
+  - jupyterlab
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - astropy
+  - h5py
+  - xarray
+  - tqdm
+  - arviz
+  - corner
+  - emcee
+  - pip:
+      - wheel
+      - mlx
+      - lightkurve
+      - wotan
