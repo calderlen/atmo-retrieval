@@ -162,6 +162,18 @@ def create_parser():
         default=None,
         help="Path to FastChem parameters.dat (required for fastchem_hybrid_grid)",
     )
+    model_group.add_argument(
+        "--nlayer",
+        type=int,
+        default=None,
+        help=f"Number of atmospheric layers (default: {config.NLAYER})",
+    )
+    model_group.add_argument(
+        "--n-spectral-points",
+        type=int,
+        default=None,
+        help=f"Number of spectral grid points (default: {config.N_SPECTRAL_POINTS})",
+    )
 
     # Phase analysis options
     phase_group = parser.add_argument_group("Phase Analysis")
@@ -291,6 +303,14 @@ def apply_cli_overrides(args):
         config.CHEMISTRY_MODEL_DEFAULT = args.chemistry_model
     if args.fastchem_parameter_file:
         config.FASTCHEM_PARAMETER_FILE = args.fastchem_parameter_file
+    if args.nlayer is not None:
+        if args.nlayer < 1:
+            raise ValueError("--nlayer must be >= 1.")
+        config.NLAYER = args.nlayer
+    if args.n_spectral_points is not None:
+        if args.n_spectral_points < 1:
+            raise ValueError("--n-spectral-points must be >= 1.")
+        config.N_SPECTRAL_POINTS = args.n_spectral_points
 
     # Output directory (auto-set based on planet/ephemeris/mode)
     if args.output:
@@ -439,6 +459,7 @@ def print_config_summary(config, args):
     print(f"  Layers: {config.NLAYER}")
     print(f"  Pressure: {config.PRESSURE_TOP:.1e} - {config.PRESSURE_BTM:.1e} bar")
     print(f"  Temperature: {config.T_LOW}-{config.T_HIGH} K")
+    print(f"  Spectral grid points: {config.N_SPECTRAL_POINTS:,}")
 
     print(f"\nMolecules:")
     for mol in list(config.MOLPATH_HITEMP.keys()) + list(config.MOLPATH_EXOMOL.keys()):
