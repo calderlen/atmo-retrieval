@@ -321,6 +321,7 @@ def build_premodit_from_snapshot(
     T_low: float,
     T_high: float,
     cutwing: float | None = None,
+    aux_extra: dict[str, object] | None = None,
 ) -> OpaPremodit:
     """Create preMODIT opacity from database snapshot and save it."""
     cutwing_val = _resolve_cutwing(cutwing)
@@ -343,6 +344,7 @@ def build_premodit_from_snapshot(
                 "molmass": molmass,
                 "cutwing": float(cutwing_val),
                 "diffmode": int(diffmode),
+                **(aux_extra or {}),
             },
         )
     except Exception as exc:
@@ -542,6 +544,8 @@ def load_atomic_opacities(
                     raise ValueError("Cached opacity grid mismatch.")
                 if not _opa_settings_match(opa, diffmode, cutwing_val):
                     raise ValueError("Cached opacity settings mismatch.")
+                if opa.aux.get("snapshot_precision") != "float64":
+                    raise ValueError("Cached atomic snapshot precision mismatch.")
                 molmass = opa.aux.get("molmass", None)
                 if molmass is None:
                     raise KeyError("Missing molmass in cached opacity.")
@@ -586,6 +590,7 @@ def load_atomic_opacities(
             T_low,
             T_high,
             cutwing=cutwing_val,
+            aux_extra={"snapshot_precision": "float64"},
         )
         opa_atoms[atom] = opa
         atommass_list.append(molmass)

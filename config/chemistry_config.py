@@ -9,8 +9,8 @@ These are defaults for composition solvers and chemistry models.
 # ==============================================================================
 
 # Logarithmic VMR prior bounds for trace species
-LOG_VMR_MIN = -15.0  # Minimum log10(VMR)
-LOG_VMR_MAX = 0.0    # Maximum log10(VMR)
+LOG_VMR_MIN = -12.0  # Minimum log10(VMR)
+LOG_VMR_MAX = -2.0   # Maximum log10(VMR)
 
 # ==============================================================================
 # BULK COMPOSITION

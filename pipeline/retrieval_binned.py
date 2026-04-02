@@ -174,7 +174,7 @@ def compare_phase_posteriors(
         # Filter to interesting parameters
         params_to_compare = [
             p for p in all_params 
-            if p.startswith("dRV") or p.startswith("logVMR") or p in ["Kp", "Vsys"]
+            if p.startswith("dRV") or p.startswith("logVMR") or p == "Kp"
         ]
     
     comparison = {

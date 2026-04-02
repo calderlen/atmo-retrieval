@@ -207,7 +207,9 @@ def load_kurucz_atomic(
     if not filepath.exists():
         raise FileNotFoundError(f"Kurucz gfall file not found: {filepath}")
 
-    adb = AdbKurucz(str(filepath), nu_grid, gpu_transfer=False)
+    # ExoJAX 2.2.x accesses jnp-backed ielem/iion attributes during __init__,
+    # so gpu_transfer must remain enabled for atomic backends.
+    adb = AdbKurucz(str(filepath), nu_grid, gpu_transfer=True)
     mask = _species_mask(adb, element, iion, code)
     return adb, mask
 
@@ -221,7 +223,9 @@ def load_vald_atomic(
     element, ionization = parse_species(species)
     iion = ionization_to_iion(ionization)
     code = element_to_atomic_number(element)
-    adb = AdbVald(str(vald_file), nu_grid, gpu_transfer=False)
+    # ExoJAX 2.2.x accesses jnp-backed ielem/iion attributes during __init__,
+    # so gpu_transfer must remain enabled for atomic backends.
+    adb = AdbVald(str(vald_file), nu_grid, gpu_transfer=True)
     mask = _species_mask(adb, element, iion, code)
     return adb, mask
 
@@ -257,13 +261,18 @@ def create_atomic_snapshot(
     Tref: float = 296.0,
 ) -> Tuple[MDBSnapshot, float]:
     """Convert AdbKurucz/AdbVald to a snapshot for OpaPremodit."""
-    nu_lines = _maybe_mask(_get_adb_attr(adb, "nu_lines"), mask)
-    elower = _maybe_mask(_get_adb_attr(adb, "elower"), mask)
-    Sij0 = _maybe_mask(_get_adb_attr(adb, "Sij0"), mask)
+    # Atomic preMODIT is numerically sensitive to dtype. In practice Kurucz/VALD
+    # lower-state energies arrive as float32, which overflows the line-strength
+    # temperature scaling for hot atmospheres and yields NaN xsmatrix values.
+    nu_lines = np.asarray(_maybe_mask(_get_adb_attr(adb, "nu_lines"), mask), dtype=np.float64)
+    elower = np.asarray(_maybe_mask(_get_adb_attr(adb, "elower"), mask), dtype=np.float64)
+    Sij0 = np.asarray(_maybe_mask(_get_adb_attr(adb, "Sij0"), mask), dtype=np.float64)
 
     molmass = _extract_molmass(adb, mask)
 
     T_gQT, gQT = _extract_partition(adb, mask, Tref)
+    T_gQT = np.asarray(T_gQT, dtype=np.float64)
+    gQT = np.asarray(gQT, dtype=np.float64)
 
     lines = Lines(
         nu_lines=nu_lines,
@@ -282,9 +291,13 @@ def create_atomic_snapshot(
     n_Texp = _maybe_mask(_get_adb_attr(adb, "n_Texp"), mask)
     alpha_ref = _maybe_mask(_get_adb_attr(adb, "alpha_ref"), mask)
     if n_Texp is None:
-        n_Texp = np.full(nlines, 0.5)
+        n_Texp = np.full(nlines, 0.5, dtype=np.float64)
+    else:
+        n_Texp = np.asarray(n_Texp, dtype=np.float64)
     if alpha_ref is None:
-        alpha_ref = np.full(nlines, 0.05)
+        alpha_ref = np.full(nlines, 0.05, dtype=np.float64)
+    else:
+        alpha_ref = np.asarray(alpha_ref, dtype=np.float64)
 
     snapshot = MDBSnapshot(meta=meta, lines=lines, n_Texp=n_Texp, alpha_ref=alpha_ref)
     return snapshot, float(molmass)
@@ -338,11 +351,11 @@ def _extract_partition(adb: object, mask: np.ndarray | None, Tref: float) -> Tup
         qtmask = _maybe_mask(qtmask_arr, mask)
         if qtmask is not None and len(qtmask) > 0:
             qt_idx = int(np.asarray(qtmask)[0])
-            gQT = np.asarray(gQT_284)[qt_idx]
-            return np.asarray(T_gQT), gQT
+            gQT = np.asarray(gQT_284, dtype=np.float64)[qt_idx]
+            return np.asarray(T_gQT, dtype=np.float64), gQT
 
     # Fallback: flat partition function
-    return np.array([Tref], dtype=float), np.array([1.0], dtype=float)
+    return np.array([Tref], dtype=np.float64), np.array([1.0], dtype=np.float64)
 
 
 def _species_mask(adb: object, element: str, iion: int, ielem: int | None = None) -> np.ndarray | None:

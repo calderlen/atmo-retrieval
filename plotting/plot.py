@@ -186,7 +186,7 @@ def _default_corner_variables(sample_dict: dict) -> list[str]:
         return name.split("/")[-1]
 
     priority = [
-        "Kp", "Vsys", "dRV", "dRV_0", "dRV_slope",
+        "Kp", "dRV", "dRV_0", "dRV_slope",
         "Rp", "Mp", "Rstar",
         "T0", "T_bottom", "T_top", "Tirr", "kappa_ir_cgs", "gamma",
         "T_deep", "log_P_trans", "delta_P",

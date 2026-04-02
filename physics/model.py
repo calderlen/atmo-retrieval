@@ -62,6 +62,7 @@ CIA_COLLISION_PAIRS: tuple[tuple[str, str, str], ...] = (
 class SharedSystemConfig:
     Kp_mean: float
     Kp_std: float
+    Kp_bounds: tuple[float, float] | None
     Vsys_mean: float
     Vsys_std: float
     Rp_mean: float
@@ -248,7 +249,21 @@ def sysrem_model_distortion(
     """
     if U.shape[1] == 0:
         return M
-    M_fit = U @ jnp.linalg.solve((V @ U).T @ (V @ U), (V @ U).T @ (V @ M))
+
+    weighted_basis = V @ U
+    weighted_model = V @ M
+    gram = weighted_basis.T @ weighted_basis
+    rhs = weighted_basis.T @ weighted_model
+
+    # The common phase-binned SYSREM case uses a single basis vector.
+    # Avoid routing that 1x1 solve through cuSolver, which has been unstable
+    # on some GPU setups despite the problem being just a scalar division.
+    if U.shape[1] == 1:
+        coeffs = rhs / jnp.clip(gram[0, 0], EPS, None)
+    else:
+        coeffs = jnp.linalg.solve(gram, rhs)
+
+    M_fit = U @ coeffs
     return M - M_fit
 
 
@@ -1147,8 +1162,18 @@ def _normalize_bandpass_observation_inputs(
 def _sample_shared_system_state(
     shared_config: SharedSystemConfig,
 ) -> SharedSystemState:
-    Kp = numpyro.sample("Kp", dist.TruncatedNormal(shared_config.Kp_mean, shared_config.Kp_std, low=0.0))
-    Vsys = numpyro.sample("Vsys", dist.Normal(shared_config.Vsys_mean, shared_config.Vsys_std))
+    import math
+    if shared_config.Kp_bounds is not None:
+        Kp = numpyro.sample("Kp", dist.Uniform(*shared_config.Kp_bounds))
+    elif shared_config.Kp_std is None or math.isnan(float(shared_config.Kp_std)) or shared_config.Kp_std <= 0:
+        Kp = jnp.asarray(shared_config.Kp_mean)
+        numpyro.deterministic("Kp", Kp)
+    else:
+        Kp = numpyro.sample(
+            "Kp",
+            dist.TruncatedNormal(shared_config.Kp_mean, shared_config.Kp_std, low=0.0),
+        )
+    Vsys = jnp.asarray(shared_config.Vsys_mean)
     Mp = numpyro.sample("Mp", dist.TruncatedNormal(shared_config.Mp_mean, shared_config.Mp_std, low=0.0)) * MJ
     Rstar = numpyro.sample(
         "Rstar",
@@ -1649,9 +1674,16 @@ def build_shared_system_config(
     *,
     params: dict,
 ) -> SharedSystemConfig:
+    Kp_low = params.get("Kp_low")
+    Kp_high = params.get("Kp_high")
+    Kp_bounds = None
+    if (Kp_low is not None) and (Kp_high is not None):
+        Kp_bounds = (Kp_low, Kp_high)
+
     return SharedSystemConfig(
         Kp_mean=params["Kp"],
         Kp_std=params["Kp_err"],
+        Kp_bounds=Kp_bounds,
         Vsys_mean=params["RV_abs"],
         Vsys_std=params["RV_abs_err"],
         Rp_mean=params["R_p"],

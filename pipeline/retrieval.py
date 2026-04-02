@@ -615,9 +615,18 @@ def _build_spectroscopic_observation_inputs(
 
 
 def _coerce_model_params(params: dict) -> dict[str, float | None]:
+    Kp_low = params.get("Kp_low")
+    Kp_high = params.get("Kp_high")
+    if Kp_low is not None and Kp_low != Kp_low:
+        Kp_low = None
+    if Kp_high is not None and Kp_high != Kp_high:
+        Kp_high = None
+
     return {
         "Kp": params.get("Kp", config.DEFAULT_KP),
         "Kp_err": params.get("Kp_err", config.DEFAULT_KP_ERR),
+        "Kp_low": Kp_low,
+        "Kp_high": Kp_high,
         "RV_abs": params.get("RV_abs", config.DEFAULT_RV_ABS),
         "RV_abs_err": params.get("RV_abs_err", config.DEFAULT_RV_ABS_ERR),
         "R_p": params["R_p"].nominal_value if hasattr(params["R_p"], "nominal_value") else params["R_p"],
@@ -628,6 +637,8 @@ def _coerce_model_params(params: dict) -> dict[str, float | None]:
         "R_star_err": params["R_star"].std_dev if hasattr(params["R_star"], "std_dev") else config.DEFAULT_RSTAR_ERR,
         "T_star": params.get("T_star", config.DEFAULT_TSTAR),
         "T_eq": params.get("T_eq"),
+        "Tirr_mean": params.get("Tirr_mean", params.get("T_eq")),
+        "Tirr_std": params.get("Tirr_std"),
         "a": (
             params["a"].nominal_value
             if ("a" in params and hasattr(params["a"], "nominal_value"))
@@ -1056,8 +1067,8 @@ def _build_atmosphere_regions(
             pt_profile=str(spec.get("pt_profile", default_pt_profile)),
             T_low=spec.get("T_low"),
             T_high=spec.get("T_high"),
-            Tirr_mean=spec.get("Tirr_mean", model_params.get("T_eq")),
-            Tirr_std=spec.get("Tirr_std"),
+            Tirr_mean=spec.get("Tirr_mean", model_params.get("Tirr_mean")),
+            Tirr_std=spec.get("Tirr_std", model_params.get("Tirr_std")),
             Tint_fixed=spec.get("Tint_fixed"),
             kappa_ir_cgs_bounds=None if kappa_bounds is None else tuple(kappa_bounds),
             gamma_bounds=None if gamma_bounds is None else tuple(gamma_bounds),
@@ -1370,6 +1381,8 @@ def run_retrieval(
         skip_svi=skip_svi,
         svi_only=svi_only,
         seed=seed,
+        chemistry_model=chemistry_model,
+        epoch=epoch,
     )
 
     # Get planet parameters
@@ -1655,7 +1668,13 @@ def run_retrieval(
 
     with _StepTimer("Step 7/7"):
         if not skip_svi:
-            print(f"  SVI warm-up: {config.SVI_NUM_STEPS} steps, LR={config.SVI_LEARNING_RATE}")
+            svi_lr_message = f"  SVI warm-up: {config.SVI_NUM_STEPS} steps, LR={config.SVI_LEARNING_RATE}"
+            if config.SVI_LR_DECAY_STEPS is not None and config.SVI_LR_DECAY_RATE is not None:
+                svi_lr_message += (
+                    " with exponential decay "
+                    f"(steps={config.SVI_LR_DECAY_STEPS}, rate={config.SVI_LR_DECAY_RATE})"
+                )
+            print(svi_lr_message)
             rng_key, rng_key_ = random.split(rng_key)
             svi_params, svi_losses, init_strategy, _, svi_guide = run_svi(
                 model_c,
@@ -1668,6 +1687,8 @@ def run_retrieval(
                 output_dir=str(output_dir),
                 num_steps=config.SVI_NUM_STEPS,
                 lr=config.SVI_LEARNING_RATE,
+                lr_decay_steps=config.SVI_LR_DECAY_STEPS,
+                lr_decay_rate=config.SVI_LR_DECAY_RATE,
             )
 
             if svi_only:

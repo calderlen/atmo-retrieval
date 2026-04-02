@@ -20,7 +20,7 @@ from typing import Callable
 OBSERVATORY = "lbt"
 INSTRUMENT = "PEPSI"
 OBSERVING_MODE = "full"
-RESOLUTION_MODE = "uhr"  # Options: "standard" (R=50k), "hr" (R=120k), "uhr" (R=270k)
+RESOLUTION_MODE = "hr"  # Options: "standard" (R=50k), "hr" (R=120k), "uhr" (R=270k)
 
 
 # ==============================================================================
@@ -142,7 +142,7 @@ TELLURIC_REGIONS: dict[str, dict[str, list[tuple[float, float]]]] = {
 INSTRUMENTS: dict[str, dict[str, dict]] = {
     "lbt": {
         "PEPSI": {
-            "resolution": 270000,  # Default to UHR mode
+            "resolution": 120000,  # Default to HR mode
             "resolution_modes": {
                 "standard": 50000,   # 300 µm fiber
                 "hr": 120000,        # 200 µm fiber (High Resolution)

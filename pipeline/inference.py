@@ -3,6 +3,7 @@ from typing import Callable
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.example_libraries import optimizers as jax_optimizers
 
 from numpyro.infer import SVI, Trace_ELBO
 import numpyro
@@ -10,7 +11,7 @@ import numpyro.distributions as dist
 import numpyro.optim as optim
 from numpyro import handlers
 from numpyro.infer.autoguide import AutoMultivariateNormal, AutoGuideList
-from numpyro.infer.initialization import init_to_value
+from numpyro.infer.initialization import init_to_value, init_to_median
 
 
 def create_prior_guide(
@@ -47,7 +48,7 @@ def build_guide(
         return site["name"] in {"Mp", "Rstar", "Rp"}
 
     model_hidden = handlers.block(model_c, hide_fn=_hide_from_autoguide)
-    guide.append(AutoMultivariateNormal(model_hidden))
+    guide.append(AutoMultivariateNormal(model_hidden, init_loc_fn=init_to_median))
 
     return guide
 
@@ -71,6 +72,21 @@ def save_svi_outputs(
     print(f"SVI init values saved to {output_dir}/svi_init_values.npz")
 
 
+def build_svi_optimizer(
+    lr: float,
+    decay_steps: int | None = None,
+    decay_rate: float | None = None,
+) -> optim._NumPyroOptim:
+    if (decay_steps is None) != (decay_rate is None):
+        raise ValueError("SVI learning-rate decay requires both decay_steps and decay_rate.")
+
+    if decay_steps is not None and decay_rate is not None:
+        schedule = jax_optimizers.exponential_decay(lr, decay_steps, decay_rate)
+        return optim.Adam(schedule)
+
+    return optim.Adam(lr)
+
+
 def run_svi(
     model_c: Callable,
     rng_key: jax.Array,
@@ -82,9 +98,11 @@ def run_svi(
     output_dir: str,
     num_steps: int = 1000,
     lr: float = 0.005,
+    lr_decay_steps: int | None = None,
+    lr_decay_rate: float | None = None,
 ) -> tuple[dict, jnp.ndarray, Callable, dict, AutoGuideList]:
     guide = build_guide(model_c, Mp_mean, Mp_std, Rstar_mean, Rstar_std)
-    optimizer = optim.Adam(lr)
+    optimizer = build_svi_optimizer(lr, decay_steps=lr_decay_steps, decay_rate=lr_decay_rate)
     svi = SVI(model_c, guide, optimizer, loss=Trace_ELBO())
 
     svi_result = svi.run(

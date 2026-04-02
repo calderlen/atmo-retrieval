@@ -64,6 +64,13 @@ def create_parser():
     )
     data_group.add_argument("--wavelength-range", type=str, choices=["blue", "green", "red", "full"], default=None, help="Wavelength range mode (default: from config)")
     data_group.add_argument(
+        "--resolution-mode",
+        type=str,
+        choices=["standard", "hr", "uhr"],
+        default=None,
+        help=f"Instrument resolution mode (default: {config.RESOLUTION_MODE})",
+    )
+    data_group.add_argument(
         "--bandpass-tbl",
         type=str,
         action="append",
@@ -78,6 +85,29 @@ def create_parser():
         type=int,
         default=None,
         help="Number of SVI steps (default: from config)"
+    )
+    inference_group.add_argument(
+        "--svi-learning-rate",
+        type=float,
+        default=None,
+        help="SVI learning rate (default: from config)"
+    )
+    inference_group.add_argument(
+        "--svi-lr-decay-steps",
+        type=int,
+        default=None,
+        help="Use exponential learning-rate decay with this many decay steps"
+    )
+    inference_group.add_argument(
+        "--svi-lr-decay-rate",
+        type=float,
+        default=None,
+        help="Use exponential learning-rate decay with this multiplicative decay rate"
+    )
+    inference_group.add_argument(
+        "--no-svi-lr-decay",
+        action="store_true",
+        help="Disable SVI exponential learning-rate decay, even if enabled in config"
     )
     inference_group.add_argument(
         "--mcmc-warmup",
@@ -279,7 +309,7 @@ def load_custom_config(config_path):
 def apply_custom_config(custom_config):
     for name in dir(custom_config):
         if name.isupper():
-            setattr(config, name, getattr(custom_config, name))
+            config.set_runtime_config(name, getattr(custom_config, name))
 
     return config
 
@@ -287,36 +317,40 @@ def apply_custom_config(custom_config):
 def apply_cli_overrides(args):
     # Planet and ephemeris selection
     if args.planet:
-        config.PLANET = args.planet
+        config.set_runtime_config("PLANET", args.planet)
     if args.ephemeris:
-        config.EPHEMERIS = args.ephemeris
+        config.set_runtime_config("EPHEMERIS", args.ephemeris)
+
+    # Retrieval mode and observing mode must be synced before derived paths are built.
+    if args.mode:
+        config.set_runtime_config("RETRIEVAL_MODE", args.mode)
+    if args.wavelength_range:
+        config.set_runtime_config("OBSERVING_MODE", args.wavelength_range)
+    if args.resolution_mode:
+        config.set_runtime_config("RESOLUTION_MODE", args.resolution_mode)
 
     # Validate planet/ephemeris combination
     params = config.get_params()  # Will raise if invalid
 
-    # Retrieval mode
-    if args.mode:
-        config.RETRIEVAL_MODE = args.mode
-
     # Chemistry model
     if args.chemistry_model:
-        config.CHEMISTRY_MODEL_DEFAULT = args.chemistry_model
+        config.set_runtime_config("CHEMISTRY_MODEL_DEFAULT", args.chemistry_model)
     if args.fastchem_parameter_file:
-        config.FASTCHEM_PARAMETER_FILE = args.fastchem_parameter_file
+        config.set_runtime_config("FASTCHEM_PARAMETER_FILE", args.fastchem_parameter_file)
     if args.nlayer is not None:
         if args.nlayer < 1:
             raise ValueError("--nlayer must be >= 1.")
-        config.NLAYER = args.nlayer
+        config.set_runtime_config("NLAYER", args.nlayer)
     if args.n_spectral_points is not None:
         if args.n_spectral_points < 1:
             raise ValueError("--n-spectral-points must be >= 1.")
-        config.N_SPECTRAL_POINTS = args.n_spectral_points
+        config.set_runtime_config("N_SPECTRAL_POINTS", args.n_spectral_points)
 
     # Output directory (auto-set based on planet/ephemeris/mode)
     if args.output:
-        config.DIR_SAVE = args.output
+        config.set_runtime_config("DIR_SAVE", args.output)
     else:
-        config.DIR_SAVE = config.get_output_dir()
+        config.set_runtime_config("DIR_SAVE", config.get_output_dir())
     os.makedirs(config.DIR_SAVE, exist_ok=True)
 
     # HITRAN credentials (for HITEMP downloads)
@@ -326,20 +360,16 @@ def apply_cli_overrides(args):
         os.environ["HITRAN_PASSWORD"] = args.hitran_password
 
     # Data directory
-    config.DATA_DIR = config.get_data_dir(epoch=args.epoch)
-    config.TRANSMISSION_DATA = config.get_transmission_paths(epoch=args.epoch)
-    config.EMISSION_DATA = config.get_emission_paths(epoch=args.epoch)
-
-    # Wavelength range / observing mode
-    if args.wavelength_range:
-        config.OBSERVING_MODE = args.wavelength_range
+    config.set_runtime_config("DATA_DIR", config.get_data_dir(epoch=args.epoch))
+    config.set_runtime_config("TRANSMISSION_DATA", config.get_transmission_paths(epoch=args.epoch))
+    config.set_runtime_config("EMISSION_DATA", config.get_emission_paths(epoch=args.epoch))
 
     # Quick mode
     if args.quick:
-        config.SVI_NUM_STEPS = config.QUICK_SVI_STEPS
-        config.MCMC_NUM_WARMUP = config.QUICK_MCMC_WARMUP
-        config.MCMC_NUM_SAMPLES = config.QUICK_MCMC_SAMPLES
-        config.MCMC_NUM_CHAINS = config.QUICK_MCMC_CHAINS
+        config.set_runtime_config("SVI_NUM_STEPS", config.QUICK_SVI_STEPS)
+        config.set_runtime_config("MCMC_NUM_WARMUP", config.QUICK_MCMC_WARMUP)
+        config.set_runtime_config("MCMC_NUM_SAMPLES", config.QUICK_MCMC_SAMPLES)
+        config.set_runtime_config("MCMC_NUM_CHAINS", config.QUICK_MCMC_CHAINS)
         print(
             f"🚀 Quick mode: {config.QUICK_SVI_STEPS} SVI steps, "
             f"{config.QUICK_MCMC_SAMPLES} MCMC samples"
@@ -347,22 +377,42 @@ def apply_cli_overrides(args):
 
     # Inference parameters
     if args.svi_steps is not None:
-        config.SVI_NUM_STEPS = args.svi_steps
+        config.set_runtime_config("SVI_NUM_STEPS", args.svi_steps)
+    if args.svi_learning_rate is not None:
+        if args.svi_learning_rate <= 0:
+            raise ValueError("--svi-learning-rate must be > 0.")
+        config.set_runtime_config("SVI_LEARNING_RATE", args.svi_learning_rate)
+    if args.no_svi_lr_decay:
+        config.set_runtime_config("SVI_LR_DECAY_STEPS", None)
+        config.set_runtime_config("SVI_LR_DECAY_RATE", None)
+    if args.svi_lr_decay_steps is not None:
+        if args.svi_lr_decay_steps < 1:
+            raise ValueError("--svi-lr-decay-steps must be >= 1.")
+        config.set_runtime_config("SVI_LR_DECAY_STEPS", args.svi_lr_decay_steps)
+    if args.svi_lr_decay_rate is not None:
+        if not (0 < args.svi_lr_decay_rate < 1):
+            raise ValueError("--svi-lr-decay-rate must be between 0 and 1.")
+        config.set_runtime_config("SVI_LR_DECAY_RATE", args.svi_lr_decay_rate)
+    if (config.SVI_LR_DECAY_STEPS is None) != (config.SVI_LR_DECAY_RATE is None):
+        raise ValueError(
+            "SVI exponential decay requires both SVI_LR_DECAY_STEPS and "
+            "SVI_LR_DECAY_RATE to be set."
+        )
     if args.mcmc_warmup is not None:
-        config.MCMC_NUM_WARMUP = args.mcmc_warmup
+        config.set_runtime_config("MCMC_NUM_WARMUP", args.mcmc_warmup)
     if args.mcmc_samples is not None:
-        config.MCMC_NUM_SAMPLES = args.mcmc_samples
+        config.set_runtime_config("MCMC_NUM_SAMPLES", args.mcmc_samples)
     if args.mcmc_chains is not None:
-        config.MCMC_NUM_CHAINS = args.mcmc_chains
+        config.set_runtime_config("MCMC_NUM_CHAINS", args.mcmc_chains)
 
     # Opacity options
     if args.build_opacities:
-        config.OPA_LOAD = False
-        config.OPA_SAVE = True
+        config.set_runtime_config("OPA_LOAD", False)
+        config.set_runtime_config("OPA_SAVE", True)
     elif args.load_opacities:
-        config.OPA_LOAD = True
+        config.set_runtime_config("OPA_LOAD", True)
     if args.save_opacities:
-        config.OPA_SAVE = True
+        config.set_runtime_config("OPA_SAVE", True)
 
     # Species selection
     def _parse_csv(value: str) -> list[str]:
@@ -381,20 +431,20 @@ def apply_cli_overrides(args):
     if use_defaults:
         default_atoms = set(config.DEFAULT_SPECIES.get("atoms", []))
         default_mols = set(config.DEFAULT_SPECIES.get("molecules", []))
-        config.ATOMIC_SPECIES = {
+        config.set_runtime_config("ATOMIC_SPECIES", {
             k: v for k, v in config.ATOMIC_SPECIES.items() if k in default_atoms
-        }
-        config.MOLPATH_HITEMP = {
+        })
+        config.set_runtime_config("MOLPATH_HITEMP", {
             k: v for k, v in config.MOLPATH_HITEMP.items() if k in default_mols
-        }
-        config.MOLPATH_EXOMOL = {
+        })
+        config.set_runtime_config("MOLPATH_EXOMOL", {
             k: v for k, v in config.MOLPATH_EXOMOL.items() if k in default_mols
-        }
+        })
         print(f"Using default detected species (pass --all-species for full set)")
 
     if args.no_molecules:
-        config.MOLPATH_HITEMP = {}
-        config.MOLPATH_EXOMOL = {}
+        config.set_runtime_config("MOLPATH_HITEMP", {})
+        config.set_runtime_config("MOLPATH_EXOMOL", {})
         if args.molecules:
             print("Warning: --no-molecules overrides --molecules.")
     elif args.molecules:
@@ -404,11 +454,11 @@ def apply_cli_overrides(args):
         missing = wanted - set(mol_h.keys()) - set(mol_e.keys())
         if missing:
             print(f"Warning: Unknown molecules ignored: {', '.join(sorted(missing))}")
-        config.MOLPATH_HITEMP = mol_h
-        config.MOLPATH_EXOMOL = mol_e
+        config.set_runtime_config("MOLPATH_HITEMP", mol_h)
+        config.set_runtime_config("MOLPATH_EXOMOL", mol_e)
 
     if args.no_atoms:
-        config.ATOMIC_SPECIES = {}
+        config.set_runtime_config("ATOMIC_SPECIES", {})
         if args.atoms:
             print("Warning: --no-atoms overrides --atoms.")
     elif args.atoms:
@@ -417,7 +467,7 @@ def apply_cli_overrides(args):
         missing = wanted - set(atoms.keys())
         if missing:
             print(f"Warning: Unknown atoms ignored: {', '.join(sorted(missing))}")
-        config.ATOMIC_SPECIES = atoms
+        config.set_runtime_config("ATOMIC_SPECIES", atoms)
 
     return config
 def print_config_summary(config, args):
@@ -446,14 +496,23 @@ def print_config_summary(config, args):
     print(f"\nObserving mode: {config.OBSERVING_MODE}")
     wav_min, wav_max = config.get_wavelength_range()
     print(f"Wavelength range: {wav_min}-{wav_max} Angstroms")
+    print(f"Resolution mode: {config.RESOLUTION_MODE}")
     print(f"Resolution: R = {config.get_resolution():,}")
 
     print(f"\nInference:")
     print(f"  SVI steps: {config.SVI_NUM_STEPS:,}")
+    print(f"  SVI learning rate: {config.SVI_LEARNING_RATE}")
+    if config.SVI_LR_DECAY_STEPS is not None and config.SVI_LR_DECAY_RATE is not None:
+        print(
+            "  SVI LR schedule: "
+            f"exponential decay (steps={config.SVI_LR_DECAY_STEPS}, "
+            f"rate={config.SVI_LR_DECAY_RATE})"
+        )
     if not args.svi_only:
         print(f"  MCMC warmup: {config.MCMC_NUM_WARMUP:,}")
         print(f"  MCMC samples: {config.MCMC_NUM_SAMPLES:,}")
         print(f"  MCMC chains: {config.MCMC_NUM_CHAINS}")
+    print(f"  Vsys handling: fixed at systemic velocity = {params['RV_abs']} km/s")
 
     print(f"\nAtmosphere:")
     print(f"  Layers: {config.NLAYER}")

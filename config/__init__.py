@@ -16,6 +16,16 @@ from datetime import datetime
 import platform
 import jax
 
+from . import chemistry_config as _chemistry_config
+from . import data_config as _data_config
+from . import inference_config as _inference_config
+from . import instrument_config as _instrument_config
+from . import model_config as _model_config
+from . import paths_config as _paths_config
+from . import photometry_config as _photometry_config
+from . import planets_config as _planets_config
+from . import tellurics_config as _tellurics_config
+
 # Re-export everything for convenience
 from .planets_config import (
     PLANET,
@@ -34,6 +44,7 @@ from .instrument_config import (
     INSTRUMENT,
     OBSERVATORY,
     OBSERVING_MODE,
+    RESOLUTION_MODE,
     # Main config database
     INSTRUMENTS,
     TELLURIC_REGIONS,
@@ -120,6 +131,8 @@ from .paths_config import (
 from .inference_config import (
     SVI_NUM_STEPS,
     SVI_LEARNING_RATE,
+    SVI_LR_DECAY_STEPS,
+    SVI_LR_DECAY_RATE,
     MCMC_NUM_WARMUP,
     MCMC_NUM_SAMPLES,
     MCMC_MAX_TREE_DEPTH,
@@ -190,6 +203,27 @@ from .tellurics_config import (
 )
 
 
+_RUNTIME_CONFIG_MODULES = (
+    _planets_config,
+    _instrument_config,
+    _model_config,
+    _paths_config,
+    _inference_config,
+    _chemistry_config,
+    _data_config,
+    _photometry_config,
+    _tellurics_config,
+)
+
+
+def set_runtime_config(name: str, value) -> None:
+    """Update a config variable across the package and source modules."""
+    globals()[name] = value
+    for module in _RUNTIME_CONFIG_MODULES:
+        if hasattr(module, name):
+            setattr(module, name, value)
+
+
 def save_run_config(
     output_dir: str,
     mode: str,
@@ -197,6 +231,8 @@ def save_run_config(
     skip_svi: bool,
     svi_only: bool,
     seed: int,
+    chemistry_model: str | None = None,
+    epoch: str | None = None,
 ) -> None:
     """Save run configuration to log file.
 
@@ -235,17 +271,22 @@ def save_run_config(
         f.write("-" * 70 + "\n")
         f.write(f"Planet: {PLANET}\n")
         f.write(f"Ephemeris: {EPHEMERIS}\n")
+        if epoch is not None:
+            f.write(f"Epoch: {epoch}\n")
         f.write(f"Period: {params['period']}\n")
         f.write(f"R_p: {params['R_p']}\n")
         f.write(f"M_p: {params['M_p']}\n")
         f.write(f"R_star: {params['R_star']}\n")
-        f.write(f"T_star: {params['T_star']}\n\n")
+        f.write(f"T_star: {params['T_star']}\n")
+        f.write(f"Systemic velocity (fixed): {params.get('RV_abs')}\n\n")
 
         # Retrieval mode
         f.write("RETRIEVAL CONFIGURATION\n")
         f.write("-" * 70 + "\n")
         f.write(f"Mode: {mode}\n")
         f.write(f"P-T profile: {pt_profile}\n")
+        if chemistry_model is not None:
+            f.write(f"Chemistry model: {chemistry_model}\n")
         f.write(f"Output directory: {output_dir}\n\n")
 
         # Wavelength/spectral setup
@@ -257,6 +298,7 @@ def save_run_config(
         wav_min, wav_max = get_wavelength_range()
         f.write(f"Wavelength range: {wav_min} - {wav_max} Angstroms\n")
         f.write(f"Spectral points: {N_SPECTRAL_POINTS}\n")
+        f.write(f"Resolution mode: {RESOLUTION_MODE}\n")
         f.write(f"Resolution: R = {get_resolution():,}\n\n")
 
         # preMODIT grid
@@ -295,6 +337,15 @@ def save_run_config(
         if not skip_svi:
             f.write(f"SVI steps: {SVI_NUM_STEPS:,}\n")
             f.write(f"SVI learning rate: {SVI_LEARNING_RATE}\n")
+            f.write("Vsys handling: fixed at systemic velocity\n")
+            if SVI_LR_DECAY_STEPS is not None and SVI_LR_DECAY_RATE is not None:
+                f.write(
+                    "SVI LR schedule: "
+                    f"exponential_decay(steps={SVI_LR_DECAY_STEPS}, "
+                    f"rate={SVI_LR_DECAY_RATE})\n"
+                )
+            else:
+                f.write("SVI LR schedule: constant\n")
         else:
             f.write("SVI: SKIPPED\n")
 

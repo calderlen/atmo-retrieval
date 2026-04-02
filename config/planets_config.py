@@ -78,8 +78,12 @@ PLANETS = {
             "R_p": 1.741,                # R_J
             "R_p_err": 0.07,
             "T_eq": 2262,                # K
+            "Tirr_mean": 2862,           # K (Guillot irradiation-temperature prior mean)
+            "Tirr_std": 24,              # K
             "Kp": 169.0,                 # km/s
             "Kp_err": 6.1,
+            "Kp_low": nan,
+            "Kp_high": nan,
             "RV_abs": -22.78,            # km/s (systemic velocity)
             "RV_abs_err": 0.11,
             # Atmospheric parameters

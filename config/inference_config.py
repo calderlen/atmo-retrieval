@@ -7,7 +7,9 @@ Inference parameters for SVI and MCMC sampling.
 # ==============================================================================
 
 SVI_NUM_STEPS = 2000
-SVI_LEARNING_RATE = 0.005
+SVI_LEARNING_RATE = 0.001
+SVI_LR_DECAY_STEPS = None
+SVI_LR_DECAY_RATE = None
 
 # ==============================================================================
 # MCMC PARAMETERS
