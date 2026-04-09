@@ -1,10 +1,14 @@
+import hashlib
 import os
 from contextlib import redirect_stdout
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from astropy import constants as const
+from astropy import units as u
 import jax
 from jax import random
 import jax.numpy as jnp
@@ -62,6 +66,327 @@ def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, 
     phase = np.load(data_dir / "phase.npy")
     
     return wavelength, data, sigma, phase
+
+
+def _normalize_phoenix_spectrum_path(path: str | Path) -> str:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    return str(candidate.resolve())
+
+
+def _normalize_phoenix_cache_dir(path: str | Path | None) -> Path:
+    candidate = config.PHOENIX_CACHE_DIR if path is None else Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    candidate = candidate.resolve()
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+@lru_cache(maxsize=None)
+def _read_phoenix_spectrum_ascii(path_str: str) -> tuple[np.ndarray, np.ndarray]:
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(f"PHOENIX spectrum file not found: {path}")
+
+    try:
+        raw = np.loadtxt(path, dtype=float, comments="#")
+    except Exception as exc:
+        raise ValueError(f"Failed to read PHOENIX spectrum from {path}: {exc}") from exc
+
+    if raw.ndim == 1:
+        if raw.size == 0:
+            raise ValueError(f"PHOENIX spectrum file is empty: {path}")
+        if raw.size != 2:
+            raise ValueError(
+                f"PHOENIX spectrum file {path} must have exactly two columns "
+                "(wavelength_A, stellar_surface_flux)."
+            )
+        raw = raw[np.newaxis, :]
+
+    if raw.ndim != 2 or raw.shape[1] != 2:
+        raise ValueError(
+            f"PHOENIX spectrum file {path} must have exactly two columns "
+            f"(wavelength_A, stellar_surface_flux); got shape {raw.shape}."
+        )
+
+    wavelength_angstrom = np.asarray(raw[:, 0], dtype=float)
+    stellar_surface_flux = np.asarray(raw[:, 1], dtype=float)
+    if np.any(~np.isfinite(wavelength_angstrom)) or np.any(~np.isfinite(stellar_surface_flux)):
+        raise ValueError(f"PHOENIX spectrum file {path} contains non-finite values.")
+
+    order = np.argsort(wavelength_angstrom)
+    wavelength_angstrom = wavelength_angstrom[order]
+    stellar_surface_flux = stellar_surface_flux[order]
+    if np.any(np.diff(wavelength_angstrom) <= 0):
+        raise ValueError(
+            f"PHOENIX spectrum file {path} must be strictly increasing in wavelength."
+        )
+    if np.any(stellar_surface_flux <= 0):
+        raise ValueError(
+            f"PHOENIX spectrum file {path} must have strictly positive stellar surface flux values."
+        )
+
+    return wavelength_angstrom, stellar_surface_flux
+
+
+@lru_cache(maxsize=None)
+def _read_processed_phoenix_cache(path_str: str) -> tuple[np.ndarray, np.ndarray]:
+    path = Path(path_str)
+    try:
+        with np.load(path) as raw:
+            wavelength_angstrom = np.asarray(raw["wavelength_angstrom"], dtype=float)
+            stellar_surface_flux = np.asarray(raw["stellar_surface_flux"], dtype=float)
+    except Exception as exc:
+        raise ValueError(f"Failed to read cached PHOENIX spectrum from {path}: {exc}") from exc
+
+    if wavelength_angstrom.ndim != 1 or stellar_surface_flux.ndim != 1:
+        raise ValueError(
+            f"Cached PHOENIX spectrum {path} must contain 1D wavelength_angstrom and "
+            "stellar_surface_flux arrays."
+        )
+    if wavelength_angstrom.shape != stellar_surface_flux.shape:
+        raise ValueError(
+            f"Cached PHOENIX spectrum {path} has mismatched shapes "
+            f"{wavelength_angstrom.shape} and {stellar_surface_flux.shape}."
+        )
+    return wavelength_angstrom, stellar_surface_flux
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _derive_stellar_logg_cgs(Mstar_msun: float, Rstar_rsun: float) -> float:
+    g_cgs = (
+        const.G * (Mstar_msun * const.M_sun) / (Rstar_rsun * const.R_sun) ** 2
+    ).to_value(u.cm / u.s**2)
+    return float(np.log10(g_cgs))
+
+
+def _resolve_chromatic_phoenix_parameters(
+    *,
+    component_name: str,
+    Tstar: float | None,
+    logg_star: float | None,
+    metallicity: float | None,
+    Mstar: float | None,
+    Rstar: float | None,
+) -> tuple[float, float, float]:
+    temperature = _coerce_optional_float(Tstar)
+    if temperature is None:
+        raise ValueError(
+            f"Emission component '{component_name}' requires a finite Tstar for chromatic "
+            "PHOENIX retrieval."
+        )
+
+    resolved_logg = _coerce_optional_float(logg_star)
+    if resolved_logg is None:
+        Mstar_val = _coerce_optional_float(Mstar)
+        Rstar_val = _coerce_optional_float(Rstar)
+        if Mstar_val is None or Rstar_val is None:
+            raise ValueError(
+                f"Emission component '{component_name}' requires either a finite logg_star "
+                "or both finite M_star and R_star for chromatic PHOENIX retrieval."
+            )
+        resolved_logg = _derive_stellar_logg_cgs(Mstar_val, Rstar_val)
+
+    resolved_metallicity = _coerce_optional_float(metallicity)
+    if resolved_metallicity is None:
+        resolved_metallicity = 0.0
+
+    return temperature, resolved_logg, resolved_metallicity
+
+
+def _format_phoenix_cache_float(value: float) -> str:
+    return f"{value:+.3f}".replace("+", "p").replace("-", "m").replace(".", "p")
+
+
+def _build_processed_phoenix_cache_path(
+    *,
+    cache_dir: Path,
+    temperature: float,
+    logg: float,
+    metallicity: float,
+    target_wavelength_angstrom: np.ndarray,
+) -> Path:
+    grid_hash = hashlib.sha1(
+        np.asarray(target_wavelength_angstrom, dtype=np.float64).tobytes()
+    ).hexdigest()[:16]
+    filename = (
+        "phoenix_"
+        f"T{_format_phoenix_cache_float(temperature)}_"
+        f"logg{_format_phoenix_cache_float(logg)}_"
+        f"feh{_format_phoenix_cache_float(metallicity)}_"
+        f"{grid_hash}.npz"
+    )
+    return cache_dir / filename
+
+
+def _convert_chromatic_surface_flux_to_exojax_units(
+    wavelength: u.Quantity,
+    surface_flux: u.Quantity,
+) -> np.ndarray:
+    wavelength_cm = u.Quantity(wavelength).to(u.cm)
+    energy_per_photon = (const.h * const.c / wavelength_cm) / u.photon
+    surface_flux_lambda = (u.Quantity(surface_flux) * energy_per_photon).to(
+        u.erg / (u.s * u.cm**2 * u.cm)
+    )
+    surface_flux_wavenumber = surface_flux_lambda * wavelength_cm**2
+    return np.asarray(
+        surface_flux_wavenumber.to_value(u.erg / (u.s * u.cm)),
+        dtype=float,
+    )
+
+
+def _load_chromatic_phoenix_surface_flux_on_grid(
+    *,
+    nu_grid: np.ndarray,
+    component_name: str,
+    Tstar: float | None,
+    logg_star: float | None,
+    metallicity: float | None,
+    Mstar: float | None,
+    Rstar: float | None,
+    phoenix_cache_dir: str | Path | None,
+) -> np.ndarray:
+    target_wavelength_angstrom = 1.0e8 / np.asarray(nu_grid, dtype=float)
+    temperature, resolved_logg, resolved_metallicity = _resolve_chromatic_phoenix_parameters(
+        component_name=component_name,
+        Tstar=Tstar,
+        logg_star=logg_star,
+        metallicity=metallicity,
+        Mstar=Mstar,
+        Rstar=Rstar,
+    )
+    cache_dir = _normalize_phoenix_cache_dir(phoenix_cache_dir)
+    cache_path = _build_processed_phoenix_cache_path(
+        cache_dir=cache_dir,
+        temperature=temperature,
+        logg=resolved_logg,
+        metallicity=resolved_metallicity,
+        target_wavelength_angstrom=target_wavelength_angstrom,
+    )
+
+    if cache_path.exists():
+        cached_wavelength_angstrom, cached_flux = _read_processed_phoenix_cache(str(cache_path))
+        if cached_wavelength_angstrom.shape == target_wavelength_angstrom.shape and np.array_equal(
+            cached_wavelength_angstrom,
+            target_wavelength_angstrom,
+        ):
+            return cached_flux
+
+    try:
+        from chromatic import get_phoenix_photons
+    except ImportError as exc:
+        raise ImportError(
+            "chromatic-lightcurves is required to auto-fetch PHOENIX spectra when "
+            "phoenix_spectrum_path is not provided. Install chromatic-lightcurves or "
+            "provide a local two-column PHOENIX spectrum file."
+        ) from exc
+
+    sort_idx = np.argsort(target_wavelength_angstrom)
+    query_wavelength_um = (target_wavelength_angstrom[sort_idx] / 1.0e4) * u.micron
+    wavelength_um, surface_flux = get_phoenix_photons(
+        temperature=temperature,
+        logg=resolved_logg,
+        metallicity=resolved_metallicity,
+        wavelength=query_wavelength_um,
+    )
+    flux_sorted = _convert_chromatic_surface_flux_to_exojax_units(
+        wavelength=wavelength_um,
+        surface_flux=surface_flux,
+    )
+    stellar_surface_flux = np.empty_like(flux_sorted)
+    stellar_surface_flux[sort_idx] = flux_sorted
+
+    if np.any(~np.isfinite(stellar_surface_flux)):
+        raise ValueError(
+            f"chromatic returned non-finite PHOENIX surface flux values for emission "
+            f"component '{component_name}'."
+        )
+    if np.any(stellar_surface_flux <= 0):
+        raise ValueError(
+            f"chromatic returned non-positive PHOENIX surface flux values for emission "
+            f"component '{component_name}'."
+        )
+
+    np.savez_compressed(
+        cache_path,
+        wavelength_angstrom=target_wavelength_angstrom,
+        stellar_surface_flux=stellar_surface_flux,
+        temperature=np.asarray(temperature, dtype=float),
+        logg=np.asarray(resolved_logg, dtype=float),
+        metallicity=np.asarray(resolved_metallicity, dtype=float),
+    )
+    return stellar_surface_flux
+
+
+def _load_phoenix_surface_flux_on_grid(
+    *,
+    phoenix_spectrum_path: str | Path | None,
+    phoenix_cache_dir: str | Path | None,
+    nu_grid: np.ndarray,
+    mode: str,
+    component_name: str,
+    Tstar: float | None,
+    logg_star: float | None,
+    metallicity: float | None,
+    Mstar: float | None,
+    Rstar: float | None,
+) -> np.ndarray | None:
+    if _normalize_retrieval_mode(mode) != "emission":
+        return None
+
+    if phoenix_spectrum_path is None:
+        return _load_chromatic_phoenix_surface_flux_on_grid(
+            nu_grid=nu_grid,
+            component_name=component_name,
+            Tstar=Tstar,
+            logg_star=logg_star,
+            metallicity=metallicity,
+            Mstar=Mstar,
+            Rstar=Rstar,
+            phoenix_cache_dir=phoenix_cache_dir,
+        )
+
+    normalized_path = _normalize_phoenix_spectrum_path(phoenix_spectrum_path)
+    wavelength_angstrom, stellar_surface_flux = _read_phoenix_spectrum_ascii(normalized_path)
+
+    target_wavelength_angstrom = 1.0e8 / np.asarray(nu_grid, dtype=float)
+    target_min = float(np.min(target_wavelength_angstrom))
+    target_max = float(np.max(target_wavelength_angstrom))
+    source_min = float(np.min(wavelength_angstrom))
+    source_max = float(np.max(wavelength_angstrom))
+    if target_min < source_min or target_max > source_max:
+        raise ValueError(
+            f"PHOENIX spectrum {normalized_path} does not cover the wavelength range "
+            f"required by emission component '{component_name}' "
+            f"({target_min:.3f}-{target_max:.3f} A requested, "
+            f"{source_min:.3f}-{source_max:.3f} A available)."
+        )
+
+    interpolated_flux = np.interp(
+        target_wavelength_angstrom,
+        wavelength_angstrom,
+        stellar_surface_flux,
+    )
+    if np.any(~np.isfinite(interpolated_flux)):
+        raise ValueError(
+            f"Interpolated PHOENIX stellar surface flux for component '{component_name}' "
+            f"contains non-finite values."
+        )
+
+    return np.asarray(interpolated_flux, dtype=float)
 
 
 @dataclass(frozen=True)
@@ -456,6 +781,41 @@ def _summarize_observed_spectrum(
     return obs_mean, obs_err
 
 
+def _validate_mcmc_device_layout(
+    *,
+    num_chains: int,
+    chain_method: str,
+    require_gpu_per_chain: bool,
+) -> None:
+    chain_method = str(chain_method).strip().lower()
+    local_devices = list(jax.local_devices())
+    gpu_devices = [device for device in local_devices if device.platform == "gpu"]
+
+    print(f"  JAX default backend: {jax.default_backend()}")
+    print(f"  JAX local devices: {local_devices}")
+
+    if not require_gpu_per_chain:
+        return
+
+    if chain_method != "parallel":
+        raise RuntimeError(
+            "MCMC_REQUIRE_GPU_PER_CHAIN requires MCMC_CHAIN_METHOD='parallel'."
+        )
+
+    if jax.default_backend() != "gpu":
+        raise RuntimeError(
+            "This run requires GPU-backed parallel chains, but JAX default backend "
+            f"is {jax.default_backend()!r}."
+        )
+
+    if len(gpu_devices) < num_chains:
+        raise RuntimeError(
+            f"This run requires at least {num_chains} visible GPU devices for "
+            f"{num_chains} MCMC chains, but JAX sees {len(gpu_devices)} GPU device(s). "
+            "Request more GPUs or reduce --mcmc-chains."
+        )
+
+
 def _phase_dependent_drv(params: dict[str, float], phase: np.ndarray) -> jnp.ndarray:
     return jnp.asarray(params.get("dRV", 0.0))
 
@@ -645,10 +1005,13 @@ def _build_spectroscopic_observation_inputs(
 def _coerce_model_params(params: dict) -> dict[str, float | None]:
     Kp_low = params.get("Kp_low")
     Kp_high = params.get("Kp_high")
+    Mp_upper_3sigma = params.get("M_p_upper_3sigma")
     if Kp_low is not None and Kp_low != Kp_low:
         Kp_low = None
     if Kp_high is not None and Kp_high != Kp_high:
         Kp_high = None
+    if Mp_upper_3sigma is not None and Mp_upper_3sigma != Mp_upper_3sigma:
+        Mp_upper_3sigma = None
 
     return {
         "Kp": params.get("Kp", config.DEFAULT_KP),
@@ -661,9 +1024,17 @@ def _coerce_model_params(params: dict) -> dict[str, float | None]:
         "R_p_err": params["R_p"].std_dev if hasattr(params["R_p"], "std_dev") else config.DEFAULT_RP_ERR,
         "M_p": params["M_p"].nominal_value if hasattr(params["M_p"], "nominal_value") else params["M_p"],
         "M_p_err": params["M_p"].std_dev if hasattr(params["M_p"], "std_dev") else config.DEFAULT_MP_ERR,
+        "M_p_upper_3sigma": Mp_upper_3sigma,
+        "M_star": (
+            params["M_star"].nominal_value
+            if ("M_star" in params and hasattr(params["M_star"], "nominal_value"))
+            else params.get("M_star")
+        ),
         "R_star": params["R_star"].nominal_value if hasattr(params["R_star"], "nominal_value") else params["R_star"],
         "R_star_err": params["R_star"].std_dev if hasattr(params["R_star"], "std_dev") else config.DEFAULT_RSTAR_ERR,
         "T_star": params.get("T_star", config.DEFAULT_TSTAR),
+        "logg_star": params.get("logg_star"),
+        "Fe_H": params.get("Fe_H"),
         "T_eq": params.get("T_eq"),
         "Tirr_mean": params.get("Tirr_mean", params.get("T_eq")),
         "Tirr_std": params.get("Tirr_std"),
@@ -800,6 +1171,12 @@ def _build_primary_spectroscopic_component(
     opa_atoms: dict,
     region_name: str,
     Tstar: float | None,
+    logg_star: float | None,
+    metallicity: float | None,
+    Mstar: float | None,
+    Rstar: float | None,
+    phoenix_spectrum_path: str | Path | None,
+    phoenix_cache_dir: str | Path | None,
     phase_mode: PhaseMode,
     apply_sysrem: bool,
     radial_velocity_mode: str,
@@ -808,6 +1185,18 @@ def _build_primary_spectroscopic_component(
     sample_prefix: str | None = None,
 ) -> SpectroscopicComponentBundle:
     mode = _normalize_retrieval_mode(mode)
+    stellar_surface_flux = _load_phoenix_surface_flux_on_grid(
+        phoenix_spectrum_path=phoenix_spectrum_path,
+        phoenix_cache_dir=phoenix_cache_dir,
+        nu_grid=nu_grid,
+        mode=mode,
+        component_name=name,
+        Tstar=Tstar,
+        logg_star=logg_star,
+        metallicity=metallicity,
+        Mstar=Mstar,
+        Rstar=Rstar,
+    )
     observation_config = build_spectroscopic_observation_config(
         name=name,
         region_name=region_name,
@@ -821,6 +1210,7 @@ def _build_primary_spectroscopic_component(
         instrument_resolution=instrument_resolution,
         inst_nus=inst_nus,
         Tstar=Tstar,
+        stellar_surface_flux=stellar_surface_flux,
         radial_velocity_mode=radial_velocity_mode,
         phase_mode=phase_mode,
         likelihood_kind=likelihood_kind,
@@ -1115,6 +1505,12 @@ def _load_joint_spectroscopic_component(
     *,
     default_mode: str,
     default_tstar: float | None,
+    default_logg_star: float | None,
+    default_metallicity: float | None,
+    default_mstar: float | None,
+    default_rstar: float | None,
+    default_phoenix_spectrum_path: str | Path | None,
+    default_phoenix_cache_dir: str | Path | None,
 ) -> SpectroscopicComponentBundle:
     component_mode = _normalize_retrieval_mode(spec.get("mode", default_mode))
     region_name = _normalize_region_name(spec.get("region_name"), component_mode)
@@ -1132,6 +1528,12 @@ def _load_joint_spectroscopic_component(
         )
     )
     Tstar = spec.get("Tstar", default_tstar)
+    logg_star = spec.get("logg_star", spec.get("phoenix_logg", default_logg_star))
+    metallicity = spec.get("Fe_H", spec.get("phoenix_metallicity", default_metallicity))
+    Mstar = spec.get("M_star", default_mstar)
+    Rstar = spec.get("R_star", default_rstar)
+    phoenix_spectrum_path = spec.get("phoenix_spectrum_path", default_phoenix_spectrum_path)
+    phoenix_cache_dir = spec.get("phoenix_cache_dir", default_phoenix_cache_dir)
 
     if "tbl_path" in spec:
         wav_obs, spectrum, uncertainty, _meta = load_nasa_archive_spectrum(
@@ -1215,6 +1617,18 @@ def _load_joint_spectroscopic_component(
         instrument_resolution,
     )
     opa_cias, opa_mols, opa_atoms = _load_opacity_bundle(nu_grid)
+    stellar_surface_flux = _load_phoenix_surface_flux_on_grid(
+        phoenix_spectrum_path=phoenix_spectrum_path,
+        phoenix_cache_dir=phoenix_cache_dir,
+        nu_grid=nu_grid,
+        mode=component_mode,
+        component_name=name,
+        Tstar=Tstar,
+        logg_star=logg_star,
+        metallicity=metallicity,
+        Mstar=Mstar,
+        Rstar=Rstar,
+    )
 
     observation_config = build_spectroscopic_observation_config(
         name=name,
@@ -1229,6 +1643,7 @@ def _load_joint_spectroscopic_component(
         instrument_resolution=instrument_resolution,
         inst_nus=inst_nus_component,
         Tstar=Tstar,
+        stellar_surface_flux=stellar_surface_flux,
         radial_velocity_mode=radial_velocity_mode,
         phase_mode=phase_mode,
         likelihood_kind=likelihood_kind,
@@ -1267,7 +1682,13 @@ def _load_bandpass_constraint(
     *,
     default_mode: str,
     default_tstar: float | None,
+    default_logg_star: float | None,
+    default_metallicity: float | None,
+    default_mstar: float | None,
+    default_rstar: float | None,
     default_semi_major_axis_au: float | None,
+    default_phoenix_spectrum_path: str | Path | None,
+    default_phoenix_cache_dir: str | Path | None,
 ) -> BandpassConstraintBundle:
     component_mode = _normalize_retrieval_mode(spec.get("mode", default_mode))
     region_name = _normalize_region_name(spec.get("region_name"), component_mode)
@@ -1277,6 +1698,12 @@ def _load_bandpass_constraint(
     sigma = float(spec["sigma"])
     photon_weighted = bool(spec.get("photon_weighted", False))
     Tstar = spec.get("Tstar", default_tstar)
+    logg_star = spec.get("logg_star", spec.get("phoenix_logg", default_logg_star))
+    metallicity = spec.get("Fe_H", spec.get("phoenix_metallicity", default_metallicity))
+    Mstar = spec.get("M_star", default_mstar)
+    Rstar = spec.get("R_star", default_rstar)
+    phoenix_spectrum_path = spec.get("phoenix_spectrum_path", default_phoenix_spectrum_path)
+    phoenix_cache_dir = spec.get("phoenix_cache_dir", default_phoenix_cache_dir)
     include_reflection = bool(spec.get("include_reflection", False))
     semi_major_axis_au = spec.get("semi_major_axis_au", default_semi_major_axis_au)
     if semi_major_axis_au is not None:
@@ -1318,6 +1745,18 @@ def _load_bandpass_constraint(
         )
 
     opa_cias, opa_mols, opa_atoms = _load_opacity_bundle(nu_grid)
+    stellar_surface_flux = _load_phoenix_surface_flux_on_grid(
+        phoenix_spectrum_path=phoenix_spectrum_path,
+        phoenix_cache_dir=phoenix_cache_dir,
+        nu_grid=nu_grid,
+        mode=component_mode,
+        component_name=name,
+        Tstar=Tstar,
+        logg_star=logg_star,
+        metallicity=metallicity,
+        Mstar=Mstar,
+        Rstar=Rstar,
+    )
     observation_config = build_bandpass_observation_config(
         name=name,
         region_name=region_name,
@@ -1331,6 +1770,7 @@ def _load_bandpass_constraint(
         observable=observable,
         photon_weighted=photon_weighted,
         Tstar=Tstar,
+        stellar_surface_flux=stellar_surface_flux,
         include_reflection=include_reflection,
         semi_major_axis_au=semi_major_axis_au,
         geometric_albedo_bounds=geometric_albedo_bounds,
@@ -1388,6 +1828,8 @@ def run_retrieval(
     joint_spectra: list[dict[str, Any]] | None = None,
     bandpass_constraints: list[dict[str, Any]] | None = None,
     atmosphere_regions: list[dict[str, Any]] | None = None,
+    phoenix_spectrum_path: str | Path | None = None,
+    phoenix_cache_dir: str | Path | None = None,
 ) -> None:
     retrieval_start = perf_counter()
     mode = _normalize_retrieval_mode(mode)
@@ -1411,6 +1853,8 @@ def run_retrieval(
         seed=seed,
         chemistry_model=chemistry_model,
         epoch=epoch,
+        phoenix_spectrum_path=None if phoenix_spectrum_path is None else str(phoenix_spectrum_path),
+        phoenix_cache_dir=None if phoenix_cache_dir is None else str(phoenix_cache_dir),
     )
 
     # Get planet parameters
@@ -1569,6 +2013,12 @@ def run_retrieval(
     with _StepTimer("Step 6/7"):
         model_params = _coerce_model_params(params)
         primary_region_name = _default_region_name_for_mode(mode)
+        if mode == "emission":
+            if phoenix_spectrum_path is None:
+                print("  PHOENIX stellar spectrum: chromatic auto-fetch")
+                print(f"  Processed PHOENIX cache: {_normalize_phoenix_cache_dir(phoenix_cache_dir)}")
+            else:
+                print(f"  PHOENIX stellar spectrum: {phoenix_spectrum_path}")
 
         shared_system = build_shared_system_config(params=model_params)
 
@@ -1604,6 +2054,12 @@ def run_retrieval(
             opa_atoms=opa_atoms,
             region_name=primary_region_name,
             Tstar=model_params["T_star"],
+            logg_star=model_params["logg_star"],
+            metallicity=model_params["Fe_H"],
+            Mstar=model_params["M_star"],
+            Rstar=model_params["R_star"],
+            phoenix_spectrum_path=phoenix_spectrum_path,
+            phoenix_cache_dir=phoenix_cache_dir,
             phase_mode=phase_mode,
             apply_sysrem=apply_sysrem,
             radial_velocity_mode=primary_radial_velocity_mode,
@@ -1623,6 +2079,12 @@ def run_retrieval(
                     spec,
                     default_mode=mode,
                     default_tstar=model_params["T_star"],
+                    default_logg_star=model_params["logg_star"],
+                    default_metallicity=model_params["Fe_H"],
+                    default_mstar=model_params["M_star"],
+                    default_rstar=model_params["R_star"],
+                    default_phoenix_spectrum_path=phoenix_spectrum_path,
+                    default_phoenix_cache_dir=phoenix_cache_dir,
                 )
                 if component.name in observations_payload:
                     raise ValueError(f"Duplicate joint component name: {component.name}")
@@ -1637,7 +2099,13 @@ def run_retrieval(
                     spec,
                     default_mode=mode,
                     default_tstar=model_params["T_star"],
+                    default_logg_star=model_params["logg_star"],
+                    default_metallicity=model_params["Fe_H"],
+                    default_mstar=model_params["M_star"],
+                    default_rstar=model_params["R_star"],
                     default_semi_major_axis_au=model_params["a"],
+                    default_phoenix_spectrum_path=phoenix_spectrum_path,
+                    default_phoenix_cache_dir=phoenix_cache_dir,
                 )
                 if component.name in observations_payload:
                     raise ValueError(f"Duplicate joint component name: {component.name}")
@@ -1710,6 +2178,9 @@ def run_retrieval(
                 model_inputs=model_inputs,
                 Mp_mean=model_params["M_p"],
                 Mp_std=model_params["M_p_err"],
+                Mp_upper_3sigma=model_params.get("M_p_upper_3sigma"),
+                Rp_mean=model_params["R_p"],
+                Rp_std=model_params["R_p_err"],
                 Rstar_mean=model_params["R_star"],
                 Rstar_std=model_params["R_star_err"],
                 output_dir=str(output_dir),
@@ -1794,6 +2265,13 @@ def run_retrieval(
         print(f"\n  Running HMC-NUTS sampling...")
         print(f"  Warmup: {config.MCMC_NUM_WARMUP}, Samples: {config.MCMC_NUM_SAMPLES}")
         print(f"  Chains: {config.MCMC_NUM_CHAINS}")
+        print(f"  Chain method: {config.MCMC_CHAIN_METHOD}")
+
+        _validate_mcmc_device_layout(
+            num_chains=config.MCMC_NUM_CHAINS,
+            chain_method=config.MCMC_CHAIN_METHOD,
+            require_gpu_per_chain=config.MCMC_REQUIRE_GPU_PER_CHAIN,
+        )
 
         kernel = NUTS(
             model_c,
@@ -1804,7 +2282,8 @@ def run_retrieval(
             kernel,
             num_warmup=config.MCMC_NUM_WARMUP,
             num_samples=config.MCMC_NUM_SAMPLES,
-            num_chains=config.MCMC_NUM_CHAINS
+            num_chains=config.MCMC_NUM_CHAINS,
+            chain_method=config.MCMC_CHAIN_METHOD,
         )
 
         rng_key, rng_key_ = random.split(rng_key)

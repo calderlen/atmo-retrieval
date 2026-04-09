@@ -44,7 +44,7 @@ def create_parser():
     config_group = parser.add_argument_group("Configuration")
     config_group.add_argument("--config", type=str, default=None, help="Path to custom config file (default: use config.py)")
     config_group.add_argument(
-        "--config-profile",
+        "--profile",
         type=str,
         choices=config.list_runtime_profiles(),
         default=config.get_runtime_profile_name(),
@@ -138,6 +138,21 @@ def create_parser():
         help="Number of MCMC chains (default: from config)"
     )
     inference_group.add_argument(
+        "--mcmc-chain-method",
+        type=str,
+        choices=["parallel", "sequential", "vectorized"],
+        default=None,
+        help="NumPyro MCMC chain execution mode (default: from config)"
+    )
+    inference_group.add_argument(
+        "--require-gpu-per-chain",
+        action="store_true",
+        help=(
+            "Fail unless at least one GPU is visible for each requested MCMC "
+            "chain when using parallel chain execution"
+        )
+    )
+    inference_group.add_argument(
         "--quick",
         action="store_true",
         help="Quick test mode (100 SVI steps, 100 MCMC samples)"
@@ -201,6 +216,16 @@ def create_parser():
         type=str,
         default=None,
         help="Path to FastChem parameters.dat (required for bonidie and fastchem_hybrid_grid)",
+    )
+    model_group.add_argument(
+        "--phoenix-spectrum-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional local two-column ASCII PHOENIX stellar spectrum for emission mode "
+            "(wavelength_A, stellar_surface_flux). If omitted, emission mode can "
+            "auto-fetch PHOENIX spectra through chromatic-lightcurves."
+        ),
     )
     model_group.add_argument(
         "--nlayer",
@@ -414,6 +439,14 @@ def apply_cli_overrides(args):
         config.set_runtime_config("MCMC_NUM_SAMPLES", args.mcmc_samples)
     if args.mcmc_chains is not None:
         config.set_runtime_config("MCMC_NUM_CHAINS", args.mcmc_chains)
+    if args.mcmc_chain_method is not None:
+        config.set_runtime_config("MCMC_CHAIN_METHOD", args.mcmc_chain_method)
+    if args.require_gpu_per_chain:
+        config.set_runtime_config("MCMC_REQUIRE_GPU_PER_CHAIN", True)
+    if config.MCMC_REQUIRE_GPU_PER_CHAIN and config.MCMC_CHAIN_METHOD != "parallel":
+        raise ValueError(
+            "--require-gpu-per-chain requires --mcmc-chain-method parallel."
+        )
 
     # Opacity options
     if args.build_opacities:
@@ -547,6 +580,9 @@ def print_config_summary(config, args):
         print(f"  MCMC warmup: {config.MCMC_NUM_WARMUP:,}")
         print(f"  MCMC samples: {config.MCMC_NUM_SAMPLES:,}")
         print(f"  MCMC chains: {config.MCMC_NUM_CHAINS}")
+        print(f"  MCMC chain method: {config.MCMC_CHAIN_METHOD}")
+        if config.MCMC_REQUIRE_GPU_PER_CHAIN:
+            print("  MCMC GPU policy: require >= 1 visible GPU per chain")
     print(f"  Vsys handling: fixed at systemic velocity = {params['RV_abs']} km/s")
 
     print(f"\nAtmosphere:")
@@ -572,7 +608,7 @@ def main():
         os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
     runtime_config = config
-    runtime_config.apply_runtime_profile(args.config_profile)
+    runtime_config.apply_runtime_profile(args.profile)
 
     # Load config
     if args.config:
@@ -645,6 +681,7 @@ def main():
             seed=args.seed,
             joint_spectra=joint_spectra or None,
             bandpass_constraints=bandpass_constraints or None,
+            phoenix_spectrum_path=args.phoenix_spectrum_path,
         )
 
     elif args.mode == "emission":
@@ -662,6 +699,7 @@ def main():
             seed=args.seed,
             joint_spectra=joint_spectra or None,
             bandpass_constraints=bandpass_constraints or None,
+            phoenix_spectrum_path=args.phoenix_spectrum_path,
         )
 
     return 0

@@ -23,3 +23,4 @@ dependencies:
       - mlx
       - lightkurve
       - wotan
+      - chromatic-lightcurves

@@ -21,6 +21,7 @@ dependencies:
       - tqdm
       - lightkurve
       - wotan
+      - chromatic-lightcurves
       # Retrieval + diagnostics
       - numpyro
       - arviz

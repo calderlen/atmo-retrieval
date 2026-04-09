@@ -114,6 +114,7 @@ from .paths_config import (
     get_lowres_dir,
     get_transmission_paths,
     get_emission_paths,
+    PHOENIX_CACHE_DIR,
     DATA_DIR,
     LOWRES_DIR,
     TRANSMISSION_DATA,
@@ -137,6 +138,8 @@ from .inference_config import (
     MCMC_NUM_SAMPLES,
     MCMC_MAX_TREE_DEPTH,
     MCMC_NUM_CHAINS,
+    MCMC_CHAIN_METHOD,
+    MCMC_REQUIRE_GPU_PER_CHAIN,
     INIT_TO_MEDIAN_SAMPLES,
     QUICK_SVI_STEPS,
     QUICK_MCMC_WARMUP,
@@ -291,6 +294,8 @@ def save_run_config(
     seed: int,
     chemistry_model: str | None = None,
     epoch: str | None = None,
+    phoenix_spectrum_path: str | None = None,
+    phoenix_cache_dir: str | None = None,
 ) -> None:
     """Save run configuration to log file.
 
@@ -346,6 +351,10 @@ def save_run_config(
         f.write(f"P-T profile: {pt_profile}\n")
         if chemistry_model is not None:
             f.write(f"Chemistry model: {chemistry_model}\n")
+        if phoenix_spectrum_path is not None:
+            f.write(f"PHOENIX spectrum: {phoenix_spectrum_path}\n")
+        if phoenix_cache_dir is not None:
+            f.write(f"PHOENIX cache dir: {phoenix_cache_dir}\n")
         f.write(f"Output directory: {output_dir}\n\n")
 
         # Wavelength/spectral setup
@@ -412,6 +421,8 @@ def save_run_config(
             f.write(f"\nMCMC warmup: {MCMC_NUM_WARMUP:,}\n")
             f.write(f"MCMC samples: {MCMC_NUM_SAMPLES:,}\n")
             f.write(f"MCMC chains: {MCMC_NUM_CHAINS}\n")
+            f.write(f"MCMC chain method: {MCMC_CHAIN_METHOD}\n")
+            f.write(f"MCMC require GPU per chain: {MCMC_REQUIRE_GPU_PER_CHAIN}\n")
             f.write(f"MCMC max tree depth: {MCMC_MAX_TREE_DEPTH}\n")
         else:
             f.write("\nMCMC: SKIPPED (SVI only)\n")

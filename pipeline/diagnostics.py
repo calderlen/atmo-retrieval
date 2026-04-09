@@ -133,6 +133,8 @@ def build_primary_diagnostic_context(
     phase_mode: str = "global",
     atmosphere_regions: list[dict[str, Any]] | None = None,
     apply_sysrem: bool | None = None,
+    phoenix_spectrum_path: str | Path | None = None,
+    phoenix_cache_dir: str | Path | None = None,
 ) -> PrimaryDiagnosticContext:
     if data_format != "timeseries":
         raise ValueError("Diagnostics currently only support data_format='timeseries'.")
@@ -227,6 +229,12 @@ def build_primary_diagnostic_context(
             opa_atoms=opa_atoms,
             region_name=primary_region_name,
             Tstar=model_params["T_star"],
+            logg_star=model_params["logg_star"],
+            metallicity=model_params["Fe_H"],
+            Mstar=model_params["M_star"],
+            Rstar=model_params["R_star"],
+            phoenix_spectrum_path=phoenix_spectrum_path,
+            phoenix_cache_dir=phoenix_cache_dir,
             phase_mode=phase_mode,
             apply_sysrem=bool(config.APPLY_SYSREM_DEFAULT) if apply_sysrem is None else bool(apply_sysrem),
             radial_velocity_mode="orbital",

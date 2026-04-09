@@ -21,6 +21,8 @@ MCMC_MAX_TREE_DEPTH = 10
 
 # Parallel chains
 MCMC_NUM_CHAINS = 2
+MCMC_CHAIN_METHOD = "parallel"
+MCMC_REQUIRE_GPU_PER_CHAIN = False
 # TODO: if MCMC_NUM_CHAINS = 4 w/o parallel gpus then 4 chains will run sequentially, which is fine for testing but not ideal. see how t correctly make this code run in parallel on GPUs, then change this parameter before a run
 
 

@@ -75,6 +75,7 @@ PLANETS = {
             # Planetary parameters
             "M_p": 3.382,                # M_J (upper limit)
             "M_p_err": 0.13,
+            "M_p_upper_3sigma": 3.382,
             "R_p": 1.741,                # R_J
             "R_p_err": 0.07,
             "T_eq": 2262,                # K
@@ -136,6 +137,7 @@ PLANETS = {
             # Planetary parameters
             "M_p": 3.382,
             "M_p_err": 0.13,
+            "M_p_upper_3sigma": 3.382,
             "R_p": 1.741,
             "R_p_err": 0.07,
             "T_eq": nan,
@@ -193,6 +195,7 @@ PLANETS = {
             # Planetary parameters
             "M_p": 3.382,
             "M_p_err": 0.13,
+            "M_p_upper_3sigma": 3.382,
             "R_p": 1.735,
             "R_p_err": 0.07,
             "T_eq": nan,

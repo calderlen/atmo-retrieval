@@ -17,14 +17,21 @@ from numpyro.infer.initialization import init_to_value, init_to_median
 def create_prior_guide(
     Mp_mean: float,
     Mp_std: float,
+    Mp_upper_3sigma: float | None,
+    Rp_mean: float,
+    Rp_std: float,
     Rstar_mean: float,
     Rstar_std: float,
 ) -> Callable:
     def prior_guide(*args, **kwargs) -> dict:
         del args, kwargs
-        Mp = numpyro.sample("Mp", dist.TruncatedNormal(Mp_mean, Mp_std, low=0.0))
+        if Mp_upper_3sigma is not None:
+            Mp = numpyro.sample("Mp", dist.HalfNormal(Mp_upper_3sigma / 3.0))
+        else:
+            Mp = numpyro.sample("Mp", dist.TruncatedNormal(Mp_mean, Mp_std, low=0.0))
+        Rp = numpyro.sample("Rp", dist.TruncatedNormal(Rp_mean, Rp_std, low=0.0))
         Rstar = numpyro.sample("Rstar", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0))
-        return {"Mp": Mp, "Rstar": Rstar}
+        return {"Mp": Mp, "Rp": Rp, "Rstar": Rstar}
 
     return prior_guide
 
@@ -33,11 +40,22 @@ def build_guide(
     model_c: Callable,
     Mp_mean: float,
     Mp_std: float,
+    Mp_upper_3sigma: float | None,
+    Rp_mean: float,
+    Rp_std: float,
     Rstar_mean: float,
     Rstar_std: float,
 ) -> AutoGuideList:
     guide = AutoGuideList(model_c)
-    prior_guide = create_prior_guide(Mp_mean, Mp_std, Rstar_mean, Rstar_std)
+    prior_guide = create_prior_guide(
+        Mp_mean,
+        Mp_std,
+        Mp_upper_3sigma,
+        Rp_mean,
+        Rp_std,
+        Rstar_mean,
+        Rstar_std,
+    )
     guide.append(prior_guide)
 
     def _hide_from_autoguide(site: dict) -> bool:
@@ -93,6 +111,9 @@ def run_svi(
     model_inputs: dict[str, object],
     Mp_mean: float,
     Mp_std: float,
+    Mp_upper_3sigma: float | None,
+    Rp_mean: float,
+    Rp_std: float,
     Rstar_mean: float,
     Rstar_std: float,
     output_dir: str,
@@ -101,7 +122,16 @@ def run_svi(
     lr_decay_steps: int | None = None,
     lr_decay_rate: float | None = None,
 ) -> tuple[dict, jnp.ndarray, Callable, dict, AutoGuideList]:
-    guide = build_guide(model_c, Mp_mean, Mp_std, Rstar_mean, Rstar_std)
+    guide = build_guide(
+        model_c,
+        Mp_mean,
+        Mp_std,
+        Mp_upper_3sigma,
+        Rp_mean,
+        Rp_std,
+        Rstar_mean,
+        Rstar_std,
+    )
     optimizer = build_svi_optimizer(lr, decay_steps=lr_decay_steps, decay_rate=lr_decay_rate)
     svi = SVI(model_c, guide, optimizer, loss=Trace_ELBO())
 
@@ -115,7 +145,8 @@ def run_svi(
     losses = svi_result.losses
 
     svi_median = guide[-1].median(params)
-    svi_median.update({"Mp": Mp_mean, "Rstar": Rstar_mean})
+    Mp_init = Mp_upper_3sigma / 3.0 if Mp_upper_3sigma is not None else Mp_mean
+    svi_median.update({"Mp": Mp_init, "Rp": Rp_mean, "Rstar": Rstar_mean})
     init_strategy = init_to_value(values=svi_median)
 
     save_svi_outputs(params, losses, svi_median, output_dir)

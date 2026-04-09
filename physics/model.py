@@ -29,7 +29,6 @@ from exojax.database import molinfo
 from exojax.opacity.opacont import OpaCIA
 from exojax.opacity.premodit.api import OpaPremodit
 from exojax.postproc.specop import SopInstProfile, SopRotation
-from exojax.rt.planck import piBarr
 from exojax.utils.astrofunc import gravity_jupiter as gravity_surface
 from exojax.utils.constants import MJ, RJ, Rs
 
@@ -69,6 +68,7 @@ class SharedSystemConfig:
     Rp_std: float
     Mp_mean: float
     Mp_std: float
+    Mp_upper_3sigma: float | None
     Rstar_mean: float
     Rstar_std: float
     period_day: float
@@ -115,6 +115,7 @@ class SpectroscopicObservationConfig:
     subtract_per_exposure_mean: bool
     apply_sysrem: bool
     Tstar: float | None
+    stellar_surface_flux: jnp.ndarray | None = None
     sample_prefix: str | None = None
 
 
@@ -133,6 +134,7 @@ class BandpassObservationConfig:
     observable: BandpassObservable
     photon_weighted: bool
     Tstar: float | None
+    stellar_surface_flux: jnp.ndarray | None = None
     include_reflection: bool = False
     semi_major_axis_au: float | None = None
     geometric_albedo_bounds: tuple[float, float] | None = None
@@ -1205,6 +1207,7 @@ def compute_model_timeseries(
     beta_inst: float,
     period_day: float,
     Tstar: float | None = None,
+    stellar_surface_flux: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     rt = art.run(dtau, Tarr, mmw_profile, Rp, g_ref)
 
@@ -1219,10 +1222,11 @@ def compute_model_timeseries(
     if mode == "transmission":
         return jnp.sqrt(planet_ts) * (Rp / Rstar)
 
-    if Tstar is None:
-        raise ValueError("Tstar is required for emission mode.")
-
-    Fs = piBarr(nu_grid, Tstar)
+    Fs = _resolve_emission_stellar_surface_flux(
+        nu_grid=nu_grid,
+        stellar_surface_flux=stellar_surface_flux,
+        context="compute_model_timeseries",
+    )
     Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
     return planet_ts / jnp.clip(Fs_ts, EPS, None) * (Rp / Rstar) ** 2
 
@@ -1409,7 +1413,10 @@ def _sample_shared_system_state(
             dist.TruncatedNormal(shared_config.Kp_mean, shared_config.Kp_std, low=0.0),
         )
     Vsys = jnp.asarray(shared_config.Vsys_mean)
-    Mp = numpyro.sample("Mp", dist.TruncatedNormal(shared_config.Mp_mean, shared_config.Mp_std, low=0.0)) * MJ
+    if shared_config.Mp_upper_3sigma is not None:
+        Mp = numpyro.sample("Mp", dist.HalfNormal(shared_config.Mp_upper_3sigma / 3.0)) * MJ
+    else:
+        Mp = numpyro.sample("Mp", dist.TruncatedNormal(shared_config.Mp_mean, shared_config.Mp_std, low=0.0)) * MJ
     Rstar = numpyro.sample(
         "Rstar",
         dist.TruncatedNormal(shared_config.Rstar_mean, shared_config.Rstar_std, low=0.0),
@@ -1564,14 +1571,40 @@ def _compute_native_observable_spectrum(
     g_ref: float | jnp.ndarray,
     nu_grid: jnp.ndarray,
     Tstar: float | None = None,
+    stellar_surface_flux: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     rt = art.run(dtau, Tarr, mmw_profile, Rp, g_ref)
 
     if mode == "transmission":
         return jnp.sqrt(rt) * (Rp / Rstar)
 
-    Fs = piBarr(nu_grid, Tstar)
+    Fs = _resolve_emission_stellar_surface_flux(
+        nu_grid=nu_grid,
+        stellar_surface_flux=stellar_surface_flux,
+        context="_compute_native_observable_spectrum",
+    )
     return rt / jnp.clip(Fs, EPS, None) * (Rp / Rstar) ** 2
+
+
+def _resolve_emission_stellar_surface_flux(
+    *,
+    nu_grid: jnp.ndarray,
+    stellar_surface_flux: jnp.ndarray | None,
+    context: str,
+) -> jnp.ndarray:
+    if stellar_surface_flux is None:
+        raise ValueError(
+            f"{context} requires stellar_surface_flux for emission mode. "
+            "Provide phoenix_spectrum_path when building the observation config."
+        )
+
+    stellar_surface_flux = jnp.asarray(stellar_surface_flux)
+    if stellar_surface_flux.shape != nu_grid.shape:
+        raise ValueError(
+            f"{context} expected stellar_surface_flux.shape={nu_grid.shape}, "
+            f"got {stellar_surface_flux.shape}."
+        )
+    return stellar_surface_flux
 
 
 def _gaussian_log_likelihood(
@@ -1740,6 +1773,7 @@ def _evaluate_spectroscopic_component(
         beta_inst=component_config.beta_inst,
         period_day=shared_config.period_day,
         Tstar=component_config.Tstar,
+        stellar_surface_flux=component_config.stellar_surface_flux,
     )
     model_ts = apply_model_pipeline_corrections(
         model_ts,
@@ -1782,6 +1816,7 @@ def _evaluate_bandpass_component(
         g_ref=shared_state.g_ref,
         nu_grid=component_config.nu_grid,
         Tstar=component_config.Tstar,
+        stellar_surface_flux=component_config.stellar_surface_flux,
     )
     observable_spectrum = _transform_bandpass_observable(
         spectrum,
@@ -1912,6 +1947,7 @@ def build_shared_system_config(
     Kp_low = params.get("Kp_low")
     Kp_high = params.get("Kp_high")
     Kp_bounds = None
+    Mp_upper_3sigma = params.get("M_p_upper_3sigma")
     if (Kp_low is not None) and (Kp_high is not None):
         Kp_bounds = (Kp_low, Kp_high)
 
@@ -1925,6 +1961,7 @@ def build_shared_system_config(
         Rp_std=params["R_p_err"],
         Mp_mean=params["M_p"],
         Mp_std=params["M_p_err"],
+        Mp_upper_3sigma=Mp_upper_3sigma,
         Rstar_mean=params["R_star"],
         Rstar_std=params["R_star_err"],
         period_day=params["period"],
@@ -2021,6 +2058,7 @@ def build_spectroscopic_observation_config(
     instrument_resolution: float,
     inst_nus: jnp.ndarray,
     Tstar: float | None = None,
+    stellar_surface_flux: jnp.ndarray | np.ndarray | None = None,
     radial_velocity_mode: RVBehavior = "orbital",
     phase_mode: PhaseMode | None = config.DEFAULT_PHASE_MODE,
     likelihood_kind: SpectroscopicLikelihood = "matched_filter",
@@ -2035,6 +2073,19 @@ def build_spectroscopic_observation_config(
 
     nu_grid = jnp.asarray(nu_grid)
     inst_nus = jnp.asarray(inst_nus)
+    stellar_surface_flux_arr = None
+    if stellar_surface_flux is not None:
+        stellar_surface_flux_arr = jnp.asarray(stellar_surface_flux)
+        if stellar_surface_flux_arr.shape != nu_grid.shape:
+            raise ValueError(
+                f"stellar_surface_flux shape {stellar_surface_flux_arr.shape} does not match "
+                f"nu_grid shape {nu_grid.shape}"
+            )
+    if mode == "emission" and stellar_surface_flux_arr is None:
+        raise ValueError(
+            "Emission spectroscopic observations require stellar_surface_flux. "
+            "Provide phoenix_spectrum_path when building the observation config."
+        )
     check_grid_resolution(nu_grid, instrument_resolution)
     beta_inst = 1.0 / (instrument_resolution * 2.3548200450309493)
 
@@ -2059,6 +2110,7 @@ def build_spectroscopic_observation_config(
         subtract_per_exposure_mean=subtract_per_exposure_mean,
         apply_sysrem=apply_sysrem,
         Tstar=Tstar,
+        stellar_surface_flux=stellar_surface_flux_arr,
         sample_prefix=sample_prefix,
     )
 
@@ -2091,6 +2143,7 @@ def build_bandpass_observation_config(
     observable: BandpassObservable,
     photon_weighted: bool = False,
     Tstar: float | None = None,
+    stellar_surface_flux: jnp.ndarray | np.ndarray | None = None,
     include_reflection: bool = False,
     semi_major_axis_au: float | None = None,
     geometric_albedo_bounds: tuple[float, float] | None = None,
@@ -2105,6 +2158,19 @@ def build_bandpass_observation_config(
     nu_grid = jnp.asarray(nu_grid)
     wavelength_m = jnp.asarray(wavelength_m)
     response = jnp.asarray(response)
+    stellar_surface_flux_arr = None
+    if stellar_surface_flux is not None:
+        stellar_surface_flux_arr = jnp.asarray(stellar_surface_flux)
+        if stellar_surface_flux_arr.shape != nu_grid.shape:
+            raise ValueError(
+                f"stellar_surface_flux shape {stellar_surface_flux_arr.shape} does not match "
+                f"nu_grid shape {nu_grid.shape}"
+            )
+    if mode == "emission" and stellar_surface_flux_arr is None:
+        raise ValueError(
+            "Emission bandpass observations require stellar_surface_flux. "
+            "Provide phoenix_spectrum_path when building the observation config."
+        )
     if wavelength_m.shape != response.shape:
         raise ValueError(
             f"wavelength_m shape {wavelength_m.shape} does not match response shape {response.shape}"
@@ -2123,6 +2189,7 @@ def build_bandpass_observation_config(
         observable=observable,
         photon_weighted=photon_weighted,
         Tstar=Tstar,
+        stellar_surface_flux=stellar_surface_flux_arr,
         include_reflection=include_reflection,
         semi_major_axis_au=semi_major_axis_au,
         geometric_albedo_bounds=geometric_albedo_bounds,

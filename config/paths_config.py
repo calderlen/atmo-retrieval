@@ -17,6 +17,8 @@ PROJECT_ROOT = Path(__file__).parent.parent
 
 INPUT_DIR = PROJECT_ROOT / "input"
 INPUT_DIR.mkdir(exist_ok=True)
+PHOENIX_CACHE_DIR = Path(os.environ.get("PHOENIX_CACHE_DIR") or INPUT_DIR / ".phoenix_cache")
+PHOENIX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ==============================================================================
 # DATABASE PATHS

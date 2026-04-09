@@ -67,6 +67,26 @@ OSC:
 			- 42 GPU (32GB) nodes, NVIDIA Volta V100 GPUs, 48 cores per node, 384GB RAM, 2 GPUs per node, 1TB local disk space
 			- 4 Dense GPU nodes, NVIDIA Volta V100 GPUs, 48 cores per node, 768GB RAM, 4 GPUs per node, 4 TB local disk space
 		- Ascend	
+			- quad gpu mode
+				- 24 servers (nodes) each with 
+					- with 4 NVIDIA A100s each, each with 80GB VRAM
+					- 1 TB ram
+					- 2 AMD EPYC 7643 CPUs
+						- 48 cores per CPU
+			- triple gpu mode
+				- 84 servers (nodes) 
+					- 3 NVIDIA A100s, each with 40GB VRAM
+					- 2 AMD EPYC 7H12 processors
+						- 64 cores per CPU
+					- 512GB RAM
+			- dual gpu mode
+				- 214 servers (nodes) each with
+					- 2 NVIDIA A100s, each with 40GB VRAM
+					- 2 AMD EPYC 7H12 CPUs
+						- 64 cores per CPU
+					- 512GB RAM
+			2 login nodes --- IP address: 192.148.247.[180-181]
+
 - limits
 	- 168hr for single node jobs
 	- 96hr for mutli-node jobs

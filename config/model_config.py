@@ -31,7 +31,7 @@ T_HIGH = 4500.0
 # Guillot profile defaults and bounds
 TINT_FIXED = 100.0
 LOG_KAPPA_IR_BOUNDS = (-4.0, 0.0)
-LOG_GAMMA_BOUNDS = (-2.0, 2.0)
+LOG_GAMMA_BOUNDS = (0.0, 2.0)
 
 # Model/inference defaults
 DEFAULT_KP = 169.0  # planet radial velocity semi-amplitude [km/s]
