@@ -58,8 +58,8 @@ DEFAULT_PHASE_MODE = "global"
 # SPECTRAL GRID PARAMETERS
 # ==============================================================================
 
-#N_SPECTRAL_POINTS = 250000
-N_SPECTRAL_POINTS = 50000
+N_SPECTRAL_POINTS = 500000
+#N_SPECTRAL_POINTS = 50000
 WAV_MIN_OFFSET = 100  # Angstroms
 WAV_MAX_OFFSET = 100  # Angstroms
 

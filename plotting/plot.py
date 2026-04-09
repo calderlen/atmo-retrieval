@@ -8,6 +8,53 @@ from exojax.plot.atmplot import plotcf
 from physics.model import reconstruct_temperature_profile
 
 
+_CORNER_LOG10_BASES = frozenset({"kappa_ir_cgs", "gamma"})
+
+
+def _basename(name: str) -> str:
+    return name.split("/")[-1]
+
+
+def _replace_basename(name: str, new_base: str) -> str:
+    if "/" not in name:
+        return new_base
+    prefix, _ = name.rsplit("/", 1)
+    return f"{prefix}/{new_base}"
+
+
+def _augment_corner_samples(sample_dict: dict | None) -> dict | None:
+    if sample_dict is None:
+        return None
+
+    augmented = dict(sample_dict)
+    for name, values in sample_dict.items():
+        base = _basename(name)
+        if base not in _CORNER_LOG10_BASES:
+            continue
+
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0 or np.any(~np.isfinite(arr)) or np.any(arr <= 0.0):
+            continue
+
+        augmented[_replace_basename(name, f"log10_{base}")] = np.log10(arr)
+
+    return augmented
+
+
+def _corner_label(name: str) -> str:
+    base = _basename(name)
+    if base.startswith("log10_"):
+        label = f"log10({base[6:]})"
+    else:
+        label = base
+
+    if "/" not in name:
+        return label
+
+    prefix, _ = name.rsplit("/", 1)
+    return f"{prefix}/{label}"
+
+
 def plot_svi_loss(loss_values: np.ndarray, save_path: str) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
     x = np.arange(len(loss_values))
@@ -163,7 +210,8 @@ def _corner_data(
         arr = arr.reshape(arr.shape[0], -1)
         for j in range(arr.shape[1]):
             cols.append(arr[:, j])
-            labels.append(var if arr.shape[1] == 1 else f"{var}[{j}]")
+            base_label = _corner_label(var)
+            labels.append(base_label if arr.shape[1] == 1 else f"{base_label}[{j}]")
     if not cols:
         return None, None
     return np.column_stack(cols), labels
@@ -182,13 +230,10 @@ def _default_corner_variables(sample_dict: dict) -> list[str]:
     if not sample_dict:
         return []
 
-    def _basename(name: str) -> str:
-        return name.split("/")[-1]
-
     priority = [
         "Kp", "dRV", "dRV_0", "dRV_slope",
         "Rp", "Mp", "Rstar",
-        "T0", "T_bottom", "T_top", "Tirr", "kappa_ir_cgs", "gamma",
+        "T0", "T_bottom", "T_top", "Tirr", "log10_kappa_ir_cgs", "log10_gamma",
         "T_deep", "log_P_trans", "delta_P",
         "log_metallicity", "C_O_ratio",
     ]
@@ -215,6 +260,10 @@ def _default_corner_variables(sample_dict: dict) -> list[str]:
 
     for name in sorted(corner_ready):
         base = _basename(name)
+        if base in _CORNER_LOG10_BASES:
+            log_name = _replace_basename(name, f"log10_{base}")
+            if log_name in corner_ready:
+                continue
         if name in selected or base in skip_names or base.endswith("_kms"):
             continue
         selected.append(name)
@@ -272,16 +321,19 @@ def save_retrieval_corner_plots(
     svi_samples: dict | None = None,
     variables: list[str] | None = None,
 ) -> None:
-    if hmc_samples is None and svi_samples is None:
+    hmc_corner_samples = _augment_corner_samples(hmc_samples)
+    svi_corner_samples = _augment_corner_samples(svi_samples)
+
+    if hmc_corner_samples is None and svi_corner_samples is None:
         print("No posterior samples available for corner plots; skipping.")
         return
 
     if variables is None:
         merged_samples = {}
-        if hmc_samples is not None:
-            merged_samples.update(hmc_samples)
-        if svi_samples is not None:
-            for key, value in svi_samples.items():
+        if hmc_corner_samples is not None:
+            merged_samples.update(hmc_corner_samples)
+        if svi_corner_samples is not None:
+            for key, value in svi_corner_samples.items():
                 merged_samples.setdefault(key, value)
         variables = _default_corner_variables(merged_samples)
 
@@ -289,34 +341,37 @@ def save_retrieval_corner_plots(
         print("No suitable variables for corner plots; skipping.")
         return
 
-    if svi_samples is not None:
-        svi_vars = [v for v in variables if v in svi_samples]
+    if svi_corner_samples is not None:
+        svi_vars = [v for v in variables if v in svi_corner_samples]
         if svi_vars:
             plot_corner(
-                svi_samples=svi_samples,
+                svi_samples=svi_corner_samples,
                 variables=svi_vars,
                 save_path=os.path.join(output_dir, "corner_plot_svi.png"),
             )
         else:
             print("No SVI variables available for corner_plot_svi.png; skipping.")
 
-    if hmc_samples is not None:
-        hmc_vars = [v for v in variables if v in hmc_samples]
+    if hmc_corner_samples is not None:
+        hmc_vars = [v for v in variables if v in hmc_corner_samples]
         if hmc_vars:
             plot_corner(
-                hmc_samples=hmc_samples,
+                hmc_samples=hmc_corner_samples,
                 variables=hmc_vars,
                 save_path=os.path.join(output_dir, "corner_plot_hmc.png"),
             )
         else:
             print("No HMC variables available for corner_plot_hmc.png; skipping.")
 
-    if hmc_samples is not None and svi_samples is not None:
-        overlay_vars = [v for v in variables if v in hmc_samples and v in svi_samples]
+    if hmc_corner_samples is not None and svi_corner_samples is not None:
+        overlay_vars = [
+            v for v in variables
+            if v in hmc_corner_samples and v in svi_corner_samples
+        ]
         if overlay_vars:
             plot_corner(
-                hmc_samples=hmc_samples,
-                svi_samples=svi_samples,
+                hmc_samples=hmc_corner_samples,
+                svi_samples=svi_corner_samples,
                 variables=overlay_vars,
                 save_path=os.path.join(output_dir, "corner_plot_overlay.png"),
             )

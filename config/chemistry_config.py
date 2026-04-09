@@ -61,6 +61,14 @@ FASTCHEM_HYBRID_N_CO_RATIO = 17
 FASTCHEM_HYBRID_METALLICITY_RANGE = METALLICITY_RANGE
 FASTCHEM_HYBRID_CO_RATIO_RANGE = CO_RATIO_RANGE
 
+# Bonidie-style hybrid chemistry:
+# free constant VMRs only for the detected refractory line species,
+# with fixed-composition FastChem used for H-, e-, and H.
+BONIDIE_FREE_ATOMIC_SPECIES = ("Fe I", "Ni I", "Ca I")
+BONIDIE_FREE_MOLECULAR_SPECIES = ()
+BONIDIE_CONTINUUM_SPECIES = FASTCHEM_HYBRID_CONTINUUM_SPECIES
+BONIDIE_LOG_METALLICITY = 0.0
+
 # ==============================================================================
 # DISEQUILIBRIUM CHEMISTRY
 # ==============================================================================

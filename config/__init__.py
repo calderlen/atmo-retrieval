@@ -165,6 +165,10 @@ from .chemistry_config import (
     FASTCHEM_HYBRID_N_CO_RATIO,
     FASTCHEM_HYBRID_METALLICITY_RANGE,
     FASTCHEM_HYBRID_CO_RATIO_RANGE,
+    BONIDIE_FREE_ATOMIC_SPECIES,
+    BONIDIE_FREE_MOLECULAR_SPECIES,
+    BONIDIE_CONTINUUM_SPECIES,
+    BONIDIE_LOG_METALLICITY,
     LOG_KZZ_RANGE,
     LOG_QUENCH_P_RANGE,
 )
@@ -202,6 +206,12 @@ from .tellurics_config import (
     TELLURIC_VRMAX,
 )
 
+from .runtime_profiles import (
+    CONFIG_PROFILE_ENVVAR,
+    CONFIG_PROFILES,
+    DEFAULT_RUNTIME_PROFILE,
+)
+
 
 _RUNTIME_CONFIG_MODULES = (
     _planets_config,
@@ -215,6 +225,8 @@ _RUNTIME_CONFIG_MODULES = (
     _tellurics_config,
 )
 
+_active_runtime_profile = DEFAULT_RUNTIME_PROFILE
+
 
 def set_runtime_config(name: str, value) -> None:
     """Update a config variable across the package and source modules."""
@@ -222,6 +234,52 @@ def set_runtime_config(name: str, value) -> None:
     for module in _RUNTIME_CONFIG_MODULES:
         if hasattr(module, name):
             setattr(module, name, value)
+
+
+def list_runtime_profiles() -> tuple[str, ...]:
+    """Return available named runtime profiles."""
+    return tuple(CONFIG_PROFILES.keys())
+
+
+def get_runtime_profile_name() -> str:
+    """Return the currently active runtime profile name."""
+    return _active_runtime_profile
+
+
+def get_runtime_profile(profile_name: str | None = None) -> dict:
+    """Return the profile definition for the active or requested profile."""
+    normalized = _normalize_runtime_profile_name(
+        profile_name if profile_name is not None else _active_runtime_profile
+    )
+    return CONFIG_PROFILES[normalized]
+
+
+def _normalize_runtime_profile_name(profile_name: str) -> str:
+    normalized = str(profile_name).strip().lower()
+    if normalized not in CONFIG_PROFILES:
+        available = ", ".join(sorted(CONFIG_PROFILES))
+        raise ValueError(
+            f"Unknown runtime profile {profile_name!r}. "
+            f"Available profiles: {available}."
+        )
+    return normalized
+
+
+def apply_runtime_profile(profile_name: str) -> str:
+    """Apply a named runtime profile across config modules."""
+    global _active_runtime_profile
+
+    normalized = _normalize_runtime_profile_name(profile_name)
+    profile = CONFIG_PROFILES[normalized]
+    for name, value in profile["overrides"].items():
+        set_runtime_config(name, value)
+    _active_runtime_profile = normalized
+    return normalized
+
+
+apply_runtime_profile(
+    os.environ.get(CONFIG_PROFILE_ENVVAR) or DEFAULT_RUNTIME_PROFILE
+)
 
 
 def save_run_config(
@@ -284,6 +342,7 @@ def save_run_config(
         f.write("RETRIEVAL CONFIGURATION\n")
         f.write("-" * 70 + "\n")
         f.write(f"Mode: {mode}\n")
+        f.write(f"Config profile: {get_runtime_profile_name()}\n")
         f.write(f"P-T profile: {pt_profile}\n")
         if chemistry_model is not None:
             f.write(f"Chemistry model: {chemistry_model}\n")

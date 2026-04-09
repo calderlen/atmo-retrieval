@@ -35,6 +35,7 @@ from dataio.collapse_transmission_timeseries_to_1d import (
     get_phase_bin_mask,
     get_sysrem_chunk_indices,
 )
+from dataio.horus import remove_doppler_shadow
 
 
 def _output_dir_for(planet: str, epoch: str, arm: str) -> Path:
@@ -248,6 +249,113 @@ def _sanitize_columns(
     return wavelength, data, sigma
 
 
+def _shadow_status(
+    *,
+    applied: bool,
+    skip_reason: str | None = None,
+    scaling: float | None = None,
+) -> dict[str, Any]:
+    return {
+        "applied": bool(applied),
+        "skip_reason": skip_reason,
+        "scaling": scaling,
+    }
+
+
+def _is_missing_numeric(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        return not bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return True
+
+
+def _build_shadow_inputs(
+    planet_cfg: dict[str, Any],
+    phase: np.ndarray,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    phase = np.asarray(phase, dtype=float)
+    if phase.ndim != 1 or phase.size == 0 or not np.all(np.isfinite(phase)):
+        reason = "invalid_phase_array"
+        print(f"Warning: skipping Doppler shadow removal ({reason}).")
+        return None, _shadow_status(applied=False, skip_reason=reason)
+
+    planet_field_names = ("rp_rs", "b", "lambda_angle", "a_rs", "period")
+    stellar_field_map = {
+        "vsini": "v_sini_star",
+        "gamma1": "gamma1",
+        "gamma2": "gamma2",
+    }
+
+    missing: list[str] = []
+    planet_params: dict[str, float] = {}
+    for field_name in planet_field_names:
+        value = planet_cfg.get(field_name)
+        if _is_missing_numeric(value):
+            missing.append(field_name)
+        else:
+            planet_params[field_name] = float(value)
+
+    stellar_params: dict[str, float] = {}
+    for out_name, cfg_name in stellar_field_map.items():
+        value = planet_cfg.get(cfg_name)
+        if _is_missing_numeric(value):
+            missing.append(cfg_name)
+        else:
+            stellar_params[out_name] = float(value)
+
+    if missing:
+        reason = f"missing_or_invalid_shadow_params: {', '.join(missing)}"
+        print(f"Warning: skipping Doppler shadow removal ({reason}).")
+        return None, _shadow_status(applied=False, skip_reason=reason)
+
+    return {
+        "phase": phase,
+        "planet_params": planet_params,
+        "stellar_params": stellar_params,
+    }, _shadow_status(applied=False)
+
+
+def _apply_default_doppler_shadow(
+    data: np.ndarray,
+    wavelength: np.ndarray,
+    phase: np.ndarray,
+    *,
+    planet_cfg: dict[str, Any],
+    subtract_median: bool,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    data = np.asarray(data, dtype=float)
+    wavelength = np.asarray(wavelength, dtype=float)
+    phase = np.asarray(phase, dtype=float)
+
+    if not subtract_median:
+        reason = "subtract_median_disabled"
+        print("Warning: skipping Doppler shadow removal because --no-subtract-median was used.")
+        return data, _shadow_status(applied=False, skip_reason=reason)
+
+    shadow_inputs, status = _build_shadow_inputs(planet_cfg, phase)
+    if shadow_inputs is None:
+        return data, status
+
+    print("Applying Doppler shadow removal to retrieval-prep cube...")
+    corrected_data, _shadow_model, fit_info = remove_doppler_shadow(
+        data,
+        wavelength,
+        shadow_inputs["phase"],
+        shadow_inputs["planet_params"],
+        shadow_inputs["stellar_params"],
+    )
+    scaling = fit_info.get("scaling")
+    scaling_value = None if _is_missing_numeric(scaling) else float(scaling)
+    if scaling_value is not None:
+        print(f"  Doppler shadow scaling: {scaling_value:.6g}")
+    return np.asarray(corrected_data, dtype=float), _shadow_status(
+        applied=True,
+        scaling=scaling_value,
+    )
+
+
 def _sysrem_vdiag_from_sigma(sigma: np.ndarray) -> np.ndarray:
     exposure_sigma = np.sqrt(np.mean(np.square(sigma), axis=1))
     return 1.0 / np.clip(exposure_sigma, 1.0e-30, None)
@@ -311,6 +419,7 @@ def _save_metadata(
     subtract_median: bool,
     run_sysrem: bool,
     regrid: bool,
+    doppler_shadow_status: dict[str, Any],
 ) -> None:
     metadata = {
         "planet": planet,
@@ -328,6 +437,9 @@ def _save_metadata(
         "regrid": bool(regrid),
         "subtract_median": bool(subtract_median),
         "run_sysrem": bool(run_sysrem),
+        "doppler_shadow_applied": bool(doppler_shadow_status.get("applied", False)),
+        "doppler_shadow_skip_reason": doppler_shadow_status.get("skip_reason"),
+        "doppler_shadow_scaling": doppler_shadow_status.get("scaling"),
     }
     (output_dir / "timeseries_prep.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",
@@ -484,7 +596,16 @@ def main() -> int:
     print(f"Loaded {n_spectra} exposures with {npix} pixels each before selection.")
 
     t0 = _nearest_transit_midpoint(np.asarray(jd), reference_epoch, period)
-    phase = get_orbital_phase(np.asarray(jd), t0, period, ra, dec)
+    phase = np.asarray(get_orbital_phase(np.asarray(jd), t0, period, ra, dec), dtype=float)
+    wave_1d_full = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave, dtype=float)
+    data = np.asarray(data, dtype=float)
+    data, doppler_shadow_status = _apply_default_doppler_shadow(
+        data,
+        wave_1d_full,
+        phase,
+        planet_cfg=planet_cfg,
+        subtract_median=args.subtract_median,
+    )
     selection = _phase_selection_mask(
         phase,
         phase_bin=args.phase_bin,
@@ -556,6 +677,7 @@ def main() -> int:
         subtract_median=args.subtract_median,
         run_sysrem=args.run_sysrem,
         regrid=args.regrid,
+        doppler_shadow_status=doppler_shadow_status,
     )
 
     print("\nSaved retrieval-ready time-series products:")

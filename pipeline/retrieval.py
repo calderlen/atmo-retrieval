@@ -22,7 +22,7 @@ from dataio.load import (
     load_observed_spectrum,
     parse_nasa_archive_tbl,
 )
-from physics.chemistry import ConstantVMR, FastChemHybridChemistry
+from physics.chemistry import BonidieChemistry, ConstantVMR, FastChemHybridChemistry, FreeVMR
 from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from databases.opacity import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
 from physics.model import (
@@ -306,6 +306,34 @@ def _build_composition_solver(
     if model == "constant":
         return ConstantVMR()
 
+    if model == "free":
+        return FreeVMR()
+
+    if model == "bonidie":
+        parameter_file = fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
+        if parameter_file is None:
+            raise ValueError(
+                "chemistry_model='bonidie' requires a FastChem parameters.dat "
+                "path. Pass --fastchem-parameter-file or set "
+                "FASTCHEM_PARAMETER_FILE in config."
+            )
+
+        return BonidieChemistry(
+            fastchem_parameter_file=parameter_file,
+            free_atomic_species=tuple(config.BONIDIE_FREE_ATOMIC_SPECIES),
+            free_molecular_species=tuple(config.BONIDIE_FREE_MOLECULAR_SPECIES),
+            continuum_species=tuple(config.BONIDIE_CONTINUUM_SPECIES),
+            log_metallicity=float(config.BONIDIE_LOG_METALLICITY),
+            log_vmr_min=float(config.LOG_VMR_MIN),
+            log_vmr_max=float(config.LOG_VMR_MAX),
+            h2_he_ratio=float(config.H2_HE_RATIO),
+            n_temp=int(config.FASTCHEM_N_TEMP),
+            n_pressure=int(config.FASTCHEM_N_PRESSURE),
+            t_min=float(config.FASTCHEM_T_MIN),
+            t_max=float(config.FASTCHEM_T_MAX),
+            cache_dir=config.FASTCHEM_CACHE_DIR,
+        )
+
     if model == "fastchem_hybrid_grid":
         parameter_file = fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
         if parameter_file is None:
@@ -334,7 +362,7 @@ def _build_composition_solver(
 
     raise ValueError(
         f"Unknown chemistry_model: {chemistry_model}. "
-        "Choose from {'constant', 'fastchem_hybrid_grid'}."
+        "Choose from {'constant', 'free', 'bonidie', 'fastchem_hybrid_grid'}."
     )
 
 
