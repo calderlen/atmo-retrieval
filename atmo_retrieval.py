@@ -571,18 +571,19 @@ def main():
         os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
         os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
-    config.apply_runtime_profile(args.config_profile)
+    runtime_config = config
+    runtime_config.apply_runtime_profile(args.config_profile)
 
     # Load config
     if args.config:
         print(f"Loading custom config: {args.config}")
         custom_config = load_custom_config(args.config)
-        config = apply_custom_config(custom_config)
+        runtime_config = apply_custom_config(custom_config)
     # Apply CLI overrides
-    config = apply_cli_overrides(args)
+    runtime_config = apply_cli_overrides(args)
 
     # Print configuration summary
-    print_config_summary(config, args)
+    print_config_summary(runtime_config, args)
 
     joint_spectra = []
     for tbl_path in args.joint_spectrum_tbl or []:
@@ -602,7 +603,7 @@ def main():
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             no_plots=args.no_plots,
-            pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
+            pt_profile=args.pt_profile or runtime_config.PT_PROFILE_DEFAULT,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
@@ -620,7 +621,7 @@ def main():
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             no_plots=args.no_plots,
-            pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
+            pt_profile=args.pt_profile or runtime_config.PT_PROFILE_DEFAULT,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
@@ -637,7 +638,7 @@ def main():
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             no_plots=args.no_plots,
-            pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
+            pt_profile=args.pt_profile or runtime_config.PT_PROFILE_DEFAULT,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
@@ -654,7 +655,7 @@ def main():
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             no_plots=args.no_plots,
-            pt_profile=args.pt_profile or config.PT_PROFILE_DEFAULT,
+            pt_profile=args.pt_profile or runtime_config.PT_PROFILE_DEFAULT,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
