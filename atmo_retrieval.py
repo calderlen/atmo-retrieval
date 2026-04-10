@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import math
 import re
 import sys
 import os
@@ -14,6 +15,9 @@ from pipeline.retrieval import (
     run_retrieval,
 )
 from pipeline.retrieval_binned import run_phase_binned_retrieval
+
+
+TESS_BTJD_OFFSET = 2457000.0
 
 
 def create_parser():
@@ -86,6 +90,200 @@ def create_parser():
         action="append",
         default=None,
         help="Explicit NASA .tbl file to include as one or more bandpass constraints",
+    )
+
+    tess_group = parser.add_argument_group("TESS Transit Fit")
+    tess_group.add_argument(
+        "--fit-tess-transit",
+        action="store_true",
+        help=(
+            "Fit raw TESS photometry with lightkurve+mlexo and inject the resulting "
+            "broadband transit constraint into the retrieval"
+        ),
+    )
+    tess_group.add_argument(
+        "--tess-target",
+        type=str,
+        default=None,
+        help="Target name to pass to lightkurve (default: reuse --planet)",
+    )
+    tess_group.add_argument(
+        "--tess-sector",
+        type=int,
+        action="append",
+        default=None,
+        help="TESS sector to include; pass multiple times to include multiple sectors",
+    )
+    tess_group.add_argument(
+        "--tess-exptime-s",
+        type=int,
+        default=120,
+        help="Requested TESS cadence in seconds for lightkurve search (default: 120)",
+    )
+    tess_group.add_argument(
+        "--tess-quality-bitmask",
+        type=str,
+        default="default",
+        help=(
+            "Lightkurve cadence quality mask for TESS downloads. "
+            "Use one of none/default/hard/hardest or an integer bitmask "
+            "(default: default)"
+        ),
+    )
+    tess_group.add_argument(
+        "--tess-flux-column",
+        type=str,
+        default="pdcsap_flux",
+        help=(
+            "Flux column to read from the downloaded TESS light curves "
+            "(default: pdcsap_flux)"
+        ),
+    )
+    tess_group.add_argument(
+        "--tess-author",
+        type=str,
+        default="SPOC",
+        help="TESS light curve author to request from lightkurve (default: SPOC)",
+    )
+    tess_group.add_argument(
+        "--tess-mission",
+        type=str,
+        default="TESS",
+        help="Mission label to pass to lightkurve (default: TESS)",
+    )
+    tess_group.add_argument(
+        "--tess-period-d",
+        type=float,
+        default=None,
+        help="Transit period in days (default: use active planet config)",
+    )
+    tess_group.add_argument(
+        "--tess-t0-btjd",
+        type=float,
+        default=None,
+        help="Transit mid-time in BTJD for the TESS fit",
+    )
+    tess_group.add_argument(
+        "--tess-t0-bjd",
+        type=float,
+        default=None,
+        help=(
+            "Transit mid-time in BJD_TDB for the TESS fit. "
+            "Converted internally to BTJD by subtracting 2457000.0"
+        ),
+    )
+    tess_group.add_argument(
+        "--tess-duration-d",
+        type=float,
+        default=None,
+        help="Transit duration in days (default: use active planet config)",
+    )
+    tess_group.add_argument(
+        "--tess-radius-ratio-guess",
+        type=float,
+        default=None,
+        help="Initial Rp/R* guess for the transit fit (default: use active planet config)",
+    )
+    tess_group.add_argument(
+        "--tess-impact-guess",
+        type=float,
+        default=None,
+        help="Initial impact-parameter guess for the transit fit (default: use active planet config)",
+    )
+    tess_group.add_argument(
+        "--tess-rho-star-solar-guess",
+        type=float,
+        default=None,
+        help="Optional stellar-density prior mean in solar-density units",
+    )
+    tess_group.add_argument(
+        "--tess-rho-star-solar-sigma",
+        type=float,
+        default=None,
+        help="Optional stellar-density prior sigma in solar-density units",
+    )
+    tess_group.add_argument(
+        "--tess-model-window-d",
+        type=float,
+        default=None,
+        help="Half-width of the TESS fit window around transit in days",
+    )
+    tess_group.add_argument(
+        "--tess-plot-window-d",
+        type=float,
+        default=None,
+        help="Half-width of the stored phase plot window in days",
+    )
+    tess_group.add_argument(
+        "--tess-flatten-window-length",
+        type=int,
+        default=None,
+        help="Savitzky-Golay window length for light-curve flattening",
+    )
+    tess_group.add_argument(
+        "--tess-outlier-sigma",
+        type=float,
+        default=None,
+        help="Sigma threshold for outlier rejection in out-of-transit cadences",
+    )
+    tess_group.add_argument(
+        "--tess-emcee-nwalkers-min",
+        type=int,
+        default=None,
+        help="Minimum number of emcee walkers for the TESS fit",
+    )
+    tess_group.add_argument(
+        "--tess-emcee-burnin-steps",
+        type=int,
+        default=None,
+        help="Number of emcee burn-in steps for the TESS fit",
+    )
+    tess_group.add_argument(
+        "--tess-emcee-production-steps",
+        type=int,
+        default=None,
+        help="Number of emcee production steps for the TESS fit",
+    )
+    tess_group.add_argument(
+        "--tess-emcee-thin",
+        type=int,
+        default=None,
+        help="Thin factor for stored TESS emcee samples",
+    )
+    tess_group.add_argument(
+        "--tess-emcee-use-pool",
+        action="store_true",
+        help="Enable multiprocessing for the TESS emcee run",
+    )
+    tess_group.add_argument(
+        "--tess-mlexo-root",
+        type=str,
+        default=None,
+        help="Path to a local mlexo checkout if it is not adjacent to this repo",
+    )
+    tess_group.add_argument(
+        "--tess-observable",
+        type=str,
+        choices=["radius_ratio", "transit_depth"],
+        default="radius_ratio",
+        help="Which fitted transit observable to pass into retrieval (default: radius_ratio)",
+    )
+    tess_group.add_argument(
+        "--tess-constraint-name",
+        type=str,
+        default="tess_transit",
+        help="Name to assign to the injected TESS bandpass constraint",
+    )
+    tess_group.add_argument(
+        "--tess-photon-weighted",
+        action="store_true",
+        help="Mark the generated TESS bandpass constraint as photon-weighted",
+    )
+    tess_group.add_argument(
+        "--tess-bandpass-tbl-output",
+        type=str,
+        default=None,
+        help="Optional path to also write the fitted TESS bandpass constraint as a NASA-style .tbl",
     )
 
     # Inference parameters
@@ -509,6 +707,156 @@ def apply_cli_overrides(args):
         config.set_runtime_config("ATOMIC_SPECIES", atoms)
 
     return config
+
+
+def _is_finite_number(value):
+    try:
+        return value is not None and math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _parse_tess_quality_bitmask(value):
+    text = str(value).strip()
+    if not text:
+        raise ValueError("--tess-quality-bitmask cannot be empty.")
+    if re.fullmatch(r"[+-]?\d+", text):
+        return int(text)
+    allowed = {"none", "default", "hard", "hardest"}
+    if text.lower() not in allowed:
+        raise ValueError(
+            "--tess-quality-bitmask must be one of none/default/hard/hardest "
+            "or an integer bitmask."
+        )
+    return text.lower()
+
+
+def _require_tess_value(cli_value, fallback_value, *, cli_flag: str, config_key: str) -> float:
+    if _is_finite_number(cli_value):
+        return float(cli_value)
+    if _is_finite_number(fallback_value):
+        return float(fallback_value)
+    raise ValueError(
+        f"Missing {config_key} for TESS transit fit. Pass {cli_flag} or add a finite "
+        f"{config_key!r} entry to the active planet config."
+    )
+
+
+def _resolve_tess_t0_btjd(args, params) -> float:
+    if _is_finite_number(args.tess_t0_btjd):
+        return float(args.tess_t0_btjd)
+    if _is_finite_number(args.tess_t0_bjd):
+        return float(args.tess_t0_bjd) - TESS_BTJD_OFFSET
+    if _is_finite_number(params.get("epoch")):
+        return float(params["epoch"]) - TESS_BTJD_OFFSET
+    raise ValueError(
+        "Missing transit mid-time for TESS transit fit. Pass --tess-t0-btjd, "
+        "--tess-t0-bjd, or add a finite 'epoch' to the active planet config."
+    )
+
+
+def _build_tess_transit_fit_config(args, params, tess_module):
+    if args.mode != "transmission":
+        raise ValueError("--fit-tess-transit is only supported for transmission retrievals.")
+
+    config_kwargs = {
+        "target": args.tess_target or args.planet,
+        "period_d": _require_tess_value(
+            args.tess_period_d,
+            params.get("period"),
+            cli_flag="--tess-period-d",
+            config_key="period",
+        ),
+        "t0_btjd": _resolve_tess_t0_btjd(args, params),
+        "transit_duration_d": _require_tess_value(
+            args.tess_duration_d,
+            params.get("duration"),
+            cli_flag="--tess-duration-d",
+            config_key="duration",
+        ),
+        "radius_ratio_guess": _require_tess_value(
+            args.tess_radius_ratio_guess,
+            params.get("rp_rs"),
+            cli_flag="--tess-radius-ratio-guess",
+            config_key="rp_rs",
+        ),
+        "impact_guess": _require_tess_value(
+            args.tess_impact_guess,
+            params.get("b"),
+            cli_flag="--tess-impact-guess",
+            config_key="b",
+        ),
+        "mission": args.tess_mission,
+        "author": args.tess_author,
+        "exptime_s": int(args.tess_exptime_s),
+        "quality_bitmask": _parse_tess_quality_bitmask(args.tess_quality_bitmask),
+        "flux_column": str(args.tess_flux_column).strip(),
+        "planet_name": args.planet,
+        "reference": args.ephemeris or config.EPHEMERIS,
+        "note": "Generated from raw TESS transit photometry via atmo_retrieval CLI",
+    }
+    if args.tess_sector:
+        config_kwargs["sectors"] = tuple(int(sector) for sector in args.tess_sector)
+    if args.tess_mlexo_root:
+        config_kwargs["mlexo_root"] = args.tess_mlexo_root
+
+    optional_numeric = {
+        "rho_star_solar_guess": args.tess_rho_star_solar_guess,
+        "rho_star_solar_sigma": args.tess_rho_star_solar_sigma,
+        "model_window_d": args.tess_model_window_d,
+        "plot_window_d": args.tess_plot_window_d,
+        "flatten_window_length": args.tess_flatten_window_length,
+        "outlier_sigma": args.tess_outlier_sigma,
+        "emcee_nwalkers_min": args.tess_emcee_nwalkers_min,
+        "emcee_burnin_steps": args.tess_emcee_burnin_steps,
+        "emcee_production_steps": args.tess_emcee_production_steps,
+        "emcee_thin": args.tess_emcee_thin,
+    }
+    for key, value in optional_numeric.items():
+        if value is not None:
+            config_kwargs[key] = value
+    if args.tess_emcee_use_pool:
+        config_kwargs["emcee_use_pool"] = True
+
+    return tess_module.TessTransitFitConfig(**config_kwargs)
+
+
+def _fit_tess_transit_constraint(args, params):
+    tess_module = importlib.import_module("dataio.tess_photometry")
+    fit_config = _build_tess_transit_fit_config(args, params, tess_module)
+
+    sector_text = (
+        ", ".join(str(sector) for sector in fit_config.sectors)
+        if fit_config.sectors
+        else "all available"
+    )
+    print("\nFitting raw TESS transit photometry for retrieval constraint...")
+    print(f"  Target: {fit_config.target}")
+    print(f"  Sectors: {sector_text}")
+    print(f"  Cadence: {fit_config.exptime_s} s")
+    print(f"  Quality bitmask: {fit_config.quality_bitmask}")
+    print(f"  Flux column: {fit_config.flux_column}")
+    print(f"  Observable export: {args.tess_observable}")
+
+    result = tess_module.fit_tess_transit_to_bandpass_constraint(
+        fit_config,
+        observable=args.tess_observable,
+        constraint_name=args.tess_constraint_name,
+        photon_weighted=True if args.tess_photon_weighted else None,
+        tbl_path=args.tess_bandpass_tbl_output,
+    )
+    constraint = result.bandpass_constraint
+
+    print(
+        "  Fitted constraint: "
+        f"{constraint['observable']} = {constraint['value']:.8f} +/- {constraint['sigma']:.8f}"
+    )
+    if args.tess_bandpass_tbl_output:
+        print(f"  Wrote TESS bandpass .tbl: {args.tess_bandpass_tbl_output}")
+
+    return constraint
+
+
 def print_config_summary(config, args):
     params = config.get_params()
     
@@ -538,6 +886,17 @@ def print_config_summary(config, args):
     print(f"Wavelength range: {wav_min}-{wav_max} Angstroms")
     print(f"Resolution mode: {config.RESOLUTION_MODE}")
     print(f"Resolution: R = {config.get_resolution():,}")
+    if args.fit_tess_transit:
+        sectors = ", ".join(str(sector) for sector in (args.tess_sector or [])) or "all available"
+        print(f"\nTESS transit fit:")
+        print(f"  Lightkurve target: {args.tess_target or args.planet}")
+        print(f"  Sectors: {sectors}")
+        print(f"  Cadence: {args.tess_exptime_s} s")
+        print(f"  Quality bitmask: {_parse_tess_quality_bitmask(args.tess_quality_bitmask)}")
+        print(f"  Flux column: {args.tess_flux_column}")
+        print(f"  Observable export: {args.tess_observable}")
+        if args.tess_bandpass_tbl_output:
+            print(f"  .tbl export: {args.tess_bandpass_tbl_output}")
 
     print(f"\nInference:")
     print(f"  SVI steps: {config.SVI_NUM_STEPS:,}")
@@ -593,6 +952,8 @@ def main():
         joint_spectra.append(make_joint_spectrum_component_from_tbl(tbl_path))
 
     bandpass_constraints = []
+    if args.fit_tess_transit:
+        bandpass_constraints.append(_fit_tess_transit_constraint(args, runtime_config.get_params()))
     for tbl_path in args.bandpass_tbl or []:
         bandpass_constraints.extend(make_bandpass_constraints_from_tbl(tbl_path))
 
