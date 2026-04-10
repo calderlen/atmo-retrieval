@@ -876,8 +876,8 @@ def plot_contribution_combined(
 ) -> None:
     """Create combined contribution function plot with total and per-species panels.
     
-    Similar to Figure 4 in Bonidie et al. 2026, showing the total contribution
-    function alongside individual species contributions.
+    Shows the total contribution function alongside individual species
+    contributions.
     
     Args:
         nu_grid: Wavenumber grid

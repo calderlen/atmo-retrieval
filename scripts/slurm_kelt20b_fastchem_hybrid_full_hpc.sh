@@ -1,55 +1,52 @@
 #!/bin/bash
-#SBATCH --job-name=retrieval-260409-1-kelt20b-20190504-bonidie-guillot-full
-#SBATCH --chdir=/home/calder/code/atmo-retrieval
-#SBATCH --output=%x_%j.out
-#SBATCH --error=%x_%j.err
+#SBATCH --account=PAS2489
+#SBATCH --job-name=k20b_20190504
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
 #SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=16
+#SBATCH --cluster ascend
 #SBATCH --partition=gpu
-#SBATCH --account=PAS2489
-#SBATCH --mail-type=ALL 
+#SBATCH --mail-type=ALL
+#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.err
 
 set -euo pipefail
+trap 'echo "[$(date)] Failed on line $LINENO"' ERR
+
+cd "$SLURM_SUBMIT_DIR"
 
 echo "[$(date)] Starting ${SLURM_JOB_NAME:-local_job} in ${PWD}"
 echo "Host: $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID:-no_slurm}"
+echo "CPUs/task: ${SLURM_CPUS_PER_TASK:-unset}"
+echo "GPUs on node: ${SLURM_GPUS_ON_NODE:-unset}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
 
-if [[ ! -f input/fastchem/parameters_py.dat ]]; then
-    echo "Missing FastChem parameter file: input/fastchem/parameters_py.dat" >&2
-    exit 1
-fi
-
-if [[ -f /home/calder/miniforge3/etc/profile.d/conda.sh ]]; then
-    source /home/calder/miniforge3/etc/profile.d/conda.sh
-    conda activate retrieval
-else
-    echo "Conda activation script not found: /home/calder/miniforge3/etc/profile.d/conda.sh" >&2
-    exit 1
-fi
-
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_ALLOCATOR=platform
-export TF_FORCE_GPU_ALLOW_GROWTH=true
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export NUMEXPR_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
-echo "Python: $(command -v python)"
-python --version
+nvidia-smi -L || true
 
-srun --ntasks=1 python -m atmo_retrieval \
+# TODO: replace with your OSC environment Python executable.
+PYTHON_BIN="/path/to/osc/envs/retrieval/bin/python"
+
+echo "Python: $PYTHON_BIN"
+"$PYTHON_BIN" --version
+
+/usr/bin/time -v srun --ntasks=1 "$PYTHON_BIN" -m atmo_retrieval \
   --profile hpc \
   --planet KELT-20b \
   --mode transmission \
   --epoch 20190504 \
   --data-format timeseries \
   --wavelength-range full \
-  --chemistry-model bonidie \
+  --chemistry-model fastchem_hybrid_grid \
+  --atoms "Fe I,Ni I,Cr I,Na I" \
+  --no-molecules \
   --pt-profile guillot \
   --fastchem-parameter-file input/fastchem/parameters_py.dat \
   --load-opacities \
@@ -61,6 +58,7 @@ srun --ntasks=1 python -m atmo_retrieval \
   --svi-learning-rate 0.001 \
   --svi-lr-decay-steps 2000 \
   --svi-lr-decay-rate 0.5 \
-  --no-preallocate
+  --joint-spectrum-tbl input/lrs/kelt20b/KELT_20_b_3.12080_5244_2.tbl \
+  --joint-spectrum-tbl input/lrs/kelt20b/KELT_20_b_3.12080_5244_3.tbl
 
 echo "[$(date)] Job finished"

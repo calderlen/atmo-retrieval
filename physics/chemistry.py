@@ -934,206 +934,6 @@ class FastChemEquilibriumCondensationChemistry(FastChemEquilibriumChemistry):
         return output_data
 
 
-class BonidieChemistry(FastChemEquilibriumChemistry):
-    """Bonidie et al.-style hybrid chemistry.
-
-    This mirrors the paper's setup:
-    - free constant-with-altitude VMRs for selected line species
-    - fixed-composition FastChem interpolation for continuum species
-    - all other requested species held at negligible abundance
-    """
-
-    def __init__(
-        self,
-        *args,
-        free_atomic_species: tuple[str, ...] = chem_config.BONIDIE_FREE_ATOMIC_SPECIES,
-        free_molecular_species: tuple[str, ...] = chem_config.BONIDIE_FREE_MOLECULAR_SPECIES,
-        continuum_species: tuple[str, ...] = chem_config.BONIDIE_CONTINUUM_SPECIES,
-        log_metallicity: float = chem_config.BONIDIE_LOG_METALLICITY,
-        log_vmr_min: float = chem_config.LOG_VMR_MIN,
-        log_vmr_max: float = chem_config.LOG_VMR_MAX,
-        h2_he_ratio: float = chem_config.H2_HE_RATIO,
-        **kwargs,
-    ):
-        super().__init__(
-            *args,
-            log_metallicity=log_metallicity,
-            **kwargs,
-        )
-        self.free_atomic_species = tuple(free_atomic_species)
-        self.free_molecular_species = tuple(free_molecular_species)
-        self.free_species = self.free_molecular_species + self.free_atomic_species
-        self.continuum_species = tuple(continuum_species)
-        self.log_vmr_min = float(log_vmr_min)
-        self.log_vmr_max = float(log_vmr_max)
-        self.h2_he_ratio = float(h2_he_ratio)
-        self._warned_ignored_species = False
-
-        self._free_solver = ConstantVMR(
-            log_vmr_min=self.log_vmr_min,
-            log_vmr_max=self.log_vmr_max,
-            h2_he_ratio=self.h2_he_ratio,
-        )
-
-    def _warn_ignored_species(
-        self,
-        mol_names: list[str],
-        atom_names: list[str],
-    ) -> None:
-        if self._warned_ignored_species:
-            return
-
-        requested = set(mol_names) | set(atom_names)
-        allowed = set(self.free_species) | set(self.continuum_species)
-        ignored = sorted(requested - allowed)
-        if ignored:
-            logger.warning(
-                "BonidieChemistry ignores species outside free species %s and "
-                "continuum species %s: %s",
-                self.free_species,
-                self.continuum_species,
-                ignored,
-            )
-        self._warned_ignored_species = True
-
-    def sample(
-        self,
-        mol_names: list[str],
-        mol_masses: list[float],
-        atom_names: list[str],
-        atom_masses: list[float],
-        art: object,
-        Tarr: jnp.ndarray | None = None,
-    ) -> CompositionState:
-        self._warn_ignored_species(mol_names, atom_names)
-
-        free_mol = [
-            (name, mass)
-            for name, mass in zip(mol_names, mol_masses)
-            if name in self.free_molecular_species
-        ]
-        free_atom = [
-            (name, mass)
-            for name, mass in zip(atom_names, atom_masses)
-            if name in self.free_atomic_species
-        ]
-
-        free_mol_names = [name for name, _ in free_mol]
-        free_mol_masses = [mass for _, mass in free_mol]
-        free_atom_names = [name for name, _ in free_atom]
-        free_atom_masses = [mass for _, mass in free_atom]
-
-        base = self._free_solver.sample(
-            free_mol_names,
-            free_mol_masses,
-            free_atom_names,
-            free_atom_masses,
-            art,
-            Tarr=Tarr,
-        )
-
-        if Tarr is None:
-            T_mid = (self.t_min + self.t_max) / 2.0
-            Tarr = jnp.full(art.pressure.shape, T_mid)
-
-        log_P = jnp.log10(art.pressure)
-        n_layers = art.pressure.size
-
-        mol_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in mol_names}
-        atom_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in atom_names}
-        for i, name in enumerate(free_mol_names):
-            mol_profile_map[name] = jnp.full(n_layers, base.vmr_mols[i])
-        for i, name in enumerate(free_atom_names):
-            atom_profile_map[name] = jnp.full(n_layers, base.vmr_atoms[i])
-
-        needed = [
-            species
-            for species in self.continuum_species
-            if (species in mol_profile_map) or (species in atom_profile_map)
-        ]
-        if needed:
-            if self._vmr_grids is None or any(
-                species not in self._vmr_grids for species in needed
-            ):
-                self.build_grid(np.asarray(art.pressure), needed)
-
-            overrides = {
-                species: self._interp_2d(self._vmr_grids[species], Tarr, log_P)
-                for species in needed
-                if species in self._vmr_grids
-            }
-            for species, vmr_profile in overrides.items():
-                if species in mol_profile_map:
-                    mol_profile_map[species] = vmr_profile
-                else:
-                    atom_profile_map[species] = vmr_profile
-
-        vmr_mols_profiles = [mol_profile_map[name] for name in mol_names]
-        vmr_atoms_profiles = [atom_profile_map[name] for name in atom_names]
-
-        if (len(vmr_mols_profiles) + len(vmr_atoms_profiles)) > 0:
-            all_profiles = jnp.array(vmr_mols_profiles + vmr_atoms_profiles)
-            sum_trace = jnp.sum(all_profiles, axis=0)
-            scale = jnp.where(sum_trace > 1.0, (1.0 - 1.0e-12) / sum_trace, 1.0)
-            all_profiles = all_profiles * scale[None, :]
-            vmr_mols_profiles = [all_profiles[i] for i in range(len(vmr_mols_profiles))]
-            vmr_atoms_profiles = [
-                all_profiles[len(vmr_mols_profiles) + i]
-                for i in range(len(vmr_atoms_profiles))
-            ]
-            vmr_trace_tot = jnp.sum(all_profiles, axis=0)
-        else:
-            vmr_trace_tot = jnp.zeros(n_layers)
-
-        h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
-        he_frac = 1.0 / (self.h2_he_ratio + 1.0)
-        vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
-        vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
-
-        mass_H2 = molinfo.molmass_isotope("H2")
-        mass_He = molinfo.molmass_isotope("He", db_HIT=False)
-        mmw_profile = mass_H2 * vmrH2_profile + mass_He * vmrHe_profile
-        for vmr_profile, mass in zip(vmr_mols_profiles, mol_masses):
-            mmw_profile = mmw_profile + mass * vmr_profile
-        for vmr_profile, mass in zip(vmr_atoms_profiles, atom_masses):
-            mmw_profile = mmw_profile + mass * vmr_profile
-
-        if len(vmr_mols_profiles) > 0:
-            mmr_mols = jnp.array([
-                vmr_profile * (mass / mmw_profile)
-                for vmr_profile, mass in zip(vmr_mols_profiles, mol_masses)
-            ])
-        else:
-            mmr_mols = jnp.zeros((0, n_layers))
-
-        if len(vmr_atoms_profiles) > 0:
-            mmr_atoms = jnp.array([
-                vmr_profile * (mass / mmw_profile)
-                for vmr_profile, mass in zip(vmr_atoms_profiles, atom_masses)
-            ])
-        else:
-            mmr_atoms = jnp.zeros((0, n_layers))
-
-        vmr_mols_scalar = [jnp.mean(profile) for profile in vmr_mols_profiles]
-        vmr_atoms_scalar = [jnp.mean(profile) for profile in vmr_atoms_profiles]
-        vmrH2 = jnp.mean(vmrH2_profile)
-        vmrHe = jnp.mean(vmrHe_profile)
-        mmw = jnp.mean(mmw_profile)
-
-        return CompositionState(
-            vmr_mols=vmr_mols_scalar,
-            vmr_atoms=vmr_atoms_scalar,
-            vmrH2=vmrH2,
-            vmrHe=vmrHe,
-            mmw=mmw,
-            mmr_mols=mmr_mols,
-            mmr_atoms=mmr_atoms,
-            vmrH2_profile=vmrH2_profile,
-            vmrHe_profile=vmrHe_profile,
-            mmw_profile=mmw_profile,
-        )
-
-
 class FastChemHybridChemistry(FastChemEquilibriumChemistry):
     """Hybrid chemistry with free trace VMRs and FastChem continuum species.
 
@@ -1166,6 +966,9 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         self.co_ratio_range = co_ratio_range
         self.n_metallicity = int(n_metallicity)
         self.n_co_ratio = int(n_co_ratio)
+        self.log_vmr_min = float(log_vmr_min)
+        self.log_vmr_max = float(log_vmr_max)
+        self.h2_he_ratio = float(h2_he_ratio)
         self._log_metallicity_grid = np.linspace(
             self.metallicity_range[0],
             self.metallicity_range[1],
@@ -1180,9 +983,9 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         self._hybrid_species_built: list[str] | None = None
 
         self._free_solver = ConstantVMR(
-            log_vmr_min=log_vmr_min,
-            log_vmr_max=log_vmr_max,
-            h2_he_ratio=h2_he_ratio,
+            log_vmr_min=self.log_vmr_min,
+            log_vmr_max=self.log_vmr_max,
+            h2_he_ratio=self.h2_he_ratio,
         )
 
     def _hybrid_cache_key(self, pressure_bar: np.ndarray, species_names: list[str]) -> str:
@@ -1495,8 +1298,8 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         else:
             vmr_trace_tot = jnp.zeros(n_layers)
 
-        h2_frac = self._free_solver.h2_he_ratio / (self._free_solver.h2_he_ratio + 1.0)
-        he_frac = 1.0 / (self._free_solver.h2_he_ratio + 1.0)
+        h2_frac = self.h2_he_ratio / (self.h2_he_ratio + 1.0)
+        he_frac = 1.0 / (self.h2_he_ratio + 1.0)
         vmrH2_profile = (1.0 - vmr_trace_tot) * h2_frac
         vmrHe_profile = (1.0 - vmr_trace_tot) * he_frac
 

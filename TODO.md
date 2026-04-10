@@ -31,14 +31,8 @@
         - TOI-1518b / Cabot21
 
 - TODO:
-    - attempt a full end-to-end retrieval run after a config sanity check
     - decide whether `N_VMR_NODES` should match the number of P-T layers
-    - decide whether to combine exposures into a full-transit spectrum before retrieval
-    - decide whether additional normalization is needed after preprocessing
     - go through config and set up a representative retrieval run
-    - fix missing CUDA on the home desktop
-    - maybe run some HPC usage analysis on this code?
-    - need to upload data to the HPC environment w rclone before run
     - see about distributed GPU run of code to avoid OOM
         - is sharding the right approach here?
     - implement a `combine_observations`-type function for atmo-retrieval if multi-observation workflows need it
@@ -50,7 +44,6 @@
         - FastChem condensation
         - KELT-20b 2019 transmission data since it is lower resolution
         - 50k wavelength resolution grid, unless a larger grid proves necessary
-    - cluster access / VNC workflow still needs to be set up cleanly
     - MPI for Python that supports GPUs?
     - time runs with `/usr/bin/time` on cluster
     - profile the scripts a lot before running on OSC

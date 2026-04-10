@@ -46,7 +46,7 @@ from physics.pt import (
 )
 
 # chemistry models
-from physics.chemistry import BonidieChemistry, CompositionSolver, ConstantVMR, FreeVMR
+from physics.chemistry import CompositionSolver, ConstantVMR, FastChemHybridChemistry, FreeVMR
 
 
 EPS = 1.0e-30 # prevent divide by zero
@@ -752,6 +752,94 @@ def reconstruct_vmr_profiles(
     return vmr_mols, vmr_atoms
 
 
+def reconstruct_fastchem_hybrid_profiles(
+    posterior_params: dict,
+    composition_solver: FastChemHybridChemistry,
+    mol_names: list[str],
+    atom_names: list[str],
+    art: object,
+    Tarr: jnp.ndarray,
+    *,
+    sample_prefix: str | None = None,
+) -> tuple[dict[str, jnp.ndarray], dict[str, jnp.ndarray]]:
+    local_params = _extract_scoped_site_params(posterior_params, sample_prefix)
+    log_metallicity = _posterior_site_value(
+        posterior_params,
+        "log_metallicity",
+        local_params=local_params,
+    )
+    co_ratio = _posterior_site_value(
+        posterior_params,
+        "C_O_ratio",
+        local_params=local_params,
+    )
+
+    vmr_mols_scalar, vmr_atoms_scalar = reconstruct_vmr_scalars(
+        posterior_params,
+        mol_names,
+        atom_names,
+        sample_prefix=sample_prefix,
+    )
+    n_layers = art.pressure.size
+    log_P = jnp.log10(art.pressure)
+
+    mol_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in mol_names}
+    atom_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in atom_names}
+    for mol, vmr in vmr_mols_scalar.items():
+        mol_profile_map[mol] = jnp.full(n_layers, vmr)
+    for atom, vmr in vmr_atoms_scalar.items():
+        atom_profile_map[atom] = jnp.full(n_layers, vmr)
+
+    needed = [
+        species
+        for species in composition_solver.continuum_species
+        if (species in mol_profile_map) or (species in atom_profile_map)
+    ]
+    if needed:
+        if composition_solver._hybrid_vmr_grids is None or any(
+            species not in composition_solver._hybrid_vmr_grids for species in needed
+        ):
+            composition_solver._build_hybrid_grid(np.asarray(art.pressure), needed)
+
+        for species in needed:
+            if species not in composition_solver._hybrid_vmr_grids:
+                continue
+            vmr_profile = composition_solver._interp_4d(
+                composition_solver._hybrid_vmr_grids[species],
+                jnp.asarray(log_metallicity),
+                jnp.asarray(co_ratio),
+                Tarr,
+                log_P,
+            )
+            if species in mol_profile_map:
+                mol_profile_map[species] = vmr_profile
+            else:
+                atom_profile_map[species] = vmr_profile
+
+    vmr_mols_profiles = [mol_profile_map[name] for name in mol_names]
+    vmr_atoms_profiles = [atom_profile_map[name] for name in atom_names]
+    if vmr_mols_profiles or vmr_atoms_profiles:
+        all_profiles = jnp.array(vmr_mols_profiles + vmr_atoms_profiles)
+        sum_trace = jnp.sum(all_profiles, axis=0)
+        scale = jnp.where(sum_trace > 1.0, (1.0 - 1.0e-12) / sum_trace, 1.0)
+        all_profiles = all_profiles * scale[None, :]
+        vmr_mols_profiles = [all_profiles[i] for i in range(len(vmr_mols_profiles))]
+        vmr_atoms_profiles = [
+            all_profiles[len(vmr_mols_profiles) + i]
+            for i in range(len(vmr_atoms_profiles))
+        ]
+
+    vmr_mols_profiles_dict = {
+        mol: vmr_mols_profiles[i]
+        for i, mol in enumerate(mol_names)
+    }
+    vmr_atoms_profiles_dict = {
+        atom: vmr_atoms_profiles[i]
+        for i, atom in enumerate(atom_names)
+    }
+    return vmr_mols_profiles_dict, vmr_atoms_profiles_dict
+
+
 def compute_mmw_and_h2he_from_vmr(
     vmr_mols: dict[str, float],
     vmr_atoms: dict[str, float],
@@ -946,74 +1034,22 @@ def compute_atmospheric_state_from_posterior(
             atom: float(jnp.mean(vmr_profile))
             for atom, vmr_profile in vmr_atoms_profiles.items()
         }
-    elif isinstance(composition_solver, BonidieChemistry):
-        vmr_mols_scalar, vmr_atoms_scalar = reconstruct_vmr_scalars(
+    elif isinstance(composition_solver, FastChemHybridChemistry):
+        vmr_mols_profiles_dict, vmr_atoms_profiles_dict = reconstruct_fastchem_hybrid_profiles(
             params,
+            composition_solver,
             mol_names,
             atom_names,
+            art,
+            Tarr,
             sample_prefix=sample_prefix,
         )
-        n_layers = art.pressure.size
-        mol_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in mol_names}
-        atom_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in atom_names}
-
-        for mol, vmr in vmr_mols_scalar.items():
-            mol_profile_map[mol] = jnp.full(n_layers, vmr)
-        for atom, vmr in vmr_atoms_scalar.items():
-            atom_profile_map[atom] = jnp.full(n_layers, vmr)
-
-        needed = [
-            species
-            for species in composition_solver.continuum_species
-            if (species in mol_profile_map) or (species in atom_profile_map)
-        ]
-        if needed:
-            if composition_solver._vmr_grids is None or any(
-                species not in composition_solver._vmr_grids for species in needed
-            ):
-                composition_solver.build_grid(np.asarray(art.pressure), needed)
-
-            for species in needed:
-                if species not in composition_solver._vmr_grids:
-                    continue
-                vmr_profile = composition_solver._interp_2d(
-                    composition_solver._vmr_grids[species],
-                    Tarr,
-                    jnp.log10(art.pressure),
-                )
-                if species in mol_profile_map:
-                    mol_profile_map[species] = vmr_profile
-                else:
-                    atom_profile_map[species] = vmr_profile
-
-        vmr_mols_profiles = [mol_profile_map[name] for name in mol_names]
-        vmr_atoms_profiles = [atom_profile_map[name] for name in atom_names]
-        if (len(vmr_mols_profiles) + len(vmr_atoms_profiles)) > 0:
-            all_profiles = jnp.array(vmr_mols_profiles + vmr_atoms_profiles)
-            sum_trace = jnp.sum(all_profiles, axis=0)
-            scale = jnp.where(sum_trace > 1.0, (1.0 - 1.0e-12) / sum_trace, 1.0)
-            all_profiles = all_profiles * scale[None, :]
-            vmr_mols_profiles = [all_profiles[i] for i in range(len(vmr_mols_profiles))]
-            vmr_atoms_profiles = [
-                all_profiles[len(vmr_mols_profiles) + i]
-                for i in range(len(vmr_atoms_profiles))
-            ]
-
-        vmr_mols_profiles_dict = {
-            mol: vmr_mols_profiles[i]
-            for i, mol in enumerate(mol_names)
-        }
-        vmr_atoms_profiles_dict = {
-            atom: vmr_atoms_profiles[i]
-            for i, atom in enumerate(atom_names)
-        }
-
         mmw_profile, vmrH2_profile, vmrHe_profile = compute_mmw_and_h2he_from_vmr_profiles(
             vmr_mols_profiles_dict,
             vmr_atoms_profiles_dict,
             mol_names,
             atom_names,
-            n_layers=n_layers,
+            n_layers=art.pressure.size,
             h2_he_ratio=float(composition_solver.h2_he_ratio),
         )
         mmr_mols, mmr_atoms = convert_vmr_profiles_to_mmr_profiles(
@@ -1034,7 +1070,7 @@ def compute_atmospheric_state_from_posterior(
     else:
         raise NotImplementedError(
             "Atmospheric-state reconstruction is only implemented for "
-            "ConstantVMR, FreeVMR, and BonidieChemistry. Skip contribution "
+            "ConstantVMR, FreeVMR, and FastChemHybridChemistry. Skip contribution "
             "diagnostics for other "
             "chemistry solvers."
         )

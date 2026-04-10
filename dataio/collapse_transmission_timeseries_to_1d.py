@@ -1049,7 +1049,7 @@ def main():
     print(f"  - wavelength_transmission.npy ({len(wave_angstrom)} points, Angstroms)")
     print(f"  - spectrum_transmission.npy")
     print(f"  - uncertainty_transmission.npy")
-    print("\n✓ Transmission spectrum saved successfully!")
+    print("\nTransmission spectrum saved successfully.")
 
     return 0
 

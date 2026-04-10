@@ -204,7 +204,7 @@ def create_parser():
     model_group.add_argument(
         "--chemistry-model",
         type=str,
-        choices=["constant", "free", "bonidie", "fastchem_hybrid_grid"],
+        choices=["constant", "free", "fastchem_hybrid_grid"],
         default=config.CHEMISTRY_MODEL_DEFAULT,
         help=(
             "Chemistry/composition model "
@@ -215,7 +215,7 @@ def create_parser():
         "--fastchem-parameter-file",
         type=str,
         default=None,
-        help="Path to FastChem parameters.dat (required for bonidie and fastchem_hybrid_grid)",
+        help="Path to FastChem parameters.dat (required for fastchem_hybrid_grid)",
     )
     model_group.add_argument(
         "--phoenix-spectrum-path",
@@ -315,11 +315,6 @@ def create_parser():
         default=42,
         help="Random seed (default: 42)"
     )
-    exec_group.add_argument(
-        "--no-preallocate",
-        action="store_true",
-        help="Disable JAX GPU preallocation (slower but safer on memory)"
-    )
 
     # Info
     parser.add_argument(
@@ -406,7 +401,7 @@ def apply_cli_overrides(args):
         config.set_runtime_config("MCMC_NUM_SAMPLES", config.QUICK_MCMC_SAMPLES)
         config.set_runtime_config("MCMC_NUM_CHAINS", config.QUICK_MCMC_CHAINS)
         print(
-            f"🚀 Quick mode: {config.QUICK_SVI_STEPS} SVI steps, "
+            f"Quick mode: {config.QUICK_SVI_STEPS} SVI steps, "
             f"{config.QUICK_MCMC_SAMPLES} MCMC samples"
         )
 
@@ -463,18 +458,8 @@ def apply_cli_overrides(args):
         return parts
 
     # Apply default species filter unless --all-species or explicit selection
-    bonidie_defaults = (
-        args.chemistry_model == "bonidie"
-        and not args.all_species
-        and not args.atoms
-        and not args.molecules
-        and not args.no_atoms
-        and not args.no_molecules
-    )
-
     use_defaults = (
         config.USE_DEFAULT_SPECIES
-        and not bonidie_defaults
         and not args.all_species
         and not args.atoms
         and not args.molecules
@@ -482,20 +467,7 @@ def apply_cli_overrides(args):
         and not args.no_molecules
     )
 
-    if bonidie_defaults:
-        bonidie_atoms = set(config.BONIDIE_FREE_ATOMIC_SPECIES)
-        bonidie_mols = set(config.BONIDIE_FREE_MOLECULAR_SPECIES)
-        config.set_runtime_config("ATOMIC_SPECIES", {
-            k: v for k, v in config.ATOMIC_SPECIES.items() if k in bonidie_atoms
-        })
-        config.set_runtime_config("MOLPATH_HITEMP", {
-            k: v for k, v in config.MOLPATH_HITEMP.items() if k in bonidie_mols
-        })
-        config.set_runtime_config("MOLPATH_EXOMOL", {
-            k: v for k, v in config.MOLPATH_EXOMOL.items() if k in bonidie_mols
-        })
-        print("Using Bonidie default species: Fe I, Ni I, Ca I (no molecules)")
-    elif use_defaults:
+    if use_defaults:
         default_atoms = set(config.DEFAULT_SPECIES.get("atoms", []))
         default_mols = set(config.DEFAULT_SPECIES.get("molecules", []))
         config.set_runtime_config("ATOMIC_SPECIES", {
@@ -552,7 +524,7 @@ def print_config_summary(config, args):
     print(f"\nMode: {config.RETRIEVAL_MODE.upper()}")
     print(f"Config profile: {config.get_runtime_profile_name()}")
     print(f"Chemistry model: {args.chemistry_model}")
-    if args.chemistry_model in {"bonidie", "fastchem_hybrid_grid"}:
+    if args.chemistry_model == "fastchem_hybrid_grid":
         fc_file = args.fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
         print(f"FastChem parameter file: {fc_file}")
     print(f"Phase mode: {args.phase_mode}")
@@ -601,11 +573,6 @@ def print_config_summary(config, args):
 def main():
     parser = create_parser()
     args = parser.parse_args()
-
-    if args.no_preallocate:
-        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-        os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
-        os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
     runtime_config = config
     runtime_config.apply_runtime_profile(args.profile)

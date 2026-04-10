@@ -14,7 +14,7 @@ import numpy as np
 from numpyro.infer import SVI, Trace_ELBO
 
 import config
-from physics.chemistry import BonidieChemistry, ConstantVMR, FreeVMR
+from physics.chemistry import ConstantVMR, FastChemHybridChemistry, FreeVMR
 from physics.model import compute_atmospheric_state_from_posterior
 from pipeline import retrieval as _retrieval
 from pipeline.inference import build_guide, build_svi_optimizer
@@ -317,18 +317,30 @@ def default_named_params_for_context(context: PrimaryDiagnosticContext) -> dict[
             params[f"logVMR_{atom_name}"] = log_center
         for mol_name in region.mol_names:
             params[f"logVMR_{mol_name}"] = log_center
-    elif isinstance(composition_solver, BonidieChemistry):
+    elif isinstance(composition_solver, FastChemHybridChemistry):
         log_center = 0.5 * (
             float(composition_solver.log_vmr_min) + float(composition_solver.log_vmr_max)
         )
-        allowed_atoms = set(composition_solver.free_atomic_species)
-        allowed_mols = set(composition_solver.free_molecular_species)
         for atom_name in region.atom_names:
-            if atom_name in allowed_atoms:
+            if atom_name not in composition_solver.continuum_species:
                 params[f"logVMR_{atom_name}"] = log_center
         for mol_name in region.mol_names:
-            if mol_name in allowed_mols:
+            if mol_name not in composition_solver.continuum_species:
                 params[f"logVMR_{mol_name}"] = log_center
+        params["log_metallicity"] = float(
+            0.5
+            * (
+                float(composition_solver.metallicity_range[0])
+                + float(composition_solver.metallicity_range[1])
+            )
+        )
+        params["C_O_ratio"] = float(
+            0.5
+            * (
+                float(composition_solver.co_ratio_range[0])
+                + float(composition_solver.co_ratio_range[1])
+            )
+        )
     elif isinstance(composition_solver, FreeVMR):
         log_center = 0.5 * (
             float(composition_solver.log_vmr_min) + float(composition_solver.log_vmr_max)
@@ -421,12 +433,12 @@ def _infer_chemistry_model_from_run_dir(run_dir: str | Path) -> str:
     with np.load(init_path) as init_values:
         keys = set(init_values.files)
 
+    if {"log_metallicity", "C_O_ratio"}.issubset(keys):
+        return "fastchem_hybrid_grid"
     if any("_node" in key for key in keys if key.startswith("logVMR_")):
         return "free"
     if any(key.startswith("logVMR_") for key in keys):
         return "constant"
-    if {"log_metallicity", "C_O_ratio"}.issubset(keys):
-        return "fastchem_hybrid_grid"
     return "constant"
 
 
