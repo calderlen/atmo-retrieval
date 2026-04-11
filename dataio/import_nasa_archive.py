@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
+import config
 from dataio.load import load_nasa_archive_spectrum, parse_nasa_archive_tbl
 
 
@@ -33,7 +34,7 @@ def main() -> int:
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Output directory (default: input/lrs/<planet>/<spec_num>)",
+        help="Output directory (default: input/lrs/<mode>/<planet>/<spec_num>)",
     )
     parser.add_argument(
         "--mode",
@@ -82,7 +83,7 @@ def main() -> int:
         planet_name = metadata.get("PL_NAME", tbl_path.stem)
         spec_num = metadata.get("SPEC_NUM", tbl_path.stem)
         planet_dir = _sanitize_name(planet_name)
-        output_dir = Path("input/lrs") / planet_dir / str(spec_num)
+        output_dir = config.get_lowres_dir(planet=planet_dir, mode=mode) / str(spec_num)
     else:
         output_dir = Path(args.output_dir)
 

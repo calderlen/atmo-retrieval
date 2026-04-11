@@ -37,7 +37,7 @@ METALLICITY_RANGE = (-2.0, 3.0)
 CO_RATIO_RANGE = (0.1, 2.0)
 
 # Solar elemental abundance table (Asplund 2020; log epsilon format)
-SOLAR_ABUNDANCE_FILE = "input/abundances/asplund_2020_extended"
+SOLAR_ABUNDANCE_FILE = "reference/abundances/asplund_2020_extended"
 
 # ==============================================================================
 # FASTCHEM GRID PARAMETERS
@@ -47,7 +47,7 @@ FASTCHEM_N_TEMP = 50
 FASTCHEM_N_PRESSURE = 50
 FASTCHEM_T_MIN = 500.0
 FASTCHEM_T_MAX = 5000.0
-FASTCHEM_CACHE_DIR = "input/.fastchem_cache"
+FASTCHEM_CACHE_DIR = "cache/fastchem"
 FASTCHEM_DATA_DIR = None  # None = use pyfastchem defaults
 FASTCHEM_PARAMETER_FILE = None  # Path to FastChem parameters.dat
 

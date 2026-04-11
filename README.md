@@ -17,7 +17,8 @@ python -m atmo_retrieval --planet KELT-20b --mode transmission --epoch 20250601
 Low-resolution inputs are passed explicitly:
 - use `--joint-spectrum-tbl path/to/file.tbl` for multi-bin low-res spectra
 - use `--bandpass-tbl path/to/file.tbl` for single-band / sparse broadband constraints
-- paths can be full paths or relative to `input/lrs`, e.g. `kelt20b/file.tbl`
+- `--joint-spectrum-tbl` paths can be full paths or relative to `input/lrs`, canonical form `transmission/kelt9b/file.tbl` or `emission/kelt20b/file.tbl`
+- `--bandpass-tbl` paths can be full paths or relative to `input/phot`, canonical form `transmission/kelt20b/file.tbl` or `emission/kelt9b/file.tbl`
 
 ## joint retrieval bandpass constraints
 
@@ -36,10 +37,11 @@ flowchart TD
     end
 
     subgraph DS[Data sources]
-        T1[input/hrs time-series products]
-        T2[input/hrs collapsed 1D spectrum products]
-        T3[input/lrs explicit low-res .tbl files]
-        T4[direct Python arrays and component dicts]
+        T1[input/hrs mode-scoped raw and processed HRS products]
+        T2[input/lrs mode-scoped low-res spectra<br/>.tbl or imported .npy bundles]
+        T3[input/phot mode-scoped broadband constraint .tbl files]
+        T4[reference bandpasses and abundance tables]
+        T5[direct Python arrays and component dicts]
     end
 
     subgraph UT[Optional utilities]
@@ -84,15 +86,17 @@ flowchart TD
     T1 -. used directly when data_format is timeseries .-> D
     T1 -. timeseries only .-> M
     T2 -. optional input when data_format is spectrum .-> D
-    T3 -. passed via joint-spectrum-tbl or bandpass-tbl .-> X
+    T2 -. passed via joint-spectrum-tbl .-> X
+    T3 -. passed via bandpass-tbl .-> X
+    T4 -. static response and abundance assets .-> B
     X --> B
-    T4 -. optional programmatic entry .-> B
+    T5 -. optional programmatic entry .-> B
 
     T1 --> U1
     T1 --> U2
-    U1 -. writes derived 1D npy products .-> T2
-    U2 -. writes derived 1D npy products .-> T2
-    U3 -. writes imported archive files .-> T3
+    U1 -. writes derived 1D npy products .-> T1
+    U2 -. writes derived 1D npy products .-> T1
+    U3 -. writes imported archive files .-> T2
 ```
 
 - Solid arrows: normal code dependencies or execution flow.
@@ -147,18 +151,51 @@ modules:
 ## expected input directory structure
 
 ```
-input/hrs/{planet}/{epoch}/{arm}/
-  wavelength_transmission.npy
-  spectrum_transmission.npy
-  uncertainty_transmission.npy
+input/hrs/{mode}/{planet}/{epoch}/{arm}/
+  wavelength_{mode}.npy
+  spectrum_{mode}.npy
+  uncertainty_{mode}.npy
 
-input/hrs/{epoch}_{planet}/
+input/hrs/{mode}/raw/{planet}/{epoch}/
   ... raw PEPSI files ...
 
-input/lrs/{planet}/
+input/lrs/{mode}/{planet}/
   *.tbl
-  *.dat
-  *.csv
+  {spec_num}/
+    wavelength_{mode}.npy
+    spectrum_{mode}.npy
+    uncertainty_{mode}.npy
+    metadata.json
+
+input/lrs/{mode}/raw/{planet}/
+  hst_wfc3_ir_g102_pid17082/
+    IF0L02RCQ/
+      if0l02rcq_flt.fits
+      ...
+  ... other source archive bundles / auxiliary tables ...
+
+input/phot/{mode}/{planet}/
+  *.tbl
+
+input/phot/{mode}/raw/{planet}/
+  ... cadence-level photometry or upstream fit products ...
+
+reference/bandpasses/
+  tess-response-function-v2.0.csv
+
+reference/abundances/
+  asplund_2020_extended
+
+cache/phoenix/
+cache/opacity/
+
+db/
+  hitemp/
+  exomol/
+  exoatom/
+  kurucz/
+  vald/
+  cia/
 ```
 
 ## outputs

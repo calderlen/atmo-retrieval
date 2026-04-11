@@ -51,7 +51,7 @@ from radis.api.hitempapi import login_to_hitran
 
 
 # Opacity cache directory (relative to project root)
-from config.paths_config import PROJECT_ROOT, DB_KURUCZ, DB_VALD, USE_KURUCZ, USE_VALD
+from config.paths_config import DB_KURUCZ, DB_VALD, OPA_CACHE_DIR, USE_KURUCZ, USE_VALD
 try:
     from databases.atomic import (
         load_kurucz_atomic,
@@ -70,7 +70,6 @@ except Exception as exc:  # pragma: no cover - depends on external exojax instal
     parse_species = None
     ATOMIC_MASSES_DB = {}
     _ATOMIC_BACKEND_IMPORT_ERROR = exc
-OPA_CACHE_DIR = PROJECT_ROOT / "input" / ".opa_cache"
 OPA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Atomic mass lookup (most common isotopes)

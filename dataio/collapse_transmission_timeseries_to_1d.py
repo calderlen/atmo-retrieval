@@ -553,7 +553,7 @@ def get_pepsi_data(
     observation_epoch: str,
     planet_name: str,
     do_molecfit: bool = config.DEFAULT_USE_MOLECFIT,
-    data_dir: str = config.DEFAULT_RAW_DATA_DIR,
+    data_dir: str | os.PathLike[str] | None = None,
     barycentric_correction: bool = config.DEFAULT_BARYCORR,
     apply_introduced_shift: bool = config.DEFAULT_INTRODUCED_SHIFT,
     regrid: bool = False,
@@ -571,7 +571,7 @@ def get_pepsi_data(
         observation_epoch: Observation date (YYYYMMDD)
         planet_name: Planet name
         do_molecfit: Use molecfit-corrected files
-        data_dir: Base data directory
+        data_dir: Epoch-specific raw exposure directory
         barycentric_correction: Apply barycentric velocity correction
         apply_introduced_shift: Apply epoch-specific wavelength shift
         regrid: Regrid all spectra to common wavelength grid
@@ -586,6 +586,13 @@ def get_pepsi_data(
         Additional keys in dict if preprocessing applied
     """
     ckms = 2.9979e5
+
+    if data_dir is None:
+        data_dir = config.get_raw_hrs_dir(
+            planet=planet_name,
+            epoch=observation_epoch,
+            mode="transmission",
+        )
 
     # Get config for this instrument
     header_keys = get_header_keys()
@@ -923,7 +930,12 @@ def main():
                         help='Apply epoch-specific Molecfit shift (default)')
     parser.add_argument('--no-introduced-shift', action='store_false', dest='introduced_shift',
                         help='Disable epoch-specific Molecfit shift')
-    parser.add_argument('--output-dir', type=str, default=None, help='Output directory (default: input/hrs/{planet}/{epoch}/{arm})')
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default=None,
+        help='Output directory (default: input/hrs/transmission/<planet>/<epoch>/<arm>)',
+    )
     parser.add_argument('--bin-size', type=int, default=config.DEFAULT_BIN_SIZE, help='Spectral binning (pixels)')
 
     args = parser.parse_args()
@@ -934,7 +946,7 @@ def main():
             args.epoch,
             args.planet,
             prefer_molecfit,
-            config.DEFAULT_RAW_DATA_DIR,
+            config.get_raw_hrs_dir(planet=args.planet, epoch=args.epoch, mode="transmission"),
             barycentric_correction=args.barycorr,
             apply_introduced_shift=args.introduced_shift if prefer_molecfit else False,
         )
@@ -945,7 +957,7 @@ def main():
                 args.epoch,
                 args.planet,
                 False,
-                config.DEFAULT_RAW_DATA_DIR,
+                config.get_raw_hrs_dir(planet=args.planet, epoch=args.epoch, mode="transmission"),
                 barycentric_correction=args.barycorr,
                 apply_introduced_shift=False,
             )
@@ -1036,7 +1048,14 @@ def main():
     # Setup output directory
     if args.output_dir is None:
         planet_dir = args.planet.lower().replace('-', '')
-        args.output_dir = f'input/hrs/{planet_dir}/{args.epoch}/{args.arm}'
+        args.output_dir = str(
+            config.get_data_dir(
+                planet=args.planet,
+                epoch=args.epoch,
+                arm=args.arm,
+                mode="transmission",
+            )
+        )
 
     os.makedirs(args.output_dir, exist_ok=True)
 

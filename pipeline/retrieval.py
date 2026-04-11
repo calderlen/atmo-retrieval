@@ -1290,6 +1290,18 @@ def _resolve_lowres_tbl_path(tbl_path: str | Path) -> Path:
     return candidate
 
 
+def _resolve_bandpass_tbl_path(tbl_path: str | Path) -> Path:
+    candidate = Path(tbl_path)
+    if candidate.exists() or candidate.is_absolute():
+        return candidate
+
+    prefixed = config.INPUT_DIR / "phot" / candidate
+    if prefixed.exists():
+        return prefixed
+
+    return candidate
+
+
 def make_joint_spectrum_component_from_tbl(tbl_path: str | Path) -> dict[str, Any]:
     tbl_path = _resolve_lowres_tbl_path(tbl_path)
     metadata, _columns, _data_by_col, _units_by_col = parse_nasa_archive_tbl(tbl_path)
@@ -1309,7 +1321,7 @@ def make_joint_spectrum_component_from_tbl(tbl_path: str | Path) -> dict[str, An
 
 
 def make_bandpass_constraints_from_tbl(tbl_path: str | Path) -> list[dict[str, Any]]:
-    tbl_path = _resolve_lowres_tbl_path(tbl_path)
+    tbl_path = _resolve_bandpass_tbl_path(tbl_path)
     metadata, _columns, data_by_col, units_by_col = parse_nasa_archive_tbl(tbl_path)
     mode = _infer_tbl_mode(metadata)
     if mode is None:

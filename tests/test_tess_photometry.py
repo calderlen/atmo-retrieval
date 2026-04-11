@@ -163,6 +163,21 @@ class TessPhotometryTests(unittest.TestCase):
         self.assertAlmostEqual(constraint["value"], 0.0125)
         self.assertAlmostEqual(constraint["sigma"], 0.00075)
 
+    def test_make_tess_constraint_defaults_to_transit_depth(self):
+        summary = {
+            "transit_depth_percent": {
+                "median": 1.25,
+                "plus": 0.10,
+                "minus": 0.05,
+            }
+        }
+
+        constraint = make_tess_bandpass_constraint_from_mlexo(summary_stats=summary)
+
+        self.assertEqual(constraint["observable"], "transit_depth")
+        self.assertAlmostEqual(constraint["value"], 0.0125)
+        self.assertAlmostEqual(constraint["sigma"], 0.001)
+
     def test_write_tess_bandpass_tbl_round_trips_through_loader(self):
         constraint = {
             "name": "tess_transit",

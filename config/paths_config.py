@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 
 from .planets_config import PLANET, EPHEMERIS
+from .instrument_config import OBSERVING_MODE
+from .model_config import RETRIEVAL_MODE
 
 # ==============================================================================
 # BASE DIRECTORIES
@@ -17,20 +19,39 @@ PROJECT_ROOT = Path(__file__).parent.parent
 
 INPUT_DIR = PROJECT_ROOT / "input"
 INPUT_DIR.mkdir(exist_ok=True)
-PHOENIX_CACHE_DIR = Path(os.environ.get("PHOENIX_CACHE_DIR") or INPUT_DIR / ".phoenix_cache")
+
+REFERENCE_DIR = PROJECT_ROOT / "reference"
+REFERENCE_DIR.mkdir(exist_ok=True)
+
+REFERENCE_BANDPASS_DIR = REFERENCE_DIR / "bandpasses"
+REFERENCE_BANDPASS_DIR.mkdir(parents=True, exist_ok=True)
+
+REFERENCE_ABUNDANCE_DIR = REFERENCE_DIR / "abundances"
+REFERENCE_ABUNDANCE_DIR.mkdir(parents=True, exist_ok=True)
+
+CACHE_DIR = PROJECT_ROOT / "cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+PHOENIX_CACHE_DIR = Path(os.environ.get("PHOENIX_CACHE_DIR") or CACHE_DIR / "phoenix")
 PHOENIX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+OPA_CACHE_DIR = CACHE_DIR / "opacity"
+OPA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ==============================================================================
 # DATABASE PATHS
 # ==============================================================================
 
+DB_ROOT_DIR = PROJECT_ROOT / "db"
+DB_ROOT_DIR.mkdir(exist_ok=True)
+
 # Molecular databases (override with env vars if set)
-DB_HITEMP = Path(os.environ.get("HITEMP_DIR") or INPUT_DIR / ".db_HITEMP")
-DB_EXOMOL = Path(os.environ.get("EXOMOL_DIR") or INPUT_DIR / ".db_ExoMol")
-DB_EXOATOM = Path(os.environ.get("EXOATOM_DIR") or INPUT_DIR / ".db_ExoAtom")
-DB_KURUCZ = Path(os.environ.get("KURUCZ_DIR") or INPUT_DIR / ".db_kurucz")
-DB_VALD = Path(os.environ.get("VALD_DIR") or INPUT_DIR / ".db_VALD")
-DB_CIA = Path(os.environ.get("CIA_DIR") or INPUT_DIR / ".db_CIA")
+DB_HITEMP = Path(os.environ.get("HITEMP_DIR") or DB_ROOT_DIR / "hitemp")
+DB_EXOMOL = Path(os.environ.get("EXOMOL_DIR") or DB_ROOT_DIR / "exomol")
+DB_EXOATOM = Path(os.environ.get("EXOATOM_DIR") or DB_ROOT_DIR / "exoatom")
+DB_KURUCZ = Path(os.environ.get("KURUCZ_DIR") or DB_ROOT_DIR / "kurucz")
+DB_VALD = Path(os.environ.get("VALD_DIR") or DB_ROOT_DIR / "vald")
+DB_CIA = Path(os.environ.get("CIA_DIR") or DB_ROOT_DIR / "cia")
 
 for db_dir in (DB_HITEMP, DB_EXOMOL, DB_EXOATOM, DB_KURUCZ, DB_VALD, DB_CIA):
     db_dir.mkdir(parents=True, exist_ok=True)
@@ -136,30 +157,83 @@ ATOMIC_SPECIES = {
 # DATA PATHS
 # ==============================================================================
 
-# Import here to avoid circular import at module level
-from .instrument_config import OBSERVING_MODE
-from .model_config import RETRIEVAL_MODE
+
+def _planet_slug(planet: str) -> str:
+    return planet.strip().lower().replace("-", "").replace(" ", "")
 
 
-def get_data_dir(planet: str | None = None, arm: str | None = None, epoch: str | None = None) -> Path:
-    """Get processed high-resolution data directory for a planet, arm, and optional epoch."""
-    planet = planet or PLANET
-    arm = arm or OBSERVING_MODE
-    base = INPUT_DIR / "hrs" / planet.lower().replace("-", "")
+def _normalize_retrieval_mode(mode: str | None) -> str:
+    resolved = (mode or RETRIEVAL_MODE).strip().lower()
+    if resolved not in {"transmission", "emission"}:
+        raise ValueError(f"Unsupported retrieval mode: {mode!r}")
+    return resolved
+
+
+def get_raw_hrs_dir(
+    planet: str | None = None,
+    *,
+    epoch: str | None = None,
+    mode: str | None = None,
+) -> Path:
+    """Get raw high-resolution exposure directory for a planet and epoch."""
+    planet_slug = _planet_slug(planet or PLANET)
+    resolved_mode = _normalize_retrieval_mode(mode)
+    base = INPUT_DIR / "hrs" / resolved_mode / "raw" / planet_slug
     if epoch:
-        return base / epoch / arm
-    return base / arm
+        return base / epoch
+    return base
 
 
-def get_lowres_dir(planet: str | None = None) -> Path:
-    """Get low-resolution data directory for a planet."""
-    planet = planet or PLANET
-    return INPUT_DIR / "lrs" / planet.lower().replace("-", "")
+def get_data_dir(
+    planet: str | None = None,
+    arm: str | None = None,
+    epoch: str | None = None,
+    *,
+    mode: str | None = None,
+) -> Path:
+    """Get processed high-resolution data directory for a planet, arm, and optional epoch."""
+    planet_slug = _planet_slug(planet or PLANET)
+    resolved_mode = _normalize_retrieval_mode(mode)
+    resolved_arm = arm or OBSERVING_MODE
+    base = INPUT_DIR / "hrs" / resolved_mode / planet_slug
+    if epoch:
+        return base / epoch / resolved_arm
+    return base / resolved_arm
+
+
+def get_lowres_dir(
+    planet: str | None = None,
+    *,
+    mode: str | None = None,
+    raw: bool = False,
+) -> Path:
+    """Get low-resolution spectrum directory for a planet and mode."""
+    planet_slug = _planet_slug(planet or PLANET)
+    resolved_mode = _normalize_retrieval_mode(mode)
+    base = INPUT_DIR / "lrs" / resolved_mode
+    if raw:
+        return base / "raw" / planet_slug
+    return base / planet_slug
+
+
+def get_phot_dir(
+    planet: str | None = None,
+    *,
+    mode: str | None = None,
+    raw: bool = False,
+) -> Path:
+    """Get broadband photometry directory for a planet and mode."""
+    planet_slug = _planet_slug(planet or PLANET)
+    resolved_mode = _normalize_retrieval_mode(mode)
+    base = INPUT_DIR / "phot" / resolved_mode
+    if raw:
+        return base / "raw" / planet_slug
+    return base / planet_slug
 
 
 def get_transmission_paths(planet: str | None = None, arm: str | None = None, epoch: str | None = None) -> dict[str, Path]:
     """Get paths to transmission data files."""
-    data_dir = get_data_dir(planet, arm=arm, epoch=epoch)
+    data_dir = get_data_dir(planet, arm=arm, epoch=epoch, mode="transmission")
     return {
         "wavelength": data_dir / "wavelength_transmission.npy",
         "spectrum": data_dir / "spectrum_transmission.npy",
@@ -169,7 +243,7 @@ def get_transmission_paths(planet: str | None = None, arm: str | None = None, ep
 
 def get_emission_paths(planet: str | None = None, arm: str | None = None, epoch: str | None = None) -> dict[str, Path]:
     """Get paths to emission data files."""
-    data_dir = get_data_dir(planet, arm=arm, epoch=epoch)
+    data_dir = get_data_dir(planet, arm=arm, epoch=epoch, mode="emission")
     return {
         "wavelength": data_dir / "wavelength_emission.npy",
         "spectrum": data_dir / "spectrum_emission.npy",
@@ -178,7 +252,9 @@ def get_emission_paths(planet: str | None = None, arm: str | None = None, epoch:
 
 
 DATA_DIR = get_data_dir()
+RAW_HRS_DIR = get_raw_hrs_dir(mode="transmission")
 LOWRES_DIR = get_lowres_dir()
+PHOT_DIR = get_phot_dir()
 TRANSMISSION_DATA = get_transmission_paths()
 EMISSION_DATA = get_emission_paths()
 
@@ -230,7 +306,7 @@ OPA_SAVE = False
 
 # Atomic database preferences
 # Kurucz: auto-downloaded from kurucz.harvard.edu
-# VALD: requires manual download from vald.astro.uu.se (place in .db_VALD/)
+# VALD: requires manual download from vald.astro.uu.se (place in db/vald/)
 USE_KURUCZ = True
 USE_VALD = True
 

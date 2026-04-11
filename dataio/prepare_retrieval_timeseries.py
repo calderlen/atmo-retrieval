@@ -2,7 +2,7 @@
 """Prepare retrieval-ready time-series products from PEPSI exposure folders.
 
 This module converts raw/reduced PEPSI exposure directories such as
-``input/hrs/20250601_KELT-20b`` into the `.npy` bundle consumed by the
+``input/hrs/transmission/raw/kelt20b/20250601`` into the `.npy` bundle consumed by the
 time-series retrieval path:
 
 - ``wavelength.npy`` (1D wavelength grid in Angstroms)
@@ -39,7 +39,11 @@ from dataio.horus import remove_doppler_shadow
 
 
 def _output_dir_for(planet: str, epoch: str, arm: str) -> Path:
-    return Path("input/hrs") / planet.lower().replace("-", "") / epoch / arm
+    return config.get_data_dir(planet=planet, epoch=epoch, arm=arm, mode="transmission")
+
+
+def _raw_input_dir_for(planet: str, epoch: str) -> Path:
+    return config.get_raw_hrs_dir(planet=planet, epoch=epoch, mode="transmission")
 
 
 def _nearest_transit_midpoint(jd: np.ndarray, reference_epoch: float, period: float) -> float:
@@ -82,7 +86,7 @@ def _load_single_arm(
         observation_epoch=epoch,
         planet_name=planet,
         do_molecfit=prefer_molecfit,
-        data_dir=config.DEFAULT_RAW_DATA_DIR,
+        data_dir=_raw_input_dir_for(planet, epoch),
         barycentric_correction=barycorr,
         apply_introduced_shift=introduced_shift if prefer_molecfit else False,
         regrid=regrid,
@@ -96,7 +100,7 @@ def _load_single_arm(
             observation_epoch=epoch,
             planet_name=planet,
             do_molecfit=False,
-            data_dir=config.DEFAULT_RAW_DATA_DIR,
+            data_dir=_raw_input_dir_for(planet, epoch),
             barycentric_correction=barycorr,
             apply_introduced_shift=False,
             regrid=regrid,
@@ -106,7 +110,7 @@ def _load_single_arm(
     if result is None:
         raise FileNotFoundError(
             f"Could not load {arm}-arm PEPSI data for {planet} {epoch} from "
-            f"{config.DEFAULT_RAW_DATA_DIR}."
+            f"{_raw_input_dir_for(planet, epoch)}."
         )
     return _unwrap_result(result)
 
@@ -476,7 +480,10 @@ def create_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=str,
         default=None,
-        help="Output directory (default: input/hrs/{planet}/{epoch}/{arm})",
+        help=(
+            "Output directory "
+            "(default: input/hrs/transmission/<planet>/<epoch>/<arm>)"
+        ),
     )
     parser.add_argument(
         "--molecfit",

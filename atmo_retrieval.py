@@ -89,7 +89,10 @@ def create_parser():
         type=str,
         action="append",
         default=None,
-        help="Explicit NASA .tbl file to include as one or more bandpass constraints",
+        help=(
+            "Explicit NASA .tbl file to include as one or more bandpass constraints "
+            "(full path or relative to input/phot; canonical form: <mode>/<planet>/file.tbl)"
+        ),
     )
 
     tess_group = parser.add_argument_group("TESS Transit Fit")
@@ -265,8 +268,8 @@ def create_parser():
         "--tess-observable",
         type=str,
         choices=["radius_ratio", "transit_depth"],
-        default="radius_ratio",
-        help="Which fitted transit observable to pass into retrieval (default: radius_ratio)",
+        default="transit_depth",
+        help="Which fitted transit observable to pass into retrieval (default: transit_depth)",
     )
     tess_group.add_argument(
         "--tess-constraint-name",
@@ -283,7 +286,10 @@ def create_parser():
         "--tess-bandpass-tbl-output",
         type=str,
         default=None,
-        help="Optional path to also write the fitted TESS bandpass constraint as a NASA-style .tbl",
+        help=(
+            "Optional path to also write the fitted TESS bandpass constraint as a "
+            "NASA-style .tbl (canonical location: input/phot/<mode>/<planet>/...)"
+        ),
     )
 
     # Inference parameters

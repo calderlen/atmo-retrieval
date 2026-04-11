@@ -43,7 +43,7 @@ def _pepsi_data_patterns(
         mode: Spectrograph arm (blue/red/green/full)
         file_prefix: File prefix for this mode
         do_molecfit: Whether to look for molecfit-corrected files
-        data_dir: Base data directory
+        data_dir: Epoch-specific raw exposure directory
 
     Returns:
         List of glob patterns to try in order
@@ -59,7 +59,7 @@ def _pepsi_data_patterns(
         pepsi_exts.insert(0, "bwl")
 
     patterns = []
-    base_path = f"{data_dir}/{observation_epoch}_{planet_name}"
+    base_path = str(data_dir)
 
     if do_molecfit:
         for ext in pepsi_exts:

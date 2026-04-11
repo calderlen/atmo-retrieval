@@ -223,6 +223,47 @@ class AtmoRetrievalTessCliTests(unittest.TestCase):
             "transit_depth",
         )
 
+    def test_main_defaults_tess_observable_to_transit_depth(self):
+        fake_modules = self._fake_modules()
+        with patch.dict(sys.modules, fake_modules, clear=False):
+            module = self._load_module(fake_modules)
+            retrieval_mod = fake_modules["pipeline.retrieval"]
+            tess_mod = fake_modules["dataio.tess_photometry"]
+
+            argv = [
+                "atmo_retrieval.py",
+                "--planet",
+                "KELT-20b",
+                "--mode",
+                "transmission",
+                "--epoch",
+                "20200101",
+                "--fit-tess-transit",
+                "--tess-target",
+                "TIC 123456789",
+                "--tess-sector",
+                "14",
+                "--tess-t0-bjd",
+                "2458000.25",
+                "--svi-only",
+                "--no-plots",
+            ]
+
+            with patch.object(sys, "argv", argv):
+                rc = module.main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(tess_mod.fit_calls), 1)
+        _fit_config, fit_kwargs = tess_mod.fit_calls[0]
+        self.assertEqual(fit_kwargs["observable"], "transit_depth")
+
+        self.assertEqual(len(retrieval_mod.run_calls), 1)
+        retrieval_kwargs = retrieval_mod.run_calls[0]
+        self.assertEqual(
+            retrieval_kwargs["bandpass_constraints"][0]["observable"],
+            "transit_depth",
+        )
+
     def test_quality_bitmask_parser_accepts_integer_bitmask(self):
         fake_modules = self._fake_modules()
         with patch.dict(sys.modules, fake_modules, clear=False):
