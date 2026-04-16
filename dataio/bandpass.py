@@ -64,9 +64,7 @@ def load_tess_bandpass(
     response_clean = response_arr[mask]
 
     if wavelength_m.size < 2:
-        raise ValueError(
-            f"Bandpass file {bandpass_path} does not contain enough valid points."
-        )
+        raise ValueError(f"Bandpass file {bandpass_path} does not contain enough valid points.")
 
     order = np.argsort(wavelength_m)
     wavelength_m = wavelength_m[order]

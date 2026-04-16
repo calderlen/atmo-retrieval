@@ -43,7 +43,10 @@ def _parse_metadata_line(line: str) -> tuple[str, str] | None:
 
 
 def _parse_pipe_row(line: str) -> list[str]:
-    return [part.strip() for part in line.strip().strip("|").split("|")]
+    parts = []
+    for part in line.strip().strip("|").split("|"):
+        parts.append(part.strip())
+    return parts
 
 
 def _parse_token(token: str) -> float | str | None:
@@ -106,12 +109,13 @@ def parse_nasa_archive_tbl(
 
     columns = header_rows[0]
     units_row = header_rows[2] if len(header_rows) >= 3 else []
-    units_by_col = {
-        col: (units_row[idx] if idx < len(units_row) else "")
-        for idx, col in enumerate(columns)
-    }
+    units_by_col: dict[str, str] = {}
+    for idx, col in enumerate(columns):
+        units_by_col[col] = units_row[idx] if idx < len(units_row) else ""
 
-    data_by_col: dict[str, list[float | str | None]] = {col: [] for col in columns}
+    data_by_col: dict[str, list[float | str | None]] = {}
+    for col in columns:
+        data_by_col[col] = []
     n_cols = len(columns)
 
     for row in data_rows:
@@ -201,18 +205,13 @@ def load_nasa_archive_spectrum(
         elif "transit" in spec_type_lower or "transmission" in spec_type_lower:
             mode = "transmission"
         else:
-            raise ValueError(
-                "Could not infer mode from SPEC_TYPE; provide mode='emission' or 'transmission'."
-            )
+            raise ValueError("Could not infer mode from SPEC_TYPE; provide mode='emission' or 'transmission'.")
 
     if value_column is None:
         value_column = _select_value_column(columns, mode)
 
     if err1_column is None and err2_column is None:
         err1_column, err2_column = _select_error_columns(columns, value_column)
-
-    if "CENTRALWAVELNG" not in data_by_col:
-        raise ValueError("CENTRALWAVELNG column is required but missing.")
 
     wav_raw = _to_float_array(data_by_col["CENTRALWAVELNG"])
     spec_raw = _to_float_array(data_by_col[value_column])

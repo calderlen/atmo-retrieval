@@ -171,13 +171,13 @@ def run_memory_profile(
             pressure_btm=config.PRESSURE_BTM,
             nlayer=nl,
         )
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
     art.change_temperature_range(config.T_LOW, config.T_HIGH)
     _print_snapshot("After RT setup", tracker)
 
     print("\n[3/4] Loading opacities...")
-    cia_paths = {k: str(v) for k, v in config.CIA_PATHS.items()}
+    cia_paths = {}
+    for k, v in config.CIA_PATHS.items():
+        cia_paths[k] = str(v)
     _ = setup_cia_opacities(cia_paths, nu_grid)
     opa_mols: dict[str, object] = {}
     opa_atoms: dict[str, object] = {}
@@ -185,8 +185,12 @@ def run_memory_profile(
         print("  Skipping opacities")
     else:
         opa_load = True if load_only else config.OPA_LOAD
-        molpath_hitemp = {k: str(v) for k, v in config.MOLPATH_HITEMP.items()}
-        molpath_exomol = {k: str(v) for k, v in config.MOLPATH_EXOMOL.items()}
+        molpath_hitemp = {}
+        for k, v in config.MOLPATH_HITEMP.items():
+            molpath_hitemp[k] = str(v)
+        molpath_exomol = {}
+        for k, v in config.MOLPATH_EXOMOL.items():
+            molpath_exomol[k] = str(v)
         opa_mols, _ = load_molecular_opacities(
             molpath_hitemp,
             molpath_exomol,
@@ -213,8 +217,11 @@ def run_memory_profile(
 
     print("\n[4/4] Estimating device memory...")
     if not skip_opacities:
-        opa_items = [(f"mol:{k}", v) for k, v in opa_mols.items()]
-        opa_items += [(f"atom:{k}", v) for k, v in opa_atoms.items()]
+        opa_items = []
+        for k, v in opa_mols.items():
+            opa_items.append((f"mol:{k}", v))
+        for k, v in opa_atoms.items():
+            opa_items.append((f"atom:{k}", v))
         art_mem, opa_mem, total_mem = _estimate_device_mem(opa_items, art=art, nfree=nfree)
         result.est_art_bytes = art_mem
         result.est_opa_bytes = opa_mem

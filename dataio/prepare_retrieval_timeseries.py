@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 
 import config
-from config.planets_config import EPHEMERIS, PLANETS, PHASE_BINS
+from config.planets_config import EPHEMERIS, PHASE_BINS, get_params
 from dataio.collapse_transmission_timeseries_to_1d import (
     combine_full_arms,
     compute_contact_phases,
@@ -53,14 +53,7 @@ def _nearest_transit_midpoint(jd: np.ndarray, reference_epoch: float, period: fl
 
 
 def _planet_config(planet: str) -> dict[str, Any]:
-    cfg = PLANETS.get(planet, {}).get(EPHEMERIS, {})
-    if not cfg:
-        available = ", ".join(sorted(PLANETS.keys()))
-        raise ValueError(
-            f"Planet '{planet}' not found in config/planets_config.py. "
-            f"Available planets: {available}"
-        )
-    return cfg
+    return get_params(planet, EPHEMERIS)
 
 
 def _unwrap_result(result: Any) -> tuple[tuple[np.ndarray, ...], dict[str, Any]]:
@@ -166,13 +159,15 @@ def _load_data(
             do_molecfit=molecfit,
             stop_delta_stddev=config.DEFAULT_SYSREM_STOP_TOL,
         )
+        n_systematics_used = []
+        for i in range(U_sysrem.shape[2]):
+            n_systematics_used.append(
+                int(np.sum(np.any(np.isfinite(U_sysrem[:, :, i]), axis=0)))
+            )
         extras = {
             "U_sysrem": U_sysrem,
             "no_tellurics": no_tellurics,
-            "n_systematics_used": [
-                int(np.sum(np.any(np.isfinite(U_sysrem[:, :, i]), axis=0)))
-                for i in range(U_sysrem.shape[2])
-            ],
+            "n_systematics_used": n_systematics_used,
         }
         combined = (
             wave,
@@ -223,9 +218,7 @@ def _sanitize_columns(
     if wavelength.ndim != 1:
         raise ValueError(f"Expected 1D wavelength grid, got shape {wavelength.shape}.")
     if data.ndim != 2 or sigma.ndim != 2:
-        raise ValueError(
-            f"Expected 2D data/sigma matrices, got {data.shape=} and {sigma.shape=}."
-        )
+        raise ValueError(f"Expected 2D data/sigma matrices, got {data.shape=} and {sigma.shape=}.")
     if data.shape != sigma.shape:
         raise ValueError(f"data shape {data.shape} does not match sigma shape {sigma.shape}.")
     if data.shape[1] != wavelength.size:
@@ -362,7 +355,7 @@ def _apply_default_doppler_shadow(
 
 def _sysrem_vdiag_from_sigma(sigma: np.ndarray) -> np.ndarray:
     exposure_sigma = np.sqrt(np.mean(np.square(sigma), axis=1))
-    return 1.0 / np.clip(exposure_sigma, 1.0e-30, None)
+    return 1.0 / np.clip(exposure_sigma, config.F32_FLOOR_RECIP, None)
 
 
 def _chunk_labels_from_indices(
@@ -385,13 +378,10 @@ def _sysrem_basis_counts(U_full: np.ndarray) -> np.ndarray:
     if U_full.ndim != 3:
         raise ValueError(f"Unsupported U_sysrem shape: {U_full.shape}")
 
-    return np.asarray(
-        [
-            int(np.sum(np.any(np.isfinite(U_full[:, :, chunk]), axis=0)))
-            for chunk in range(U_full.shape[2])
-        ],
-        dtype=int,
-    )
+    counts = []
+    for chunk in range(U_full.shape[2]):
+        counts.append(int(np.sum(np.any(np.isfinite(U_full[:, :, chunk]), axis=0))))
+    return np.asarray(counts, dtype=int)
 
 
 def _sysrem_chunk_vdiag_from_sigma(
@@ -425,6 +415,9 @@ def _save_metadata(
     regrid: bool,
     doppler_shadow_status: dict[str, Any],
 ) -> None:
+    contacts_serialized: dict[str, float] = {}
+    for k, v in contacts.items():
+        contacts_serialized[k] = float(v)
     metadata = {
         "planet": planet,
         "ephemeris": EPHEMERIS,
@@ -437,7 +430,7 @@ def _save_metadata(
         "phase_max": float(np.max(phase)),
         "jd_min": float(np.min(jd)),
         "jd_max": float(np.max(jd)),
-        "contacts": {k: float(v) for k, v in contacts.items()},
+        "contacts": contacts_serialized,
         "regrid": bool(regrid),
         "subtract_median": bool(subtract_median),
         "run_sysrem": bool(run_sysrem),
@@ -452,9 +445,7 @@ def _save_metadata(
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Prepare retrieval-ready time-series products from PEPSI exposures."
-    )
+    parser = argparse.ArgumentParser(description="Prepare retrieval-ready time-series products from PEPSI exposures.")
     parser.add_argument("--epoch", type=str, required=True, help="Observation epoch (YYYYMMDD)")
     parser.add_argument(
         "--planet",
@@ -569,22 +560,19 @@ def main() -> int:
     ra = planet_cfg.get("RA")
     dec = planet_cfg.get("Dec")
     reference_epoch = planet_cfg.get("epoch")
-    missing = [
-        name
-        for name, value in (
-            ("period", period),
-            ("duration", duration),
-            ("RA", ra),
-            ("Dec", dec),
-            ("epoch", reference_epoch),
-            ("tau", planet_cfg.get("tau")),
-        )
-        if value is None or value != value
-    ]
+    missing = []
+    for name, value in (
+        ("period", period),
+        ("duration", duration),
+        ("RA", ra),
+        ("Dec", dec),
+        ("epoch", reference_epoch),
+        ("tau", planet_cfg.get("tau")),
+    ):
+        if value is None or value != value:
+            missing.append(name)
     if missing:
-        raise ValueError(
-            f"Missing required planet parameters for {args.planet}: {', '.join(missing)}."
-        )
+        raise ValueError(f"Missing required planet parameters for {args.planet}: {', '.join(missing)}.")
 
     print(f"\nLoading PEPSI {args.arm} data for {args.planet} ({args.epoch})...")
     result, extras = _load_data(

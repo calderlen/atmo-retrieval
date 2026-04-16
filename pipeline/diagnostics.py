@@ -26,9 +26,6 @@ _FULL_ATOMIC_SPECIES = deepcopy(config.ATOMIC_SPECIES)
 _FULL_MOLPATH_HITEMP = deepcopy(config.MOLPATH_HITEMP)
 _FULL_MOLPATH_EXOMOL = deepcopy(config.MOLPATH_EXOMOL)
 
-_EPS = 1.0e-30
-
-
 @dataclass(frozen=True)
 class PrimaryDiagnosticContext:
     planet: str
@@ -58,11 +55,10 @@ def _deepcopy_or_value(value: Any) -> Any:
 
 @contextmanager
 def temporary_runtime_config(overrides: dict[str, Any]):
-    previous = {
-        name: _deepcopy_or_value(getattr(config, name))
-        for name in overrides
-        if hasattr(config, name)
-    }
+    previous = {}
+    for name in overrides:
+        if hasattr(config, name):
+            previous[name] = _deepcopy_or_value(getattr(config, name))
     try:
         for name, value in overrides.items():
             config.set_runtime_config(name, _deepcopy_or_value(value))
@@ -301,26 +297,18 @@ def default_named_params_for_context(context: PrimaryDiagnosticContext) -> dict[
             params["Tirr"] = float(region.Tirr_mean)
         else:
             params["Tirr"] = 0.5 * (float(region.T_low) + float(region.T_high))
-        params["kappa_ir_cgs"] = float(
-            np.sqrt(region.kappa_ir_cgs_bounds[0] * region.kappa_ir_cgs_bounds[1])
-        )
-        params["gamma"] = float(
-            np.sqrt(region.gamma_bounds[0] * region.gamma_bounds[1])
-        )
+        params["kappa_ir_cgs"] = float(np.sqrt(region.kappa_ir_cgs_bounds[0] * region.kappa_ir_cgs_bounds[1]))
+        params["gamma"] = float(np.sqrt(region.gamma_bounds[0] * region.gamma_bounds[1]))
 
     composition_solver = region.composition_solver
     if isinstance(composition_solver, ConstantVMR):
-        log_center = 0.5 * (
-            float(composition_solver.log_vmr_min) + float(composition_solver.log_vmr_max)
-        )
+        log_center = 0.5 * (float(composition_solver.log_vmr_min) + float(composition_solver.log_vmr_max))
         for atom_name in region.atom_names:
             params[f"logVMR_{atom_name}"] = log_center
         for mol_name in region.mol_names:
             params[f"logVMR_{mol_name}"] = log_center
     elif isinstance(composition_solver, FastChemHybridChemistry):
-        log_center = 0.5 * (
-            float(composition_solver.log_vmr_min) + float(composition_solver.log_vmr_max)
-        )
+        log_center = 0.5 * (float(composition_solver.log_vmr_min) + float(composition_solver.log_vmr_max))
         for atom_name in region.atom_names:
             if not composition_solver.is_hybrid_managed_species(atom_name):
                 params[f"logVMR_{atom_name}"] = log_center
@@ -343,9 +331,7 @@ def default_named_params_for_context(context: PrimaryDiagnosticContext) -> dict[
                 )
             )
     elif isinstance(composition_solver, FreeVMR):
-        log_center = 0.5 * (
-            float(composition_solver.log_vmr_min) + float(composition_solver.log_vmr_max)
-        )
+        log_center = 0.5 * (float(composition_solver.log_vmr_min) + float(composition_solver.log_vmr_max))
         for atom_name in region.atom_names:
             for i in range(int(composition_solver.n_nodes)):
                 params[f"logVMR_{atom_name}_node{i}"] = log_center
@@ -369,12 +355,14 @@ def merge_named_params(
 def load_named_init_values(run_dir: str | Path) -> dict[str, Any]:
     run_dir = Path(run_dir)
     with np.load(run_dir / "svi_init_values.npz") as init_values:
-        return {
-            key: np.asarray(init_values[key]).item()
-            if np.asarray(init_values[key]).shape == ()
-            else np.asarray(init_values[key])
-            for key in init_values.files
-        }
+        loaded = {}
+        for key in init_values.files:
+            value = np.asarray(init_values[key])
+            if value.shape == ():
+                loaded[key] = value.item()
+            else:
+                loaded[key] = value
+        return loaded
 
 
 def load_saved_run_config(run_dir: str | Path) -> dict[str, Any]:
@@ -454,9 +442,7 @@ def build_diag_config_from_run_dir(
 
     resolved_epoch = epoch or saved.get("Epoch")
     if resolved_epoch is None:
-        raise ValueError(
-            "epoch must be provided for saved runs that do not log it in run_config.log."
-        )
+        raise ValueError("epoch must be provided for saved runs that do not log it in run_config.log.")
 
     resolved_chemistry_model = (
         chemistry_model
@@ -600,20 +586,14 @@ def spectroscopic_log_likelihood(
 
     if likelihood_kind == "gaussian":
         resid = data - model_ts
-        return float(
-            -0.5
-            * np.sum(
-                np.square(resid / np.clip(sigma, _EPS, None))
-                + np.log(2.0 * np.pi * np.square(np.clip(sigma, _EPS, None)))
-            )
-        )
+        return float(-0.5 * np.sum( np.square(resid / np.clip(sigma, config.F32_FLOOR_RECIPSQ, None)) + np.log(2.0 * np.pi * np.square(np.clip(sigma, config.F32_FLOOR_RECIPSQ, None)))))
 
     if likelihood_kind != "matched_filter":
         raise ValueError(f"Unsupported likelihood kind: {likelihood_kind}")
 
-    w_ij = 1.0 / np.clip(sigma, _EPS, None) ** 2
+    w_ij = 1.0 / np.clip(sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
     numerator = np.sum(w_ij * data * model_ts, axis=1)
-    denominator = np.sum(w_ij * np.square(model_ts), axis=1) + _EPS
+    denominator = np.sum(w_ij * np.square(model_ts), axis=1) + config.F32_FLOOR_RECIP
     alpha = numerator / denominator
     resid = data - alpha[:, None] * model_ts
     chi2 = np.sum(w_ij * np.square(resid), axis=1)
@@ -755,9 +735,9 @@ def _matched_filter_scale(
     sigma: np.ndarray,
 ) -> np.ndarray:
     """Compute per-exposure matched-filter scaling alpha = sum(w*d*m)/sum(w*m^2)."""
-    w = 1.0 / np.clip(sigma, _EPS, None) ** 2
+    w = 1.0 / np.clip(sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
     num = np.sum(w * data * model, axis=1)
-    den = np.sum(w * np.square(model), axis=1) + _EPS
+    den = np.sum(w * np.square(model), axis=1) + config.F32_FLOOR_RECIP
     return num / den
 
 
@@ -889,10 +869,8 @@ def plot_processed_timeseries_comparison(
         for idx, (mlabel, marr) in enumerate(model_arrays.items()):
             alpha = _matched_filter_scale(observed, marr, sigma)
             # Per-exposure cross-correlation SNR
-            w = 1.0 / np.clip(sigma, _EPS, None) ** 2
-            ccf = np.sum(w * observed * marr, axis=1) / np.sqrt(
-                np.sum(w * np.square(marr), axis=1) + _EPS
-            )
+            w = 1.0 / np.clip(sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
+            ccf = np.sum(w * observed * marr, axis=1) / np.sqrt(np.sum(w * np.square(marr), axis=1) + config.F32_FLOOR_RECIP)
             all_axes[2, idx].plot(phase, ccf, lw=1.2, label=mlabel)
             all_axes[2, idx].axhline(0, color="gray", ls="--", lw=0.8)
             all_axes[2, idx].set_title(f"CCF signal: {mlabel}")
@@ -903,10 +881,8 @@ def plot_processed_timeseries_comparison(
         # Last column of row 3: overlay comparison
         if ncols > 2:
             for mlabel, marr in model_arrays.items():
-                w = 1.0 / np.clip(sigma, _EPS, None) ** 2
-                ccf = np.sum(w * observed * marr, axis=1) / np.sqrt(
-                    np.sum(w * np.square(marr), axis=1) + _EPS
-                )
+                w = 1.0 / np.clip(sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
+                ccf = np.sum(w * observed * marr, axis=1) / np.sqrt(np.sum(w * np.square(marr), axis=1) + config.F32_FLOOR_RECIP)
                 all_axes[2, 2].plot(phase, ccf, lw=1.2, label=mlabel)
             all_axes[2, 2].axhline(0, color="gray", ls="--", lw=0.8)
             all_axes[2, 2].set_title("CCF comparison")
@@ -991,7 +967,10 @@ def run_multiseed_svi(
         )
         losses = np.asarray(jax.device_get(svi_result.losses))
         median = guide[-1].median(svi_result.params)
-        median = {key: np.asarray(jax.device_get(value)) for key, value in median.items()}
+        median_cpu = {}
+        for key, value in median.items():
+            median_cpu[key] = np.asarray(jax.device_get(value))
+        median = median_cpu
 
         summary: dict[str, Any] = {
             "seed": int(seed),

@@ -39,9 +39,6 @@ def compute_contact_phases(params: dict) -> dict[str, float]:
     duration = params["duration"]
     half_dur_phase = (duration / period) / 2
 
-    if "tau" not in params:
-        raise ValueError("'tau' (ingress/egress duration) required in params")
-
     tau = params["tau"]
     if tau != tau:
         raise ValueError("'tau' is NaN")
@@ -353,9 +350,7 @@ def do_sysrem(
             # Accept and apply this systematic
             U_sysrem[:, system, chunk] = a
             corrected_flux[:, this_one] = trial_flux
-            corrected_error[:, this_one] = np.sqrt(
-                corrected_error[:, this_one]**2 + sigma_syserr**2
-            )
+            corrected_error[:, this_one] = np.sqrt(corrected_error[:, this_one]**2 + sigma_syserr**2)
             stddev_prev = stddev_next
             n_systematics_used[chunk] += 1
 
@@ -397,10 +392,7 @@ def get_phase_bin_mask(
         # Full transit: T1 to T4
         contacts = compute_contact_phases(params)
         return (phase >= contacts["T1"]) & (phase <= contacts["T4"])
-    
-    if bin_name not in PHASE_BINS:
-        raise ValueError(f"Unknown phase bin: {bin_name}. Available: {list(PHASE_BINS.keys())} or 'full'")
-    
+
     boundaries = get_phase_boundaries(params)
     lo, hi = boundaries[bin_name]
     return (phase >= lo) & (phase <= hi)
@@ -985,11 +977,7 @@ def main():
     print(f"JD range: {jd.min():.4f} - {jd.max():.4f}")
 
     # Calculate transmission spectrum using planet config
-    planet_config = PLANETS.get(args.planet, {}).get(EPHEMERIS, {})
-    if not planet_config:
-        print(f"ERROR: Planet '{args.planet}' not found in config/planets_config.py")
-        print(f"Available planets: {list(PLANETS.keys())}")
-        return 1
+    planet_config = PLANETS[args.planet][EPHEMERIS]
 
     period = planet_config.get('period')
     duration = planet_config.get('duration')

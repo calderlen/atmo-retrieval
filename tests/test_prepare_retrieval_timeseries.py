@@ -170,15 +170,9 @@ class PrepareRetrievalTimeseriesMainTests(unittest.TestCase):
     def _run_main(self, argv, *, planet_cfg, result, remove_output, phase, chunk_indices=None):
         with ExitStack() as stack:
             stack.enter_context(patch.object(sys, "argv", argv))
-            stack.enter_context(
-                patch("dataio.prepare_retrieval_timeseries._planet_config", return_value=planet_cfg)
-            )
-            stack.enter_context(
-                patch("dataio.prepare_retrieval_timeseries._load_data", return_value=result)
-            )
-            stack.enter_context(
-                patch("dataio.prepare_retrieval_timeseries.get_orbital_phase", return_value=phase)
-            )
+            stack.enter_context(patch("dataio.prepare_retrieval_timeseries._planet_config", return_value=planet_cfg))
+            stack.enter_context(patch("dataio.prepare_retrieval_timeseries._load_data", return_value=result))
+            stack.enter_context(patch("dataio.prepare_retrieval_timeseries.get_orbital_phase", return_value=phase))
             remove_mock = stack.enter_context(
                 patch(
                     "dataio.prepare_retrieval_timeseries.remove_doppler_shadow",

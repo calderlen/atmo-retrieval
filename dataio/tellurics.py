@@ -190,8 +190,6 @@ class TelluricFitter:
         Returns:
             Telluric transmission spectrum
         """
-        if self.params is None:
-            raise RuntimeError("Must call fit() first")
         return np.array(self._model(self.params, self._initial_guess))
     
     def correct_spectrum(self, spectrum: np.ndarray) -> np.ndarray:

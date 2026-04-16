@@ -59,11 +59,6 @@ def run_phase_binned_retrieval(
             f"{_describe_sysrem_inputs(sysrem_inputs)}"
         )
     
-    # Validate phase bins
-    for bin_name in phase_bins:
-        if bin_name not in PHASE_BINS:
-            raise ValueError(f"Unknown phase bin: {bin_name}. Available: {list(PHASE_BINS.keys())}")
-    
     # Print phase coverage summary
     coverage = summarize_phase_coverage(phase, params)
     print("\n" + "=" * 70)
@@ -137,17 +132,19 @@ def run_phase_binned_retrieval(
             config.DIR_SAVE = previous_dir
     
     # Generate comparison if we have multiple successful retrievals
-    successful_bins = [
-        b for b, r in results.items()
-        if isinstance(r, dict) and "samples" in r and "error" not in r
-    ]
+    successful_bins = []
+    for b, r in results.items():
+        if isinstance(r, dict) and "samples" in r and "error" not in r:
+            successful_bins.append(b)
     
     if len(successful_bins) >= 2:
         comparison_dir = os.path.join(base_output_dir, "comparison")
         os.makedirs(comparison_dir, exist_ok=True)
-        
+        successful_results = {}
+        for b in successful_bins:
+            successful_results[b] = results[b]
         comparison = compare_phase_posteriors(
-            {b: results[b] for b in successful_bins},
+            successful_results,
             output_dir=comparison_dir,
         )
         results["comparison"] = comparison
@@ -172,10 +169,10 @@ def compare_phase_posteriors(
                 all_params.update(post["samples"].keys())
         
         # Filter to interesting parameters
-        params_to_compare = [
-            p for p in all_params 
-            if p.startswith("dRV") or p.startswith("logVMR") or p == "Kp"
-        ]
+        params_to_compare = []
+        for p in all_params:
+            if p.startswith("dRV") or p.startswith("logVMR") or p == "Kp":
+                params_to_compare.append(p)
     
     comparison = {
         "bins": bin_names,
@@ -275,9 +272,15 @@ def compare_phase_posteriors(
             elif isinstance(obj, (np.floating, np.integer)):
                 return float(obj)
             elif isinstance(obj, dict):
-                return {k: convert_to_serializable(v) for k, v in obj.items()}
+                converted = {}
+                for k, v in obj.items():
+                    converted[k] = convert_to_serializable(v)
+                return converted
             elif isinstance(obj, list):
-                return [convert_to_serializable(v) for v in obj]
+                converted = []
+                for v in obj:
+                    converted.append(convert_to_serializable(v))
+                return converted
             return obj
         
         comparison_serializable = convert_to_serializable(comparison)

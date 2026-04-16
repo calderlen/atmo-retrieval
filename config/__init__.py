@@ -21,6 +21,7 @@ from . import data_config as _data_config
 from . import inference_config as _inference_config
 from . import instrument_config as _instrument_config
 from . import model_config as _model_config
+from . import numerics_config as _numerics_config
 from . import paths_config as _paths_config
 from . import photometry_config as _photometry_config
 from . import planets_config as _planets_config
@@ -182,6 +183,13 @@ from .chemistry_config import (
     LOG_QUENCH_P_RANGE,
 )
 
+from .numerics_config import (
+    F32_EPS,
+    F32_FLOOR_RECIP,
+    F32_FLOOR_RECIPSQ,
+    F64_FLOOR,
+)
+
 from .data_config import (
     DEFAULT_DATA_PLANET,
     DEFAULT_DATA_ARM,
@@ -229,6 +237,7 @@ _RUNTIME_CONFIG_MODULES = (
     _paths_config,
     _inference_config,
     _chemistry_config,
+    _numerics_config,
     _data_config,
     _photometry_config,
     _tellurics_config,
@@ -257,20 +266,12 @@ def get_runtime_profile_name() -> str:
 
 def get_runtime_profile(profile_name: str | None = None) -> dict:
     """Return the profile definition for the active or requested profile."""
-    normalized = _normalize_runtime_profile_name(
-        profile_name if profile_name is not None else _active_runtime_profile
-    )
+    normalized = _normalize_runtime_profile_name(profile_name if profile_name is not None else _active_runtime_profile)
     return CONFIG_PROFILES[normalized]
 
 
 def _normalize_runtime_profile_name(profile_name: str) -> str:
     normalized = str(profile_name).strip().lower()
-    if normalized not in CONFIG_PROFILES:
-        available = ", ".join(sorted(CONFIG_PROFILES))
-        raise ValueError(
-            f"Unknown runtime profile {profile_name!r}. "
-            f"Available profiles: {available}."
-        )
     return normalized
 
 
@@ -286,9 +287,7 @@ def apply_runtime_profile(profile_name: str) -> str:
     return normalized
 
 
-apply_runtime_profile(
-    os.environ.get(CONFIG_PROFILE_ENVVAR) or DEFAULT_RUNTIME_PROFILE
-)
+apply_runtime_profile(os.environ.get(CONFIG_PROFILE_ENVVAR) or DEFAULT_RUNTIME_PROFILE)
 
 
 def save_run_config(

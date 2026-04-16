@@ -63,12 +63,8 @@ def _pepsi_data_patterns(
 
     if do_molecfit:
         for ext in pepsi_exts:
-            patterns.append(
-                f"{base_path}/molecfit_weak/SCIENCE_TELLURIC_CORR_{file_prefix}*.dxt.{ext}.fits"
-            )
-            patterns.append(
-                f"{base_path}/**/SCIENCE_TELLURIC_CORR_{file_prefix}*.dxt.{ext}.fits"
-            )
+            patterns.append(f"{base_path}/molecfit_weak/SCIENCE_TELLURIC_CORR_{file_prefix}*.dxt.{ext}.fits")
+            patterns.append(f"{base_path}/**/SCIENCE_TELLURIC_CORR_{file_prefix}*.dxt.{ext}.fits")
     else:
         for ext in pepsi_exts:
             patterns.append(f"{base_path}/{file_prefix}*.dxt.{ext}")

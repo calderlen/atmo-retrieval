@@ -149,9 +149,7 @@ def numpyro_pspline_knots_on_art_grid(
     p_bar = _validate_pressure_bar(art.pressure)
 
     # Knot temperatures
-    T_knots = jnp.stack(
-        [numpyro.sample(f"T_{i}", dist.Uniform(T_low, T_high)) for i in range(n_knots)]
-    )
+    T_knots = jnp.stack([numpyro.sample(f"T_{i}", dist.Uniform(T_low, T_high)) for i in range(n_knots)])
 
     # Smoothness hyperparameter γ
     gamma = numpyro.sample("gamma", dist.InverseGamma(inv_gamma_a, inv_gamma_b))
@@ -214,8 +212,6 @@ def numpyro_gp_temperature(
         T_mid = numpyro.sample("T_mid", dist.Uniform(T_low, T_high))
         dT_dlogP = numpyro.sample("dT_dlogP", dist.Normal(0.0, 1500.0))  # K per dex (broad)
         mu = T_mid + dT_dlogP * (x_dex - jnp.mean(x_dex))
-    else:
-        raise ValueError("mean_kind must be 'isothermal' or 'linear'.")
 
     # GP hyperparameters
     amp = numpyro.sample("gp_amp", dist.HalfNormal(amp_scale))  # K
@@ -231,8 +227,6 @@ def numpyro_gp_temperature(
         K = _gp_kernel_rbf(x, amp, ell)
     elif kernel == "matern32":
         K = _gp_kernel_matern32(x, amp, ell)
-    else:
-        raise ValueError("kernel must be 'matern32' or 'rbf'.")
 
     # Diagonal stabilization:
     # - jitter is dimensionless here; multiply by amp^2 for scale-consistent stabilization

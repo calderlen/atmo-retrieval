@@ -120,13 +120,9 @@ def _read_phoenix_spectrum_ascii(path_str: str) -> tuple[np.ndarray, np.ndarray]
     wavelength_angstrom = wavelength_angstrom[order]
     stellar_surface_flux = stellar_surface_flux[order]
     if np.any(np.diff(wavelength_angstrom) <= 0):
-        raise ValueError(
-            f"PHOENIX spectrum file {path} must be strictly increasing in wavelength."
-        )
+        raise ValueError(f"PHOENIX spectrum file {path} must be strictly increasing in wavelength.")
     if np.any(stellar_surface_flux <= 0):
-        raise ValueError(
-            f"PHOENIX spectrum file {path} must have strictly positive stellar surface flux values."
-        )
+        raise ValueError(f"PHOENIX spectrum file {path} must have strictly positive stellar surface flux values.")
 
     return wavelength_angstrom, stellar_surface_flux
 
@@ -167,9 +163,7 @@ def _coerce_optional_float(value: Any) -> float | None:
 
 
 def _derive_stellar_logg_cgs(Mstar_msun: float, Rstar_rsun: float) -> float:
-    g_cgs = (
-        const.G * (Mstar_msun * const.M_sun) / (Rstar_rsun * const.R_sun) ** 2
-    ).to_value(u.cm / u.s**2)
+    g_cgs = (const.G * (Mstar_msun * const.M_sun) / (Rstar_rsun * const.R_sun) ** 2).to_value(u.cm / u.s**2)
     return float(np.log10(g_cgs))
 
 
@@ -219,9 +213,7 @@ def _build_processed_phoenix_cache_path(
     metallicity: float,
     target_wavelength_angstrom: np.ndarray,
 ) -> Path:
-    grid_hash = hashlib.sha1(
-        np.asarray(target_wavelength_angstrom, dtype=np.float64).tobytes()
-    ).hexdigest()[:16]
+    grid_hash = hashlib.sha1(np.asarray(target_wavelength_angstrom, dtype=np.float64).tobytes()).hexdigest()[:16]
     filename = (
         "phoenix_"
         f"T{_format_phoenix_cache_float(temperature)}_"
@@ -238,9 +230,7 @@ def _convert_chromatic_surface_flux_to_exojax_units(
 ) -> np.ndarray:
     wavelength_cm = u.Quantity(wavelength).to(u.cm)
     energy_per_photon = (const.h * const.c / wavelength_cm) / u.photon
-    surface_flux_lambda = (u.Quantity(surface_flux) * energy_per_photon).to(
-        u.erg / (u.s * u.cm**2 * u.cm)
-    )
+    surface_flux_lambda = (u.Quantity(surface_flux) * energy_per_photon).to(u.erg / (u.s * u.cm**2 * u.cm))
     surface_flux_wavenumber = surface_flux_lambda * wavelength_cm**2
     return np.asarray(
         surface_flux_wavenumber.to_value(u.erg / (u.s * u.cm)),
@@ -414,9 +404,7 @@ def _chunk_indices_from_labels(chunk_labels: np.ndarray) -> tuple[np.ndarray, ..
     labels = sorted(int(label) for label in np.unique(chunk_labels))
     expected = list(range(len(labels)))
     if labels != expected:
-        raise ValueError(
-            f"chunk_labels must be contiguous and start at 0; got labels {labels}."
-        )
+        raise ValueError(f"chunk_labels must be contiguous and start at 0; got labels {labels}.")
 
     return tuple(np.where(chunk_labels == label)[0].astype(int) for label in labels)
 
@@ -444,7 +432,9 @@ def _load_sysrem_inputs(data_dir: str | Path) -> dict[str, np.ndarray]:
 
     if u_path.suffix == ".npz":
         with np.load(u_path) as u_data:
-            raw = {name: np.asarray(u_data[name]) for name in u_data.files}
+            raw = {}
+            for name in u_data.files:
+                raw[name] = np.asarray(u_data[name])
         if "chunk_labels" in raw:
             return raw
         if v_path is None:
@@ -456,9 +446,7 @@ def _load_sysrem_inputs(data_dir: str | Path) -> dict[str, np.ndarray]:
         return raw
 
     if v_path is None:
-        raise FileNotFoundError(
-            f"No SYSREM weighting file found alongside {u_path.name} in {data_dir}."
-        )
+        raise FileNotFoundError(f"No SYSREM weighting file found alongside {u_path.name} in {data_dir}.")
     return {
         "U": np.load(u_path),
         "V": np.load(v_path),
@@ -474,20 +462,14 @@ def _validate_sysrem_inputs(
         if U.ndim == 2:
             U = U[:, :, np.newaxis]
         if U.ndim != 3:
-            raise ValueError(
-                f"Chunked SYSREM U must have shape (n_exp, n_basis, n_chunks); got {U.shape}."
-            )
+            raise ValueError(f"Chunked SYSREM U must have shape (n_exp, n_basis, n_chunks); got {U.shape}.")
         if U.shape[0] != n_exp:
-            raise ValueError(
-                f"U exposure axis mismatch: U.shape[0]={U.shape[0]} but n_exp={n_exp}."
-            )
+            raise ValueError(f"U exposure axis mismatch: U.shape[0]={U.shape[0]} but n_exp={n_exp}.")
 
         chunk_indices = _chunk_indices_from_labels(raw["chunk_labels"])
         n_chunks = len(chunk_indices)
         if U.shape[2] != n_chunks:
-            raise ValueError(
-                f"Chunk count mismatch: U has {U.shape[2]} chunks but chunk_labels encodes {n_chunks}."
-            )
+            raise ValueError(f"Chunk count mismatch: U has {U.shape[2]} chunks but chunk_labels encodes {n_chunks}.")
 
         V_chunk_diag = raw.get("V_chunk_diag")
         if V_chunk_diag is None:
@@ -497,9 +479,7 @@ def _validate_sysrem_inputs(
             V_chunk_diag = V_chunk_diag[np.newaxis, :]
         expected_chunk_shape = (n_chunks, n_exp)
         if V_chunk_diag.shape != expected_chunk_shape:
-            raise ValueError(
-                f"V_chunk_diag shape mismatch: got {V_chunk_diag.shape}, expected {expected_chunk_shape}."
-            )
+            raise ValueError(f"V_chunk_diag shape mismatch: got {V_chunk_diag.shape}, expected {expected_chunk_shape}.")
 
         U_chunks: list[np.ndarray] = []
         V_chunks: list[np.ndarray] = []
@@ -508,15 +488,11 @@ def _validate_sysrem_inputs(
             keep = np.any(np.isfinite(U_chunk), axis=0)
             U_chunk = U_chunk[:, keep]
             if U_chunk.ndim != 2 or U_chunk.shape[0] != n_exp:
-                raise ValueError(
-                    f"Chunk {chunk} has invalid U shape {U_chunk.shape} for n_exp={n_exp}."
-                )
+                raise ValueError(f"Chunk {chunk} has invalid U shape {U_chunk.shape} for n_exp={n_exp}.")
 
             V_diag = np.asarray(V_chunk_diag[chunk], dtype=float)
             if np.any(~np.isfinite(V_diag)) or np.any(V_diag <= 0):
-                raise ValueError(
-                    f"Chunk {chunk} has invalid V_chunk_diag values; all entries must be finite and > 0."
-                )
+                raise ValueError(f"Chunk {chunk} has invalid V_chunk_diag values; all entries must be finite and > 0.")
 
             U_chunks.append(U_chunk)
             V_chunks.append(np.diag(V_diag))
@@ -537,21 +513,15 @@ def _validate_sysrem_inputs(
         )
 
     if U.shape[0] != n_exp:
-        raise ValueError(
-            f"U exposure axis mismatch: U.shape[0]={U.shape[0]} but n_exp={n_exp}."
-        )
+        raise ValueError(f"U exposure axis mismatch: U.shape[0]={U.shape[0]} but n_exp={n_exp}.")
     if V.ndim == 1:
         if V.size != n_exp:
-            raise ValueError(
-                f"V exposure axis mismatch: V.size={V.size} but n_exp={n_exp}."
-            )
+            raise ValueError(f"V exposure axis mismatch: V.size={V.size} but n_exp={n_exp}.")
         V = np.diag(V)
     elif V.ndim == 2:
         expected_shape = (n_exp, n_exp)
         if V.shape != expected_shape:
-            raise ValueError(
-                f"V shape mismatch: V.shape={V.shape} but expected {expected_shape}."
-            )
+            raise ValueError(f"V shape mismatch: V.shape={V.shape} but expected {expected_shape}.")
 
     return SysremInputBundle(U=U, V=V)
 
@@ -593,9 +563,7 @@ def _subset_sysrem_inputs(
         return SysremInputBundle(
             chunk_indices=tuple(np.asarray(chunk_indices, dtype=int) for chunk_indices in sysrem.chunk_indices),
             U_chunks=tuple(np.asarray(U_chunk)[indices] for U_chunk in sysrem.U_chunks),
-            V_chunks=tuple(
-                np.asarray(V_chunk)[np.ix_(indices, indices)] for V_chunk in sysrem.V_chunks
-            ),
+            V_chunks=tuple(np.asarray(V_chunk)[np.ix_(indices, indices)] for V_chunk in sysrem.V_chunks),
         )
 
     return SysremInputBundle(
@@ -695,15 +663,11 @@ def _preflight_spectrum_checks(
         expected_exposures = 1
     else:
         if data.shape[1] != wav_obs.size:
-            raise ValueError(
-                f"data spectral axis {data.shape[1]} != wavelength length {wav_obs.size}"
-            )
+            raise ValueError(f"data spectral axis {data.shape[1]} != wavelength length {wav_obs.size}")
         expected_exposures = data.shape[0]
 
     if phase.size != expected_exposures:
-        raise ValueError(
-            f"phase length {phase.size} != number of exposures {expected_exposures}"
-        )
+        raise ValueError(f"phase length {phase.size} != number of exposures {expected_exposures}")
 
 
 def _preflight_grid_checks(inst_nus: np.ndarray, nu_grid: np.ndarray) -> None:
@@ -742,10 +706,10 @@ def _sample_svi_posterior(
         print(f"  Warning: failed to sample SVI posterior for corner plots: {exc}")
         return None
 
-    return {
-        name: np.asarray(jax.device_get(values))
-        for name, values in svi_draws.items()
-    }
+    svi_draws_np = {}
+    for name, values in svi_draws.items():
+        svi_draws_np[name] = np.asarray(jax.device_get(values))
+    return svi_draws_np
 
 
 def _summarize_observed_spectrum(
@@ -771,7 +735,10 @@ def _validate_mcmc_device_layout(
 ) -> None:
     chain_method = str(chain_method).strip().lower()
     local_devices = list(jax.local_devices())
-    gpu_devices = [device for device in local_devices if device.platform == "gpu"]
+    gpu_devices = []
+    for device in local_devices:
+        if device.platform == "gpu":
+            gpu_devices.append(device)
 
     print(f"  JAX default backend: {jax.default_backend()}")
     print(f"  JAX local devices: {local_devices}")
@@ -780,9 +747,7 @@ def _validate_mcmc_device_layout(
         return
 
     if chain_method != "parallel":
-        raise RuntimeError(
-            "MCMC_REQUIRE_GPU_PER_CHAIN requires MCMC_CHAIN_METHOD='parallel'."
-        )
+        raise RuntimeError("MCMC_REQUIRE_GPU_PER_CHAIN requires MCMC_CHAIN_METHOD='parallel'.")
 
     if jax.default_backend() != "gpu":
         raise RuntimeError(
@@ -1347,11 +1312,11 @@ def make_bandpass_constraints_from_tbl(tbl_path: str | Path) -> list[dict[str, A
 
     bandwidth_values = np.full_like(wav_angstrom, np.nan, dtype=float)
     if "BANDWIDTH" in data_by_col:
+        raw_bandwidth_values = []
+        for value in data_by_col["BANDWIDTH"]:
+            raw_bandwidth_values.append(np.nan if value is None else float(value))
         raw_bandwidth = np.asarray(
-            [
-                np.nan if value is None else float(value)
-                for value in data_by_col["BANDWIDTH"]
-            ],
+            raw_bandwidth_values,
             dtype=float,
         )
         if raw_bandwidth.size == wav_angstrom.size:
@@ -1550,14 +1515,10 @@ def _load_joint_spectroscopic_component(
             elif isinstance(sysrem_spec, dict):
                 sysrem = _validate_sysrem_inputs(sysrem_spec, n_exp=(1 if data.ndim == 1 else data.shape[0]))
             else:
-                raise TypeError(
-                    f"Unsupported sysrem spec type for component '{name}': {type(sysrem_spec)!r}"
-                )
+                raise TypeError(f"Unsupported sysrem spec type for component '{name}': {type(sysrem_spec)!r}")
         elif spec.get("U") is not None or spec.get("V") is not None:
             if spec.get("U") is None or spec.get("V") is None:
-                raise ValueError(
-                    f"Joint spectroscopic component '{name}' must provide both U and V together."
-                )
+                raise ValueError(f"Joint spectroscopic component '{name}' must provide both U and V together.")
             sysrem = _validate_sysrem_inputs(
                 {"U": np.asarray(spec["U"]), "V": np.asarray(spec["V"])},
                 n_exp=(1 if data.ndim == 1 else data.shape[0]),
@@ -2062,9 +2023,7 @@ def run_retrieval(
             sample_prefix=primary_sample_prefix,
         )
         observation_configs: list[object] = [primary_component.observation_config]
-        observations_payload: dict[str, object] = {
-            primary_component.name: primary_component.observation_inputs
-        }
+        observations_payload: dict[str, object] = {primary_component.name: primary_component.observation_inputs}
 
         auxiliary_components: list[SpectroscopicComponentBundle] = []
         if joint_spectra:
@@ -2301,10 +2260,9 @@ def run_retrieval(
 
     if not no_plots:
         print("\n  Generating corner plots...")
-        posterior_np = {
-            name: np.asarray(jax.device_get(values))
-            for name, values in posterior_sample.items()
-        }
+        posterior_np = {}
+        for name, values in posterior_sample.items():
+            posterior_np[name] = np.asarray(jax.device_get(values))
 
         if svi_params is not None and svi_guide is not None:
             n_hmc_samples = max(100, int(config.MCMC_NUM_SAMPLES))
@@ -2352,10 +2310,9 @@ def run_retrieval(
         print("\n  Computing atmospheric state from posterior...")
 
         if posterior_np is None:
-            posterior_np = {
-                name: np.asarray(jax.device_get(values))
-                for name, values in posterior_sample.items()
-            }
+            posterior_np = {}
+            for name, values in posterior_sample.items():
+                posterior_np[name] = np.asarray(jax.device_get(values))
 
         try:
             atmo_state = compute_atmospheric_state_from_posterior(
@@ -2462,9 +2419,9 @@ def run_retrieval(
 
             # Per-species contribution functions (if available)
             if atmo_state['dtau_per_species']:
-                dtau_per_species_np = {
-                    k: np.array(v) for k, v in atmo_state['dtau_per_species'].items()
-                }
+                dtau_per_species_np = {}
+                for k, v in atmo_state['dtau_per_species'].items():
+                    dtau_per_species_np[k] = np.array(v)
 
                 plot_contribution_per_species(
                     nu_grid=np.array(primary_component.nu_grid),

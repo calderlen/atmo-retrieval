@@ -139,9 +139,7 @@ def compute_planet_positions(
         # Eccentric case
         omega = 2.0 * np.pi / period * (1.0 - eccentricity**2)**(-1.5) * (1.0 + eccentricity * np.sin(periarg))**2
         theta = omega * phase * period + np.pi / 2.0 - periarg
-        z = a_rs * (1.0 - eccentricity**2) / (1.0 + eccentricity * np.cos(theta)) * (
-            np.sin(periarg) * np.sin(theta) - np.cos(periarg) * np.cos(theta)
-        )
+        z = a_rs * (1.0 - eccentricity**2) / (1.0 + eccentricity * np.cos(theta)) * (np.sin(periarg) * np.sin(theta) - np.cos(periarg) * np.cos(theta))
 
     # Project onto stellar disk with spin-orbit angle
     x_planet = z * np.cos(lambda_angle) + b * np.sin(lambda_angle)

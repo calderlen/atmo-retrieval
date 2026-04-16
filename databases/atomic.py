@@ -133,8 +133,6 @@ def parse_species(species: str) -> Tuple[str, int]:
     ionization = 0
     if len(parts) > 1:
         roman = parts[1]
-        if roman not in ROMAN_TO_INT:
-            raise ValueError(f"Unsupported ionization label: {species}")
         ionization = ROMAN_TO_INT[roman] - 1
     return element, ionization
 

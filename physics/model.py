@@ -51,9 +51,6 @@ from physics.pt import (
 
 # chemistry models
 from physics.chemistry import CompositionSolver, ConstantVMR, FastChemHybridChemistry, FreeVMR
-
-
-EPS = 1.0e-30 # prevent divide by zero
 CIA_COLLISION_PAIRS: tuple[tuple[str, str, str], ...] = (
     ("H2H2", "H2", "H2"),
     ("H2He", "H2", "He"),
@@ -271,7 +268,7 @@ def sysrem_model_distortion(
     # Avoid routing that 1x1 solve through cuSolver, which has been unstable
     # on some GPU setups despite the problem being just a scalar division.
     if U.shape[1] == 1:
-        coeffs = rhs / jnp.clip(gram[0, 0], EPS, None)
+        coeffs = rhs / jnp.clip(gram[0, 0], config.F32_FLOOR_RECIP, None)
     else:
         coeffs = jnp.linalg.solve(gram, rhs)
 
@@ -553,25 +550,24 @@ def _extract_scoped_site_params(
     sample_prefix: str | None,
 ) -> dict:
     if sample_prefix is None:
-        return {
-            key: value
-            for key, value in posterior_params.items()
-            if "/" not in key
-        }
+        unscoped = {}
+        for key, value in posterior_params.items():
+            if "/" not in key:
+                unscoped[key] = value
+        return unscoped
 
     prefix = f"{sample_prefix}/"
-    scoped = {
-        key[len(prefix):]: value
-        for key, value in posterior_params.items()
-        if key.startswith(prefix)
-    }
+    scoped = {}
+    for key, value in posterior_params.items():
+        if key.startswith(prefix):
+            scoped[key[len(prefix):]] = value
     if scoped:
         return scoped
-    return {
-        key: value
-        for key, value in posterior_params.items()
-        if "/" not in key
-    }
+    unscoped = {}
+    for key, value in posterior_params.items():
+        if "/" not in key:
+            unscoped[key] = value
+    return unscoped
 
 
 def _posterior_site_value(
@@ -779,35 +775,33 @@ def reconstruct_vmr_profiles(
         log_vmr_profile = jnp.interp(log_p, log_p_nodes, log_vmr_nodes_arr)
         return jnp.power(10.0, log_vmr_profile)
 
-    vmr_mols = {
-        mol: profile
-        for mol in mol_names
-        if (profile := _profile_for_species(mol)) is not None
-    }
-    vmr_atoms = {
-        atom: profile
-        for atom in atom_names
-        if (profile := _profile_for_species(atom)) is not None
-    }
+    vmr_mols = {}
+    for mol in mol_names:
+        profile = _profile_for_species(mol)
+        if profile is not None:
+            vmr_mols[mol] = profile
+    vmr_atoms = {}
+    for atom in atom_names:
+        profile = _profile_for_species(atom)
+        if profile is not None:
+            vmr_atoms[atom] = profile
 
     all_profiles = [*vmr_mols.values(), *vmr_atoms.values()]
     if all_profiles:
         stacked = jnp.stack(all_profiles, axis=0)
         sum_trace = jnp.sum(stacked, axis=0)
-        scale = jnp.where(sum_trace > 1.0, (1.0 - 1.0e-12) / sum_trace, 1.0)
+        scale = jnp.where(sum_trace > 1.0, 1.0 / sum_trace, 1.0)
         scaled = stacked * scale[None, :]
 
         mol_keys = list(vmr_mols)
         atom_keys = list(vmr_atoms)
         mol_count = len(mol_keys)
-        vmr_mols = {
-            mol: scaled[i]
-            for i, mol in enumerate(mol_keys)
-        }
-        vmr_atoms = {
-            atom: scaled[mol_count + i]
-            for i, atom in enumerate(atom_keys)
-        }
+        vmr_mols = {}
+        for i, mol in enumerate(mol_keys):
+            vmr_mols[mol] = scaled[i]
+        vmr_atoms = {}
+        for i, atom in enumerate(atom_keys):
+            vmr_atoms[atom] = scaled[mol_count + i]
 
     return vmr_mols, vmr_atoms
 
@@ -848,12 +842,15 @@ def reconstruct_fastchem_hybrid_profiles(
     n_layers = art.pressure.size
     log_P = jnp.log10(art.pressure)
 
-    mol_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in mol_names}
-    atom_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in atom_names}
-    continuum_profile_map = {
-        species: jnp.full(n_layers, 1.0e-30)
-        for species in composition_solver.hidden_continuum_species()
-    }
+    mol_profile_map = {}
+    for name in mol_names:
+        mol_profile_map[name] = jnp.full(n_layers, 1.0e-30)
+    atom_profile_map = {}
+    for name in atom_names:
+        atom_profile_map[name] = jnp.full(n_layers, 1.0e-30)
+    continuum_profile_map = {}
+    for species in composition_solver.hidden_continuum_species():
+        continuum_profile_map[species] = jnp.full(n_layers, 1.0e-30)
     for mol, vmr in vmr_mols_scalar.items():
         mol_profile_map[mol] = jnp.full(n_layers, vmr)
     for atom, vmr in vmr_atoms_scalar.items():
@@ -861,9 +858,7 @@ def reconstruct_fastchem_hybrid_profiles(
 
     needed = list(continuum_profile_map)
     if needed and has_hybrid_params:
-        if composition_solver._hybrid_vmr_grids is None or any(
-            species not in composition_solver._hybrid_vmr_grids for species in needed
-        ):
+        if composition_solver._hybrid_vmr_grids is None or any(species not in composition_solver._hybrid_vmr_grids for species in needed):
             composition_solver._build_hybrid_grid(np.asarray(art.pressure), needed)
 
         for species in needed:
@@ -890,7 +885,7 @@ def reconstruct_fastchem_hybrid_profiles(
     if vmr_mols_profiles or vmr_atoms_profiles or continuum_profiles:
         all_profiles = jnp.array(vmr_mols_profiles + vmr_atoms_profiles + continuum_profiles)
         sum_trace = jnp.sum(all_profiles, axis=0)
-        scale = jnp.where(sum_trace > 1.0, (1.0 - 1.0e-12) / sum_trace, 1.0)
+        scale = jnp.where(sum_trace > 1.0, 1.0 / sum_trace, 1.0)
         all_profiles = all_profiles * scale[None, :]
         vmr_mols_profiles = [all_profiles[i] for i in range(len(vmr_mols_profiles))]
         vmr_atoms_profiles = [
@@ -903,14 +898,12 @@ def reconstruct_fastchem_hybrid_profiles(
             for i, name in enumerate(continuum_profile_map)
         }
 
-    vmr_mols_profiles_dict = {
-        mol: vmr_mols_profiles[i]
-        for i, mol in enumerate(mol_names)
-    }
-    vmr_atoms_profiles_dict = {
-        atom: vmr_atoms_profiles[i]
-        for i, atom in enumerate(atom_names)
-    }
+    vmr_mols_profiles_dict = {}
+    for i, mol in enumerate(mol_names):
+        vmr_mols_profiles_dict[mol] = vmr_mols_profiles[i]
+    vmr_atoms_profiles_dict = {}
+    for i, atom in enumerate(atom_names):
+        vmr_atoms_profiles_dict[atom] = vmr_atoms_profiles[i]
     return vmr_mols_profiles_dict, vmr_atoms_profiles_dict, continuum_profile_map
 
 
@@ -921,10 +914,12 @@ def compute_mmw_and_h2he_from_vmr(
     atom_names: list[str],
     h2_he_ratio: float = config.H2_HE_RATIO,
 ) -> tuple[float, float, float]:
-    mol_masses = {m: molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names}
-    atom_masses = {
-        a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names
-    }
+    mol_masses = {}
+    for mol in mol_names:
+        mol_masses[mol] = molinfo.molmass_isotope(mol, db_HIT=False)
+    atom_masses = {}
+    for atom in atom_names:
+        atom_masses[atom] = molinfo.molmass_isotope(_element_from_species(atom), db_HIT=False)
 
     vmr_trace_tot = sum(vmr_mols.values()) + sum(vmr_atoms.values())
     vmr_trace_tot = min(max(vmr_trace_tot, 0.0), 1.0)
@@ -955,9 +950,7 @@ def compute_mmw_and_h2he_from_vmr_profiles(
     extra_species_masses: dict[str, float] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     mol_masses = {m: molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names}
-    atom_masses = {
-        a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names
-    }
+    atom_masses = {a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names}
 
     profile_values = [
         *vmr_mols.values(),
@@ -1001,9 +994,7 @@ def convert_vmr_to_mmr_profiles(
     art: object,
 ) -> tuple[dict[str, jnp.ndarray], dict[str, jnp.ndarray]]:
     mol_masses = {m: molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names}
-    atom_masses = {
-        a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names
-    }
+    atom_masses = {a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names}
 
     mmr_mols = {}
     for mol, vmr in vmr_mols.items():
@@ -1028,9 +1019,7 @@ def convert_vmr_profiles_to_mmr_profiles(
     mmw: jnp.ndarray,
 ) -> tuple[dict[str, jnp.ndarray], dict[str, jnp.ndarray]]:
     mol_masses = {m: molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names}
-    atom_masses = {
-        a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names
-    }
+    atom_masses = {a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names}
 
     mmr_mols = {}
     for mol, vmr_profile in vmr_mols.items():
@@ -1114,14 +1103,12 @@ def compute_atmospheric_state_from_posterior(
             atom_names,
             mmw_profile,
         )
-        vmr_mols = {
-            mol: float(jnp.mean(vmr_profile))
-            for mol, vmr_profile in vmr_mols_profiles.items()
-        }
-        vmr_atoms = {
-            atom: float(jnp.mean(vmr_profile))
-            for atom, vmr_profile in vmr_atoms_profiles.items()
-        }
+        vmr_mols = {}
+        for mol, vmr_profile in vmr_mols_profiles.items():
+            vmr_mols[mol] = float(jnp.mean(vmr_profile))
+        vmr_atoms = {}
+        for atom, vmr_profile in vmr_atoms_profiles.items():
+            vmr_atoms[atom] = float(jnp.mean(vmr_profile))
     elif isinstance(composition_solver, FastChemHybridChemistry):
         (
             vmr_mols_profiles_dict,
@@ -1153,21 +1140,13 @@ def compute_atmospheric_state_from_posterior(
             atom_names,
             mmw_profile,
         )
-        vmr_mols = {
-            mol: float(jnp.mean(vmr_profile))
-            for mol, vmr_profile in vmr_mols_profiles_dict.items()
-        }
-        vmr_atoms = {
-            atom: float(jnp.mean(vmr_profile))
-            for atom, vmr_profile in vmr_atoms_profiles_dict.items()
-        }
-    else:
-        raise NotImplementedError(
-            "Atmospheric-state reconstruction is only implemented for "
-            "ConstantVMR, FreeVMR, and FastChemHybridChemistry. Skip contribution "
-            "diagnostics for other "
-            "chemistry solvers."
-        )
+        vmr_mols = {}
+        for mol, vmr_profile in vmr_mols_profiles_dict.items():
+            vmr_mols[mol] = float(jnp.mean(vmr_profile))
+        vmr_atoms = {}
+        for atom, vmr_profile in vmr_atoms_profiles_dict.items():
+            vmr_atoms[atom] = float(jnp.mean(vmr_profile))
+
 
     # Compute gravity profile
     Rp = params.get("Rp", config.DEFAULT_POSTERIOR_RP) * RJ
@@ -1362,7 +1341,7 @@ def compute_model_timeseries(
         context="compute_model_timeseries",
     )
     Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
-    return planet_ts / jnp.clip(Fs_ts, EPS, None) * (Rp / Rstar) ** 2
+    return planet_ts / jnp.clip(Fs_ts, config.F32_FLOOR_RECIP, None) * (Rp / Rstar) ** 2
 
 
 def apply_model_pipeline_corrections(
@@ -1396,7 +1375,7 @@ def _lnL_exposure(
     m_i: jnp.ndarray,
     w_i: jnp.ndarray,
 ) -> jnp.ndarray:
-    alpha_i = jnp.sum(w_i * f_i * m_i) / (jnp.sum(w_i * m_i**2) + EPS)
+    alpha_i = jnp.sum(w_i * f_i * m_i) / (jnp.sum(w_i * m_i**2) + config.F32_FLOOR_RECIP)
     r_i = f_i - alpha_i * m_i
     chi2_i = jnp.sum(w_i * r_i**2)
     norm_i = jnp.sum(jnp.log((2.0 * jnp.pi) / w_i))
@@ -1413,37 +1392,23 @@ def _normalize_chunked_sysrem_inputs(
     U_chunks_np = tuple(np.asarray(U_chunk) for U_chunk in chunked_sysrem.U_chunks)
     V_chunks_np = tuple(np.asarray(V_chunk) for V_chunk in chunked_sysrem.V_chunks)
 
-    if not (
-        len(chunk_indices_np) == len(U_chunks_np) == len(V_chunks_np)
-    ):
-        raise ValueError(
-            "chunked_sysrem must provide the same number of chunk indices, U chunks, and V chunks."
-        )
+    if not (len(chunk_indices_np) == len(U_chunks_np) == len(V_chunks_np)):
+        raise ValueError("chunked_sysrem must provide the same number of chunk indices, U chunks, and V chunks.")
 
     assigned = np.zeros((n_wave,), dtype=bool)
     normalized_indices: list[jnp.ndarray] = []
     normalized_u_chunks: list[jnp.ndarray] = []
     normalized_v_chunks: list[jnp.ndarray] = []
 
-    for chunk_number, (indices, U_chunk, V_chunk) in enumerate(
-        zip(chunk_indices_np, U_chunks_np, V_chunks_np)
-    ):
+    for chunk_number, (indices, U_chunk, V_chunk) in enumerate(zip(chunk_indices_np, U_chunks_np, V_chunks_np)):
         if indices.ndim != 1:
-            raise ValueError(
-                f"chunk_indices[{chunk_number}] must be 1D, got shape {indices.shape}."
-            )
+            raise ValueError(f"chunk_indices[{chunk_number}] must be 1D, got shape {indices.shape}.")
         if np.any(indices < 0) or np.any(indices >= n_wave):
-            raise ValueError(
-                f"chunk_indices[{chunk_number}] contains out-of-range wavelength columns."
-            )
+            raise ValueError(f"chunk_indices[{chunk_number}] contains out-of-range wavelength columns.")
         if np.unique(indices).size != indices.size:
-            raise ValueError(
-                f"chunk_indices[{chunk_number}] contains duplicate wavelength columns."
-            )
+            raise ValueError(f"chunk_indices[{chunk_number}] contains duplicate wavelength columns.")
         if np.any(assigned[indices]):
-            raise ValueError(
-                f"chunk_indices[{chunk_number}] overlaps another SYSREM chunk."
-            )
+            raise ValueError(f"chunk_indices[{chunk_number}] overlaps another SYSREM chunk.")
         assigned[indices] = True
 
         if U_chunk.ndim != 2 or U_chunk.shape[0] != n_exp:
@@ -1453,14 +1418,10 @@ def _normalize_chunked_sysrem_inputs(
             )
         if V_chunk.ndim == 1:
             if V_chunk.size != n_exp:
-                raise ValueError(
-                    f"V_chunks[{chunk_number}] length {V_chunk.size} does not match n_exp={n_exp}."
-                )
+                raise ValueError(f"V_chunks[{chunk_number}] length {V_chunk.size} does not match n_exp={n_exp}.")
             V_chunk = np.diag(V_chunk)
         elif V_chunk.ndim != 2 or V_chunk.shape != (n_exp, n_exp):
-            raise ValueError(
-                f"V_chunks[{chunk_number}] must have shape {(n_exp, n_exp)}, got {V_chunk.shape}."
-            )
+            raise ValueError(f"V_chunks[{chunk_number}] must have shape {(n_exp, n_exp)}, got {V_chunk.shape}.")
 
         normalized_indices.append(jnp.asarray(indices, dtype=jnp.int32))
         normalized_u_chunks.append(jnp.asarray(U_chunk))
@@ -1468,9 +1429,7 @@ def _normalize_chunked_sysrem_inputs(
 
     if not np.all(assigned):
         missing = int(np.sum(~assigned))
-        raise ValueError(
-            f"chunked_sysrem does not cover the full wavelength axis; {missing} columns are unassigned."
-        )
+        raise ValueError(f"chunked_sysrem does not cover the full wavelength axis; {missing} columns are unassigned.")
 
     return ChunkedSysremInputs(
         chunk_indices=tuple(normalized_indices),
@@ -1498,9 +1457,7 @@ def _normalize_spectroscopic_observation_inputs(
     if phase is None:
         phase = jnp.zeros((data.shape[0],), dtype=data.dtype)
     if phase.shape[0] != data.shape[0]:
-        raise ValueError(
-            f"phase length {phase.shape[0]} does not match number of exposures {data.shape[0]}"
-        )
+        raise ValueError(f"phase length {phase.shape[0]} does not match number of exposures {data.shape[0]}")
     if chunked_sysrem is not None and (U is not None or V is not None):
         raise ValueError("Provide either global U/V SYSREM inputs or chunked_sysrem, not both.")
     if V is not None:
@@ -1651,15 +1608,24 @@ def _validate_unique_sample_prefixes(
     if len(items) <= 1:
         return
 
-    missing = [getattr(item, "name", "<unnamed>") for item in items if getattr(item, "sample_prefix", None) is None]
+    missing = []
+    for item in items:
+        if getattr(item, "sample_prefix", None) is None:
+            missing.append(getattr(item, "name", "<unnamed>"))
     if missing:
         raise ValueError(
             f"Multiple {label} require explicit sample_prefix values. Missing sample_prefix for: "
             + ", ".join(missing)
         )
 
-    prefixes = [str(getattr(item, "sample_prefix")) for item in items]
-    duplicates = sorted({prefix for prefix in prefixes if prefixes.count(prefix) > 1})
+    prefixes = []
+    for item in items:
+        prefixes.append(str(getattr(item, "sample_prefix")))
+    duplicate_prefixes = set()
+    for prefix in prefixes:
+        if prefixes.count(prefix) > 1:
+            duplicate_prefixes.add(prefix)
+    duplicates = sorted(duplicate_prefixes)
     if duplicates:
         raise ValueError(
             f"{label.capitalize()} sample_prefix values must be unique. Duplicates: "
@@ -1719,7 +1685,7 @@ def _compute_native_observable_spectrum(
         stellar_surface_flux=stellar_surface_flux,
         context="_compute_native_observable_spectrum",
     )
-    return rt / jnp.clip(Fs, EPS, None) * (Rp / Rstar) ** 2
+    return rt / jnp.clip(Fs, config.F32_FLOOR_RECIP, None) * (Rp / Rstar) ** 2
 
 
 def _resolve_emission_stellar_surface_flux(
@@ -1748,7 +1714,7 @@ def _gaussian_log_likelihood(
     model: jnp.ndarray,
     sigma: jnp.ndarray,
 ) -> jnp.ndarray:
-    var = jnp.clip(sigma, EPS, None) ** 2
+    var = jnp.clip(sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
     return -0.5 * jnp.sum(((data - model) ** 2) / var + jnp.log(2.0 * jnp.pi * var))
 
 
@@ -1760,7 +1726,7 @@ def _bandpass_weighted_mean(
     *,
     photon_weighted: bool,
 ) -> jnp.ndarray:
-    model_wavelength_m = 1.0e-2 / jnp.clip(nu_grid, EPS, None)
+    model_wavelength_m = 1.0e-2 / jnp.clip(nu_grid, config.F32_FLOOR_RECIP, None)
 
     model_sort_idx = jnp.argsort(model_wavelength_m)
     wl_model = model_wavelength_m[model_sort_idx]
@@ -1773,7 +1739,11 @@ def _bandpass_weighted_mean(
     rsp_interp = jnp.interp(wl_model, wl_band, rsp_band, left=0.0, right=0.0)
     weights = rsp_interp * wl_model if photon_weighted else rsp_interp
     norm = jnp.trapezoid(weights, wl_model)
-    return jnp.trapezoid(spec_sorted * weights, wl_model) / jnp.clip(norm, EPS, None)
+    return jnp.trapezoid(spec_sorted * weights, wl_model) / jnp.clip(
+        norm,
+        config.F32_FLOOR_RECIP,
+        None,
+    )
 
 
 def _transform_bandpass_observable(
@@ -1819,7 +1789,7 @@ def _compute_reflected_bandpass_component(
     semi_major_axis_au: float,
 ) -> jnp.ndarray:
     semi_major_axis_m = semi_major_axis_au * config.AU_M
-    rp_over_a = Rp_m / jnp.clip(semi_major_axis_m, EPS, None)
+    rp_over_a = Rp_m / jnp.clip(semi_major_axis_m, config.F32_FLOOR_RECIP, None)
     return geometric_albedo * rp_over_a**2
 
 
@@ -1926,10 +1896,11 @@ def _evaluate_spectroscopic_component(
             model_ts,
             observation_inputs.sigma,
         )
+
     if component_config.likelihood_kind != "matched_filter":
         raise ValueError(f"Unknown spectroscopic likelihood kind: {component_config.likelihood_kind}")
 
-    w_ij = 1.0 / jnp.clip(observation_inputs.sigma, EPS, None) ** 2
+    w_ij = 1.0 / jnp.clip(observation_inputs.sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
     return jnp.sum(jax.vmap(_lnL_exposure)(observation_inputs.data, model_ts, w_ij))
 
 
@@ -2006,14 +1977,13 @@ def joint_retrieval_model(
 ) -> None:
     multi_observation = len(model_config.observations) > 1
     shared_state = _sample_shared_system_state(model_config.shared_system)
-    region_states = {
-        region_config.name: _sample_atmosphere_state(
+    region_states = {}
+    for region_config in model_config.atmosphere_regions:
+        region_states[region_config.name] = _sample_atmosphere_state(
             region_config,
             shared_state,
             scope_prefix=region_config.sample_prefix,
         )
-        for region_config in model_config.atmosphere_regions
-    }
 
     total_lnL = 0.0
     for component_config in model_config.observations:
@@ -2108,13 +2078,15 @@ def _build_species_metadata(
     mol_names: tuple[str, ...],
     atom_names: tuple[str, ...],
 ) -> tuple[tuple[str, ...], tuple[str, ...], jnp.ndarray, jnp.ndarray]:
-    mol_masses = jnp.array(
-        [molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names]
-    )
+    mol_mass_values = []
+    for mol in mol_names:
+        mol_mass_values.append(molinfo.molmass_isotope(mol, db_HIT=False))
+    mol_masses = jnp.array(mol_mass_values)
     if atom_names:
-        atom_masses = jnp.array(
-            [molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names]
-        )
+        atom_mass_values = []
+        for atom in atom_names:
+            atom_mass_values.append(molinfo.molmass_isotope(_element_from_species(atom), db_HIT=False))
+        atom_masses = jnp.array(atom_mass_values)
     else:
         atom_masses = jnp.zeros((0,))
     return mol_names, atom_names, mol_masses, atom_masses
@@ -2145,9 +2117,7 @@ def build_atmosphere_region_config(
     if Tint_fixed is None:
         Tint_fixed = config.TINT_FIXED
     if kappa_ir_cgs_bounds is None:
-        kappa_ir_cgs_bounds = tuple(
-            float(10.0**bound) for bound in config.LOG_KAPPA_IR_BOUNDS
-        )
+        kappa_ir_cgs_bounds = tuple(float(10.0**bound) for bound in config.LOG_KAPPA_IR_BOUNDS)
     if gamma_bounds is None:
         gamma_bounds = tuple(float(10.0**bound) for bound in config.LOG_GAMMA_BOUNDS)
 
@@ -2256,13 +2226,9 @@ def _validate_bandpass_observable(
     observable: BandpassObservable,
 ) -> None:
     if mode == "transmission" and observable not in {"radius_ratio", "transit_depth"}:
-        raise ValueError(
-            "Transmission bandpass observations must use 'radius_ratio' or 'transit_depth'."
-        )
+        raise ValueError("Transmission bandpass observations must use 'radius_ratio' or 'transit_depth'.")
     if mode == "emission" and observable not in {"flux_ratio", "eclipse_depth"}:
-        raise ValueError(
-            "Emission bandpass observations must use 'flux_ratio' or 'eclipse_depth'."
-        )
+        raise ValueError("Emission bandpass observations must use 'flux_ratio' or 'eclipse_depth'.")
 
 
 def build_bandpass_observation_config(
@@ -2308,9 +2274,7 @@ def build_bandpass_observation_config(
             "Provide phoenix_spectrum_path when building the observation config."
         )
     if wavelength_m.shape != response.shape:
-        raise ValueError(
-            f"wavelength_m shape {wavelength_m.shape} does not match response shape {response.shape}"
-        )
+        raise ValueError(f"wavelength_m shape {wavelength_m.shape} does not match response shape {response.shape}")
 
     return BandpassObservationConfig(
         name=name,

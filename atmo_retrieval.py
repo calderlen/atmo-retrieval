@@ -643,9 +643,7 @@ def apply_cli_overrides(args):
     if args.require_gpu_per_chain:
         config.set_runtime_config("MCMC_REQUIRE_GPU_PER_CHAIN", True)
     if config.MCMC_REQUIRE_GPU_PER_CHAIN and config.MCMC_CHAIN_METHOD != "parallel":
-        raise ValueError(
-            "--require-gpu-per-chain requires --mcmc-chain-method parallel."
-        )
+        raise ValueError("--require-gpu-per-chain requires --mcmc-chain-method parallel.")
 
     # Opacity options
     if args.build_opacities:
@@ -658,7 +656,11 @@ def apply_cli_overrides(args):
 
     # Species selection
     def _parse_csv(value: str) -> list[str]:
-        parts = [p.strip() for p in re.split(r"[,\n]+", value) if p.strip()]
+        parts = []
+        for part in re.split(r"[,\n]+", value):
+            stripped = part.strip()
+            if stripped:
+                parts.append(stripped)
         return parts
 
     # Apply default species filter unless --all-species or explicit selection
@@ -674,15 +676,21 @@ def apply_cli_overrides(args):
     if use_defaults:
         default_atoms = set(config.DEFAULT_SPECIES.get("atoms", []))
         default_mols = set(config.DEFAULT_SPECIES.get("molecules", []))
-        config.set_runtime_config("ATOMIC_SPECIES", {
-            k: v for k, v in config.ATOMIC_SPECIES.items() if k in default_atoms
-        })
-        config.set_runtime_config("MOLPATH_HITEMP", {
-            k: v for k, v in config.MOLPATH_HITEMP.items() if k in default_mols
-        })
-        config.set_runtime_config("MOLPATH_EXOMOL", {
-            k: v for k, v in config.MOLPATH_EXOMOL.items() if k in default_mols
-        })
+        default_atomic_species = {}
+        for k, v in config.ATOMIC_SPECIES.items():
+            if k in default_atoms:
+                default_atomic_species[k] = v
+        default_molpath_hitemp = {}
+        for k, v in config.MOLPATH_HITEMP.items():
+            if k in default_mols:
+                default_molpath_hitemp[k] = v
+        default_molpath_exomol = {}
+        for k, v in config.MOLPATH_EXOMOL.items():
+            if k in default_mols:
+                default_molpath_exomol[k] = v
+        config.set_runtime_config("ATOMIC_SPECIES", default_atomic_species)
+        config.set_runtime_config("MOLPATH_HITEMP", default_molpath_hitemp)
+        config.set_runtime_config("MOLPATH_EXOMOL", default_molpath_exomol)
         print(f"Using default detected species (pass --all-species for full set)")
 
     if args.no_molecules:
@@ -692,8 +700,14 @@ def apply_cli_overrides(args):
             print("Warning: --no-molecules overrides --molecules.")
     elif args.molecules:
         wanted = set(_parse_csv(args.molecules))
-        mol_h = {k: v for k, v in config.MOLPATH_HITEMP.items() if k in wanted}
-        mol_e = {k: v for k, v in config.MOLPATH_EXOMOL.items() if k in wanted}
+        mol_h = {}
+        for k, v in config.MOLPATH_HITEMP.items():
+            if k in wanted:
+                mol_h[k] = v
+        mol_e = {}
+        for k, v in config.MOLPATH_EXOMOL.items():
+            if k in wanted:
+                mol_e[k] = v
         missing = wanted - set(mol_h.keys()) - set(mol_e.keys())
         if missing:
             print(f"Warning: Unknown molecules ignored: {', '.join(sorted(missing))}")
@@ -706,7 +720,10 @@ def apply_cli_overrides(args):
             print("Warning: --no-atoms overrides --atoms.")
     elif args.atoms:
         wanted = set(_parse_csv(args.atoms))
-        atoms = {k: v for k, v in config.ATOMIC_SPECIES.items() if k in wanted}
+        atoms = {}
+        for k, v in config.ATOMIC_SPECIES.items():
+            if k in wanted:
+                atoms[k] = v
         missing = wanted - set(atoms.keys())
         if missing:
             print(f"Warning: Unknown atoms ignored: {', '.join(sorted(missing))}")

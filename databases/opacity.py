@@ -175,9 +175,7 @@ def _patch_radis_download():
         def download_and_parse_one_file(urlname, local_file, Ndownload):
             if verbose:
                 inputf = urlname.split("/")[-1]
-                print(
-                    f"Downloading {inputf} for {molecule} ({Ndownload}/{Ntotal_downloads})."
-                )
+                print(f"Downloading {inputf} for {molecule} ({Ndownload}/{Ntotal_downloads}).")
 
             db_path = str(self.local_databases).lower()
             if "hitemp" in db_path:

@@ -754,14 +754,6 @@ def get_params(planet: str | None = None, ephemeris: str | None = None) -> dict:
     """Get planet parameters for the specified planet and ephemeris."""
     planet = planet or PLANET
     ephemeris = ephemeris or EPHEMERIS
-
-    if planet not in PLANETS:
-        raise ValueError(f"Unknown planet: {planet}. Available: {list(PLANETS.keys())}")
-
-    if ephemeris not in PLANETS[planet]:
-        available = list(PLANETS[planet].keys())
-        raise ValueError(f"Unknown ephemeris '{ephemeris}' for {planet}. Available: {available}")
-
     return PLANETS[planet][ephemeris]
 
 
@@ -773,6 +765,4 @@ def list_planets() -> list[str]:
 def list_ephemerides(planet: str | None = None) -> list[str]:
     """List available ephemerides for a planet."""
     planet = planet or PLANET
-    if planet not in PLANETS:
-        raise ValueError(f"Unknown planet: {planet}")
     return list(PLANETS[planet].keys())

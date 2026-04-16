@@ -143,11 +143,11 @@ def plot_temperature_profile(
     Ncurve: int = 100,
 ) -> None:
     fig, ax = plt.subplots(figsize=(6, 7))
-    sample_sizes = [
-        np.asarray(values).shape[0]
-        for values in posterior_samples.values()
-        if np.asarray(values).ndim > 0
-    ]
+    sample_sizes = []
+    for values in posterior_samples.values():
+        arr = np.asarray(values)
+        if arr.ndim > 0:
+            sample_sizes.append(arr.shape[0])
     if not sample_sizes:
         raise ValueError("posterior_samples does not contain any sample arrays.")
 
@@ -204,7 +204,10 @@ def _corner_data(
 
     cols = []
     labels = []
-    available = [v for v in variables if v in sample_dict]
+    available = []
+    for var in variables:
+        if var in sample_dict:
+            available.append(var)
     for var in available:
         arr = np.asarray(sample_dict[var])
         arr = arr.reshape(arr.shape[0], -1)
@@ -241,11 +244,11 @@ def _default_corner_variables(sample_dict: dict) -> list[str]:
         "dRV_mean", "dRV_std", "dRV_at_ingress", "dRV_at_egress",
     }
 
-    corner_ready = {
-        name: np.asarray(values)
-        for name, values in sample_dict.items()
-        if _is_corner_friendly(np.asarray(values))
-    }
+    corner_ready = {}
+    for name, values in sample_dict.items():
+        arr = np.asarray(values)
+        if _is_corner_friendly(arr):
+            corner_ready[name] = arr
 
     selected: list[str] = []
 
@@ -342,7 +345,10 @@ def save_retrieval_corner_plots(
         return
 
     if svi_corner_samples is not None:
-        svi_vars = [v for v in variables if v in svi_corner_samples]
+        svi_vars = []
+        for var in variables:
+            if var in svi_corner_samples:
+                svi_vars.append(var)
         if svi_vars:
             plot_corner(
                 svi_samples=svi_corner_samples,
@@ -353,7 +359,10 @@ def save_retrieval_corner_plots(
             print("No SVI variables available for corner_plot_svi.png; skipping.")
 
     if hmc_corner_samples is not None:
-        hmc_vars = [v for v in variables if v in hmc_corner_samples]
+        hmc_vars = []
+        for var in variables:
+            if var in hmc_corner_samples:
+                hmc_vars.append(var)
         if hmc_vars:
             plot_corner(
                 hmc_samples=hmc_corner_samples,
@@ -364,10 +373,10 @@ def save_retrieval_corner_plots(
             print("No HMC variables available for corner_plot_hmc.png; skipping.")
 
     if hmc_corner_samples is not None and svi_corner_samples is not None:
-        overlay_vars = [
-            v for v in variables
-            if v in hmc_corner_samples and v in svi_corner_samples
-        ]
+        overlay_vars = []
+        for var in variables:
+            if var in hmc_corner_samples and var in svi_corner_samples:
+                overlay_vars.append(var)
         if overlay_vars:
             plot_corner(
                 hmc_samples=hmc_corner_samples,
@@ -907,7 +916,11 @@ def plot_contribution_combined(
     
     # Filter species if requested
     if species_to_show is not None:
-        dtau_per_species = {k: v for k, v in dtau_per_species.items() if k in species_to_show}
+        filtered_dtau_per_species = {}
+        for k, v in dtau_per_species.items():
+            if k in species_to_show:
+                filtered_dtau_per_species[k] = v
+        dtau_per_species = filtered_dtau_per_species
     
     n_species = len(dtau_per_species)
     

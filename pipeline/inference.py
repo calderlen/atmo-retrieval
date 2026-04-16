@@ -77,9 +77,13 @@ def save_svi_outputs(
     init_values: dict,
     output_dir: str,
 ) -> None:
-    params_cpu = {k: np.asarray(jax.device_get(v)) for k, v in params.items()}
+    params_cpu = {}
+    for k, v in params.items():
+        params_cpu[k] = np.asarray(jax.device_get(v))
     losses_cpu = np.asarray(jax.device_get(losses))
-    init_cpu = {k: np.asarray(jax.device_get(v)) for k, v in init_values.items()}
+    init_cpu = {}
+    for k, v in init_values.items():
+        init_cpu[k] = np.asarray(jax.device_get(v))
 
     np.savez(os.path.join(output_dir, "svi_params.npz"), **params_cpu)
     np.save(os.path.join(output_dir, "svi_losses.npy"), losses_cpu)

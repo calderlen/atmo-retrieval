@@ -70,9 +70,7 @@ class TessTransitFitConfig:
     emcee_thin: int = 5
     emcee_init_scale: float = 1.0e-3
     emcee_use_pool: bool = False
-    emcee_n_processes: int = field(
-        default_factory=lambda: max(1, min(4, (os.cpu_count() or 1) - 1))
-    )
+    emcee_n_processes: int = field(default_factory=lambda: max(1, min(4, (os.cpu_count() or 1) - 1)))
     emcee_start_method: str = "fork"
     mlexo_root: str | Path | None = None
     planet_name: str | None = None
@@ -136,9 +134,7 @@ def _load_module_or_raise(module_name: str, *, install_hint: str) -> Any:
     try:
         return importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            f"Required dependency '{module_name}' is not available. {install_hint}"
-        ) from exc
+        raise ModuleNotFoundError(f"Required dependency '{module_name}' is not available. {install_hint}") from exc
 
 
 def _load_mlexo_runtime(config: TessTransitFitConfig) -> _MlexoRuntime:
@@ -261,9 +257,7 @@ def build_joint_tess_dataset(
             mask=transit_mask,
         )
 
-        sector_phase = (
-            (sector_flat.time.value - t0_btjd + 0.5 * period_d) % period_d
-        ) - 0.5 * period_d
+        sector_phase = ((sector_flat.time.value - t0_btjd + 0.5 * period_d) % period_d) - 0.5 * period_d
         window_mask = np.abs(sector_phase) < model_window_d
         if not np.any(window_mask):
             continue
@@ -283,18 +277,10 @@ def build_joint_tess_dataset(
             err_fill,
         )
 
-        x_parts.append(
-            np.ascontiguousarray(sector_flat.time.value[window_mask], dtype=np.float64)
-        )
-        y_parts.append(
-            np.ascontiguousarray(flux[window_mask] - 1.0, dtype=np.float64)
-        )
-        yerr_parts.append(
-            np.ascontiguousarray(flux_err[window_mask], dtype=np.float64)
-        )
-        sector_idx_parts.append(
-            np.full(np.count_nonzero(window_mask), len(sector_labels), dtype=np.int32)
-        )
+        x_parts.append(np.ascontiguousarray(sector_flat.time.value[window_mask], dtype=np.float64))
+        y_parts.append(np.ascontiguousarray(flux[window_mask] - 1.0, dtype=np.float64))
+        yerr_parts.append(np.ascontiguousarray(flux_err[window_mask], dtype=np.float64))
+        sector_idx_parts.append(np.full(np.count_nonzero(window_mask), len(sector_labels), dtype=np.int32))
         sector_labels.append(str(sector_label))
 
     if not x_parts:
@@ -313,7 +299,9 @@ def build_joint_tess_dataset(
 
     n_sectors = len(sector_labels)
     sector_counts = np.bincount(sector_idx, minlength=n_sectors)
-    sector_rows = [np.flatnonzero(sector_idx == idx) for idx in range(n_sectors)]
+    sector_rows = []
+    for idx in range(n_sectors):
+        sector_rows.append(np.flatnonzero(sector_idx == idx))
 
     return {
         "time": x,
@@ -341,9 +329,7 @@ def _rho_star_solar_to_a_over_rstar(
     period_arr = np.asarray(period, dtype=np.float64)
     rho_star_arr = np.asarray(rho_star_solar, dtype=np.float64)
     rho_star_unit = rho_star_arr * RHO_SUN_UNIT
-    return (
-        (MLEXO_G_RSUN3_PER_MSUN_DAY2 * period_arr**2 * rho_star_unit) / (3.0 * np.pi)
-    ) ** (1.0 / 3.0)
+    return ((MLEXO_G_RSUN3_PER_MSUN_DAY2 * period_arr**2 * rho_star_unit) / (3.0 * np.pi)) ** (1.0 / 3.0)
 
 
 def _circular_transit_duration(
@@ -353,9 +339,7 @@ def _circular_transit_duration(
     radius_ratio: float | np.ndarray,
 ) -> np.ndarray:
     chord = np.sqrt(np.clip((1.0 + radius_ratio) ** 2 - impact_param**2, 0.0, None))
-    sin_i = np.sqrt(
-        np.clip(1.0 - (impact_param / a_over_rstar) ** 2, 1.0e-12, 1.0)
-    )
+    sin_i = np.sqrt(np.clip(1.0 - (impact_param / a_over_rstar) ** 2, 1.0e-12, 1.0))
     arg = np.clip(chord / (a_over_rstar * sin_i), 0.0, 1.0)
     return (period / np.pi) * np.arcsin(arg)
 
@@ -616,9 +600,7 @@ def _negative_log_posterior(
     prior += 0.5 * np.sum((pars["mean_flux"] / 5.0e-4) ** 2)
     prior += 0.5 * np.sum(((pars["log_jitter"] - np.log(flux_err_ref)) / 2.0) ** 2)
     prior += 0.5 * np.sum(((pars["log_gp_sigma"] - np.log(flux_err_ref)) / 2.0) ** 2)
-    prior += 0.5 * np.sum(
-        ((pars["log_gp_rho"] - np.log(config.gp_rho_guess_d)) / 1.0) ** 2
-    )
+    prior += 0.5 * np.sum(((pars["log_gp_rho"] - np.log(config.gp_rho_guess_d)) / 1.0) ** 2)
     return float(nll + prior)
 
 
@@ -653,7 +635,9 @@ def summarize_posterior_samples(theta_samples: np.ndarray, n_sectors: int) -> di
         "u1",
         "u2",
     ]
-    derived: dict[str, list[float]] = {key: [] for key in keys}
+    derived: dict[str, list[float]] = {}
+    for key in keys:
+        derived[key] = []
     depth_percent: list[float] = []
 
     for theta in theta_arr:
@@ -670,7 +654,9 @@ def summarize_posterior_samples(theta_samples: np.ndarray, n_sectors: int) -> di
         derived["u2"].append(float(pars["u"][1]))
         depth_percent.append(100.0 * float(pars["r"]) ** 2)
 
-    summary = {key: _summarize_interval(values) for key, values in derived.items()}
+    summary = {}
+    for key, values in derived.items():
+        summary[key] = _summarize_interval(values)
     summary["transit_depth_percent"] = _summarize_interval(depth_percent)
     return summary
 
@@ -697,9 +683,7 @@ def _build_bounds(config: TessTransitFitConfig, n_sectors: int) -> np.ndarray:
     bounds.extend([(-5.0e-3, 5.0e-3)] * n_sectors)
     bounds.extend([(np.log(1.0e-7), np.log(5.0e-3))] * n_sectors)
     bounds.extend([(np.log(1.0e-7), np.log(5.0e-3))] * n_sectors)
-    bounds.extend(
-        [(np.log(config.resolved_gp_rho_min_d), np.log(config.gp_rho_max_d))] * n_sectors
-    )
+    bounds.extend([(np.log(config.resolved_gp_rho_min_d), np.log(config.gp_rho_max_d))] * n_sectors)
     return np.asarray(bounds, dtype=np.float64)
 
 
@@ -744,9 +728,7 @@ def _initialize_walkers(
     upper = bounds_arr[:, 1] - eps
 
     rng = np.random.default_rng(seed)
-    walkers = theta_map_arr + init_scale * widths * rng.standard_normal(
-        (n_walkers, theta_map_arr.size)
-    )
+    walkers = theta_map_arr + init_scale * widths * rng.standard_normal((n_walkers, theta_map_arr.size))
     walkers = np.clip(walkers, lower, upper)
 
     for idx in range(n_walkers):
@@ -922,13 +904,9 @@ def fit_tess_transit_with_mlexo(
         + best_fit["mean_flux"][dataset["sector_idx"]]
         + best_fit["gp_trend"]
     )
-    best_fit["detrended_flux"] = (
-        dataset["flux"] - best_fit["mean_flux"][dataset["sector_idx"]] - best_fit["gp_trend"]
-    )
+    best_fit["detrended_flux"] = (dataset["flux"] - best_fit["mean_flux"][dataset["sector_idx"]] - best_fit["gp_trend"])
     best_fit["residual_flux"] = dataset["flux"] - best_fit["mean_model"]
-    best_fit["phase_days"] = (
-        (dataset["time"] - best_fit["t0"] + 0.5 * best_fit["period"]) % best_fit["period"]
-    ) - 0.5 * best_fit["period"]
+    best_fit["phase_days"] = ((dataset["time"] - best_fit["t0"] + 0.5 * best_fit["period"]) % best_fit["period"]) - 0.5 * best_fit["period"]
     best_fit["phase_grid"] = np.linspace(-config.plot_window_d, config.plot_window_d, 1500)
     best_fit["phase_model_grid"] = _mlexo_transit_flux(
         best_fit["t0"] + best_fit["phase_grid"],
@@ -982,11 +960,7 @@ def make_tess_bandpass_constraint_from_mlexo(
 ) -> dict[str, Any]:
     """Convert a mlexo transit fit summary into a retrieval-ready constraint dict."""
 
-    summary = summary_stats or (
-        best_fit.get("summary_stats") if best_fit is not None else None
-    )
-    if summary is None:
-        raise ValueError("summary_stats or best_fit['summary_stats'] is required.")
+    summary = summary_stats or (best_fit.get("summary_stats") if best_fit is not None else None)
 
     if observable == "radius_ratio":
         value, sigma = _value_sigma_from_summary(summary["r"], sigma_mode=sigma_mode)
@@ -997,11 +971,6 @@ def make_tess_bandpass_constraint_from_mlexo(
         )
         value = value_pct / 100.0
         sigma = sigma_pct / 100.0
-    else:
-        raise ValueError(
-            f"Unsupported observable {observable!r}. "
-            "Use 'radius_ratio' or 'transit_depth'."
-        )
 
     constraint: dict[str, Any] = {
         "name": name,
@@ -1036,13 +1005,9 @@ def write_tess_bandpass_tbl(
     sigma = float(constraint["sigma"])
 
     if mode != "transmission":
-        raise ValueError(
-            "write_tess_bandpass_tbl currently supports transmission constraints only."
-        )
+        raise ValueError("write_tess_bandpass_tbl currently supports transmission constraints only.")
     if observable not in {"radius_ratio", "transit_depth"}:
-        raise ValueError(
-            "Transmission TESS .tbl export expects 'radius_ratio' or 'transit_depth'."
-        )
+        raise ValueError("Transmission TESS .tbl export expects 'radius_ratio' or 'transit_depth'.")
 
     transit_depth_fraction = value if observable == "transit_depth" else value**2
     if observable == "transit_depth":
