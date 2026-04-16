@@ -844,13 +844,13 @@ def reconstruct_fastchem_hybrid_profiles(
 
     mol_profile_map = {}
     for name in mol_names:
-        mol_profile_map[name] = jnp.full(n_layers, 1.0e-30)
+        mol_profile_map[name] = jnp.full(n_layers, config.TRACE_SPECIES_FLOOR)
     atom_profile_map = {}
     for name in atom_names:
-        atom_profile_map[name] = jnp.full(n_layers, 1.0e-30)
+        atom_profile_map[name] = jnp.full(n_layers, config.TRACE_SPECIES_FLOOR)
     continuum_profile_map = {}
     for species in composition_solver.hidden_continuum_species():
-        continuum_profile_map[species] = jnp.full(n_layers, 1.0e-30)
+        continuum_profile_map[species] = jnp.full(n_layers, config.TRACE_SPECIES_FLOOR)
     for mol, vmr in vmr_mols_scalar.items():
         mol_profile_map[mol] = jnp.full(n_layers, vmr)
     for atom, vmr in vmr_atoms_scalar.items():

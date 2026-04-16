@@ -182,15 +182,15 @@ def _solar_abundance_for_species(species: str) -> float:
         count = int(count_str) if count_str else 1
         counts.append((element, count))
     if not counts:
-        return 1.0e-30
+        return numerics_config.TRACE_SPECIES_FLOOR
 
     limiting = np.inf
     for element, count in counts:
         elem_abundance = SOLAR_ELEMENT_ABUNDANCES.get(element)
         if elem_abundance is None:
-            return 1.0e-30
+            return numerics_config.TRACE_SPECIES_FLOOR
         limiting = min(limiting, elem_abundance / float(count))
-    return float(max(limiting, 1.0e-30))
+    return float(max(limiting, numerics_config.TRACE_SPECIES_FLOOR))
 
 
 SOLAR_ELEMENT_ABUNDANCES = _load_solar_element_abundances()
@@ -873,7 +873,7 @@ class FastChemEquilibriumChemistry(CompositionSolver):
             if mol in self._vmr_grids:
                 vmr_prof = self._interp_2d(self._vmr_grids[mol], Tarr, log_P)
             else:
-                vmr_prof = jnp.full(n_layers, 1e-30)
+                vmr_prof = jnp.full(n_layers, numerics_config.TRACE_SPECIES_FLOOR)
             vmr_mols_profiles.append(vmr_prof)
 
         vmr_atoms_profiles = []
@@ -881,7 +881,7 @@ class FastChemEquilibriumChemistry(CompositionSolver):
             if atom in self._vmr_grids:
                 vmr_prof = self._interp_2d(self._vmr_grids[atom], Tarr, log_P)
             else:
-                vmr_prof = jnp.full(n_layers, 1e-30)
+                vmr_prof = jnp.full(n_layers, numerics_config.TRACE_SPECIES_FLOOR)
             vmr_atoms_profiles.append(vmr_prof)
 
         # H2 and He profiles
@@ -1320,15 +1320,21 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         log_P = jnp.log10(art.pressure)
         n_layers = art.pressure.size
 
-        mol_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in mol_names}
-        atom_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in atom_names}
+        mol_profile_map = {
+            name: jnp.full(n_layers, numerics_config.TRACE_SPECIES_FLOOR)
+            for name in mol_names
+        }
+        atom_profile_map = {
+            name: jnp.full(n_layers, numerics_config.TRACE_SPECIES_FLOOR)
+            for name in atom_names
+        }
         for i, name in enumerate(free_mol_names):
             mol_profile_map[name] = jnp.full(n_layers, base.vmr_mols[i])
         for i, name in enumerate(free_atom_names):
             atom_profile_map[name] = jnp.full(n_layers, base.vmr_atoms[i])
 
         continuum_profile_map = {
-            species: jnp.full(n_layers, 1.0e-30)
+            species: jnp.full(n_layers, numerics_config.TRACE_SPECIES_FLOOR)
             for species in self.hidden_continuum_species()
         }
         needed = list(continuum_profile_map)

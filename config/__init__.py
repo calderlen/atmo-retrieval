@@ -185,9 +185,13 @@ from .chemistry_config import (
 
 from .numerics_config import (
     F32_EPS,
+    F32_GRAVITY_FLOOR,
+    F32_LENGTHSCALE_FLOOR,
     F32_FLOOR_RECIP,
     F32_FLOOR_RECIPSQ,
+    F32_STDDEV_FLOOR,
     F64_FLOOR,
+    TRACE_SPECIES_FLOOR,
 )
 
 from .data_config import (

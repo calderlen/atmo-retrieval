@@ -57,8 +57,6 @@ echo "Python: $PYTHON_BIN"
   --svi-steps 10000 \
   --svi-learning-rate 0.001 \
   --svi-lr-decay-steps 2000 \
-  --svi-lr-decay-rate 0.5 \
-  --joint-spectrum-tbl input/lrs/emission/kelt20b/KELT_20_b_3.12080_5244_2.tbl \
-  --bandpass-tbl input/phot/emission/kelt20b/KELT_20_b_3.12080_5244_3.tbl
+  --svi-lr-decay-rate 0.5
 
 echo "[$(date)] Job finished"

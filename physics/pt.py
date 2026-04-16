@@ -2,6 +2,8 @@ import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 
+from config import numerics_config as numerics_config
+
 
 def isothermal_profile(art: object, T0: float) -> jnp.ndarray:
     return T0 * jnp.ones_like(art.pressure)
@@ -34,7 +36,7 @@ def guillot_profile(
     gamma: float,
 ) -> jnp.ndarray:
     P_cgs = pressure_bar * 1.0e6
-    tau = kappa_ir_cgs * P_cgs / jnp.clip(g_cgs, 1.0e-20, None)
+    tau = kappa_ir_cgs * P_cgs / jnp.clip(g_cgs, numerics_config.F32_GRAVITY_FLOOR, None)
 
     sqrt3 = jnp.sqrt(3.0)
     exp_term = jnp.exp(-sqrt3 * gamma * tau)
@@ -172,12 +174,12 @@ def numpyro_pspline_knots_on_art_grid(
 
 def _gp_kernel_rbf(x: jnp.ndarray, amp: jnp.ndarray, ell: jnp.ndarray) -> jnp.ndarray:
     dx = x[:, None] - x[None, :]
-    return (amp**2) * jnp.exp(-0.5 * (dx / jnp.clip(ell, 1e-12, None)) ** 2)
+    return (amp**2) * jnp.exp(-0.5 * (dx / jnp.clip(ell, numerics_config.F32_LENGTHSCALE_FLOOR, None)) ** 2)
 
 
 def _gp_kernel_matern32(x: jnp.ndarray, amp: jnp.ndarray, ell: jnp.ndarray) -> jnp.ndarray:
     dx = jnp.abs(x[:, None] - x[None, :])
-    r = jnp.sqrt(3.0) * dx / jnp.clip(ell, 1e-12, None)
+    r = jnp.sqrt(3.0) * dx / jnp.clip(ell, numerics_config.F32_LENGTHSCALE_FLOOR, None)
     return (amp**2) * (1.0 + r) * jnp.exp(-r)
 
 
@@ -201,7 +203,7 @@ def numpyro_gp_temperature(
     # Optional: center/scale x for numerics (still interpretable because ell is in dex pre-scaling).
     # Keep a copy of original-dex coordinate for ell interpretation:
     x_dex = x
-    x = (x - jnp.mean(x)) / (jnp.std(x) + 1e-12)
+    x = (x - jnp.mean(x)) / (jnp.std(x) + numerics_config.F32_STDDEV_FLOOR)
 
     # Mean function
     if mean_kind == "isothermal":
@@ -219,7 +221,7 @@ def numpyro_gp_temperature(
     ell_dex = numpyro.sample("gp_ell_dex", dist.LogNormal(jnp.log(ell_loc), ell_scale))
     # Convert dex-lengthscale to standardized-x lengthscale:
     # x_std = (x_dex - mean)/std, so Δx_std = Δx_dex / std_dex
-    std_dex = jnp.std(x_dex) + 1e-12
+    std_dex = jnp.std(x_dex) + numerics_config.F32_STDDEV_FLOOR
     ell = ell_dex / std_dex
 
     # Kernel matrix
