@@ -42,6 +42,7 @@ echo "Python: $PYTHON_BIN"
   --planet KELT-20b \
   --mode transmission \
   --epoch 20190504 \
+  --bandpass-tbl transmission/kelt20b/kelt20b_tess_bandpass.tbl \
   --data-format timeseries \
   --wavelength-range full \
   --chemistry-model fastchem_hybrid_grid \
