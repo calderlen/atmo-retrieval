@@ -61,6 +61,7 @@ class CompositionState(NamedTuple):
     vmrH2_profile: jnp.ndarray  # H2 VMR profile (n_layers,)
     vmrHe_profile: jnp.ndarray  # He VMR profile (n_layers,)
     mmw_profile: jnp.ndarray  # MMW profile (n_layers,)
+    continuum_vmr_profiles: dict[str, jnp.ndarray]  # Hidden continuum VMR profiles
 
 
 class CompositionSolver(Protocol):
@@ -166,6 +167,7 @@ class ConstantVMR:
             vmrH2_profile=vmrH2_profile,
             vmrHe_profile=vmrHe_profile,
             mmw_profile=mmw_profile,
+            continuum_vmr_profiles={},
         )
 
 _ELEMENT_RE = re.compile(r"([A-Z][a-z]?)(\d*)")
@@ -298,6 +300,22 @@ _FASTCHEM_SPECIES_MAP: dict[str, str] = {
     "Y II": "Y1+",
 }
 
+_CONTINUUM_SPECIES_ALIASES: dict[str, str] = {
+    "H": "H",
+    "H I": "H",
+    "e-": "e-",
+    "H-": "H-",
+}
+_CONTINUUM_SPECIES_MASSES: dict[str, float] = {
+    "H": float(molinfo.molmass_isotope("H", db_HIT=False)),
+    "H-": float(molinfo.molmass_isotope("H", db_HIT=False) + 5.48579909065e-4),
+    "e-": 5.48579909065e-4,
+}
+
+
+def _canonical_continuum_species_name(species: str) -> str:
+    return _CONTINUUM_SPECIES_ALIASES.get(species, species)
+
 
 class FreeVMR:
 
@@ -412,6 +430,7 @@ class FreeVMR:
             vmrH2_profile=vmrH2_profile,
             vmrHe_profile=vmrHe_profile,
             mmw_profile=mmw_profile,
+            continuum_vmr_profiles={},
         )
 
 # TODO: extend the current equilibrium / hybrid baseline with quenching,
@@ -577,6 +596,7 @@ class FreeVMR:
             vmrH2_profile=vmrH2_profile,
             vmrHe_profile=vmrHe_profile,
             mmw_profile=mmw_profile,
+            continuum_vmr_profiles={},
         )
 class FastChemEquilibriumChemistry(CompositionSolver):
     """Equilibrium chemistry via FastChem2.
@@ -902,6 +922,7 @@ class FastChemEquilibriumChemistry(CompositionSolver):
             vmrH2_profile=vmrH2_profile,
             vmrHe_profile=vmrHe_profile,
             mmw_profile=mmw_profile,
+            continuum_vmr_profiles={},
         )
 
 
@@ -940,6 +961,10 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
     This solver is designed for HMC-NUTS: FastChem is evaluated offline onto a
     cached 4D grid over ([M/H], C/O, T, P), and runtime sampling uses pure JAX
     interpolation to inject continuum-relevant species (e.g. H-, e-, H).
+
+    The bulk H2/He reservoir is still reconstructed from the remaining
+    abundance using the configured H2/He ratio. FastChem's bulk-gas state is
+    not yet used directly in this hybrid branch.
     """
 
     def __init__(
@@ -962,6 +987,9 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
             raise ValueError("n_co_ratio must be >= 2.")
 
         self.continuum_species = tuple(continuum_species)
+        self._canonical_continuum_species = tuple(
+            dict.fromkeys(_canonical_continuum_species_name(species) for species in self.continuum_species)
+        )
         self.metallicity_range = metallicity_range
         self.co_ratio_range = co_ratio_range
         self.n_metallicity = int(n_metallicity)
@@ -987,6 +1015,35 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
             log_vmr_max=self.log_vmr_max,
             h2_he_ratio=self.h2_he_ratio,
         )
+        if not self.requires_hybrid_parameters():
+            logger.warning(
+                "FastChemHybridChemistry requires hidden 'H'/'H I' and 'e-' "
+                "continuum drivers for the H- continuum. It will fall back to "
+                "ConstantVMR behavior."
+            )
+
+    def _canonical_species_name(self, species: str) -> str:
+        return _canonical_continuum_species_name(species)
+
+    def is_hybrid_managed_species(self, species: str) -> bool:
+        return self._canonical_species_name(species) in self._canonical_continuum_species
+
+    def hidden_continuum_species(self) -> tuple[str, ...]:
+        return tuple(
+            species for species in self._canonical_continuum_species
+            if species in _FASTCHEM_SPECIES_MAP
+        )
+
+    def opacity_driver_species(self) -> tuple[str, ...]:
+        drivers = []
+        if "H" in self._canonical_continuum_species:
+            drivers.append("H")
+        if "e-" in self._canonical_continuum_species:
+            drivers.append("e-")
+        return tuple(drivers)
+
+    def requires_hybrid_parameters(self) -> bool:
+        return {"H", "e-"}.issubset(self.opacity_driver_species())
 
     def _hybrid_cache_key(self, pressure_bar: np.ndarray, species_names: list[str]) -> str:
         h = hashlib.sha256()
@@ -1217,17 +1274,14 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         art: object,
         Tarr: jnp.ndarray | None = None,
     ) -> CompositionState:
-        log_metallicity = numpyro.sample(
-            "log_metallicity",
-            dist.Uniform(self.metallicity_range[0], self.metallicity_range[1]),
-        )
-        co_ratio = numpyro.sample(
-            "C_O_ratio",
-            dist.Uniform(self.co_ratio_range[0], self.co_ratio_range[1]),
-        )
-
-        free_mol = [(n, m) for n, m in zip(mol_names, mol_masses) if n not in self.continuum_species]
-        free_atom = [(n, m) for n, m in zip(atom_names, atom_masses) if n not in self.continuum_species]
+        free_mol = [
+            (n, m) for n, m in zip(mol_names, mol_masses)
+            if not self.is_hybrid_managed_species(n)
+        ]
+        free_atom = [
+            (n, m) for n, m in zip(atom_names, atom_masses)
+            if not self.is_hybrid_managed_species(n)
+        ]
 
         free_mol_names = [n for n, _ in free_mol]
         free_mol_masses = [m for _, m in free_mol]
@@ -1243,9 +1297,21 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
             Tarr=Tarr,
         )
 
+        if not self.requires_hybrid_parameters():
+            return base
+
         if Tarr is None:
             T_mid = (self.t_min + self.t_max) / 2.0
             Tarr = jnp.full(art.pressure.shape, T_mid)
+
+        log_metallicity = numpyro.sample(
+            "log_metallicity",
+            dist.Uniform(self.metallicity_range[0], self.metallicity_range[1]),
+        )
+        co_ratio = numpyro.sample(
+            "C_O_ratio",
+            dist.Uniform(self.co_ratio_range[0], self.co_ratio_range[1]),
+        )
 
         log_P = jnp.log10(art.pressure)
         n_layers = art.pressure.size
@@ -1257,7 +1323,11 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         for i, name in enumerate(free_atom_names):
             atom_profile_map[name] = jnp.full(n_layers, base.vmr_atoms[i])
 
-        needed = [s for s in self.continuum_species if (s in mol_profile_map) or (s in atom_profile_map)]
+        continuum_profile_map = {
+            species: jnp.full(n_layers, 1.0e-30)
+            for species in self.hidden_continuum_species()
+        }
+        needed = list(continuum_profile_map)
         if needed:
             if self._hybrid_vmr_grids is None or any(
                 s not in self._hybrid_vmr_grids for s in needed
@@ -1277,16 +1347,20 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
             }
 
             for species, vmr_prof in overrides.items():
-                if species in mol_profile_map:
-                    mol_profile_map[species] = vmr_prof
-                else:
-                    atom_profile_map[species] = vmr_prof
+                continuum_profile_map[species] = vmr_prof
+                for name in mol_profile_map:
+                    if self._canonical_species_name(name) == species:
+                        mol_profile_map[name] = vmr_prof
+                for name in atom_profile_map:
+                    if self._canonical_species_name(name) == species:
+                        atom_profile_map[name] = vmr_prof
 
         vmr_mols_profiles = [mol_profile_map[name] for name in mol_names]
         vmr_atoms_profiles = [atom_profile_map[name] for name in atom_names]
+        continuum_profiles = [continuum_profile_map[name] for name in continuum_profile_map]
 
-        if (len(vmr_mols_profiles) + len(vmr_atoms_profiles)) > 0:
-            all_profiles = jnp.array(vmr_mols_profiles + vmr_atoms_profiles)
+        if (len(vmr_mols_profiles) + len(vmr_atoms_profiles) + len(continuum_profiles)) > 0:
+            all_profiles = jnp.array(vmr_mols_profiles + vmr_atoms_profiles + continuum_profiles)
             sum_trace = jnp.sum(all_profiles, axis=0)
             scale = jnp.where(sum_trace > 1.0, (1.0 - 1.0e-12) / sum_trace, 1.0)
             all_profiles = all_profiles * scale[None, :]
@@ -1294,6 +1368,11 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
             vmr_atoms_profiles = [
                 all_profiles[len(vmr_mols_profiles) + i] for i in range(len(vmr_atoms_profiles))
             ]
+            continuum_offset = len(vmr_mols_profiles) + len(vmr_atoms_profiles)
+            continuum_profile_map = {
+                name: all_profiles[continuum_offset + i]
+                for i, name in enumerate(continuum_profile_map)
+            }
             vmr_trace_tot = jnp.sum(all_profiles, axis=0)
         else:
             vmr_trace_tot = jnp.zeros(n_layers)
@@ -1310,6 +1389,9 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
             mmw_profile = mmw_profile + mass * vmr_prof
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
             mmw_profile = mmw_profile + mass * vmr_prof
+        for species, vmr_prof in continuum_profile_map.items():
+            if species in _CONTINUUM_SPECIES_MASSES:
+                mmw_profile = mmw_profile + _CONTINUUM_SPECIES_MASSES[species] * vmr_prof
 
         if len(vmr_mols_profiles) > 0:
             mmr_mols = jnp.array([
@@ -1344,4 +1426,5 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
             vmrH2_profile=vmrH2_profile,
             vmrHe_profile=vmrHe_profile,
             mmw_profile=mmw_profile,
+            continuum_vmr_profiles=continuum_profile_map,
         )

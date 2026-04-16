@@ -29,6 +29,10 @@ from exojax.database import molinfo
 from exojax.opacity.opacont import OpaCIA
 from exojax.opacity.premodit.api import OpaPremodit
 from exojax.postproc.specop import SopInstProfile, SopRotation
+try:
+    from exojax.rt.layeropacity import layer_optical_depth_Hminus
+except ImportError:  # pragma: no cover - depends on exojax version
+    layer_optical_depth_Hminus = None
 from exojax.utils.astrofunc import gravity_jupiter as gravity_surface
 from exojax.utils.constants import MJ, RJ, Rs
 
@@ -54,6 +58,11 @@ CIA_COLLISION_PAIRS: tuple[tuple[str, str, str], ...] = (
     ("H2H2", "H2", "H2"),
     ("H2He", "H2", "He"),
 )
+CONTINUUM_SPECIES_MASSES: dict[str, float] = {
+    "H": float(molinfo.molmass_isotope("H", db_HIT=False)),
+    "H-": float(molinfo.molmass_isotope("H", db_HIT=False) + 5.48579909065e-4),
+    "e-": 5.48579909065e-4,
+}
 
 # the below dataclasses are all configuration objects, they describe how to build and sample the model
 # system paramaters that are shared across all atmospheric regions and observation types in a joint retrieval
@@ -172,6 +181,7 @@ class AtmosphereState(NamedTuple):
     mmr_atoms: dict[str, jnp.ndarray]
     vmrH2_profile: jnp.ndarray
     vmrHe_profile: jnp.ndarray
+    continuum_vmr_profiles: dict[str, jnp.ndarray]
 
 
 class ChunkedSysremInputs(NamedTuple):
@@ -369,11 +379,43 @@ def _compute_xs_opacity_terms(
     return xs_terms
 
 
+def _compute_continuum_opacity_terms(
+    art: object,
+    nu_grid: jnp.ndarray,
+    Tarr: jnp.ndarray,
+    continuum_vmr_profiles: dict[str, jnp.ndarray],
+    mmw_profile: jnp.ndarray,
+    g: jnp.ndarray,
+) -> dict[str, jnp.ndarray]:
+    """Compute hidden continuum opacity terms such as the H- continuum."""
+    if layer_optical_depth_Hminus is None:
+        return {}
+
+    vmre = continuum_vmr_profiles.get("e-")
+    vmrh = continuum_vmr_profiles.get("H")
+    if vmre is None or vmrh is None:
+        return {}
+
+    return {
+        "CONT_Hminus": layer_optical_depth_Hminus(
+            nu_grid,
+            Tarr,
+            art.pressure,
+            art.dParr,
+            vmre,
+            vmrh,
+            jnp.ravel(mmw_profile),
+            jnp.ravel(g),
+        )
+    }
+
+
 def _compute_opacity_terms(
     art: object,
     opa_mols: dict[str, OpaPremodit],
     opa_atoms: dict[str, OpaPremodit],
     opa_cias: dict[str, OpaCIA],
+    nu_grid: jnp.ndarray,
     Tarr: jnp.ndarray,
     mmr_mols: dict[str, jnp.ndarray],
     mmr_atoms: dict[str, jnp.ndarray],
@@ -381,6 +423,7 @@ def _compute_opacity_terms(
     vmrHe_profile: jnp.ndarray,
     mmw_profile: jnp.ndarray,
     g: jnp.ndarray,
+    continuum_vmr_profiles: dict[str, jnp.ndarray] | None = None,
 ) -> dict[str, jnp.ndarray]:
     """Compute all opacity terms using a single canonical implementation."""
     opacity_terms = _compute_cia_opacity_terms(
@@ -412,6 +455,16 @@ def _compute_opacity_terms(
             g,
         )
     )
+    opacity_terms.update(
+        _compute_continuum_opacity_terms(
+            art,
+            nu_grid=nu_grid,
+            Tarr=Tarr,
+            continuum_vmr_profiles={} if continuum_vmr_profiles is None else continuum_vmr_profiles,
+            mmw_profile=mmw_profile,
+            g=g,
+        )
+    )
     return opacity_terms
 
 
@@ -440,12 +493,14 @@ def compute_opacity(
     vmrHe_profile: jnp.ndarray,
     mmw_profile: jnp.ndarray,
     g: jnp.ndarray,
+    continuum_vmr_profiles: dict[str, jnp.ndarray] | None = None,
 ) -> jnp.ndarray:
     opacity_terms = _compute_opacity_terms(
         art,
         opa_mols,
         opa_atoms,
         opa_cias,
+        nu_grid,
         Tarr,
         mmr_mols,
         mmr_atoms,
@@ -453,6 +508,7 @@ def compute_opacity(
         vmrHe_profile,
         mmw_profile,
         g,
+        continuum_vmr_profiles,
     )
     return _sum_opacity_terms(opacity_terms, art, nu_grid)
 
@@ -469,12 +525,15 @@ def compute_opacity_per_species(
     vmrHe_profile: jnp.ndarray,
     mmw_profile: jnp.ndarray,
     g: jnp.ndarray,
+    nu_grid: jnp.ndarray,
+    continuum_vmr_profiles: dict[str, jnp.ndarray] | None = None,
 ) -> dict[str, jnp.ndarray]:
     return _compute_opacity_terms(
         art,
         opa_mols,
         opa_atoms,
         opa_cias,
+        nu_grid,
         Tarr,
         mmr_mols,
         mmr_atoms,
@@ -482,6 +541,7 @@ def compute_opacity_per_species(
         vmrHe_profile,
         mmw_profile,
         g,
+        continuum_vmr_profiles,
     )
 
 
@@ -761,18 +821,23 @@ def reconstruct_fastchem_hybrid_profiles(
     Tarr: jnp.ndarray,
     *,
     sample_prefix: str | None = None,
-) -> tuple[dict[str, jnp.ndarray], dict[str, jnp.ndarray]]:
+) -> tuple[dict[str, jnp.ndarray], dict[str, jnp.ndarray], dict[str, jnp.ndarray]]:
     local_params = _extract_scoped_site_params(posterior_params, sample_prefix)
-    log_metallicity = _posterior_site_value(
-        posterior_params,
-        "log_metallicity",
-        local_params=local_params,
-    )
-    co_ratio = _posterior_site_value(
-        posterior_params,
-        "C_O_ratio",
-        local_params=local_params,
-    )
+    has_hybrid_params = composition_solver.requires_hybrid_parameters()
+    if has_hybrid_params:
+        log_metallicity = _posterior_site_value(
+            posterior_params,
+            "log_metallicity",
+            local_params=local_params,
+        )
+        co_ratio = _posterior_site_value(
+            posterior_params,
+            "C_O_ratio",
+            local_params=local_params,
+        )
+    else:
+        log_metallicity = None
+        co_ratio = None
 
     vmr_mols_scalar, vmr_atoms_scalar = reconstruct_vmr_scalars(
         posterior_params,
@@ -785,17 +850,17 @@ def reconstruct_fastchem_hybrid_profiles(
 
     mol_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in mol_names}
     atom_profile_map = {name: jnp.full(n_layers, 1.0e-30) for name in atom_names}
+    continuum_profile_map = {
+        species: jnp.full(n_layers, 1.0e-30)
+        for species in composition_solver.hidden_continuum_species()
+    }
     for mol, vmr in vmr_mols_scalar.items():
         mol_profile_map[mol] = jnp.full(n_layers, vmr)
     for atom, vmr in vmr_atoms_scalar.items():
         atom_profile_map[atom] = jnp.full(n_layers, vmr)
 
-    needed = [
-        species
-        for species in composition_solver.continuum_species
-        if (species in mol_profile_map) or (species in atom_profile_map)
-    ]
-    if needed:
+    needed = list(continuum_profile_map)
+    if needed and has_hybrid_params:
         if composition_solver._hybrid_vmr_grids is None or any(
             species not in composition_solver._hybrid_vmr_grids for species in needed
         ):
@@ -811,15 +876,19 @@ def reconstruct_fastchem_hybrid_profiles(
                 Tarr,
                 log_P,
             )
-            if species in mol_profile_map:
-                mol_profile_map[species] = vmr_profile
-            else:
-                atom_profile_map[species] = vmr_profile
+            continuum_profile_map[species] = vmr_profile
+            for name in mol_profile_map:
+                if composition_solver._canonical_species_name(name) == species:
+                    mol_profile_map[name] = vmr_profile
+            for name in atom_profile_map:
+                if composition_solver._canonical_species_name(name) == species:
+                    atom_profile_map[name] = vmr_profile
 
     vmr_mols_profiles = [mol_profile_map[name] for name in mol_names]
     vmr_atoms_profiles = [atom_profile_map[name] for name in atom_names]
-    if vmr_mols_profiles or vmr_atoms_profiles:
-        all_profiles = jnp.array(vmr_mols_profiles + vmr_atoms_profiles)
+    continuum_profiles = [continuum_profile_map[name] for name in continuum_profile_map]
+    if vmr_mols_profiles or vmr_atoms_profiles or continuum_profiles:
+        all_profiles = jnp.array(vmr_mols_profiles + vmr_atoms_profiles + continuum_profiles)
         sum_trace = jnp.sum(all_profiles, axis=0)
         scale = jnp.where(sum_trace > 1.0, (1.0 - 1.0e-12) / sum_trace, 1.0)
         all_profiles = all_profiles * scale[None, :]
@@ -828,6 +897,11 @@ def reconstruct_fastchem_hybrid_profiles(
             all_profiles[len(vmr_mols_profiles) + i]
             for i in range(len(vmr_atoms_profiles))
         ]
+        continuum_offset = len(vmr_mols_profiles) + len(vmr_atoms_profiles)
+        continuum_profile_map = {
+            name: all_profiles[continuum_offset + i]
+            for i, name in enumerate(continuum_profile_map)
+        }
 
     vmr_mols_profiles_dict = {
         mol: vmr_mols_profiles[i]
@@ -837,7 +911,7 @@ def reconstruct_fastchem_hybrid_profiles(
         atom: vmr_atoms_profiles[i]
         for i, atom in enumerate(atom_names)
     }
-    return vmr_mols_profiles_dict, vmr_atoms_profiles_dict
+    return vmr_mols_profiles_dict, vmr_atoms_profiles_dict, continuum_profile_map
 
 
 def compute_mmw_and_h2he_from_vmr(
@@ -877,13 +951,19 @@ def compute_mmw_and_h2he_from_vmr_profiles(
     *,
     n_layers: int,
     h2_he_ratio: float = config.H2_HE_RATIO,
+    extra_vmr_profiles: dict[str, jnp.ndarray] | None = None,
+    extra_species_masses: dict[str, float] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     mol_masses = {m: molinfo.molmass_isotope(m, db_HIT=False) for m in mol_names}
     atom_masses = {
         a: molinfo.molmass_isotope(_element_from_species(a), db_HIT=False) for a in atom_names
     }
 
-    profile_values = [*vmr_mols.values(), *vmr_atoms.values()]
+    profile_values = [
+        *vmr_mols.values(),
+        *vmr_atoms.values(),
+        *({} if extra_vmr_profiles is None else extra_vmr_profiles).values(),
+    ]
     if profile_values:
         vmr_trace_tot = jnp.sum(jnp.stack(profile_values, axis=0), axis=0)
     else:
@@ -901,6 +981,13 @@ def compute_mmw_and_h2he_from_vmr_profiles(
         mmw = mmw + mol_masses[mol] * vmr_profile
     for atom, vmr_profile in vmr_atoms.items():
         mmw = mmw + atom_masses[atom] * vmr_profile
+    if extra_vmr_profiles:
+        extra_species_masses = {} if extra_species_masses is None else extra_species_masses
+        for species, vmr_profile in extra_vmr_profiles.items():
+            mass = extra_species_masses.get(species)
+            if mass is None:
+                continue
+            mmw = mmw + mass * vmr_profile
 
     return mmw, vmrH2, vmrHe
 
@@ -982,6 +1069,7 @@ def compute_atmospheric_state_from_posterior(
         sample_prefix=sample_prefix,
     )
     composition_solver = region_config.composition_solver
+    continuum_vmr_profiles: dict[str, jnp.ndarray] = {}
     if isinstance(composition_solver, ConstantVMR):
         vmr_mols, vmr_atoms = reconstruct_vmr_scalars(
             params,
@@ -1035,7 +1123,11 @@ def compute_atmospheric_state_from_posterior(
             for atom, vmr_profile in vmr_atoms_profiles.items()
         }
     elif isinstance(composition_solver, FastChemHybridChemistry):
-        vmr_mols_profiles_dict, vmr_atoms_profiles_dict = reconstruct_fastchem_hybrid_profiles(
+        (
+            vmr_mols_profiles_dict,
+            vmr_atoms_profiles_dict,
+            continuum_vmr_profiles,
+        ) = reconstruct_fastchem_hybrid_profiles(
             params,
             composition_solver,
             mol_names,
@@ -1051,6 +1143,8 @@ def compute_atmospheric_state_from_posterior(
             atom_names,
             n_layers=art.pressure.size,
             h2_he_ratio=float(composition_solver.h2_he_ratio),
+            extra_vmr_profiles=continuum_vmr_profiles,
+            extra_species_masses=CONTINUUM_SPECIES_MASSES,
         )
         mmr_mols, mmr_atoms = convert_vmr_profiles_to_mmr_profiles(
             vmr_mols_profiles_dict,
@@ -1095,6 +1189,7 @@ def compute_atmospheric_state_from_posterior(
         vmrHe_profile=vmrHe_profile,
         mmw_profile=mmw_profile,
         g=g,
+        continuum_vmr_profiles=continuum_vmr_profiles,
     )
 
     # Compute per-species dtau
@@ -1103,6 +1198,7 @@ def compute_atmospheric_state_from_posterior(
         opa_mols=opa_mols,
         opa_atoms=opa_atoms,
         opa_cias=opa_cias,
+        nu_grid=nu_grid,
         Tarr=Tarr,
         mmr_mols=mmr_mols,
         mmr_atoms=mmr_atoms,
@@ -1110,6 +1206,7 @@ def compute_atmospheric_state_from_posterior(
         vmrHe_profile=vmrHe_profile,
         mmw_profile=mmw_profile,
         g=g,
+        continuum_vmr_profiles=continuum_vmr_profiles,
     )
 
     return {
@@ -1123,6 +1220,7 @@ def compute_atmospheric_state_from_posterior(
         'vmrHe': vmrHe_profile,
         'vmr_mols': vmr_mols,  # scalar VMRs for reference
         'vmr_atoms': vmr_atoms,  # scalar VMRs for reference
+        'vmr_continuum': continuum_vmr_profiles,
         'mmr_mols': mmr_mols,  # MMR profiles used in opacity
         'mmr_atoms': mmr_atoms,  # MMR profiles used in opacity
         'params': params,
@@ -1520,6 +1618,7 @@ def _sample_atmosphere_state(
         mmr_atoms=mmr_atoms,
         vmrH2_profile=comp.vmrH2_profile,
         vmrHe_profile=comp.vmrHe_profile,
+        continuum_vmr_profiles=comp.continuum_vmr_profiles,
     )
 
 
@@ -1540,6 +1639,7 @@ def _compute_component_dtau(
         vmrHe_profile=atmosphere_state.vmrHe_profile,
         mmw_profile=atmosphere_state.mmw_profile,
         g=atmosphere_state.g_profile,
+        continuum_vmr_profiles=atmosphere_state.continuum_vmr_profiles,
     )
 
 

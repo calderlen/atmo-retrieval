@@ -322,25 +322,26 @@ def default_named_params_for_context(context: PrimaryDiagnosticContext) -> dict[
             float(composition_solver.log_vmr_min) + float(composition_solver.log_vmr_max)
         )
         for atom_name in region.atom_names:
-            if atom_name not in composition_solver.continuum_species:
+            if not composition_solver.is_hybrid_managed_species(atom_name):
                 params[f"logVMR_{atom_name}"] = log_center
         for mol_name in region.mol_names:
-            if mol_name not in composition_solver.continuum_species:
+            if not composition_solver.is_hybrid_managed_species(mol_name):
                 params[f"logVMR_{mol_name}"] = log_center
-        params["log_metallicity"] = float(
-            0.5
-            * (
-                float(composition_solver.metallicity_range[0])
-                + float(composition_solver.metallicity_range[1])
+        if composition_solver.requires_hybrid_parameters():
+            params["log_metallicity"] = float(
+                0.5
+                * (
+                    float(composition_solver.metallicity_range[0])
+                    + float(composition_solver.metallicity_range[1])
+                )
             )
-        )
-        params["C_O_ratio"] = float(
-            0.5
-            * (
-                float(composition_solver.co_ratio_range[0])
-                + float(composition_solver.co_ratio_range[1])
+            params["C_O_ratio"] = float(
+                0.5
+                * (
+                    float(composition_solver.co_ratio_range[0])
+                    + float(composition_solver.co_ratio_range[1])
+                )
             )
-        )
     elif isinstance(composition_solver, FreeVMR):
         log_center = 0.5 * (
             float(composition_solver.log_vmr_min) + float(composition_solver.log_vmr_max)

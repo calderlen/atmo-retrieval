@@ -643,7 +643,7 @@ def _build_composition_solver(
                 "FASTCHEM_PARAMETER_FILE in config."
             )
 
-        return FastChemHybridChemistry(
+        solver = FastChemHybridChemistry(
             fastchem_parameter_file=parameter_file,
             continuum_species=tuple(config.FASTCHEM_HYBRID_CONTINUUM_SPECIES),
             metallicity_range=tuple(config.FASTCHEM_HYBRID_METALLICITY_RANGE),
@@ -659,6 +659,13 @@ def _build_composition_solver(
             t_max=float(config.FASTCHEM_T_MAX),
             cache_dir=config.FASTCHEM_CACHE_DIR,
         )
+        if not solver.requires_hybrid_parameters():
+            raise ValueError(
+                "chemistry_model='fastchem_hybrid_grid' requires hidden continuum "
+                "drivers including at least 'H'/'H I' and 'e-' in "
+                "FASTCHEM_HYBRID_CONTINUUM_SPECIES."
+            )
+        return solver
 
     raise ValueError(
         f"Unknown chemistry_model: {chemistry_model}. "
