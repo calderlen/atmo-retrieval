@@ -57,8 +57,8 @@ flowchart TD
         D[dataio/load.py<br/>time-series and 1D spectrum loaders]
         D2[dataio/bandpass.py<br/>bandpass response loader]
         E[physics/grid_setup.py<br/>spectral grid and operators]
-        F[databases/opacity.py<br/>CIA molecular and atomic opacity loaders]
-        G[databases/atomic.py<br/>Kurucz and VALD helpers]
+        F[opacities/loader.py<br/>CIA molecular and atomic opacity loaders]
+        G[opacities/atomic_sources.py<br/>Kurucz and VALD helpers]
         H[physics/model.py<br/>joint forward model]
         I[physics/pt.py<br/>P-T profiles]
         J[physics/chemistry.py<br/>composition]
@@ -119,9 +119,10 @@ modules:
 │   ├── planets_config.py
 │   ├── photometry_config.py
 │   └── tellurics_config.py
-├── databases
-│   ├── atomic.py
-│   └── opacity.py
+├── opacities
+│   ├── __init__.py
+│   ├── atomic_sources.py
+│   └── loader.py
 ├── dataio
 │   ├── bandpass.py
 │   ├── import_nasa_archive.py
@@ -184,7 +185,7 @@ reference/bandpasses/
   tess-response-function-v2.0.csv
 
 reference/abundances/
-  asplund_2020_extended
+  asplund_2020_extended.dat
 
 cache/phoenix/
 cache/opacity/

@@ -37,7 +37,7 @@ METALLICITY_RANGE = (-2.0, 3.0)
 CO_RATIO_RANGE = (0.1, 2.0)
 
 # Solar elemental abundance table (Asplund 2020; log epsilon format)
-SOLAR_ABUNDANCE_FILE = "reference/abundances/asplund_2020_extended"
+SOLAR_ABUNDANCE_FILE = "reference/abundances/asplund_2020_extended.dat"
 
 # ==============================================================================
 # FASTCHEM GRID PARAMETERS

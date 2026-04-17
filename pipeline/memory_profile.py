@@ -12,7 +12,7 @@ from typing import Iterable, cast
 import os
 
 import config
-from databases.opacity import load_atomic_opacities, load_molecular_opacities, setup_cia_opacities
+from opacities import load_atomic_opacities, load_molecular_opacities, setup_cia_opacities
 from exojax.rt import ArtEmisPure, ArtTransPure
 from physics.grid_setup import setup_wavenumber_grid
 

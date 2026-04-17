@@ -2,10 +2,42 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from functools import lru_cache
 from pathlib import Path
 import re
 from typing import NamedTuple, Protocol
+
+# RADIS/numba can attempt file-based caching in environments where the locator
+# is unavailable; disable it before exojax/molinfo triggers those imports.
+os.environ.setdefault("NUMBA_DISABLE_CACHE", "1")
+
+
+def _patch_numba_enable_caching() -> None:
+    try:
+        from numba.core.dispatcher import Dispatcher
+        from numba.core.caching import NullCache
+    except Exception:
+        return
+
+    orig_enable_caching = getattr(Dispatcher, "enable_caching", None)
+    if orig_enable_caching is None or getattr(orig_enable_caching, "_locator_patched", False):
+        return
+
+    def _enable_caching(self):
+        try:
+            return orig_enable_caching(self)
+        except RuntimeError as exc:
+            if "no locator available" not in str(exc):
+                raise
+            self._cache = NullCache()
+            return None
+
+    _enable_caching._locator_patched = True
+    Dispatcher.enable_caching = _enable_caching
+
+
+_patch_numba_enable_caching()
 
 import jax.numpy as jnp
 import numpy as np

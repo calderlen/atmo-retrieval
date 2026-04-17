@@ -53,7 +53,7 @@ from radis.api.hitempapi import login_to_hitran
 # Opacity cache directory (relative to project root)
 from config.paths_config import DB_KURUCZ, DB_VALD, OPA_CACHE_DIR, USE_KURUCZ, USE_VALD
 try:
-    from databases.atomic import (
+    from .atomic_sources import (
         load_kurucz_atomic,
         load_vald_atomic,
         create_atomic_snapshot,

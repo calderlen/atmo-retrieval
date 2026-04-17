@@ -28,7 +28,7 @@ from dataio.load import (
 )
 from physics.chemistry import ConstantVMR, FastChemHybridChemistry, FreeVMR
 from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
-from databases.opacity import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
+from opacities import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
 from physics.model import (
     BandpassObservationInputs,
     ChunkedSysremInputs,
