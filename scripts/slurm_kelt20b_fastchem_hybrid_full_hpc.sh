@@ -49,7 +49,7 @@ echo "Python: $PYTHON_BIN"
   --atoms "Fe I,Ni I,Cr I,Na I" \
   --no-molecules \
   --pt-profile guillot \
-  --fastchem-parameter-file input/fastchem/parameters_py.dat \
+  --fastchem-parameter-file input/fastchem/parameters.dat \
   --load-opacities \
   --resolution-mode hr \
   --mcmc-chains 4 \

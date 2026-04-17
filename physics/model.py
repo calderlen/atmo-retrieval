@@ -393,6 +393,17 @@ def _compute_continuum_opacity_terms(
     if vmre is None or vmrh is None:
         return {}
 
+    # exojax.layer_optical_depth_Hminus combines layer-only quantities with
+    # a (n_layer, n_nu) continuum matrix using raw broadcasting. Provide
+    # column vectors here so layer-wise mmw and gravity broadcast correctly.
+    mmw_column = jnp.asarray(mmw_profile)
+    if mmw_column.ndim == 1:
+        mmw_column = mmw_column[:, None]
+
+    gravity_column = jnp.asarray(g)
+    if gravity_column.ndim == 1:
+        gravity_column = gravity_column[:, None]
+
     return {
         "CONT_Hminus": layer_optical_depth_Hminus(
             nu_grid,
@@ -401,8 +412,8 @@ def _compute_continuum_opacity_terms(
             art.dParr,
             vmre,
             vmrh,
-            jnp.ravel(mmw_profile),
-            jnp.ravel(g),
+            mmw_column,
+            gravity_column,
         )
     }
 

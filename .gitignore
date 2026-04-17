@@ -10,6 +10,15 @@ input/spectra/**/*.npy
 input/spectra/**/*.npz
 input/spectra/**/*.fits
 
+# Track only the public input-directory skeleton plus shareable FastChem files.
+input/**
+!input/**/
+!input/.gitkeep
+!input/**/.gitkeep
+!input/fastchem/parameters.dat
+!input/fastchem/logK_extended.dat
+!input/fastchem/logK_condensates.dat
+
 output/
 
 *.npz

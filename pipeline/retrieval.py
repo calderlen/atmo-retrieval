@@ -610,9 +610,15 @@ def _build_composition_solver(
                 "parameters.dat path. Pass --fastchem-parameter-file or set "
                 "FASTCHEM_PARAMETER_FILE in config."
             )
+        parameter_file = Path(parameter_file).expanduser()
+        if not parameter_file.exists():
+            raise FileNotFoundError(
+                "chemistry_model='fastchem_hybrid_grid' requires an existing "
+                f"FastChem parameter file, but '{parameter_file}' was not found."
+            )
 
         solver = FastChemHybridChemistry(
-            fastchem_parameter_file=parameter_file,
+            fastchem_parameter_file=str(parameter_file),
             continuum_species=tuple(config.FASTCHEM_HYBRID_CONTINUUM_SPECIES),
             metallicity_range=tuple(config.FASTCHEM_HYBRID_METALLICITY_RANGE),
             co_ratio_range=tuple(config.FASTCHEM_HYBRID_CO_RATIO_RANGE),
