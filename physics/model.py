@@ -597,7 +597,12 @@ def _sum_opacity_terms(
     dtau = jnp.zeros((art.pressure.size, nu_grid.size))
     for term_name, dtau_term in opacity_terms.items():
         _debug_nonfinite_array(f"opacity_terms[{term_name}]", dtau_term)
-        dtau = dtau + dtau_term
+        # PreModit polynomial reconstruction of line strength can return slightly
+        # negative cross sections in f32 near the edges of its robust temperature
+        # range, especially for dense atomic spectra. A negative dtau contribution
+        # produces exp(-dtau) > 1 which then NaN-propagates through the Simpson
+        # integration in transmission RT. Clamp each term to >= 0 as a hard guard.
+        dtau = dtau + jnp.clip(dtau_term, 0.0, None)
         _debug_nonfinite_array(f"opacity_cumulative[{term_name}]", dtau)
     return dtau
 
@@ -1182,6 +1187,10 @@ def compute_atmospheric_state_from_posterior(
         Tint_fixed=region_config.Tint_fixed,
         sample_prefix=sample_prefix,
     )
+    # Mirror the clip applied at sampling time in _sample_atmosphere_state so
+    # posterior-reconstructed spectra use the same in-range Tarr that was fed
+    # to the likelihood during inference. See the note there for full context.
+    Tarr = jnp.clip(Tarr, region_config.T_low, region_config.T_high)
     composition_solver = region_config.composition_solver
     continuum_vmr_profiles: dict[str, jnp.ndarray] = {}
     if isinstance(composition_solver, ConstantVMR):
@@ -1453,12 +1462,35 @@ def compute_model_timeseries(
         posinf=8000.0,
         neginf=100.0,
     )
+    # mmw floor of 1.0, not 0.1: exojax's normalized_layer_height recurrence
+    # computes a = 1 + (H_n / r_n) * log(k), where k = pressure_decrease_rate
+    # is the per-layer pressure ratio (~0.158 for P_TOP=1e-8, P_BTM=1, 10
+    # layers) and log(k) ~ -1.84. H_n is the pressure scale height normalized
+    # by radius_btm, and H_n ~ kB*T/(m_u*mmw*g*radius_btm). If mmw drops below
+    # ~0.2, H_n/r_n can exceed 1/|log(k)| ~ 0.54 at high T and low g, which
+    # flips a negative; once a < 0, layer heights flip sign, normalized radii
+    # go negative, and chord_geometric_matrix_lower evaluates safe_sqrt() on a
+    # negative argument -> NaN. Physical gas mmw cannot go below ~1 (pure H
+    # atmosphere); H2/He is ~2.3; clipping to [1.0, 50.0] keeps H_n/r_n below
+    # ~0.08 across the full [T_LOW, T_HIGH, g_ref] envelope so RT stays
+    # numerically well-posed even if FastChem returns a bad mmw at a grid
+    # corner. 50 as the upper bound generously covers heavy-metallicity
+    # atmospheres (pure H2O would be ~18, pure Fe ~56).
     mmw_rt = jnp.nan_to_num(
-        jnp.clip(mmw_profile, min=0.1, max=300.0),
+        jnp.clip(mmw_profile, min=1.0, max=50.0),
         nan=2.3,
-        posinf=300.0,
-        neginf=0.1,
+        posinf=50.0,
+        neginf=1.0,
     )
+    # Diagnostic probes BEFORE art.run to pinpoint which input carries a NaN
+    # on any remaining failure. Tarr_rt and mmw_rt are already nan_to_num'd so
+    # they should always print clean; dtau catches any NaN introduced between
+    # _sum_opacity_terms and here; Rp and g_ref are the scalar inputs.
+    _debug_nonfinite_array("spectroscopy.rt_input.dtau", dtau)
+    _debug_nonfinite_array("spectroscopy.rt_input.Tarr_rt", Tarr_rt)
+    _debug_nonfinite_array("spectroscopy.rt_input.mmw_rt", mmw_rt)
+    _debug_nonfinite_scalar("spectroscopy.rt_input.Rp", Rp)
+    _debug_nonfinite_scalar("spectroscopy.rt_input.g_ref", g_ref)
     rt = art.run(dtau, Tarr_rt, mmw_rt, Rp, g_ref)
     _debug_nonfinite_array("spectroscopy.rt", rt)
 
@@ -1647,14 +1679,14 @@ def _sample_shared_system_state(
         )
     Vsys = jnp.asarray(shared_config.Vsys_mean)
     if shared_config.Mp_upper_3sigma is not None:
-        Mp = numpyro.sample("Mp", dist.HalfNormal(shared_config.Mp_upper_3sigma / 3.0)) * MJ
+        Mp = numpyro.sample("Mp", dist.Uniform(0.5, shared_config.Mp_upper_3sigma)) * MJ
     else:
         Mp = numpyro.sample("Mp", dist.TruncatedNormal(shared_config.Mp_mean, shared_config.Mp_std, low=0.0)) * MJ
     Rstar = numpyro.sample(
         "Rstar",
         dist.TruncatedNormal(shared_config.Rstar_mean, shared_config.Rstar_std, low=0.0),
     ) * Rs
-    Rp = numpyro.sample("Rp", dist.TruncatedNormal(shared_config.Rp_mean, shared_config.Rp_std, low=0.0)) * RJ
+    Rp = numpyro.sample("Rp", dist.TruncatedNormal(shared_config.Rp_mean, shared_config.Rp_std, low=0.5)) * RJ
     g_ref = gravity_surface(Rp / RJ, Mp / MJ)
 
     shared_dRV_0 = None
@@ -1702,8 +1734,26 @@ def _sample_atmosphere_state(
     *,
     scope_prefix: str | None = None,
 ) -> AtmosphereState:
+    # Clamp Tarr to [T_low, T_high] before it feeds any downstream consumer.
+    # Rationale: guillot_profile has no notion of the configured atmospheric T
+    # range - for Tirr near T_high and gamma at the upper prior edge, the
+    # top-of-atmosphere Guillot temperature T_top^4 = (3/4)*Tirr^4*(2/3 + gamma/sqrt(3))
+    # can exceed 10,000 K, which is far outside PreModit's robust range (~1451-5585 K
+    # for [1500, 5500]) and FastChem's tabulated grid. PreModit's f32 polynomial
+    # reconstruction of line strength overflows on out-of-range T, producing Inf
+    # then NaN cross sections; FastChem's grid interpolator likewise returns NaN
+    # mass fractions when T exceeds its tabulated extent. Both propagate through
+    # opacity_terms = xsmatrix * mmr to yield all-NaN optical depths and a NaN
+    # logL that numpyro.factor rejects during MCMC init. Clipping once here
+    # guarantees every downstream Tarr consumer (composition solver, xsmatrix,
+    # gravity_profile, H-minus continuum) sees an in-range temperature. The clip
+    # gradient is zero in saturated regions, which means Guillot parameters get
+    # no likelihood pull when the unclipped profile would be unphysical anyway;
+    # tightened priors (LOG_GAMMA_BOUNDS, LOG_KAPPA_IR_BOUNDS) keep that clipped
+    # tail to a minority of prior mass.
     if scope_prefix is None:
-        Tarr = _sample_temperature_profile(region_config, shared_state.g_ref)
+        Tarr_raw = _sample_temperature_profile(region_config, shared_state.g_ref)
+        Tarr = jnp.clip(Tarr_raw, region_config.T_low, region_config.T_high)
         comp = region_config.composition_solver.sample(
             region_config.mol_names,
             region_config.mol_masses,
@@ -1714,7 +1764,8 @@ def _sample_atmosphere_state(
         )
     else:
         with numpyro.handlers.scope(prefix=scope_prefix):
-            Tarr = _sample_temperature_profile(region_config, shared_state.g_ref)
+            Tarr_raw = _sample_temperature_profile(region_config, shared_state.g_ref)
+            Tarr = jnp.clip(Tarr_raw, region_config.T_low, region_config.T_high)
             comp = region_config.composition_solver.sample(
                 region_config.mol_names,
                 region_config.mol_masses,
@@ -1875,7 +1926,30 @@ def _compute_native_observable_spectrum(
     Tstar: float | None = None,
     stellar_surface_flux: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-    rt = art.run(dtau, Tarr, mmw_profile, Rp, g_ref)
+    # Mirror the Tarr / mmw guards applied in compute_model_timeseries. See
+    # the comment on mmw_rt there for the derivation of the 1.0 floor; briefly,
+    # exojax's normalized_layer_height recurrence produces NaNs via a negative
+    # sqrt argument in chord_geometric_matrix_lower whenever mmw is small
+    # enough that the pressure scale height exceeds r_btm * |log(k)|^-1.
+    Tarr_rt = jnp.nan_to_num(
+        jnp.clip(Tarr, min=100.0, max=8000.0),
+        nan=1500.0,
+        posinf=8000.0,
+        neginf=100.0,
+    )
+    mmw_rt = jnp.nan_to_num(
+        jnp.clip(mmw_profile, min=1.0, max=50.0),
+        nan=2.3,
+        posinf=50.0,
+        neginf=1.0,
+    )
+    _debug_nonfinite_array("bandpass.rt_input.dtau", dtau)
+    _debug_nonfinite_array("bandpass.rt_input.Tarr_rt", Tarr_rt)
+    _debug_nonfinite_array("bandpass.rt_input.mmw_rt", mmw_rt)
+    _debug_nonfinite_scalar("bandpass.rt_input.Rp", Rp)
+    _debug_nonfinite_scalar("bandpass.rt_input.g_ref", g_ref)
+    rt = art.run(dtau, Tarr_rt, mmw_rt, Rp, g_ref)
+    _debug_nonfinite_array("bandpass.rt", rt)
 
     if mode == "transmission":
         # The native transmission observable is physically non-negative.
@@ -1927,17 +2001,19 @@ def _bandpass_weighted_mean(
     *,
     photon_weighted: bool,
 ) -> jnp.ndarray:
+    # nu_grid is monotonically ascending by exojax convention (ESLOG in wavenumber),
+    # so 1/nu_grid is monotonically descending and a simple reverse [::-1] yields the
+    # ascending-wavelength ordering that jnp.interp and jnp.trapezoid require. Using
+    # explicit reverse slicing avoids jnp.argsort, whose constant-folded sorted index
+    # tensor was being materialized by XLA as a compile-time constant and tripping the
+    # 31 MB allocation ceiling on the 50k-element nu_grid.
+    # wavelength_m / response are pre-sorted at config construction time (see
+    # build_bandpass_observation_config), so no argsort is needed here either.
     model_wavelength_m = 1.0e-2 / jnp.clip(nu_grid, config.F32_FLOOR_RECIP, None)
+    wl_model = model_wavelength_m[::-1]
+    spec_sorted = spectrum[::-1]
 
-    model_sort_idx = jnp.argsort(model_wavelength_m)
-    wl_model = model_wavelength_m[model_sort_idx]
-    spec_sorted = spectrum[model_sort_idx]
-
-    band_sort_idx = jnp.argsort(wavelength_m)
-    wl_band = wavelength_m[band_sort_idx]
-    rsp_band = response[band_sort_idx]
-
-    rsp_interp = jnp.interp(wl_model, wl_band, rsp_band, left=0.0, right=0.0)
+    rsp_interp = jnp.interp(wl_model, wavelength_m, response, left=0.0, right=0.0)
     weights = rsp_interp * wl_model if photon_weighted else rsp_interp
     norm = jnp.trapezoid(weights, wl_model)
     return jnp.trapezoid(spec_sorted * weights, wl_model) / jnp.clip(
@@ -2497,6 +2573,13 @@ def build_bandpass_observation_config(
         )
     if wavelength_m.shape != response.shape:
         raise ValueError(f"wavelength_m shape {wavelength_m.shape} does not match response shape {response.shape}")
+
+    # Pre-sort the bandpass response curve by wavelength so _bandpass_weighted_mean
+    # can feed jnp.interp directly without a traced argsort. See the note in that
+    # function for why this matters (XLA constant-folding of large argsort outputs).
+    band_sort_idx = jnp.argsort(wavelength_m)
+    wavelength_m = wavelength_m[band_sort_idx]
+    response = response[band_sort_idx]
 
     return BandpassObservationConfig(
         name=name,

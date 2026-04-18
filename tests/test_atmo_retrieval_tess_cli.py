@@ -88,6 +88,10 @@ class AtmoRetrievalTessCliTests(unittest.TestCase):
         config_mod.apply_runtime_profile = lambda profile: None
         config_mod.get_output_dir = lambda: str(temp_root / "output")
         config_mod.get_data_dir = lambda epoch: str(temp_root / "data" / str(epoch))
+        config_mod.get_full_arm_data_dirs = lambda epoch, mode=None: {
+            "red": temp_root / "data" / str(epoch) / "red",
+            "blue": temp_root / "data" / str(epoch) / "blue",
+        }
         config_mod.get_transmission_paths = lambda epoch: {"epoch": epoch, "mode": "transmission"}
         config_mod.get_emission_paths = lambda epoch: {"epoch": epoch, "mode": "emission"}
         config_mod.get_wavelength_range = lambda: (4800.0, 6800.0)
@@ -262,6 +266,89 @@ class AtmoRetrievalTessCliTests(unittest.TestCase):
         self.assertEqual(
             retrieval_kwargs["bandpass_constraints"][0]["observable"],
             "transit_depth",
+        )
+
+    def test_main_builds_joint_hrs_components_for_extra_epochs(self):
+        fake_modules = self._fake_modules()
+        with patch.dict(sys.modules, fake_modules, clear=False):
+            module = self._load_module(fake_modules)
+            retrieval_mod = fake_modules["pipeline.retrieval"]
+
+            argv = [
+                "atmo_retrieval.py",
+                "--planet",
+                "KELT-20b",
+                "--mode",
+                "transmission",
+                "--epoch",
+                "20200101",
+                "20200102",
+                "20200103",
+                "--svi-only",
+                "--no-plots",
+            ]
+
+            with patch.object(sys, "argv", argv):
+                rc = module.main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(retrieval_mod.run_calls), 1)
+        retrieval_kwargs = retrieval_mod.run_calls[0]
+        self.assertEqual(retrieval_kwargs["epoch"], ["20200101", "20200102", "20200103"])
+
+        joint_spectra = retrieval_kwargs["joint_spectra"]
+        self.assertEqual(len(joint_spectra), 2)
+        self.assertEqual(joint_spectra[0]["name"], "spectroscopy_red_20200102")
+        self.assertEqual(
+            joint_spectra[0]["data_dir"],
+            str(Path(self.tempdir.name) / "data" / "20200102"),
+        )
+        self.assertEqual(joint_spectra[0]["data_format"], "timeseries")
+        self.assertEqual(joint_spectra[0]["radial_velocity_mode"], "orbital")
+        self.assertEqual(joint_spectra[0]["likelihood_kind"], "matched_filter")
+        self.assertEqual(joint_spectra[1]["name"], "spectroscopy_red_20200103")
+
+    def test_main_builds_full_arm_joint_hrs_components_for_extra_epochs(self):
+        fake_modules = self._fake_modules()
+        fake_modules["config"].OBSERVING_MODE = "full"
+        with patch.dict(sys.modules, fake_modules, clear=False):
+            module = self._load_module(fake_modules)
+            retrieval_mod = fake_modules["pipeline.retrieval"]
+
+            argv = [
+                "atmo_retrieval.py",
+                "--planet",
+                "KELT-20b",
+                "--mode",
+                "emission",
+                "--wavelength-range",
+                "full",
+                "--epoch",
+                "20200101",
+                "20200102",
+                "--svi-only",
+                "--no-plots",
+            ]
+
+            with patch.object(sys, "argv", argv):
+                rc = module.main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(retrieval_mod.run_calls), 1)
+        retrieval_kwargs = retrieval_mod.run_calls[0]
+        self.assertEqual(retrieval_kwargs["epoch"], ["20200101", "20200102"])
+
+        joint_spectra = retrieval_kwargs["joint_spectra"]
+        self.assertEqual(len(joint_spectra), 2)
+        self.assertEqual(joint_spectra[0]["name"], "spectroscopy_red_20200102")
+        self.assertEqual(
+            joint_spectra[0]["data_dir"],
+            str(Path(self.tempdir.name) / "data" / "20200102" / "red"),
+        )
+        self.assertEqual(joint_spectra[1]["name"], "spectroscopy_blue_20200102")
+        self.assertEqual(
+            joint_spectra[1]["data_dir"],
+            str(Path(self.tempdir.name) / "data" / "20200102" / "blue"),
         )
 
     def test_quality_bitmask_parser_accepts_integer_bitmask(self):

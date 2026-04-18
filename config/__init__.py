@@ -302,7 +302,7 @@ def save_run_config(
     svi_only: bool,
     seed: int,
     chemistry_model: str | None = None,
-    epoch: str | None = None,
+    epoch: str | list[str] | tuple[str, ...] | None = None,
     phoenix_spectrum_path: str | None = None,
     phoenix_cache_dir: str | None = None,
 ) -> None:
@@ -319,6 +319,18 @@ def save_run_config(
     log_path = os.path.join(output_dir, "run_config.log")
 
     params = get_params()
+
+    epoch_values: list[str] = []
+    if epoch is None:
+        epoch_values = []
+    elif isinstance(epoch, str):
+        if epoch.strip():
+            epoch_values = [epoch.strip()]
+    else:
+        for value in epoch:
+            text = str(value).strip()
+            if text:
+                epoch_values.append(text)
 
     with open(log_path, "w") as f:
         f.write("=" * 70 + "\n")
@@ -343,8 +355,10 @@ def save_run_config(
         f.write("-" * 70 + "\n")
         f.write(f"Planet: {PLANET}\n")
         f.write(f"Ephemeris: {EPHEMERIS}\n")
-        if epoch is not None:
-            f.write(f"Epoch: {epoch}\n")
+        if epoch_values:
+            f.write(f"Epoch: {epoch_values[0]}\n")
+            if len(epoch_values) > 1:
+                f.write(f"Epochs: {', '.join(epoch_values)}\n")
         f.write(f"Period: {params['period']}\n")
         f.write(f"R_p: {params['R_p']}\n")
         f.write(f"M_p: {params['M_p']}\n")

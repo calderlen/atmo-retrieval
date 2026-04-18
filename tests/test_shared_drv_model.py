@@ -157,6 +157,113 @@ class SharedDRVModelTests(unittest.TestCase):
         self.assertIn("spectroscopy_blue/dRV_0", sample_sites)
         self.assertIn("spectroscopy_blue/dRV_slope", sample_sites)
 
+    def test_shared_drv_can_span_more_than_two_components(self):
+        import jax.numpy as jnp
+        import numpyro
+        from numpyro.handlers import seed, trace
+
+        from physics.model import (
+            SpectroscopicObservationConfig,
+            _sample_component_velocity_offset,
+            _sample_shared_system_state,
+            build_shared_system_config,
+        )
+
+        params = dict(
+            Kp=180.0,
+            Kp_err=5.0,
+            RV_abs=-24.0,
+            RV_abs_err=0.1,
+            R_p=1.8,
+            R_p_err=0.1,
+            M_p=3.5,
+            M_p_err=0.2,
+            R_star=1.6,
+            R_star_err=0.05,
+            period=3.47,
+        )
+        shared_cfg = build_shared_system_config(
+            params=params,
+            shared_velocity_phase_mode="linear",
+            shared_velocity_component_names=(
+                "spectroscopy_red",
+                "spectroscopy_blue",
+                "spectroscopy_red_20200102",
+            ),
+        )
+
+        def _cfg(name):
+            return SpectroscopicObservationConfig(
+                name=name,
+                region_name="region",
+                mode="transmission",
+                opa_mols={},
+                opa_atoms={},
+                opa_cias={},
+                nu_grid=jnp.asarray([1.0]),
+                sop_rot=None,
+                sop_inst=None,
+                inst_nus=jnp.asarray([1.0]),
+                beta_inst=1.0,
+                radial_velocity_mode="dRV",
+                phase_mode="linear",
+                likelihood_kind="gaussian",
+                subtract_per_exposure_mean=False,
+                apply_sysrem=False,
+                Tstar=None,
+                sample_prefix=name,
+            )
+
+        phase_red = jnp.linspace(-0.02, 0.02, 6)
+        phase_blue = jnp.linspace(-0.02, 0.02, 4)
+        phase_red_epoch2 = jnp.linspace(-0.02, 0.02, 5)
+
+        def model():
+            state = _sample_shared_system_state(shared_cfg)
+            dRV_red = _sample_component_velocity_offset(
+                _cfg("spectroscopy_red"),
+                phase_red,
+                scope_prefix="spectroscopy_red",
+                shared_state=state,
+            )
+            dRV_blue = _sample_component_velocity_offset(
+                _cfg("spectroscopy_blue"),
+                phase_blue,
+                scope_prefix="spectroscopy_blue",
+                shared_state=state,
+            )
+            dRV_red_epoch2 = _sample_component_velocity_offset(
+                _cfg("spectroscopy_red_20200102"),
+                phase_red_epoch2,
+                scope_prefix="spectroscopy_red_20200102",
+                shared_state=state,
+            )
+            numpyro.deterministic("dRV_red_out", dRV_red)
+            numpyro.deterministic("dRV_blue_out", dRV_blue)
+            numpyro.deterministic("dRV_red_epoch2_out", dRV_red_epoch2)
+
+        with seed(rng_seed=0):
+            tr = trace(model).get_trace()
+
+        sample_sites = {
+            k
+            for k, v in tr.items()
+            if v.get("type") == "sample" and not v.get("is_observed")
+        }
+        self.assertIn("shared_dRV_0", sample_sites)
+        self.assertIn("shared_dRV_slope", sample_sites)
+        self.assertNotIn("spectroscopy_red/dRV_0", sample_sites)
+        self.assertNotIn("spectroscopy_blue/dRV_0", sample_sites)
+        self.assertNotIn("spectroscopy_red_20200102/dRV_0", sample_sites)
+
+        dRV_red = np.asarray(tr["dRV_red_out"]["value"])
+        dRV_blue = np.asarray(tr["dRV_blue_out"]["value"])
+        dRV_red_epoch2 = np.asarray(tr["dRV_red_epoch2_out"]["value"])
+        self.assertTrue(np.isclose(dRV_red[0], dRV_blue[0]))
+        self.assertTrue(np.isclose(dRV_red[0], dRV_red_epoch2[0]))
+        self.assertTrue(np.isclose(dRV_red[-1], dRV_blue[-1]))
+        self.assertTrue(np.isclose(dRV_red[-1], dRV_red_epoch2[-1]))
+
 
 if __name__ == "__main__":
     unittest.main()

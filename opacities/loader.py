@@ -296,7 +296,11 @@ def _resolve_cutwing(cutwing: float | None) -> float:
 
 
 def _opa_settings_match(
-    opa: OpaPremodit, diffmode: int, cutwing: float
+    opa: OpaPremodit,
+    diffmode: int,
+    cutwing: float,
+    T_low: float | None = None,
+    T_high: float | None = None,
 ) -> bool:
     """Check whether cached opacity settings match runtime parameters."""
     aux = getattr(opa, "aux", {}) or {}
@@ -306,6 +310,18 @@ def _opa_settings_match(
     cw = aux.get("cutwing")
     if cw is None or not np.isclose(float(cw), float(cutwing)):
         return False
+    # PreModit auto_trange is recorded on the opa object as Tmin / Tmax. A mismatch
+    # means the cached LBD was built for a different robust range (different dE,
+    # Tref, Twt) and must be rebuilt or the polynomial coefficients will be wrong
+    # for the runtime temperature range.
+    if T_low is not None:
+        tmin = getattr(opa, "Tmin", None)
+        if tmin is None or not np.isclose(float(tmin), float(T_low)):
+            return False
+    if T_high is not None:
+        tmax = getattr(opa, "Tmax", None)
+        if tmax is None or not np.isclose(float(tmax), float(T_high)):
+            return False
     return True
 
 
@@ -371,7 +387,7 @@ def load_or_build_opacity(
             opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
             if not _opa_grid_matches(opa, nu_grid):
                 raise ValueError("Cached opacity grid mismatch.")
-            if not _opa_settings_match(opa, diffmode, cutwing_val):
+            if not _opa_settings_match(opa, diffmode, cutwing_val, T_low, T_high):
                 raise ValueError("Cached opacity settings mismatch.")
             return opa, opa.aux["molmass"]
         except Exception as exc:
@@ -539,7 +555,7 @@ def load_atomic_opacities(
                 opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
                 if not _opa_grid_matches(opa, nu_grid):
                     raise ValueError("Cached opacity grid mismatch.")
-                if not _opa_settings_match(opa, diffmode, cutwing_val):
+                if not _opa_settings_match(opa, diffmode, cutwing_val, T_low, T_high):
                     raise ValueError("Cached opacity settings mismatch.")
                 if opa.aux.get("snapshot_precision") != "float64":
                     raise ValueError("Cached atomic snapshot precision mismatch.")

@@ -1,5 +1,6 @@
 import hashlib
 import os
+from collections.abc import Sequence
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from functools import lru_cache
@@ -1790,6 +1791,22 @@ def _load_bandpass_constraint(
     )
 
 
+def _normalize_epoch_values(epoch: str | Sequence[str] | None) -> tuple[str, ...]:
+    if epoch is None:
+        return ()
+    if isinstance(epoch, str):
+        values = [epoch]
+    else:
+        values = []
+        for item in epoch:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                values.append(text)
+    return tuple(values)
+
+
 class _StepTimer:
     def __init__(self, label: str):
         self.label = label
@@ -1808,7 +1825,7 @@ class _StepTimer:
 
 def run_retrieval(
     mode: str = "transmission",
-    epoch: str | None = None,
+    epoch: str | Sequence[str] | None = None,
     data_format: str = config.DEFAULT_DATA_FORMAT,
     skip_svi: bool = False,
     svi_only: bool = False,
@@ -1834,6 +1851,8 @@ def run_retrieval(
 ) -> None:
     retrieval_start = perf_counter()
     mode = _normalize_retrieval_mode(mode)
+    epochs = _normalize_epoch_values(epoch)
+    primary_epoch = epochs[0] if epochs else None
     if pt_profile is None:
         raise ValueError("pt_profile must be passed explicitly.")
     if chemistry_model is None:
@@ -1853,7 +1872,7 @@ def run_retrieval(
         svi_only=svi_only,
         seed=seed,
         chemistry_model=chemistry_model,
-        epoch=epoch,
+        epoch=epochs or None,
         phoenix_spectrum_path=None if phoenix_spectrum_path is None else str(phoenix_spectrum_path),
         phoenix_cache_dir=None if phoenix_cache_dir is None else str(phoenix_cache_dir),
     )
@@ -1881,7 +1900,7 @@ def run_retrieval(
     primary_component_name = "spectroscopy_red" if full_arm_mode else "spectroscopy"
 
     if full_arm_mode:
-        arm_dirs = config.get_full_arm_data_dirs(epoch=epoch, mode=mode)
+        arm_dirs = config.get_full_arm_data_dirs(epoch=primary_epoch, mode=mode)
         blue_component_spec = {
             "name": "spectroscopy_blue",
             "mode": mode,
@@ -1898,8 +1917,11 @@ def run_retrieval(
 
     print("\n[1/7] Loading time-series data...")
     with _StepTimer("Step 1/7"):
-        if epoch:
-            print(f"  Using epoch: {epoch}")
+        if epochs:
+            if len(epochs) == 1:
+                print(f"  Using epoch: {primary_epoch}")
+            else:
+                print(f"  Using epochs: {', '.join(epochs)}")
         if any(val is not None for val in (wav_obs, data, sigma, phase)):
             phase = _normalize_phase(phase)
             print(f"  Using provided data: {data.shape[0]} exposures x {data.shape[1]} wavelengths")
@@ -1924,15 +1946,15 @@ def run_retrieval(
                     "a second spectroscopic component."
                 )
                 data_paths = (
-                    config.get_transmission_paths(epoch=epoch, arm="red")
+                    config.get_transmission_paths(epoch=primary_epoch, arm="red")
                     if mode == "transmission"
-                    else config.get_emission_paths(epoch=epoch, arm="red")
+                    else config.get_emission_paths(epoch=primary_epoch, arm="red")
                 )
             else:
-                resolved_data_dir = config.get_data_dir(epoch=epoch)
+                resolved_data_dir = config.get_data_dir(epoch=primary_epoch)
                 data_paths = (
-                    config.get_transmission_paths(epoch=epoch) if mode == "transmission"
-                    else config.get_emission_paths(epoch=epoch)
+                    config.get_transmission_paths(epoch=primary_epoch) if mode == "transmission"
+                    else config.get_emission_paths(epoch=primary_epoch)
                 )
 
             if data_format == "timeseries":
@@ -2063,8 +2085,6 @@ def run_retrieval(
             else:
                 print(f"  PHOENIX stellar spectrum: {phoenix_spectrum_path}")
 
-        shared_velocity_phase_mode: PhaseMode | None = None
-        shared_velocity_component_names: tuple[str, ...] = ()
         if full_arm_mode:
             if phase_mode not in {"global", "linear"}:
                 raise ValueError(
@@ -2072,21 +2092,6 @@ def run_retrieval(
                     "{'global','linear'} so dRV can be shared across arms; "
                     f"got {phase_mode!r}."
                 )
-            shared_velocity_phase_mode = phase_mode
-            shared_velocity_component_names = (
-                primary_component_name,
-                "spectroscopy_blue",
-            )
-            print(
-                f"  Full-arm mode: sharing dRV ({phase_mode}) between "
-                f"{primary_component_name} and spectroscopy_blue."
-            )
-
-        shared_system = build_shared_system_config(
-            params=model_params,
-            shared_velocity_phase_mode=shared_velocity_phase_mode,
-            shared_velocity_component_names=shared_velocity_component_names,
-        )
 
         primary_is_timeseries = (
             np.asarray(phase).size > 1
@@ -2176,6 +2181,30 @@ def run_retrieval(
                 scalar_constraints.append(component)
                 observation_configs.append(component.observation_config)
                 observations_payload[component.name] = component.observation_inputs
+
+        shared_velocity_phase_mode: PhaseMode | None = None
+        shared_velocity_component_names: tuple[str, ...] = ()
+        if full_arm_mode:
+            shared_velocity_phase_mode = phase_mode
+            shared_velocity_component_names = tuple(
+                [primary_component.name]
+                + [
+                    component.name
+                    for component in auxiliary_components
+                    if component.observation_config.radial_velocity_mode != "none"
+                ]
+            )
+            print(
+                f"  Full-arm mode: sharing dRV ({phase_mode}) across "
+                f"{len(shared_velocity_component_names)} spectroscopic components: "
+                f"{', '.join(shared_velocity_component_names)}."
+            )
+
+        shared_system = build_shared_system_config(
+            params=model_params,
+            shared_velocity_phase_mode=shared_velocity_phase_mode,
+            shared_velocity_component_names=shared_velocity_component_names,
+        )
 
         atmosphere_region_configs, atmosphere_region_lookup = _build_atmosphere_regions(
             model_params=model_params,

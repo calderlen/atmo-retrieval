@@ -12,7 +12,16 @@ CONFIG_PROFILES = {
     "desktop": {
         "description": "Lower-memory local defaults for desktop and laptop runs.",
         "overrides": {
-            "NLAYER": 20,
+            # NLAYER scales linearly across most GPU memory components: the PreModit
+            # xsmatrix scratch tensor, the per-layer dtau array, the chord geometric
+            # matrix, and (crucially) the reverse-mode gradient tape through those
+            # tensors during SVI init's value_and_grad pass. On a 10 GB GPU with the
+            # [1500, 5500] K PreModit range and 4 atomic species at 50k nu_grid points,
+            # NLAYER=20 peaked above the ~7.8 GB free budget and OOM'd in the backward
+            # pass. NLAYER=10 is the standard transmission-retrieval choice (see
+            # petitRADTRANS, POSEIDON, CHIMERA defaults) and preserves enough vertical
+            # resolution for a smooth Guillot profile in a ~20-data-point retrieval.
+            "NLAYER": 10,
             "N_SPECTRAL_POINTS": 50_000,
             "FASTCHEM_N_TEMP": 50,
             "FASTCHEM_N_PRESSURE": 50,

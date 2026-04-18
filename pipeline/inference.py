@@ -26,10 +26,10 @@ def create_prior_guide(
     def prior_guide(*args, **kwargs) -> dict:
         del args, kwargs
         if Mp_upper_3sigma is not None:
-            Mp = numpyro.sample("Mp", dist.HalfNormal(Mp_upper_3sigma / 3.0))
+            Mp = numpyro.sample("Mp", dist.Uniform(0.5, Mp_upper_3sigma))
         else:
             Mp = numpyro.sample("Mp", dist.TruncatedNormal(Mp_mean, Mp_std, low=0.0))
-        Rp = numpyro.sample("Rp", dist.TruncatedNormal(Rp_mean, Rp_std, low=0.0))
+        Rp = numpyro.sample("Rp", dist.TruncatedNormal(Rp_mean, Rp_std, low=0.5))
         Rstar = numpyro.sample("Rstar", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0))
         return {"Mp": Mp, "Rp": Rp, "Rstar": Rstar}
 

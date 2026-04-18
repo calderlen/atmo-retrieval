@@ -8,6 +8,20 @@ import warnings
 
 warnings.filterwarnings("once")
 
+# JAX GPU allocator configuration. Must be set before any jax import.
+# Default JAX behavior is to preallocate ~75% of GPU memory into a BFC (Best-Fit
+# with Coalescing) pool at startup. That pool is fast for JAX's own allocations
+# but collides with cuFFT, which exojax PreModit uses for the line-broadening
+# convolution: cuFFT asks BFC for its plan scratch (~8 MB) and gets RESOURCE_EXHAUSTED
+# when the pool is fully committed or fragmented.
+#
+# "platform" routes allocations through cudaMalloc/cudaFree directly, letting JAX,
+# cuFFT, and cuDNN all share the native CUDA allocator. Slightly slower per-op than
+# BFC but guarantees clean coexistence with cuFFT on tight-GPU retrievals. Pair with
+# PREALLOCATE=false so nothing is reserved upfront.
+os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import config
 from pipeline.retrieval import (
     make_bandpass_constraints_from_tbl,
@@ -18,6 +32,96 @@ from pipeline.retrieval_binned import run_phase_binned_retrieval
 
 
 TESS_BTJD_OFFSET = 2457000.0
+
+
+def _normalize_epoch_args(raw_epochs) -> list[str]:
+    epochs: list[str] = []
+
+    def _collect(value) -> None:
+        if value is None:
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                _collect(item)
+            return
+
+        text = str(value).strip()
+        if not text:
+            return
+        for token in text.split(","):
+            epoch = token.strip()
+            if epoch:
+                epochs.append(epoch)
+
+    _collect(raw_epochs)
+    if not epochs:
+        raise ValueError("At least one --epoch value is required.")
+
+    duplicates: list[str] = []
+    seen: set[str] = set()
+    for epoch in epochs:
+        if epoch in seen and epoch not in duplicates:
+            duplicates.append(epoch)
+        seen.add(epoch)
+    if duplicates:
+        raise ValueError(
+            "Duplicate epoch values are not allowed: " + ", ".join(duplicates)
+        )
+
+    return epochs
+
+
+def _build_multi_epoch_joint_spectra(
+    *,
+    epochs: list[str],
+    mode: str,
+    data_format: str,
+    phase_mode: str,
+) -> list[dict[str, object]]:
+    if len(epochs) <= 1:
+        return []
+
+    apply_sysrem = bool(
+        getattr(config, "APPLY_SYSREM_DEFAULT", False)
+        and data_format == "timeseries"
+    )
+    subtract_per_exposure_mean = bool(
+        getattr(config, "SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT", False)
+        and data_format == "timeseries"
+    )
+    radial_velocity_mode = "orbital" if data_format == "timeseries" else "none"
+    likelihood_kind = "matched_filter" if data_format == "timeseries" else "gaussian"
+
+    component_specs: list[dict[str, object]] = []
+    for epoch in epochs[1:]:
+        if config.OBSERVING_MODE == "full":
+            arm_dirs = config.get_full_arm_data_dirs(epoch=epoch, mode=mode)
+            arm_entries = (
+                ("red", arm_dirs["red"]),
+                ("blue", arm_dirs["blue"]),
+            )
+        else:
+            arm_entries = (
+                (str(config.OBSERVING_MODE), config.get_data_dir(epoch=epoch)),
+            )
+
+        for arm_label, data_dir in arm_entries:
+            component_specs.append(
+                {
+                    "name": f"spectroscopy_{arm_label}_{epoch}",
+                    "mode": mode,
+                    "data_format": data_format,
+                    "data_dir": str(data_dir),
+                    "apply_sysrem": apply_sysrem,
+                    "phase_mode": phase_mode,
+                    "radial_velocity_mode": radial_velocity_mode,
+                    "likelihood_kind": likelihood_kind,
+                    "subtract_per_exposure_mean": subtract_per_exposure_mean,
+                    "instrument_resolution": config.get_resolution(),
+                }
+            )
+
+    return component_specs
 
 
 def create_parser():
@@ -61,7 +165,17 @@ def create_parser():
 
     # Data options
     data_group = parser.add_argument_group("Data")
-    data_group.add_argument("--epoch", type=str, required=True, help="Observation epoch (YYYYMMDD) (required)")
+    data_group.add_argument(
+        "--epoch",
+        type=str,
+        nargs="+",
+        action="append",
+        required=True,
+        help=(
+            "Observation epoch(s) (YYYYMMDD). Pass multiple values to combine "
+            "same-mode HRS epochs in one retrieval."
+        ),
+    )
     data_group.add_argument(
         "--joint-spectrum-tbl",
         type=str,
@@ -549,6 +663,9 @@ def apply_custom_config(custom_config):
 
 
 def apply_cli_overrides(args):
+    epochs = _normalize_epoch_args(args.epoch)
+    primary_epoch = epochs[0]
+
     # Planet and ephemeris selection
     if args.planet:
         config.set_runtime_config("PLANET", args.planet)
@@ -603,9 +720,15 @@ def apply_cli_overrides(args):
         config.set_runtime_config("TRANSMISSION_DATA", None)
         config.set_runtime_config("EMISSION_DATA", None)
     else:
-        config.set_runtime_config("DATA_DIR", config.get_data_dir(epoch=args.epoch))
-        config.set_runtime_config("TRANSMISSION_DATA", config.get_transmission_paths(epoch=args.epoch))
-        config.set_runtime_config("EMISSION_DATA", config.get_emission_paths(epoch=args.epoch))
+        config.set_runtime_config("DATA_DIR", config.get_data_dir(epoch=primary_epoch))
+        config.set_runtime_config(
+            "TRANSMISSION_DATA",
+            config.get_transmission_paths(epoch=primary_epoch),
+        )
+        config.set_runtime_config(
+            "EMISSION_DATA",
+            config.get_emission_paths(epoch=primary_epoch),
+        )
 
     # Quick mode
     if args.quick:
@@ -891,12 +1014,17 @@ def _fit_tess_transit_constraint(args, params):
 
 def print_config_summary(config, args):
     params = config.get_params()
+    epochs = _normalize_epoch_args(args.epoch)
     
     print("\n" + "="*70)
     print("CONFIGURATION SUMMARY")
     print("="*70)
 
     print(f"\nTarget: {config.PLANET} ({config.EPHEMERIS})")
+    if len(epochs) == 1:
+        print(f"  Epoch: {epochs[0]}")
+    else:
+        print(f"  Epochs: {', '.join(epochs)}")
     print(f"  Period: {params['period']} days")
     print(f"  R_p: {params['R_p']} R_J")
     print(f"  T_star: {params['T_star']} K")
@@ -964,6 +1092,8 @@ def print_config_summary(config, args):
 def main():
     parser = create_parser()
     args = parser.parse_args()
+    args.epoch = _normalize_epoch_args(args.epoch)
+    primary_epoch = args.epoch[0]
 
     runtime_config = config
     runtime_config.apply_runtime_profile(args.profile)
@@ -976,10 +1106,22 @@ def main():
     # Apply CLI overrides
     runtime_config = apply_cli_overrides(args)
 
+    if len(args.epoch) > 1 and (args.phase_bin or args.all_phase_bins):
+        raise ValueError(
+            "Phase-binned retrievals only support a single --epoch. "
+            "Run a standard joint retrieval to combine epochs."
+        )
+
+    joint_spectra = _build_multi_epoch_joint_spectra(
+        epochs=args.epoch,
+        mode=args.mode,
+        data_format=args.data_format,
+        phase_mode=args.phase_mode,
+    )
+
     # Print configuration summary
     print_config_summary(runtime_config, args)
 
-    joint_spectra = []
     for tbl_path in args.joint_spectrum_tbl or []:
         joint_spectra.append(make_joint_spectrum_component_from_tbl(tbl_path))
 
@@ -994,7 +1136,7 @@ def main():
         run_phase_binned_retrieval(
             phase_bins=["T12", "T23", "T34"],
             mode=args.mode,
-            epoch=args.epoch,
+            epoch=primary_epoch,
             data_format=args.data_format,
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
@@ -1012,7 +1154,7 @@ def main():
         run_phase_binned_retrieval(
             phase_bins=[args.phase_bin],
             mode=args.mode,
-            epoch=args.epoch,
+            epoch=primary_epoch,
             data_format=args.data_format,
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
