@@ -4,8 +4,8 @@
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=16
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=8
 #SBATCH --cluster ascend
 #SBATCH --partition=gpu
 #SBATCH --mail-type=ALL
@@ -28,34 +28,61 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 export NUMEXPR_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+export PYTHONUNBUFFERED=1
+
+#export XLA_PYTHON_CLIENT_ALLOCATOR="${XLA_PYTHON_CLIENT_ALLOCATOR:-platform}"
+#export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 
 nvidia-smi -L || true
 
 # TODO: replace with your OSC environment Python executable.
 PYTHON_BIN="/path/to/osc/envs/retrieval/bin/python"
+BANDPASS_TBL="transmission/kelt20b/kelt20b_tess_bandpass.tbl"
+FASTCHEM_PARAMETER_FILE="input/fastchem/parameters.dat"
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "[$(date)] Python executable not found or not executable: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+if [[ ! -f "$BANDPASS_TBL" ]]; then
+  echo "[$(date)] Missing bandpass table: $BANDPASS_TBL" >&2
+  exit 1
+fi
+
+if [[ ! -f "$FASTCHEM_PARAMETER_FILE" ]]; then
+  echo "[$(date)] Missing FastChem parameter file: $FASTCHEM_PARAMETER_FILE" >&2
+  exit 1
+fi
 
 echo "Python: $PYTHON_BIN"
 "$PYTHON_BIN" --version
+echo "Bandpass table: $BANDPASS_TBL"
+echo "FastChem parameter file: $FASTCHEM_PARAMETER_FILE"
+echo "PYTHONUNBUFFERED=${PYTHONUNBUFFERED}"
 
 /usr/bin/time -v srun --ntasks=1 "$PYTHON_BIN" -m atmo_retrieval \
   --profile hpc \
   --planet KELT-20b \
   --mode transmission \
   --epoch 20190504 \
-  --bandpass-tbl transmission/kelt20b/kelt20b_tess_bandpass.tbl \
+  --bandpass-tbl "$BANDPASS_TBL" \
   --data-format timeseries \
   --wavelength-range full \
   --chemistry-model fastchem_hybrid_grid \
   --atoms "Fe I,Ni I,Cr I,Na I" \
   --no-molecules \
   --pt-profile guillot \
-  --fastchem-parameter-file input/fastchem/parameters.dat \
+  --fastchem-parameter-file "$FASTCHEM_PARAMETER_FILE" \
   --load-opacities \
   --resolution-mode hr \
-  --mcmc-chains 4 \
-  --mcmc-chain-method parallel \
-  --require-gpu-per-chain \
-  --svi-steps 10000 \
+  --nlayer 20 \
+  --n-spectral-points 130000 \
+  --mcmc-chains 2 \
+  --mcmc-chain-method sequential \
+  --mcmc-warmup 2000 \
+  --mcmc-samples 2000 \
+  --svi-steps 8000 \
   --svi-learning-rate 0.001 \
   --svi-lr-decay-steps 2000 \
   --svi-lr-decay-rate 0.5

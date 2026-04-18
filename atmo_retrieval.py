@@ -19,8 +19,8 @@ warnings.filterwarnings("once")
 # cuFFT, and cuDNN all share the native CUDA allocator. Slightly slower per-op than
 # BFC but guarantees clean coexistence with cuFFT on tight-GPU retrievals. Pair with
 # PREALLOCATE=false so nothing is reserved upfront.
-os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+#os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+#os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import config
 from pipeline.retrieval import (
