@@ -37,23 +37,8 @@ nvidia-smi -L || true
 
 # TODO: replace with your OSC environment Python executable.
 PYTHON_BIN="/path/to/osc/envs/retrieval/bin/python"
-BANDPASS_TBL="transmission/kelt20b/kelt20b_tess_bandpass.tbl"
+BANDPASS_TBL="input/phot/transmission/kelt20b/kelt20b_tess_bandpass.tbl"
 FASTCHEM_PARAMETER_FILE="input/fastchem/parameters.dat"
-
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  echo "[$(date)] Python executable not found or not executable: $PYTHON_BIN" >&2
-  exit 1
-fi
-
-if [[ ! -f "$BANDPASS_TBL" ]]; then
-  echo "[$(date)] Missing bandpass table: $BANDPASS_TBL" >&2
-  exit 1
-fi
-
-if [[ ! -f "$FASTCHEM_PARAMETER_FILE" ]]; then
-  echo "[$(date)] Missing FastChem parameter file: $FASTCHEM_PARAMETER_FILE" >&2
-  exit 1
-fi
 
 echo "Python: $PYTHON_BIN"
 "$PYTHON_BIN" --version

@@ -119,6 +119,7 @@ from .paths_config import (
     USE_DEFAULT_SPECIES,
     get_raw_hrs_dir,
     get_data_dir,
+    get_full_arm_data_dirs,
     get_lowres_dir,
     get_phot_dir,
     get_transmission_paths,
