@@ -952,6 +952,18 @@ def _compute_model_timeseries_for_plot(
         return None, atmo_state
 
 
+def _component_output_filename(
+    base_filename: str,
+    component_name: str,
+    *,
+    num_components: int,
+) -> str:
+    if num_components <= 1:
+        return base_filename
+    stem, ext = os.path.splitext(base_filename)
+    return f"{stem}_{component_name}{ext}"
+
+
 @dataclass(frozen=True)
 class SpectroscopicComponentBundle:
     name: str
@@ -1118,6 +1130,44 @@ def _build_component_grid_and_ops(
     _preflight_grid_checks(inst_nus, nu_grid)
     sop_rot, sop_inst, _ = setup_spectral_operators(nu_grid, instrument_resolution)
     return inst_nus, nu_grid, sop_rot, sop_inst
+
+
+def _build_in_memory_timeseries_component_spec(
+    *,
+    name: str,
+    mode: str,
+    wav_obs: np.ndarray,
+    data: np.ndarray,
+    sigma: np.ndarray,
+    phase: np.ndarray,
+    sysrem: SysremInputBundle | None,
+    instrument_resolution: float,
+    phase_mode: PhaseMode,
+    apply_sysrem: bool,
+    radial_velocity_mode: str,
+    likelihood_kind: str,
+    subtract_per_exposure_mean: bool,
+    region_name: str | None = None,
+) -> dict[str, Any]:
+    spec: dict[str, Any] = {
+        "name": name,
+        "mode": mode,
+        "data_format": "timeseries",
+        "wav_obs": np.asarray(wav_obs),
+        "data": np.asarray(data),
+        "sigma": np.asarray(sigma),
+        "phase": np.asarray(phase),
+        "sysrem": sysrem,
+        "instrument_resolution": float(instrument_resolution),
+        "apply_sysrem": bool(apply_sysrem),
+        "phase_mode": phase_mode,
+        "radial_velocity_mode": radial_velocity_mode,
+        "likelihood_kind": likelihood_kind,
+        "subtract_per_exposure_mean": bool(subtract_per_exposure_mean),
+    }
+    if region_name is not None:
+        spec["region_name"] = region_name
+    return spec
 
 
 def _load_opacity_bundle(
@@ -2015,20 +2065,33 @@ def run_retrieval(
         Rinst = config.get_resolution()
         print(f"  Instrument resolving power: R = {Rinst:.0f}")
 
+    nu_grid = None
+    sop_rot = None
+    sop_inst = None
+    opa_cias = None
+    opa_mols = None
+    opa_atoms = None
+
     # Setup wavenumber grid
     print("\n[3/7] Building wavenumber grid...")
     with _StepTimer("Step 3/7"):
-        wav_min, wav_max = config.get_wavelength_range()
-        nu_grid, _wav_grid, _res_high = setup_wavenumber_grid(
-            wav_min - config.WAV_MIN_OFFSET,
-            wav_max + config.WAV_MAX_OFFSET,
-            config.N_SPECTRAL_POINTS,
-            unit="AA",
-        )
-        _preflight_grid_checks(inst_nus, nu_grid)
+        if full_arm_mode:
+            print(
+                "  Full-arm mode: skipping global HRS grid; "
+                "red and blue components build arm-specific grids in step 6."
+            )
+        else:
+            wav_min, wav_max = config.get_wavelength_range()
+            nu_grid, _wav_grid, _res_high = setup_wavenumber_grid(
+                wav_min - config.WAV_MIN_OFFSET,
+                wav_max + config.WAV_MAX_OFFSET,
+                config.N_SPECTRAL_POINTS,
+                unit="AA",
+            )
+            _preflight_grid_checks(inst_nus, nu_grid)
 
-        sop_rot, sop_inst, _ = setup_spectral_operators(nu_grid, Rinst)
-        print("  Spectral operators initialized")
+            sop_rot, sop_inst, _ = setup_spectral_operators(nu_grid, Rinst)
+            print("  Spectral operators initialized")
 
     # Setup primary atmospheric RT geometry
     print("\n[4/7] Initializing primary atmospheric RT...")
@@ -2041,37 +2104,43 @@ def run_retrieval(
     # Load opacities
     print("\n[5/7] Loading opacities...")
     with _StepTimer("Step 5/7"):
-        opa_cias = setup_cia_opacities(config.CIA_PATHS, nu_grid)
-        n_cia = sum(1 for cia in opa_cias.values() if not getattr(cia, "_is_dummy", False))
-        if n_cia == 0:
-            print("  Loaded 0 CIA sources (no overlap with nu_grid)")
+        if full_arm_mode:
+            print(
+                "  Full-arm mode: skipping global opacity preload; "
+                "each arm loads opacities on its own grid in step 6."
+            )
         else:
-            print(f"  Loaded {n_cia} CIA sources")
+            opa_cias = setup_cia_opacities(config.CIA_PATHS, nu_grid)
+            n_cia = sum(1 for cia in opa_cias.values() if not getattr(cia, "_is_dummy", False))
+            if n_cia == 0:
+                print("  Loaded 0 CIA sources (no overlap with nu_grid)")
+            else:
+                print(f"  Loaded {n_cia} CIA sources")
 
-        opa_mols, _molmass_arr = load_molecular_opacities(
-            config.MOLPATH_HITEMP,
-            config.MOLPATH_EXOMOL,
-            nu_grid,
-            config.OPA_LOAD,
-            config.DIFFMODE,
-            config.T_LOW,
-            config.T_HIGH,
-            cutwing=config.PREMODIT_CUTWING,
-        )
-        print(f"  Loaded {len(opa_mols)} molecular species: {list(opa_mols.keys())}")
+            opa_mols, _molmass_arr = load_molecular_opacities(
+                config.MOLPATH_HITEMP,
+                config.MOLPATH_EXOMOL,
+                nu_grid,
+                config.OPA_LOAD,
+                config.DIFFMODE,
+                config.T_LOW,
+                config.T_HIGH,
+                cutwing=config.PREMODIT_CUTWING,
+            )
+            print(f"  Loaded {len(opa_mols)} molecular species: {list(opa_mols.keys())}")
 
-        # Load atomic opacities (optional, uses Kurucz with auto-download)
-        opa_atoms, _atommass_arr = load_atomic_opacities(
-            config.ATOMIC_SPECIES,
-            nu_grid,
-            config.OPA_LOAD,
-            config.DIFFMODE,
-            config.T_LOW,
-            config.T_HIGH,
-            cutwing=config.PREMODIT_CUTWING,
-        )
-        if opa_atoms:
-            print(f"  Loaded {len(opa_atoms)} atomic species: {list(opa_atoms.keys())}")
+            # Load atomic opacities (optional, uses Kurucz with auto-download)
+            opa_atoms, _atommass_arr = load_atomic_opacities(
+                config.ATOMIC_SPECIES,
+                nu_grid,
+                config.OPA_LOAD,
+                config.DIFFMODE,
+                config.T_LOW,
+                config.T_HIGH,
+                cutwing=config.PREMODIT_CUTWING,
+            )
+            if opa_atoms:
+                print(f"  Loaded {len(opa_atoms)} atomic species: {list(opa_atoms.keys())}")
 
     print(f"\n[6/7] Building retrieval model (primary={mode}, default P-T={pt_profile})...")
     print(f"  Chemistry model: {chemistry_model}")
@@ -2107,37 +2176,66 @@ def run_retrieval(
             else None
         )
 
-        primary_component = _build_primary_spectroscopic_component(
-            name=primary_component_name,
-            mode=mode,
-            wav_obs=wav_obs,
-            data=data,
-            sigma=sigma,
-            phase=phase,
-            sysrem=primary_sysrem,
-            instrument_resolution=Rinst,
-            nu_grid=nu_grid,
-            inst_nus=inst_nus,
-            sop_rot=sop_rot,
-            sop_inst=sop_inst,
-            opa_cias=opa_cias,
-            opa_mols=opa_mols,
-            opa_atoms=opa_atoms,
-            region_name=primary_region_name,
-            Tstar=model_params["T_star"],
-            logg_star=model_params["logg_star"],
-            metallicity=model_params["Fe_H"],
-            Mstar=model_params["M_star"],
-            Rstar=model_params["R_star"],
-            phoenix_spectrum_path=phoenix_spectrum_path,
-            phoenix_cache_dir=phoenix_cache_dir,
-            phase_mode=phase_mode,
-            apply_sysrem=apply_sysrem,
-            radial_velocity_mode=primary_radial_velocity_mode,
-            likelihood_kind=primary_likelihood_kind,
-            subtract_per_exposure_mean=primary_subtract_mean,
-            sample_prefix=primary_sample_prefix,
-        )
+        if full_arm_mode:
+            primary_component_spec = _build_in_memory_timeseries_component_spec(
+                name=primary_component_name,
+                mode=mode,
+                wav_obs=wav_obs,
+                data=data,
+                sigma=sigma,
+                phase=phase,
+                sysrem=primary_sysrem,
+                instrument_resolution=Rinst,
+                phase_mode=phase_mode,
+                apply_sysrem=apply_sysrem,
+                radial_velocity_mode=primary_radial_velocity_mode,
+                likelihood_kind=primary_likelihood_kind,
+                subtract_per_exposure_mean=primary_subtract_mean,
+                region_name=primary_region_name,
+            )
+            primary_component = _load_joint_spectroscopic_component(
+                primary_component_spec,
+                default_mode=mode,
+                default_tstar=model_params["T_star"],
+                default_logg_star=model_params["logg_star"],
+                default_metallicity=model_params["Fe_H"],
+                default_mstar=model_params["M_star"],
+                default_rstar=model_params["R_star"],
+                default_phoenix_spectrum_path=phoenix_spectrum_path,
+                default_phoenix_cache_dir=phoenix_cache_dir,
+            )
+        else:
+            primary_component = _build_primary_spectroscopic_component(
+                name=primary_component_name,
+                mode=mode,
+                wav_obs=wav_obs,
+                data=data,
+                sigma=sigma,
+                phase=phase,
+                sysrem=primary_sysrem,
+                instrument_resolution=Rinst,
+                nu_grid=nu_grid,
+                inst_nus=inst_nus,
+                sop_rot=sop_rot,
+                sop_inst=sop_inst,
+                opa_cias=opa_cias,
+                opa_mols=opa_mols,
+                opa_atoms=opa_atoms,
+                region_name=primary_region_name,
+                Tstar=model_params["T_star"],
+                logg_star=model_params["logg_star"],
+                metallicity=model_params["Fe_H"],
+                Mstar=model_params["M_star"],
+                Rstar=model_params["R_star"],
+                phoenix_spectrum_path=phoenix_spectrum_path,
+                phoenix_cache_dir=phoenix_cache_dir,
+                phase_mode=phase_mode,
+                apply_sysrem=apply_sysrem,
+                radial_velocity_mode=primary_radial_velocity_mode,
+                likelihood_kind=primary_likelihood_kind,
+                subtract_per_exposure_mean=primary_subtract_mean,
+                sample_prefix=primary_sample_prefix,
+            )
         observation_configs: list[object] = [primary_component.observation_config]
         observations_payload: dict[str, object] = {primary_component.name: primary_component.observation_inputs}
 
@@ -2224,14 +2322,18 @@ def run_retrieval(
         )
         model_c = joint_model
         model_inputs = {"observations": observations_payload}
-        primary_region_config = atmosphere_region_lookup[primary_region_name]
-        primary_pt_profile = primary_region_config.pt_profile
-        primary_component_config = primary_component.observation_config
-        primary_region_sample_prefix = primary_region_config.sample_prefix
-        primary_component_sample_prefix = primary_component_config.sample_prefix
+        shared_region_config = atmosphere_region_lookup[primary_region_name]
+        shared_pt_profile = shared_region_config.pt_profile
+        shared_region_sample_prefix = shared_region_config.sample_prefix
+        spectroscopic_components: list[SpectroscopicComponentBundle] = [primary_component]
+        spectroscopic_components.extend(auxiliary_components)
+        spectroscopic_component_count = len(spectroscopic_components)
+        component_sample_prefixes = {
+            component.name: component.observation_config.sample_prefix
+            for component in spectroscopic_components
+        }
 
-        component_names = [primary_component.name]
-        component_names.extend(component.name for component in auxiliary_components)
+        component_names = [component.name for component in spectroscopic_components]
         component_names.extend(component.name for component in scalar_constraints)
         print(
             f"  Joint model created with {len(component_names)} component(s): "
@@ -2308,50 +2410,66 @@ def run_retrieval(
                         try:
                             plot_temperature_profile(
                                 posterior_samples=svi_samples_for_plots,
-                                art=primary_region_config.art,
+                                art=shared_region_config.art,
                                 save_path=os.path.join(output_dir, "temperature_profile.png"),
-                                pt_profile=primary_pt_profile,
-                                sample_prefix=primary_region_sample_prefix,
-                                Tint_fixed=primary_region_config.Tint_fixed,
+                                pt_profile=shared_pt_profile,
+                                sample_prefix=shared_region_sample_prefix,
+                                Tint_fixed=shared_region_config.Tint_fixed,
                             )
                         except Exception as exc:
                             print(
                                 "  Skipping temperature profile plot for SVI samples: "
                                 f"{exc}"
                             )
+                        for component in spectroscopic_components:
+                            component_obs_mean, component_obs_err = _summarize_observed_spectrum(
+                                component.data,
+                                component.sigma,
+                            )
+                            component_wav_obs_nm = np.asarray(component.wav_obs) / 10.0
+                            svi_model_ts, _ = _compute_model_timeseries_for_plot(
+                                posterior_samples=svi_samples_for_plots,
+                                model_params=model_params,
+                                region_config=shared_region_config,
+                                component=component,
+                                region_sample_prefix=shared_region_sample_prefix,
+                                component_sample_prefix=component_sample_prefixes[component.name],
+                            )
 
-                        obs_mean, obs_err = _summarize_observed_spectrum(data, sigma)
-                        wav_obs_nm = np.asarray(wav_obs) / 10.0
-
-                        svi_model_ts, _ = _compute_model_timeseries_for_plot(
-                            posterior_samples=svi_samples_for_plots,
-                            model_params=model_params,
-                            region_config=primary_region_config,
-                            component=primary_component,
-                            region_sample_prefix=primary_region_sample_prefix,
-                            component_sample_prefix=primary_component_sample_prefix,
-                        )
-
-                        if svi_model_ts is not None:
-                            svi_line = np.mean(np.asarray(svi_model_ts), axis=0)
-                            if mode == "transmission":
-                                plot_transmission_spectrum(
-                                    wavelength_nm=wav_obs_nm,
-                                    rp_obs=obs_mean,
-                                    rp_err=obs_err,
-                                    rp_hmc=np.atleast_2d(svi_line),
-                                    rp_svi=svi_line,
-                                    save_path=os.path.join(output_dir, "transmission_spectrum.png"),
-                                )
-                            else:
-                                plot_emission_spectrum(
-                                    wavelength_nm=wav_obs_nm,
-                                    fp_obs=obs_mean,
-                                    fp_err=obs_err,
-                                    fp_hmc=np.atleast_2d(svi_line),
-                                    fp_svi=svi_line,
-                                    save_path=os.path.join(output_dir, "emission_spectrum.png"),
-                                )
+                            if svi_model_ts is not None:
+                                svi_line = np.mean(np.asarray(svi_model_ts), axis=0)
+                                if mode == "transmission":
+                                    plot_transmission_spectrum(
+                                        wavelength_nm=component_wav_obs_nm,
+                                        rp_obs=component_obs_mean,
+                                        rp_err=component_obs_err,
+                                        rp_hmc=np.atleast_2d(svi_line),
+                                        rp_svi=svi_line,
+                                        save_path=os.path.join(
+                                            output_dir,
+                                            _component_output_filename(
+                                                "transmission_spectrum.png",
+                                                component.name,
+                                                num_components=spectroscopic_component_count,
+                                            ),
+                                        ),
+                                    )
+                                else:
+                                    plot_emission_spectrum(
+                                        wavelength_nm=component_wav_obs_nm,
+                                        fp_obs=component_obs_mean,
+                                        fp_err=component_obs_err,
+                                        fp_hmc=np.atleast_2d(svi_line),
+                                        fp_svi=svi_line,
+                                        save_path=os.path.join(
+                                            output_dir,
+                                            _component_output_filename(
+                                                "emission_spectrum.png",
+                                                component.name,
+                                                num_components=spectroscopic_component_count,
+                                            ),
+                                        ),
+                                    )
                 print("  SVI complete (svi_only=True); skipping MCMC.")
                 return
 
@@ -2433,11 +2551,11 @@ def run_retrieval(
         try:
             plot_temperature_profile(
                 posterior_samples=posterior_np,
-                art=primary_region_config.art,
+                art=shared_region_config.art,
                 save_path=os.path.join(output_dir, "temperature_profile.png"),
-                pt_profile=primary_pt_profile,
-                sample_prefix=primary_region_sample_prefix,
-                Tint_fixed=primary_region_config.Tint_fixed,
+                pt_profile=shared_pt_profile,
+                sample_prefix=shared_region_sample_prefix,
+                Tint_fixed=shared_region_config.Tint_fixed,
             )
         except Exception as exc:
             print(
@@ -2445,7 +2563,7 @@ def run_retrieval(
                 f"{exc}"
             )
 
-    atmo_state = None
+    component_atmo_states: dict[str, dict] = {}
     if compute_contribution or not no_plots:
         print("\n  Computing atmospheric state from posterior...")
 
@@ -2454,136 +2572,197 @@ def run_retrieval(
             for name, values in posterior_sample.items():
                 posterior_np[name] = np.asarray(jax.device_get(values))
 
-        try:
-            atmo_state = compute_atmospheric_state_from_posterior(
-                posterior_samples=posterior_np,
-                region_config=primary_region_config,
-                opa_mols=primary_component.opa_mols,
-                opa_atoms=primary_component.opa_atoms,
-                opa_cias=primary_component.opa_cias,
-                nu_grid=primary_component.nu_grid,
-                use_median=True,
-                sample_prefix=primary_region_sample_prefix,
-            )
-        except Exception as exc:
-            if compute_contribution:
-                raise
-            print(
-                "  Warning: unable to compute atmospheric state; "
-                f"skipping spectrum diagnostics. ({exc})"
-            )
+        for component in spectroscopic_components:
+            try:
+                component_atmo_states[component.name] = compute_atmospheric_state_from_posterior(
+                    posterior_samples=posterior_np,
+                    region_config=shared_region_config,
+                    opa_mols=component.opa_mols,
+                    opa_atoms=component.opa_atoms,
+                    opa_cias=component.opa_cias,
+                    nu_grid=component.nu_grid,
+                    use_median=True,
+                    sample_prefix=shared_region_sample_prefix,
+                )
+            except Exception as exc:
+                if compute_contribution:
+                    raise
+                print(
+                    "  Warning: unable to compute atmospheric state for "
+                    f"{component.name}; skipping that component's diagnostics. ({exc})"
+                )
 
-    if not no_plots and atmo_state is not None:
+    if not no_plots and component_atmo_states:
         print("  Plotting fitted spectrum diagnostics...")
-        wav_obs_nm = np.asarray(wav_obs) / 10.0
-        obs_mean, obs_err = _summarize_observed_spectrum(data, sigma)
+        for component in spectroscopic_components:
+            atmo_state = component_atmo_states.get(component.name)
+            if atmo_state is None:
+                continue
 
-        hmc_model_ts, atmo_state = _compute_model_timeseries_for_plot(
-            posterior_samples=posterior_np,
-            model_params=model_params,
-            region_config=primary_region_config,
-            component=primary_component,
-            region_sample_prefix=primary_region_sample_prefix,
-            component_sample_prefix=primary_component_sample_prefix,
-            atmo_state=atmo_state,
-        )
-
-        svi_model_ts = None
-        if svi_samples_for_plots is not None:
-            svi_model_ts, _ = _compute_model_timeseries_for_plot(
-                posterior_samples=svi_samples_for_plots,
-                model_params=model_params,
-                region_config=primary_region_config,
-                component=primary_component,
-                region_sample_prefix=primary_region_sample_prefix,
-                component_sample_prefix=primary_component_sample_prefix,
+            component_wav_obs_nm = np.asarray(component.wav_obs) / 10.0
+            component_obs_mean, component_obs_err = _summarize_observed_spectrum(
+                component.data,
+                component.sigma,
             )
 
-        if hmc_model_ts is not None or svi_model_ts is not None:
-            hmc_plot = hmc_model_ts
-            if hmc_plot is None and svi_model_ts is not None:
-                hmc_plot = np.atleast_2d(np.mean(np.asarray(svi_model_ts), axis=0))
+            hmc_model_ts, atmo_state = _compute_model_timeseries_for_plot(
+                posterior_samples=posterior_np,
+                model_params=model_params,
+                region_config=shared_region_config,
+                component=component,
+                region_sample_prefix=shared_region_sample_prefix,
+                component_sample_prefix=component_sample_prefixes[component.name],
+                atmo_state=atmo_state,
+            )
+            component_atmo_states[component.name] = atmo_state
 
-            if hmc_plot is not None:
-                svi_line = np.mean(np.asarray(hmc_plot), axis=0)
-                if svi_model_ts is not None:
-                    svi_line = np.mean(np.asarray(svi_model_ts), axis=0)
+            svi_model_ts = None
+            if svi_samples_for_plots is not None:
+                svi_model_ts, _ = _compute_model_timeseries_for_plot(
+                    posterior_samples=svi_samples_for_plots,
+                    model_params=model_params,
+                    region_config=shared_region_config,
+                    component=component,
+                    region_sample_prefix=shared_region_sample_prefix,
+                    component_sample_prefix=component_sample_prefixes[component.name],
+                )
 
-                if mode == "transmission":
-                    plot_transmission_spectrum(
-                        wavelength_nm=wav_obs_nm,
-                        rp_obs=obs_mean,
-                        rp_err=obs_err,
-                        rp_hmc=np.asarray(hmc_plot),
-                        rp_svi=np.asarray(svi_line),
-                        save_path=os.path.join(output_dir, "transmission_spectrum.png"),
-                    )
-                else:
-                    plot_emission_spectrum(
-                        wavelength_nm=wav_obs_nm,
-                        fp_obs=obs_mean,
-                        fp_err=obs_err,
-                        fp_hmc=np.asarray(hmc_plot),
-                        fp_svi=np.asarray(svi_line),
-                        save_path=os.path.join(output_dir, "emission_spectrum.png"),
-                    )
+            if hmc_model_ts is not None or svi_model_ts is not None:
+                hmc_plot = hmc_model_ts
+                if hmc_plot is None and svi_model_ts is not None:
+                    hmc_plot = np.atleast_2d(np.mean(np.asarray(svi_model_ts), axis=0))
 
-    if compute_contribution and atmo_state is not None:
-        # Save atmospheric state
-        np.savez(
-            os.path.join(output_dir, "atmospheric_state.npz"),
-            dtau=np.array(atmo_state['dtau']),
-            Tarr=np.array(atmo_state['Tarr']),
-            pressure=np.array(atmo_state['pressure']),
-            dParr=np.array(atmo_state['dParr']),
-            mmw=np.array(atmo_state['mmw']),
-            vmrH2=np.array(atmo_state['vmrH2']),
-            vmrHe=np.array(atmo_state['vmrHe']),
-        )
+                if hmc_plot is not None:
+                    svi_line = np.mean(np.asarray(hmc_plot), axis=0)
+                    if svi_model_ts is not None:
+                        svi_line = np.mean(np.asarray(svi_model_ts), axis=0)
 
-        # Plot contribution function
-        if not no_plots:
-            print("  Plotting contribution function...")
+                    if mode == "transmission":
+                        plot_transmission_spectrum(
+                            wavelength_nm=component_wav_obs_nm,
+                            rp_obs=component_obs_mean,
+                            rp_err=component_obs_err,
+                            rp_hmc=np.asarray(hmc_plot),
+                            rp_svi=np.asarray(svi_line),
+                            save_path=os.path.join(
+                                output_dir,
+                                _component_output_filename(
+                                    "transmission_spectrum.png",
+                                    component.name,
+                                    num_components=spectroscopic_component_count,
+                                ),
+                            ),
+                        )
+                    else:
+                        plot_emission_spectrum(
+                            wavelength_nm=component_wav_obs_nm,
+                            fp_obs=component_obs_mean,
+                            fp_err=component_obs_err,
+                            fp_hmc=np.asarray(hmc_plot),
+                            fp_svi=np.asarray(svi_line),
+                            save_path=os.path.join(
+                                output_dir,
+                                _component_output_filename(
+                                    "emission_spectrum.png",
+                                    component.name,
+                                    num_components=spectroscopic_component_count,
+                                ),
+                            ),
+                        )
 
-            # Total contribution function
-            plot_contribution_function(
-                nu_grid=np.array(primary_component.nu_grid),
+    if compute_contribution and component_atmo_states:
+        for component in spectroscopic_components:
+            atmo_state = component_atmo_states.get(component.name)
+            if atmo_state is None:
+                continue
+
+            np.savez(
+                os.path.join(
+                    output_dir,
+                    _component_output_filename(
+                        "atmospheric_state.npz",
+                        component.name,
+                        num_components=spectroscopic_component_count,
+                    ),
+                ),
                 dtau=np.array(atmo_state['dtau']),
                 Tarr=np.array(atmo_state['Tarr']),
                 pressure=np.array(atmo_state['pressure']),
                 dParr=np.array(atmo_state['dParr']),
-                save_path=os.path.join(output_dir, "contribution_function.pdf"),
-                wavelength_unit="AA",
-                title=f"{config.PLANET} Contribution Function ({mode})",
+                mmw=np.array(atmo_state['mmw']),
+                vmrH2=np.array(atmo_state['vmrH2']),
+                vmrHe=np.array(atmo_state['vmrHe']),
             )
 
-            # Per-species contribution functions (if available)
-            if atmo_state['dtau_per_species']:
-                dtau_per_species_np = {}
-                for k, v in atmo_state['dtau_per_species'].items():
-                    dtau_per_species_np[k] = np.array(v)
+        if not no_plots:
+            print("  Plotting contribution function(s)...")
 
-                plot_contribution_per_species(
-                    nu_grid=np.array(primary_component.nu_grid),
-                    dtau_per_species=dtau_per_species_np,
-                    Tarr=np.array(atmo_state['Tarr']),
-                    pressure=np.array(atmo_state['pressure']),
-                    dParr=np.array(atmo_state['dParr']),
-                    save_path=os.path.join(output_dir, "contribution_per_species.pdf"),
-                    wavelength_unit="AA",
-                )
+            for component in spectroscopic_components:
+                atmo_state = component_atmo_states.get(component.name)
+                if atmo_state is None:
+                    continue
 
-                # Combined plot
-                plot_contribution_combined(
-                    nu_grid=np.array(primary_component.nu_grid),
+                contribution_title = f"{config.PLANET} Contribution Function ({mode})"
+                if spectroscopic_component_count > 1:
+                    contribution_title += f" [{component.name}]"
+
+                plot_contribution_function(
+                    nu_grid=np.array(component.nu_grid),
                     dtau=np.array(atmo_state['dtau']),
-                    dtau_per_species=dtau_per_species_np,
                     Tarr=np.array(atmo_state['Tarr']),
                     pressure=np.array(atmo_state['pressure']),
                     dParr=np.array(atmo_state['dParr']),
-                    save_path=os.path.join(output_dir, "contribution_combined.pdf"),
+                    save_path=os.path.join(
+                        output_dir,
+                        _component_output_filename(
+                            "contribution_function.pdf",
+                            component.name,
+                            num_components=spectroscopic_component_count,
+                        ),
+                    ),
                     wavelength_unit="AA",
+                    title=contribution_title,
                 )
+
+                if atmo_state['dtau_per_species']:
+                    dtau_per_species_np = {}
+                    for k, v in atmo_state['dtau_per_species'].items():
+                        dtau_per_species_np[k] = np.array(v)
+
+                    plot_contribution_per_species(
+                        nu_grid=np.array(component.nu_grid),
+                        dtau_per_species=dtau_per_species_np,
+                        Tarr=np.array(atmo_state['Tarr']),
+                        pressure=np.array(atmo_state['pressure']),
+                        dParr=np.array(atmo_state['dParr']),
+                        save_path=os.path.join(
+                            output_dir,
+                            _component_output_filename(
+                                "contribution_per_species.pdf",
+                                component.name,
+                                num_components=spectroscopic_component_count,
+                            ),
+                        ),
+                        wavelength_unit="AA",
+                    )
+
+                    plot_contribution_combined(
+                        nu_grid=np.array(component.nu_grid),
+                        dtau=np.array(atmo_state['dtau']),
+                        dtau_per_species=dtau_per_species_np,
+                        Tarr=np.array(atmo_state['Tarr']),
+                        pressure=np.array(atmo_state['pressure']),
+                        dParr=np.array(atmo_state['dParr']),
+                        save_path=os.path.join(
+                            output_dir,
+                            _component_output_filename(
+                                "contribution_combined.pdf",
+                                component.name,
+                                num_components=spectroscopic_component_count,
+                            ),
+                        ),
+                        wavelength_unit="AA",
+                    )
 
             print(f"  Contribution function plots saved to {output_dir}/")
     

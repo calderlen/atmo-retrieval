@@ -47,6 +47,7 @@ class ProfileResult:
     est_total_bytes: float | None = None
     est_art_bytes: float | None = None
     est_opa_bytes: float | None = None
+    component_results: dict[str, "ProfileResult"] | None = None
 
 
 def _fmt_bytes(value: float | int) -> str:
@@ -120,33 +121,22 @@ def _estimate_device_mem(
     return art_mem, opa_only_sum, total
 
 
-def run_memory_profile(
+def _run_single_memory_profile_for_range(
+    *,
     mode: str,
-    nfree: int = 10,
-    load_only: bool = False,
-    skip_opacities: bool = False,
-    nlayer: int | None = None,
-    n_spectral_points: int | None = None,
-    wav_min_override: float | None = None,
-    wav_max_override: float | None = None,
+    wav_min: float,
+    wav_max: float,
+    nfree: int,
+    load_only: bool,
+    skip_opacities: bool,
+    nlayer: int | None,
+    n_spectral_points: int | None,
 ) -> ProfileResult:
-    """Profile approximate RAM/GPU usage during retrieval setup steps."""
-    print("\nMEMORY PROFILE")
-    print("-" * 70)
-    print(f"Mode: {mode}")
-    print(f"PREMODIT_CUTWING: {config.PREMODIT_CUTWING}")
-    if jax is not None:
-        print(f"JAX backend: {jax.default_backend()}")
-        print(f"JAX devices: {jax.devices()}")
-
     tracker: dict[str, object] = {"max_used": 0.0}
     result = ProfileResult()
     _print_snapshot("Initial", tracker)
 
     print("\n[1/4] Building wavenumber grid...")
-    wav_min, wav_max = config.get_wavelength_range()
-    if wav_min_override is not None and wav_max_override is not None:
-        wav_min, wav_max = wav_min_override, wav_max_override
     npoints = n_spectral_points if n_spectral_points is not None else config.N_SPECTRAL_POINTS
     nu_grid, _wav_grid, res_high = setup_wavenumber_grid(
         wav_min - config.WAV_MIN_OFFSET,
@@ -171,6 +161,8 @@ def run_memory_profile(
             pressure_btm=config.PRESSURE_BTM,
             nlayer=nl,
         )
+    else:
+        raise ValueError(f"Unsupported mode: {mode!r}")
     art.change_temperature_range(config.T_LOW, config.T_HIGH)
     _print_snapshot("After RT setup", tracker)
 
@@ -236,6 +228,114 @@ def run_memory_profile(
         result.peak_gpu_used_bytes = float(peak)
         result.peak_gpu_label = str(tracker.get("label", "n/a"))
         print(f"\nPeak GPU used: {_fmt_bytes(peak)} (at {result.peak_gpu_label})")
+    return result
+
+
+def _combine_full_arm_profile_results(
+    component_results: dict[str, ProfileResult],
+) -> ProfileResult:
+    combined = ProfileResult(component_results=dict(component_results))
+
+    def _sum_attr(attr: str) -> float | None:
+        values = [getattr(result, attr) for result in component_results.values()]
+        finite_values = [float(value) for value in values if value is not None]
+        if not finite_values:
+            return None
+        return float(sum(finite_values))
+
+    combined.est_art_bytes = _sum_attr("est_art_bytes")
+    combined.est_opa_bytes = _sum_attr("est_opa_bytes")
+    combined.est_total_bytes = _sum_attr("est_total_bytes")
+
+    peak_arm: str | None = None
+    peak_value: float | None = None
+    peak_label: str | None = None
+    for arm, result in component_results.items():
+        if result.peak_gpu_used_bytes is None:
+            continue
+        if peak_value is None or result.peak_gpu_used_bytes > peak_value:
+            peak_arm = arm
+            peak_value = float(result.peak_gpu_used_bytes)
+            peak_label = result.peak_gpu_label
+    if peak_value is not None:
+        combined.peak_gpu_used_bytes = peak_value
+        if peak_arm is not None and peak_label is not None:
+            combined.peak_gpu_label = f"{peak_arm}:{peak_label}"
+        elif peak_arm is not None:
+            combined.peak_gpu_label = peak_arm
+
+    return combined
+
+
+def run_memory_profile(
+    mode: str,
+    nfree: int = 10,
+    load_only: bool = False,
+    skip_opacities: bool = False,
+    nlayer: int | None = None,
+    n_spectral_points: int | None = None,
+    wav_min_override: float | None = None,
+    wav_max_override: float | None = None,
+) -> ProfileResult:
+    """Profile approximate RAM/GPU usage during retrieval setup steps."""
+    print("\nMEMORY PROFILE")
+    print("-" * 70)
+    print(f"Mode: {mode}")
+    print(f"PREMODIT_CUTWING: {config.PREMODIT_CUTWING}")
+    if jax is not None:
+        print(f"JAX backend: {jax.default_backend()}")
+        print(f"JAX devices: {jax.devices()}")
+
+    if config.OBSERVING_MODE == "full":
+        if (wav_min_override is None) ^ (wav_max_override is None):
+            raise ValueError(
+                "wav_min_override and wav_max_override must be provided together."
+            )
+        if wav_min_override is not None or wav_max_override is not None:
+            raise ValueError(
+                "Full-arm memory profiling uses separate red/blue grids and does not "
+                "accept a single wav_min_override/wav_max_override pair."
+            )
+
+        component_results: dict[str, ProfileResult] = {}
+        for arm in ("red", "blue"):
+            arm_wav_min, arm_wav_max = config.get_wavelength_range(mode=arm)
+            print(f"\n=== {arm.upper()} arm ===")
+            component_results[arm] = _run_single_memory_profile_for_range(
+                mode=mode,
+                wav_min=arm_wav_min,
+                wav_max=arm_wav_max,
+                nfree=nfree,
+                load_only=load_only,
+                skip_opacities=skip_opacities,
+                nlayer=nlayer,
+                n_spectral_points=n_spectral_points,
+            )
+        result = _combine_full_arm_profile_results(component_results)
+        if result.est_total_bytes is not None:
+            print(f"\nCombined estimated total device memory: {_fmt_bytes(result.est_total_bytes)}")
+        if result.peak_gpu_used_bytes is not None and result.peak_gpu_label is not None:
+            print(
+                "Combined peak GPU used: "
+                f"{_fmt_bytes(result.peak_gpu_used_bytes)} "
+                f"(at {result.peak_gpu_label})"
+            )
+        print("Done.")
+        return result
+
+    wav_min, wav_max = config.get_wavelength_range()
+    if wav_min_override is not None and wav_max_override is not None:
+        wav_min, wav_max = wav_min_override, wav_max_override
+    result = _run_single_memory_profile_for_range(
+        mode=mode,
+        wav_min=wav_min,
+        wav_max=wav_max,
+        nfree=nfree,
+        load_only=load_only,
+        skip_opacities=skip_opacities,
+        nlayer=nlayer,
+        n_spectral_points=n_spectral_points,
+    )
     print("Done.")
     return result
 
@@ -247,11 +347,20 @@ def run_memory_sweep(
     nspec_values: list[int],
 ) -> None:
     """Run a lightweight memory sweep over selected dimensions."""
-    base_wav_min, base_wav_max = config.get_wavelength_range()
     print("\nMEMORY SWEEP")
     print("-" * 70)
     print(f"Mode: {mode}")
-    print(f"Base range: {base_wav_min:.2f}-{base_wav_max:.2f} Angstrom")
+    if config.OBSERVING_MODE == "full":
+        red_wav_min, red_wav_max = config.get_wavelength_range(mode="red")
+        blue_wav_min, blue_wav_max = config.get_wavelength_range(mode="blue")
+        print(
+            "Arm ranges: "
+            f"red {red_wav_min:.2f}-{red_wav_max:.2f} Angstrom, "
+            f"blue {blue_wav_min:.2f}-{blue_wav_max:.2f} Angstrom"
+        )
+    else:
+        base_wav_min, base_wav_max = config.get_wavelength_range()
+        print(f"Base range: {base_wav_min:.2f}-{base_wav_max:.2f} Angstrom")
 
     for nfree in nfree_values:
         print(f"\n--- nfree = {nfree} ---")

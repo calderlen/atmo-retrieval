@@ -18,8 +18,6 @@ from physics.chemistry import ConstantVMR, FastChemHybridChemistry, FreeVMR
 from physics.model import compute_atmospheric_state_from_posterior
 from pipeline import retrieval as _retrieval
 from pipeline.inference import build_guide, build_svi_optimizer
-from exojax.utils.grids import wav2nu
-from physics.grid_setup import setup_spectral_operators, setup_wavenumber_grid
 
 
 _FULL_ATOMIC_SPECIES = deepcopy(config.ATOMIC_SPECIES)
@@ -27,7 +25,7 @@ _FULL_MOLPATH_HITEMP = deepcopy(config.MOLPATH_HITEMP)
 _FULL_MOLPATH_EXOMOL = deepcopy(config.MOLPATH_EXOMOL)
 
 @dataclass(frozen=True)
-class PrimaryDiagnosticContext:
+class DiagnosticContext:
     planet: str
     ephemeris: str
     epoch: str | None
@@ -35,13 +33,14 @@ class PrimaryDiagnosticContext:
     chemistry_model: str
     pt_profile: str
     model_params: dict[str, float | None]
-    primary_region_config: object
-    primary_component: _retrieval.SpectroscopicComponentBundle
-    primary_region_sample_prefix: str | None
-    primary_component_sample_prefix: str | None
+    shared_region_config: object
+    shared_region_sample_prefix: str | None
     shared_system: object
     atmosphere_region_configs: tuple[object, ...]
     observation_configs: tuple[object, ...]
+    spectroscopic_component_names: tuple[str, ...]
+    spectroscopic_components: dict[str, _retrieval.SpectroscopicComponentBundle]
+    component_sample_prefixes: dict[str, str | None]
     model_c: Any
     model_inputs: dict[str, object]
 
@@ -110,7 +109,33 @@ def _build_runtime_overrides(
     }
 
 
-def build_primary_diagnostic_context(
+def _build_timeseries_component_spec(
+    *,
+    name: str,
+    mode: str,
+    data_dir: Path,
+    instrument_resolution: float,
+    phase_mode: str,
+    apply_sysrem: bool,
+    subtract_per_exposure_mean: bool,
+    region_name: str,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "mode": mode,
+        "region_name": region_name,
+        "data_format": "timeseries",
+        "data_dir": str(data_dir),
+        "apply_sysrem": bool(apply_sysrem),
+        "phase_mode": phase_mode,
+        "radial_velocity_mode": "orbital",
+        "likelihood_kind": "matched_filter",
+        "subtract_per_exposure_mean": bool(subtract_per_exposure_mean),
+        "instrument_resolution": float(instrument_resolution),
+    }
+
+
+def build_diagnostic_context(
     *,
     planet: str,
     ephemeris: str,
@@ -131,7 +156,7 @@ def build_primary_diagnostic_context(
     apply_sysrem: bool | None = None,
     phoenix_spectrum_path: str | Path | None = None,
     phoenix_cache_dir: str | Path | None = None,
-) -> PrimaryDiagnosticContext:
+) -> DiagnosticContext:
     if data_format != "timeseries":
         raise ValueError("Diagnostics currently only support data_format='timeseries'.")
 
@@ -151,108 +176,93 @@ def build_primary_diagnostic_context(
     with temporary_runtime_config(overrides):
         params = config.get_params(planet, ephemeris)
         model_params = _retrieval._coerce_model_params(params)
-        if observing_mode == "full":
-            raise NotImplementedError(
-                "Diagnostics currently do not support observing_mode='full'. "
-                "Run with 'red' or 'blue' individually."
-            )
-        resolved_data_dir = config.get_data_dir(planet=planet, arm=observing_mode, epoch=epoch)
-
-        wav_obs, data, sigma, phase = _retrieval.load_timeseries_data(resolved_data_dir)
-        phase = _retrieval._normalize_phase(phase)
-        primary_sysrem = _retrieval._validate_sysrem_inputs(
-            _retrieval._load_sysrem_inputs(resolved_data_dir),
-            n_exp=data.shape[0],
-        )
-
-        inst_nus = wav2nu(wav_obs, "AA")
-        if inst_nus.size > 1 and np.any(np.diff(inst_nus) <= 0):
-            sort_idx = np.argsort(inst_nus)
-            inst_nus = inst_nus[sort_idx]
-            wav_obs = wav_obs[sort_idx]
-            data = data[:, sort_idx]
-            sigma = sigma[:, sort_idx]
-
-        _retrieval._preflight_spectrum_checks(wav_obs, data, sigma, phase, inst_nus)
-
-        wav_min, wav_max = config.get_wavelength_range(mode=observing_mode)
-        nu_grid, _wav_grid, _res_high = setup_wavenumber_grid(
-            wav_min - config.WAV_MIN_OFFSET,
-            wav_max + config.WAV_MAX_OFFSET,
-            config.N_SPECTRAL_POINTS,
-            unit="AA",
-        )
-        _retrieval._preflight_grid_checks(inst_nus, nu_grid)
-
+        shared_art = _retrieval._build_art_for_mode(mode)
+        shared_region_name = _retrieval._default_region_name_for_mode(mode)
         instrument_resolution = config.get_resolution(resolution_mode=resolution_mode)
-        sop_rot, sop_inst, _ = setup_spectral_operators(nu_grid, instrument_resolution)
-
-        primary_art = _retrieval._build_art_for_mode(mode)
-        primary_region_name = _retrieval._default_region_name_for_mode(mode)
-        shared_system = _retrieval.build_shared_system_config(params=model_params)
-
-        opa_cias = _retrieval.setup_cia_opacities(config.CIA_PATHS, nu_grid)
-        opa_mols, _ = _retrieval.load_molecular_opacities(
-            config.MOLPATH_HITEMP,
-            config.MOLPATH_EXOMOL,
-            nu_grid,
-            config.OPA_LOAD,
-            config.DIFFMODE,
-            config.T_LOW,
-            config.T_HIGH,
-            cutwing=config.PREMODIT_CUTWING,
+        apply_sysrem_enabled = (
+            bool(config.APPLY_SYSREM_DEFAULT) if apply_sysrem is None else bool(apply_sysrem)
         )
-        opa_atoms, _ = _retrieval.load_atomic_opacities(
-            config.ATOMIC_SPECIES,
-            nu_grid,
-            config.OPA_LOAD,
-            config.DIFFMODE,
-            config.T_LOW,
-            config.T_HIGH,
-            cutwing=config.PREMODIT_CUTWING,
-        )
+        subtract_per_exposure_mean = bool(config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT)
 
-        primary_component = _retrieval._build_primary_spectroscopic_component(
-            name="spectroscopy",
-            mode=mode,
-            wav_obs=wav_obs,
-            data=data,
-            sigma=sigma,
-            phase=phase,
-            sysrem=primary_sysrem,
-            instrument_resolution=instrument_resolution,
-            nu_grid=nu_grid,
-            inst_nus=inst_nus,
-            sop_rot=sop_rot,
-            sop_inst=sop_inst,
-            opa_cias=opa_cias,
-            opa_mols=opa_mols,
-            opa_atoms=opa_atoms,
-            region_name=primary_region_name,
-            Tstar=model_params["T_star"],
-            logg_star=model_params["logg_star"],
-            metallicity=model_params["Fe_H"],
-            Mstar=model_params["M_star"],
-            Rstar=model_params["R_star"],
-            phoenix_spectrum_path=phoenix_spectrum_path,
-            phoenix_cache_dir=phoenix_cache_dir,
-            phase_mode=phase_mode,
-            apply_sysrem=bool(config.APPLY_SYSREM_DEFAULT) if apply_sysrem is None else bool(apply_sysrem),
-            radial_velocity_mode="orbital",
-            likelihood_kind="matched_filter",
-            subtract_per_exposure_mean=config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT,
-            sample_prefix="spectroscopy",
-        )
+        if observing_mode == "full":
+            arm_dirs = config.get_full_arm_data_dirs(epoch=epoch, mode=mode)
+            component_specs = [
+                _build_timeseries_component_spec(
+                    name="spectroscopy_red",
+                    mode=mode,
+                    data_dir=Path(arm_dirs["red"]),
+                    instrument_resolution=instrument_resolution,
+                    phase_mode=phase_mode,
+                    apply_sysrem=apply_sysrem_enabled,
+                    subtract_per_exposure_mean=subtract_per_exposure_mean,
+                    region_name=shared_region_name,
+                ),
+                _build_timeseries_component_spec(
+                    name="spectroscopy_blue",
+                    mode=mode,
+                    data_dir=Path(arm_dirs["blue"]),
+                    instrument_resolution=instrument_resolution,
+                    phase_mode=phase_mode,
+                    apply_sysrem=apply_sysrem_enabled,
+                    subtract_per_exposure_mean=subtract_per_exposure_mean,
+                    region_name=shared_region_name,
+                ),
+            ]
+            shared_system = _retrieval.build_shared_system_config(
+                params=model_params,
+                shared_velocity_phase_mode=phase_mode,
+                shared_velocity_component_names=tuple(str(spec["name"]) for spec in component_specs),
+            )
+        else:
+            resolved_data_dir = config.get_data_dir(
+                planet=planet,
+                arm=observing_mode,
+                epoch=epoch,
+            )
+            component_specs = [
+                _build_timeseries_component_spec(
+                    name="spectroscopy",
+                    mode=mode,
+                    data_dir=Path(resolved_data_dir),
+                    instrument_resolution=instrument_resolution,
+                    phase_mode=phase_mode,
+                    apply_sysrem=apply_sysrem_enabled,
+                    subtract_per_exposure_mean=subtract_per_exposure_mean,
+                    region_name=shared_region_name,
+                )
+            ]
+            shared_system = _retrieval.build_shared_system_config(params=model_params)
 
-        observation_configs: list[object] = [primary_component.observation_config]
+        loaded_components: list[_retrieval.SpectroscopicComponentBundle] = []
+        spectroscopic_components: dict[str, _retrieval.SpectroscopicComponentBundle] = {}
+        for spec in component_specs:
+            component = _retrieval._load_joint_spectroscopic_component(
+                spec,
+                default_mode=mode,
+                default_tstar=model_params["T_star"],
+                default_logg_star=model_params["logg_star"],
+                default_metallicity=model_params["Fe_H"],
+                default_mstar=model_params["M_star"],
+                default_rstar=model_params["R_star"],
+                default_phoenix_spectrum_path=phoenix_spectrum_path,
+                default_phoenix_cache_dir=phoenix_cache_dir,
+            )
+            if component.name in spectroscopic_components:
+                raise ValueError(f"Duplicate diagnostic component name: {component.name}")
+            loaded_components.append(component)
+            spectroscopic_components[component.name] = component
+
+        observation_configs: list[object] = [
+            component.observation_config for component in loaded_components
+        ]
         observations_payload = {
-            primary_component.name: primary_component.observation_inputs,
+            component.name: component.observation_inputs for component in loaded_components
         }
         atmosphere_region_configs, atmosphere_region_lookup = _retrieval._build_atmosphere_regions(
             model_params=model_params,
             primary_mode=mode,
-            primary_region_name=primary_region_name,
-            primary_art=primary_art,
+            primary_region_name=shared_region_name,
+            primary_art=shared_art,
             observation_configs=observation_configs,
             default_pt_profile=pt_profile,
             default_chemistry_model=chemistry_model,
@@ -265,9 +275,9 @@ def build_primary_diagnostic_context(
             observations=tuple(observation_configs),
         )
 
-        primary_region_config = atmosphere_region_lookup[primary_region_name]
+        shared_region_config = atmosphere_region_lookup[shared_region_name]
 
-    return PrimaryDiagnosticContext(
+    return DiagnosticContext(
         planet=planet,
         ephemeris=ephemeris,
         epoch=epoch,
@@ -275,20 +285,44 @@ def build_primary_diagnostic_context(
         chemistry_model=chemistry_model,
         pt_profile=pt_profile,
         model_params=model_params,
-        primary_region_config=primary_region_config,
-        primary_component=primary_component,
-        primary_region_sample_prefix=primary_region_config.sample_prefix,
-        primary_component_sample_prefix=primary_component.observation_config.sample_prefix,
+        shared_region_config=shared_region_config,
+        shared_region_sample_prefix=shared_region_config.sample_prefix,
         shared_system=shared_system,
         atmosphere_region_configs=tuple(atmosphere_region_configs),
         observation_configs=tuple(observation_configs),
+        spectroscopic_component_names=tuple(spectroscopic_components.keys()),
+        spectroscopic_components=dict(spectroscopic_components),
+        component_sample_prefixes={
+            component.name: component.observation_config.sample_prefix
+            for component in loaded_components
+        },
         model_c=model_c,
         model_inputs={"observations": observations_payload},
     )
 
+def _get_spectroscopic_component(
+    context: DiagnosticContext,
+    component_name: str,
+) -> _retrieval.SpectroscopicComponentBundle:
+    try:
+        return context.spectroscopic_components[str(component_name)]
+    except KeyError as exc:
+        available = ", ".join(context.spectroscopic_component_names)
+        raise KeyError(
+            f"Unknown spectroscopic component {component_name!r}. "
+            f"Available components: {available}"
+        ) from exc
 
-def default_named_params_for_context(context: PrimaryDiagnosticContext) -> dict[str, float]:
-    region = context.primary_region_config
+
+def _get_component_sample_prefix(
+    context: DiagnosticContext,
+    component_name: str,
+) -> str | None:
+    return context.component_sample_prefixes.get(str(component_name))
+
+
+def default_named_params_for_context(context: DiagnosticContext) -> dict[str, float]:
+    region = context.shared_region_config
     params: dict[str, float] = {
         "Kp": float(context.model_params["Kp"]),
         "Mp": float(context.model_params["M_p"]),
@@ -348,7 +382,7 @@ def default_named_params_for_context(context: PrimaryDiagnosticContext) -> dict[
 
 
 def merge_named_params(
-    context: PrimaryDiagnosticContext,
+    context: DiagnosticContext,
     overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     params = default_named_params_for_context(context)
@@ -477,7 +511,7 @@ def build_diag_config_from_run_dir(
 
 
 def default_kp_drv_grids(
-    context: PrimaryDiagnosticContext,
+    context: DiagnosticContext,
     *,
     num_kp: int = 11,
     num_drv: int = 17,
@@ -517,8 +551,9 @@ def _truncated_normal_logpdf(
 
 
 def _shared_system_log_prior(
-    context: PrimaryDiagnosticContext,
+    context: DiagnosticContext,
     *,
+    component_name: str,
     kp: float,
     drv: float,
 ) -> float:
@@ -539,29 +574,33 @@ def _shared_system_log_prior(
             low=0.0,
         )
 
-    phase_mode = getattr(context.primary_component.observation_config, "phase_mode", "global")
+    component = _get_spectroscopic_component(context, component_name)
+    phase_mode = getattr(component.observation_config, "phase_mode", "global")
     drv_log_prior = _normal_logpdf(drv, 0.0, 10.0) if phase_mode == "global" else 0.0
     return float(kp_log_prior + drv_log_prior)
 
 
 def synthesize_processed_model_timeseries(
-    context: PrimaryDiagnosticContext,
+    context: DiagnosticContext,
     named_params: dict[str, Any],
     *,
+    component_name: str,
     atmo_state: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     params = merge_named_params(context, named_params)
+    component = _get_spectroscopic_component(context, component_name)
+    component_sample_prefix = _get_component_sample_prefix(context, component_name)
 
     if atmo_state is None:
         atmo_state = compute_atmospheric_state_from_posterior(
             posterior_samples=params,
-            region_config=context.primary_region_config,
-            opa_mols=context.primary_component.opa_mols,
-            opa_atoms=context.primary_component.opa_atoms,
-            opa_cias=context.primary_component.opa_cias,
-            nu_grid=context.primary_component.nu_grid,
+            region_config=context.shared_region_config,
+            opa_mols=component.opa_mols,
+            opa_atoms=component.opa_atoms,
+            opa_cias=component.opa_cias,
+            nu_grid=component.nu_grid,
             use_median=True,
-            sample_prefix=context.primary_region_sample_prefix,
+            sample_prefix=context.shared_region_sample_prefix,
         )
     else:
         atmo_state = dict(atmo_state)
@@ -571,9 +610,9 @@ def synthesize_processed_model_timeseries(
     model_ts = _retrieval._synthesize_timeseries_from_atmospheric_state(
         atmo_state=atmo_state,
         model_params=context.model_params,
-        region_config=context.primary_region_config,
-        component=context.primary_component,
-        component_sample_prefix=context.primary_component_sample_prefix,
+        region_config=context.shared_region_config,
+        component=component,
+        component_sample_prefix=component_sample_prefix,
     )
     return np.asarray(model_ts), atmo_state
 
@@ -607,8 +646,9 @@ def spectroscopic_log_likelihood(
 
 
 def scan_kp_drv_surface(
-    context: PrimaryDiagnosticContext,
+    context: DiagnosticContext,
     *,
+    component_name: str,
     base_params: dict[str, Any],
     kp_grid: np.ndarray,
     drv_grid: np.ndarray,
@@ -622,15 +662,20 @@ def scan_kp_drv_surface(
     surface = np.empty((kp_grid.size, drv_grid.size), dtype=float)
 
     base_params = merge_named_params(context, base_params)
-    _, atmo_state = synthesize_processed_model_timeseries(context, base_params)
+    _, atmo_state = synthesize_processed_model_timeseries(
+        context,
+        base_params,
+        component_name=component_name,
+    )
+    component = _get_spectroscopic_component(context, component_name)
 
     observed = (
         np.asarray(data_override, dtype=float)
         if data_override is not None
-        else np.asarray(context.primary_component.data, dtype=float)
+        else np.asarray(component.data, dtype=float)
     )
-    sigma = np.asarray(context.primary_component.sigma, dtype=float)
-    likelihood_kind = str(context.primary_component.observation_config.likelihood_kind)
+    sigma = np.asarray(component.sigma, dtype=float)
+    likelihood_kind = str(component.observation_config.likelihood_kind)
 
     best_surface_value = -np.inf
     best_indices = (0, 0)
@@ -647,6 +692,7 @@ def scan_kp_drv_surface(
             model_ts, _ = synthesize_processed_model_timeseries(
                 context,
                 trial_params,
+                component_name=component_name,
                 atmo_state=atmo_state,
             )
             logl = spectroscopic_log_likelihood(
@@ -656,7 +702,12 @@ def scan_kp_drv_surface(
                 likelihood_kind=likelihood_kind,
             )
             prior = (
-                _shared_system_log_prior(context, kp=float(kp), drv=float(drv))
+                _shared_system_log_prior(
+                    context,
+                    component_name=component_name,
+                    kp=float(kp),
+                    drv=float(drv),
+                )
                 if include_log_prior
                 else 0.0
             )
@@ -688,6 +739,7 @@ def scan_kp_drv_surface(
         "best_log_likelihood_indices": best_raw_indices,
         "best_log_likelihood_params": best_raw_params,
         "base_params": base_params,
+        "component_name": str(component_name),
     }
 
 
@@ -747,25 +799,31 @@ def _matched_filter_scale(
 
 
 def plot_processed_timeseries_comparison(
-    context: PrimaryDiagnosticContext,
+    context: DiagnosticContext,
     *,
+    component_name: str,
     model_sets: dict[str, dict[str, Any]],
     observed: np.ndarray | None = None,
     wavelength_stride: int = 8,
     show_difference: bool = True,
 ) -> tuple[plt.Figure, np.ndarray]:
+    component = _get_spectroscopic_component(context, component_name)
     observed = (
         np.asarray(observed, dtype=float)
         if observed is not None
-        else np.asarray(context.primary_component.data, dtype=float)
+        else np.asarray(component.data, dtype=float)
     )
-    sigma = np.asarray(context.primary_component.sigma, dtype=float)
-    phase = np.asarray(context.primary_component.phase, dtype=float)
-    wavelength = np.asarray(context.primary_component.wav_obs, dtype=float)
+    sigma = np.asarray(component.sigma, dtype=float)
+    phase = np.asarray(component.phase, dtype=float)
+    wavelength = np.asarray(component.wav_obs, dtype=float)
 
     model_arrays: dict[str, np.ndarray] = {}
     for label, params in model_sets.items():
-        model_ts, _ = synthesize_processed_model_timeseries(context, params)
+        model_ts, _ = synthesize_processed_model_timeseries(
+            context,
+            params,
+            component_name=component_name,
+        )
         model_arrays[label] = np.asarray(model_ts, dtype=float)
 
     arrays = [observed]
@@ -899,8 +957,9 @@ def plot_processed_timeseries_comparison(
 
 
 def run_post_sysrem_injection_recovery(
-    context: PrimaryDiagnosticContext,
+    context: DiagnosticContext,
     *,
+    component_name: str,
     inject_params: dict[str, Any],
     kp_grid: np.ndarray,
     drv_grid: np.ndarray,
@@ -908,13 +967,19 @@ def run_post_sysrem_injection_recovery(
     include_log_prior: bool = False,
 ) -> dict[str, Any]:
     inject_params = merge_named_params(context, inject_params)
-    injected_model, _ = synthesize_processed_model_timeseries(context, inject_params)
-    injected_data = np.asarray(context.primary_component.data, dtype=float) + injection_scale * np.asarray(
+    component = _get_spectroscopic_component(context, component_name)
+    injected_model, _ = synthesize_processed_model_timeseries(
+        context,
+        inject_params,
+        component_name=component_name,
+    )
+    injected_data = np.asarray(component.data, dtype=float) + injection_scale * np.asarray(
         injected_model,
         dtype=float,
     )
     scan = scan_kp_drv_surface(
         context,
+        component_name=component_name,
         base_params=inject_params,
         kp_grid=kp_grid,
         drv_grid=drv_grid,
@@ -925,11 +990,12 @@ def run_post_sysrem_injection_recovery(
     scan["injected_model"] = injected_model
     scan["injection_scale"] = float(injection_scale)
     scan["inject_params"] = inject_params
+    scan["component_name"] = str(component_name)
     return scan
 
 
 def run_multiseed_svi(
-    context: PrimaryDiagnosticContext,
+    context: DiagnosticContext,
     *,
     seeds: Iterable[int],
     num_steps: int,
