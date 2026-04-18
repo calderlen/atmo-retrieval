@@ -40,6 +40,13 @@ def run_phase_binned_retrieval(
     if data_format == "spectrum":
         raise ValueError("Phase-binned retrieval requires time-series data.")
 
+    if config.OBSERVING_MODE == "full":
+        raise NotImplementedError(
+            "Phase-binned retrieval is not yet supported with OBSERVING_MODE='full'. "
+            "Run a single arm at a time (--wavelength-range red or blue) to use "
+            "--phase-bin / --all-phase-bins."
+        )
+
     resolved_data_dir = config.get_data_dir(epoch=epoch)
 
     wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)

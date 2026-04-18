@@ -1,14 +1,14 @@
 #!/usr/bin/env python
-"""Prepare retrieval-ready time-series products from PEPSI exposure folders.
+"""Prepare retrieval-ready emission time-series products from PEPSI exposures.
 
-This module converts raw/reduced PEPSI exposure directories such as
-``input/hrs/transmission/raw/kelt20b/20250601`` into the `.npy` bundle consumed by the
-time-series retrieval path:
+This module converts raw/reduced PEPSI emission exposure directories such as
+``input/hrs/emission/raw/kelt20b/20230430`` into the `.npy` bundle consumed by
+the time-series retrieval path:
 
 - ``wavelength.npy`` (1D wavelength grid in Angstroms)
 - ``data.npy`` (2D exposure x wavelength matrix)
 - ``sigma.npy`` (2D uncertainty matrix)
-- ``phase.npy`` (1D orbital phase array, mid-transit at 0)
+- ``phase.npy`` (1D orbital phase array, transit-centered convention)
 
 Optional auxiliary products are also written when available, including
 ``jd.npy``, ``snr.npy``, ``exptime.npy``, ``airmass.npy``, and SYSREM
@@ -25,32 +25,33 @@ from typing import Any
 import numpy as np
 
 import config
-from config.planets_config import EPHEMERIS, PHASE_BINS, get_params
+from config.planets_config import EPHEMERIS, get_params
 from dataio.collapse_transmission_timeseries_to_1d import (
-    compute_contact_phases,
     get_orbital_phase,
     get_pepsi_data,
-    get_phase_bin_mask,
     get_sysrem_chunk_indices,
 )
-from dataio.horus import remove_doppler_shadow
 
 
 FULL_ARM_MEMBERS: tuple[str, ...] = ("red", "blue")
 
 
+EMISSION_PHASE_BINS = {
+    "all": "all exposures",
+    "eclipse": "narrow window centered on orbital phase 0.5",
+    "dayside": "half orbit centered on orbital phase 0.5",
+    "nightside": "half orbit centered on orbital phase 0.0",
+    "pre_eclipse": "orbital phases in [0.0, 0.5)",
+    "post_eclipse": "orbital phases in [0.5, 1.0)",
+}
+
+
 def _output_dir_for(planet: str, epoch: str, arm: str) -> Path:
-    return config.get_data_dir(planet=planet, epoch=epoch, arm=arm, mode="transmission")
+    return config.get_data_dir(planet=planet, epoch=epoch, arm=arm, mode="emission")
 
 
 def _raw_input_dir_for(planet: str, epoch: str) -> Path:
-    return config.get_raw_hrs_dir(planet=planet, epoch=epoch, mode="transmission")
-
-
-def _nearest_transit_midpoint(jd: np.ndarray, reference_epoch: float, period: float) -> float:
-    obs_mid = 0.5 * (float(np.min(jd)) + float(np.max(jd)))
-    n_orbits = round((obs_mid - reference_epoch) / period)
-    return float(reference_epoch + n_orbits * period)
+    return config.get_raw_hrs_dir(planet=planet, epoch=epoch, mode="emission")
 
 
 def _planet_config(planet: str, ephemeris: str) -> dict[str, Any]:
@@ -103,7 +104,7 @@ def _load_single_arm(
         )
     if result is None:
         raise FileNotFoundError(
-            f"Could not load {arm}-arm PEPSI data for {planet} {epoch} from "
+            f"Could not load {arm}-arm PEPSI emission data for {planet} {epoch} from "
             f"{_raw_input_dir_for(planet, epoch)}."
         )
     return _unwrap_result(result)
@@ -146,17 +147,6 @@ def _load_data(
     )
 
 
-def _phase_selection_mask(
-    phase: np.ndarray,
-    *,
-    phase_bin: str,
-    planet_params: dict[str, Any],
-) -> np.ndarray:
-    if phase_bin == "all":
-        return np.ones_like(phase, dtype=bool)
-    return get_phase_bin_mask(phase, phase_bin, planet_params)
-
-
 def _sanitize_columns(
     wavelength: np.ndarray,
     data: np.ndarray,
@@ -197,111 +187,80 @@ def _sanitize_columns(
     return wavelength, data, sigma
 
 
-def _shadow_status(
-    *,
-    applied: bool,
-    skip_reason: str | None = None,
-    scaling: float | None = None,
-) -> dict[str, Any]:
-    return {
-        "applied": bool(applied),
-        "skip_reason": skip_reason,
-        "scaling": scaling,
-    }
+def _phase_mod_1(phase: np.ndarray) -> np.ndarray:
+    return np.mod(np.asarray(phase, dtype=float), 1.0)
 
 
-def _is_missing_numeric(value: Any) -> bool:
-    if value is None:
-        return True
+def _circular_phase_distance(phase: np.ndarray, center: float) -> np.ndarray:
+    phase_01 = _phase_mod_1(phase)
+    delta = np.abs(phase_01 - float(center))
+    return np.minimum(delta, 1.0 - delta)
+
+
+def _nearest_reference_epoch(jd: np.ndarray, reference_epoch: float, period: float) -> float:
+    obs_mid = 0.5 * (float(np.min(jd)) + float(np.max(jd)))
+    n_orbits = round((obs_mid - reference_epoch) / period)
+    return float(reference_epoch + n_orbits * period)
+
+
+def _is_valid_numeric(value: Any) -> bool:
     try:
-        return not bool(np.isfinite(float(value)))
+        return value is not None and bool(np.isfinite(float(value)))
     except (TypeError, ValueError):
-        return True
+        return False
 
 
-def _build_shadow_inputs(
-    planet_cfg: dict[str, Any],
-    phase: np.ndarray,
-) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    phase = np.asarray(phase, dtype=float)
-    if phase.ndim != 1 or phase.size == 0 or not np.all(np.isfinite(phase)):
-        reason = "invalid_phase_array"
-        print(f"Warning: skipping Doppler shadow removal ({reason}).")
-        return None, _shadow_status(applied=False, skip_reason=reason)
-
-    planet_field_names = ("rp_rs", "b", "lambda_angle", "a_rs", "period")
-    stellar_field_map = {
-        "vsini": "v_sini_star",
-        "gamma1": "gamma1",
-        "gamma2": "gamma2",
-    }
-
-    missing: list[str] = []
-    planet_params: dict[str, float] = {}
-    for field_name in planet_field_names:
-        value = planet_cfg.get(field_name)
-        if _is_missing_numeric(value):
-            missing.append(field_name)
-        else:
-            planet_params[field_name] = float(value)
-
-    stellar_params: dict[str, float] = {}
-    for out_name, cfg_name in stellar_field_map.items():
-        value = planet_cfg.get(cfg_name)
-        if _is_missing_numeric(value):
-            missing.append(cfg_name)
-        else:
-            stellar_params[out_name] = float(value)
-
-    if missing:
-        reason = f"missing_or_invalid_shadow_params: {', '.join(missing)}"
-        print(f"Warning: skipping Doppler shadow removal ({reason}).")
-        return None, _shadow_status(applied=False, skip_reason=reason)
-
-    return {
-        "phase": phase,
-        "planet_params": planet_params,
-        "stellar_params": stellar_params,
-    }, _shadow_status(applied=False)
+def _eclipse_half_width_phase(planet_params: dict[str, Any]) -> float:
+    duration = planet_params.get("duration")
+    period = planet_params.get("period")
+    if not _is_valid_numeric(duration):
+        raise ValueError("Emission eclipse binning requires a finite planet duration.")
+    if not _is_valid_numeric(period) or float(period) <= 0.0:
+        raise ValueError("Emission phase calculations require a finite positive orbital period.")
+    return float(duration) / (2.0 * float(period))
 
 
-def _apply_default_doppler_shadow(
-    data: np.ndarray,
-    wavelength: np.ndarray,
+def _phase_bin_definition(phase_bin: str, planet_params: dict[str, Any]) -> str:
+    if phase_bin == "all":
+        return EMISSION_PHASE_BINS["all"]
+    if phase_bin == "eclipse":
+        return (
+            "circular phase distance to 0.5 <= duration / (2 * period) "
+            f"(half-width={_eclipse_half_width_phase(planet_params):.6f})"
+        )
+    if phase_bin == "dayside":
+        return "circular phase distance to 0.5 <= 0.25"
+    if phase_bin == "nightside":
+        return "circular phase distance to 0.0 <= 0.25"
+    if phase_bin == "pre_eclipse":
+        return "orbital phase mapped to [0, 1) and selected in [0.0, 0.5)"
+    if phase_bin == "post_eclipse":
+        return "orbital phase mapped to [0, 1) and selected in [0.5, 1.0)"
+    raise ValueError(f"Unknown emission phase bin: {phase_bin}")
+
+
+def _phase_selection_mask(
     phase: np.ndarray,
     *,
-    planet_cfg: dict[str, Any],
-    subtract_median: bool,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    data = np.asarray(data, dtype=float)
-    wavelength = np.asarray(wavelength, dtype=float)
-    phase = np.asarray(phase, dtype=float)
+    phase_bin: str,
+    planet_params: dict[str, Any],
+) -> np.ndarray:
+    phase_01 = _phase_mod_1(phase)
 
-    if not subtract_median:
-        reason = "subtract_median_disabled"
-        print("Warning: skipping Doppler shadow removal because --no-subtract-median was used.")
-        return data, _shadow_status(applied=False, skip_reason=reason)
+    if phase_bin == "all":
+        return np.ones_like(phase_01, dtype=bool)
+    if phase_bin == "eclipse":
+        return _circular_phase_distance(phase_01, 0.5) <= (_eclipse_half_width_phase(planet_params) + 1.0e-12)
+    if phase_bin == "dayside":
+        return _circular_phase_distance(phase_01, 0.5) <= 0.25 + 1.0e-12
+    if phase_bin == "nightside":
+        return _circular_phase_distance(phase_01, 0.0) <= 0.25 + 1.0e-12
+    if phase_bin == "pre_eclipse":
+        return phase_01 < 0.5
+    if phase_bin == "post_eclipse":
+        return phase_01 >= 0.5
 
-    shadow_inputs, status = _build_shadow_inputs(planet_cfg, phase)
-    if shadow_inputs is None:
-        return data, status
-
-    print("Applying Doppler shadow removal to retrieval-prep cube...")
-    corrected_data, _shadow_model, fit_info = remove_doppler_shadow(
-        data,
-        wavelength,
-        shadow_inputs["phase"],
-        shadow_inputs["planet_params"],
-        shadow_inputs["stellar_params"],
-    )
-    scaling = fit_info.get("scaling")
-    scaling_value = None if _is_missing_numeric(scaling) else float(scaling)
-    if scaling_value is not None:
-        print(f"  Doppler shadow scaling: {scaling_value:.6g}")
-    return np.asarray(corrected_data, dtype=float), _shadow_status(
-        applied=True,
-        scaling=scaling_value,
-    )
+    raise ValueError(f"Unknown emission phase bin: {phase_bin}")
 
 
 def _sysrem_vdiag_from_sigma(sigma: np.ndarray) -> np.ndarray:
@@ -361,35 +320,37 @@ def _save_metadata(
     t0: float,
     phase: np.ndarray,
     jd: np.ndarray,
-    contacts: dict[str, float],
     subtract_median: bool,
     run_sysrem: bool,
     regrid: bool,
-    doppler_shadow_status: dict[str, Any],
+    planet_params: dict[str, Any],
 ) -> None:
-    contacts_serialized: dict[str, float] = {}
-    for k, v in contacts.items():
-        contacts_serialized[k] = float(v)
-    metadata = {
+    phase_01 = _phase_mod_1(phase)
+    metadata: dict[str, Any] = {
+        "mode": "emission",
         "planet": planet,
         "ephemeris": ephemeris,
         "epoch": epoch,
         "arm": arm,
         "phase_bin": phase_bin,
+        "phase_bin_definition": _phase_bin_definition(phase_bin, planet_params),
+        "phase_convention": "orbital_transit_zero",
         "t0_bjd": float(t0),
+        "eclipse_center_phase": 0.5,
         "n_exposures": int(phase.size),
         "phase_min": float(np.min(phase)),
         "phase_max": float(np.max(phase)),
+        "phase_mod1_min": float(np.min(phase_01)),
+        "phase_mod1_max": float(np.max(phase_01)),
         "jd_min": float(np.min(jd)),
         "jd_max": float(np.max(jd)),
-        "contacts": contacts_serialized,
         "regrid": bool(regrid),
         "subtract_median": bool(subtract_median),
         "run_sysrem": bool(run_sysrem),
-        "doppler_shadow_applied": bool(doppler_shadow_status.get("applied", False)),
-        "doppler_shadow_skip_reason": doppler_shadow_status.get("skip_reason"),
-        "doppler_shadow_scaling": doppler_shadow_status.get("scaling"),
     }
+    if _is_valid_numeric(planet_params.get("duration")) and _is_valid_numeric(planet_params.get("period")):
+        metadata["eclipse_half_width_phase"] = _eclipse_half_width_phase(planet_params)
+
     (output_dir / "timeseries_prep.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -397,7 +358,7 @@ def _save_metadata(
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Prepare retrieval-ready time-series products from PEPSI exposures.")
+    parser = argparse.ArgumentParser(description="Prepare retrieval-ready emission time-series products from PEPSI exposures.")
     parser.add_argument("--epoch", type=str, required=True, help="Observation epoch (YYYYMMDD)")
     parser.add_argument(
         "--planet",
@@ -421,9 +382,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--phase-bin",
         type=str,
-        choices=["all", "full", *PHASE_BINS.keys()],
-        default="full",
-        help="Which exposures to keep in the exported cube (default: full in-transit)",
+        choices=sorted(EMISSION_PHASE_BINS.keys()),
+        default="all",
+        help="Which orbital phase selection to keep in the exported cube (default: all)",
     )
     parser.add_argument(
         "--output-dir",
@@ -431,7 +392,7 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Output directory "
-            "(default: input/hrs/transmission/<planet>/<epoch>/<arm>). "
+            "(default: input/hrs/emission/<planet>/<epoch>/<arm>). "
             "Not allowed with --arm full, since red and blue are written separately."
         ),
     )
@@ -503,19 +464,90 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def main() -> int:
+    parser = create_parser()
+    args = parser.parse_args()
+
+    if not args.regrid:
+        raise ValueError(
+            "Retrieval-ready time-series export requires a common wavelength grid; "
+            "leave --regrid enabled."
+        )
+
+    if args.arm == "full" and args.output_dir:
+        raise ValueError(
+            "--output-dir is not supported with --arm full because red and blue are "
+            "written to separate directories. Run each arm explicitly with an "
+            "--output-dir, or drop --output-dir to use the default per-arm paths."
+        )
+
+    planet_cfg = _planet_config(args.planet, args.ephemeris)
+    period = planet_cfg.get("period")
+    ra = planet_cfg.get("RA")
+    dec = planet_cfg.get("Dec")
+    reference_epoch = planet_cfg.get("epoch")
+    missing = []
+    for name, value in (
+        ("period", period),
+        ("RA", ra),
+        ("Dec", dec),
+        ("epoch", reference_epoch),
+    ):
+        if not _is_valid_numeric(value) and name == "period":
+            missing.append(name)
+        elif value is None or (name in {"RA", "Dec"} and not str(value).strip()):
+            missing.append(name)
+        elif name == "epoch" and not _is_valid_numeric(value):
+            missing.append(name)
+    if missing:
+        raise ValueError(f"Missing required planet parameters for {args.planet}: {', '.join(missing)}.")
+    if args.phase_bin == "eclipse" and not _is_valid_numeric(planet_cfg.get("duration")):
+        raise ValueError(
+            f"Emission eclipse binning requires a finite duration for {args.planet} ({args.ephemeris})."
+        )
+
+    if args.arm == "full":
+        arms_to_run: tuple[str, ...] = FULL_ARM_MEMBERS
+        if args.output_dir:
+            raise ValueError(
+                "--output-dir is not supported with --arm full because red and blue are "
+                "written to separate directories. Run each arm explicitly with an "
+                "--output-dir, or drop --output-dir to use the default per-arm paths."
+            )
+    else:
+        arms_to_run = (args.arm,)
+
+    for arm in arms_to_run:
+        if args.output_dir:
+            output_dir = Path(args.output_dir)
+        else:
+            output_dir = _output_dir_for(args.planet, args.epoch, arm)
+        _process_arm(
+            arm=arm,
+            args=args,
+            planet_cfg=planet_cfg,
+            reference_epoch=float(reference_epoch),
+            period=float(period),
+            ra=str(ra),
+            dec=str(dec),
+            output_dir=output_dir,
+        )
+
+    return 0
+
+
 def _process_arm(
     *,
     arm: str,
     args: argparse.Namespace,
     planet_cfg: dict[str, Any],
+    reference_epoch: float,
+    period: float,
+    ra: str,
+    dec: str,
     output_dir: Path,
 ) -> None:
-    period = planet_cfg["period"]
-    ra = planet_cfg["RA"]
-    dec = planet_cfg["Dec"]
-    reference_epoch = planet_cfg["epoch"]
-
-    print(f"\nLoading PEPSI {arm} data for {args.planet} ({args.epoch})...")
+    print(f"\nLoading PEPSI {arm} emission data for {args.planet} ({args.epoch})...")
     result, extras = _load_data(
         arm=arm,
         epoch=args.epoch,
@@ -531,17 +563,8 @@ def _process_arm(
     wave, data, sigma, jd, snr, exptime, airmass, n_spectra, npix = result
     print(f"Loaded {n_spectra} exposures with {npix} pixels each before selection.")
 
-    t0 = _nearest_transit_midpoint(np.asarray(jd), reference_epoch, period)
+    t0 = _nearest_reference_epoch(np.asarray(jd), reference_epoch, period)
     phase = np.asarray(get_orbital_phase(np.asarray(jd), t0, period, ra, dec), dtype=float)
-    wave_1d_full = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave, dtype=float)
-    data = np.asarray(data, dtype=float)
-    data, doppler_shadow_status = _apply_default_doppler_shadow(
-        data,
-        wave_1d_full,
-        phase,
-        planet_cfg=planet_cfg,
-        subtract_median=args.subtract_median,
-    )
     selection = _phase_selection_mask(
         phase,
         phase_bin=args.phase_bin,
@@ -557,8 +580,8 @@ def _process_arm(
     snr = np.asarray(snr)[selection]
     exptime = np.asarray(exptime)[selection]
     airmass = np.asarray(airmass)[selection]
-    data = np.asarray(data)[selection]
-    sigma = np.asarray(sigma)[selection]
+    data = np.asarray(data, dtype=float)[selection]
+    sigma = np.asarray(sigma, dtype=float)[selection]
 
     wave_1d = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave)
     wave_1d, data, sigma = _sanitize_columns(wave_1d, data, sigma)
@@ -596,7 +619,6 @@ def _process_arm(
             f"{len(chunk_names)} chunks, basis counts={basis_counts.tolist()}"
         )
 
-    contacts = compute_contact_phases(planet_cfg)
     _save_metadata(
         output_dir,
         planet=args.planet,
@@ -607,14 +629,14 @@ def _process_arm(
         t0=t0,
         phase=phase,
         jd=jd,
-        contacts=contacts,
         subtract_median=args.subtract_median,
         run_sysrem=args.run_sysrem,
         regrid=args.regrid,
-        doppler_shadow_status=doppler_shadow_status,
+        planet_params=planet_cfg,
     )
 
-    print(f"\nSaved retrieval-ready time-series products (arm={arm}):")
+    phase_01 = _phase_mod_1(phase)
+    print(f"\nSaved retrieval-ready emission time-series products (arm={arm}):")
     print(f"  Output dir: {output_dir}")
     print(f"  wavelength.npy: {wave_1d.shape}")
     print(f"  data.npy: {data.shape}")
@@ -622,57 +644,11 @@ def _process_arm(
     print(f"  phase.npy: {phase.shape} ({args.phase_bin})")
     print(
         f"  Phase range: {float(np.min(phase)):.5f} to {float(np.max(phase)):.5f}; "
+        f"phase(mod1): {float(np.min(phase_01)):.5f} to {float(np.max(phase_01)):.5f}; "
         f"wavelength range: {float(np.min(wave_1d)):.1f} to {float(np.max(wave_1d)):.1f} A"
     )
     if args.run_sysrem:
         print("  Saved chunk-aware SYSREM auxiliaries: U_sysrem.npz")
-
-
-def main() -> int:
-    parser = create_parser()
-    args = parser.parse_args()
-
-    if not args.regrid:
-        raise ValueError(
-            "Retrieval-ready time-series export requires a common wavelength grid; "
-            "leave --regrid enabled."
-        )
-
-    if args.arm == "full":
-        arms_to_run: tuple[str, ...] = FULL_ARM_MEMBERS
-        if args.output_dir:
-            raise ValueError(
-                "--output-dir is not supported with --arm full because red and blue are "
-                "written to separate directories. Run each arm explicitly with an "
-                "--output-dir, or drop --output-dir to use the default per-arm paths."
-            )
-    else:
-        arms_to_run = (args.arm,)
-
-    planet_cfg = _planet_config(args.planet, args.ephemeris)
-    missing = []
-    for name in ("period", "duration", "RA", "Dec", "epoch", "tau"):
-        value = planet_cfg.get(name)
-        if value is None or value != value:
-            missing.append(name)
-    if missing:
-        raise ValueError(
-            f"Missing required planet parameters for {args.planet}: {', '.join(missing)}."
-        )
-
-    for arm in arms_to_run:
-        if args.output_dir:
-            output_dir = Path(args.output_dir)
-        else:
-            output_dir = _output_dir_for(args.planet, args.epoch, arm)
-        _process_arm(
-            arm=arm,
-            args=args,
-            planet_cfg=planet_cfg,
-            output_dir=output_dir,
-        )
-
-    return 0
 
 
 if __name__ == "__main__":

@@ -25,6 +25,8 @@ def main():
 
     raise NotImplementedError(
         "Emission spectrum reduction is not yet implemented.\n"
+        "For retrieval-ready emission time-series cubes, use: "
+        "python -m dataio.prepare_emission_retrieval_timeseries\n"
         "For transmission spectra, use: python -m dataio.collapse_transmission_timeseries_to_1d"
     )
 

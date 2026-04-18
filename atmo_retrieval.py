@@ -594,9 +594,18 @@ def apply_cli_overrides(args):
         os.environ["HITRAN_PASSWORD"] = args.hitran_password
 
     # Data directory
-    config.set_runtime_config("DATA_DIR", config.get_data_dir(epoch=args.epoch))
-    config.set_runtime_config("TRANSMISSION_DATA", config.get_transmission_paths(epoch=args.epoch))
-    config.set_runtime_config("EMISSION_DATA", config.get_emission_paths(epoch=args.epoch))
+    # NOTE: --wavelength-range full has no single on-disk DATA_DIR because the
+    # red and blue arms are stored separately and loaded as two spectroscopic
+    # components. Leave DATA_DIR unset in that case; run_retrieval() reads per-
+    # arm directories via config.get_full_arm_data_dirs().
+    if config.OBSERVING_MODE == "full":
+        config.set_runtime_config("DATA_DIR", None)
+        config.set_runtime_config("TRANSMISSION_DATA", None)
+        config.set_runtime_config("EMISSION_DATA", None)
+    else:
+        config.set_runtime_config("DATA_DIR", config.get_data_dir(epoch=args.epoch))
+        config.set_runtime_config("TRANSMISSION_DATA", config.get_transmission_paths(epoch=args.epoch))
+        config.set_runtime_config("EMISSION_DATA", config.get_emission_paths(epoch=args.epoch))
 
     # Quick mode
     if args.quick:

@@ -8,7 +8,7 @@ This script:
 4. Saves wavelength, spectrum, and uncertainty as .npy files
 
 Usage:
-    python -m dataio.collapse_transmission_timeseries_to_1d --epoch 20250601 --planet KELT-20b --arm full
+    python -m dataio.collapse_transmission_timeseries_to_1d --epoch 20250601 --planet KELT-20b --arm red
 """
 
 import argparse
@@ -142,22 +142,29 @@ def get_sysrem_chunk_indices(
     """Partition wavelength columns into SYSREM chunks.
 
     The current scheme is:
-    - ``red`` and ``full``: two chunks, non-telluric and telluric
+    - ``red``: two chunks, non-telluric and telluric
     - ``blue``: one chunk, non-telluric only
+
+    ``arm='full'`` is not supported: run SYSREM independently per arm.
     """
+    if arm == "full":
+        raise ValueError(
+            "arm='full' is not supported by get_sysrem_chunk_indices. "
+            "Run SYSREM independently for 'red' and 'blue'."
+        )
+
     wave = np.asarray(wave, dtype=float)
     if wave.ndim != 1:
         raise ValueError(f"Expected 1D wavelength grid, got shape {wave.shape}.")
 
-    telluric_arm = "red" if arm in {"red", "full"} else arm
-    telluric_config = TELLURIC_REGIONS.get(telluric_arm, {"telluric": [], "deep_mask": []})
+    telluric_config = TELLURIC_REGIONS.get(arm, {"telluric": [], "deep_mask": []})
 
     telluric_mask = np.zeros(wave.shape[0], dtype=bool)
     for wmin, wmax in telluric_config["telluric"]:
         telluric_mask |= (wave > wmin) & (wave <= wmax)
 
     no_tellurics = np.where(~telluric_mask)[0]
-    if arm in {"red", "full"}:
+    if arm == "red":
         has_tellurics = np.where(telluric_mask)[0]
         return ("non_telluric", "telluric"), (no_tellurics, has_tellurics), telluric_mask
 
@@ -169,12 +176,16 @@ def get_sysrem_deep_mask(
     arm: str,
 ) -> np.ndarray:
     """Return wavelengths that should be ignored after Molecfit correction."""
+    if arm == "full":
+        raise ValueError(
+            "arm='full' is not supported by get_sysrem_deep_mask. "
+            "Call with 'red' or 'blue' separately."
+        )
     wave = np.asarray(wave, dtype=float)
     if wave.ndim != 1:
         raise ValueError(f"Expected 1D wavelength grid, got shape {wave.shape}.")
 
-    telluric_arm = "red" if arm in {"red", "full"} else arm
-    telluric_config = TELLURIC_REGIONS.get(telluric_arm, {"telluric": [], "deep_mask": []})
+    telluric_config = TELLURIC_REGIONS.get(arm, {"telluric": [], "deep_mask": []})
 
     deep_mask = np.zeros(wave.shape[0], dtype=bool)
     for wmin, wmax in telluric_config["deep_mask"]:
@@ -183,7 +194,12 @@ def get_sysrem_deep_mask(
 
 
 def get_sysrem_max_systematics(arm: str) -> list[int]:
-    if arm in {"red", "full"}:
+    if arm == "full":
+        raise ValueError(
+            "arm='full' is not supported by get_sysrem_max_systematics. "
+            "Call with 'red' or 'blue' separately."
+        )
+    if arm == "red":
         return list(config.DEFAULT_SYSREM_MAX_SYSTEMATICS_RED)
     return list(config.DEFAULT_SYSREM_MAX_SYSTEMATICS_OTHER)
 
@@ -596,9 +612,11 @@ def get_pepsi_data(
     )
 
     spectra_files = []
+    matched_pattern = None
     for pattern in patterns:
         spectra_files = glob(pattern, recursive=True)
         if spectra_files:
+            matched_pattern = pattern
             break
 
     if not spectra_files:
@@ -606,11 +624,23 @@ def get_pepsi_data(
         return None
 
     n_spectra = len(spectra_files)
-    print(f"Found {n_spectra} spectra")
+    # Surface which PEPSI product family fed this run so provenance is never
+    # ambiguous:
+    #   .dxt.*  dual-beam coadd (preferred)
+    #   .sxt.*  single-beam coadd (used when dual-beam product unavailable)
+    #   .sxs.*  per-readout sub-exposure (last-resort fallback)
+    if matched_pattern and ".sxs." in matched_pattern:
+        product_grade = "sub-exposure (.sxs)"
+    elif matched_pattern and ".sxt." in matched_pattern:
+        product_grade = "coadded, single-beam (.sxt)"
+    else:
+        product_grade = "coadded, dual-beam (.dxt)"
+    print(f"Found {n_spectra} spectra [{product_grade}]")
 
     i = 0
     jd, snr_spectra, exptime = np.zeros(n_spectra), np.zeros(n_spectra), np.zeros(n_spectra)
     airmass = np.zeros(n_spectra)
+    missing_header_counts: dict[str, int] = {}
 
     for spectrum in spectra_files:
         hdu = fits.open(spectrum)
@@ -669,18 +699,51 @@ def get_pepsi_data(
         elif barycentric_correction and i == 0:
             print("Velocity correction: no RADVEL/OBSVEL/SSBVEL found; skipping")
 
+        # JD-OBS is load-bearing (phase calculation, exposure ordering) so we
+        # still hard-fail if it is missing. SNR/EXPTIME/AIRMASS are bookkeeping;
+        # fall back to NaN and report once at the end so the run isn't derailed
+        # by inconsistent producer metadata (some PEPSI molecfit outputs omit
+        # SNR on most exposures).
         jd[i] = header[header_keys["jd"]]  # mid-exposure time
-        snr_spectra[i] = header[header_keys["snr"]]
 
-        exptime_val = header[header_keys["exptime"]]
-        if isinstance(exptime_val, str):
-            exptime_strings = exptime_val.split(':')
-            exptime[i] = float(exptime_strings[0]) * 3600. + float(exptime_strings[1]) * 60. + float(exptime_strings[2])
+        snr_key = header_keys["snr"]
+        if snr_key in header:
+            snr_spectra[i] = header[snr_key]
         else:
-            exptime[i] = float(exptime_val)
-        airmass[i] = header[header_keys["airmass"]]
+            snr_spectra[i] = np.nan
+            missing_header_counts[snr_key] = missing_header_counts.get(snr_key, 0) + 1
+
+        exptime_key = header_keys["exptime"]
+        if exptime_key in header:
+            exptime_val = header[exptime_key]
+            if isinstance(exptime_val, str):
+                exptime_strings = exptime_val.split(':')
+                exptime[i] = (
+                    float(exptime_strings[0]) * 3600.
+                    + float(exptime_strings[1]) * 60.
+                    + float(exptime_strings[2])
+                )
+            else:
+                exptime[i] = float(exptime_val)
+        else:
+            exptime[i] = np.nan
+            missing_header_counts[exptime_key] = missing_header_counts.get(exptime_key, 0) + 1
+
+        airmass_key = header_keys["airmass"]
+        if airmass_key in header:
+            airmass[i] = header[airmass_key]
+        else:
+            airmass[i] = np.nan
+            missing_header_counts[airmass_key] = missing_header_counts.get(airmass_key, 0) + 1
+
         hdu.close()
         i += 1
+
+    if missing_header_counts:
+        summary = ", ".join(
+            f"{k}: {v}/{n_spectra}" for k, v in sorted(missing_header_counts.items())
+        )
+        print(f"Warning: missing FITS header keys on some exposures ({summary}); using NaN.")
 
     # ====================
     # Preprocessing pipeline
@@ -759,61 +822,6 @@ def get_pepsi_data(
         return result, extras
 
     return result
-
-
-def _align_exposures_by_jd(jd_a: np.ndarray, jd_b: np.ndarray, tol: float = 1.0e-4) -> tuple[np.ndarray, np.ndarray]:
-    """Match exposures by JD within a tolerance (days). Arrays must be sorted."""
-    ia = []
-    ib = []
-    j = 0
-    for i in range(len(jd_a)):
-        while j < len(jd_b) and jd_b[j] < jd_a[i] - tol:
-            j += 1
-        if j < len(jd_b) and abs(jd_b[j] - jd_a[i]) <= tol:
-            ia.append(i)
-            ib.append(j)
-    return np.array(ia, dtype=int), np.array(ib, dtype=int)
-
-
-def combine_full_arms(
-    red: tuple[np.ndarray, ...],
-    blue: tuple[np.ndarray, ...],
-    jd_tol: float = 1.0e-4,
-) -> tuple[np.ndarray, ...]:
-    """Combine red+blue arms into a single 'full' spectrum set."""
-    wave_r, flux_r, err_r, jd_r, snr_r, exptime_r, airmass_r, _, _ = red
-    wave_b, flux_b, err_b, jd_b, snr_b, exptime_b, airmass_b, _, _ = blue
-
-    ia, ib = _align_exposures_by_jd(jd_r, jd_b, tol=jd_tol)
-    if len(ia) == 0:
-        raise ValueError("No matching exposures between red and blue arms (check timestamps).")
-    if len(ia) != len(jd_r) or len(ib) != len(jd_b):
-        print(f"Warning: matched {len(ia)} exposures between red ({len(jd_r)}) and blue ({len(jd_b)}) arms.")
-
-    wave_r = wave_r[ia]
-    flux_r = flux_r[ia]
-    err_r = err_r[ia]
-    wave_b = wave_b[ib]
-    flux_b = flux_b[ib]
-    err_b = err_b[ib]
-
-    jd = jd_r[ia]
-    snr = 0.5 * (snr_r[ia] + snr_b[ib])
-    exptime = 0.5 * (exptime_r[ia] + exptime_b[ib])
-    airmass = 0.5 * (airmass_r[ia] + airmass_b[ib])
-
-    wave = np.concatenate([wave_b, wave_r], axis=1)
-    flux = np.concatenate([flux_b, flux_r], axis=1)
-    err = np.concatenate([err_b, err_r], axis=1)
-
-    sort_idx = np.argsort(wave, axis=1)
-    wave = np.take_along_axis(wave, sort_idx, axis=1)
-    flux = np.take_along_axis(flux, sort_idx, axis=1)
-    err = np.take_along_axis(err, sort_idx, axis=1)
-
-    n_spectra = wave.shape[0]
-    npix = wave.shape[1]
-    return wave, flux, err, jd, snr, exptime, airmass, n_spectra, npix
 
 
 def get_orbital_phase(
@@ -911,7 +919,7 @@ def main():
     parser = argparse.ArgumentParser(description='Prepare PEPSI data for retrieval')
     parser.add_argument('--epoch', type=str, required=True, help='Observation epoch (YYYYMMDD)')
     parser.add_argument('--planet', type=str, default=config.DEFAULT_DATA_PLANET, help='Planet name')
-    parser.add_argument('--arm', type=str, choices=['red', 'blue', 'full'], default=config.DEFAULT_DATA_ARM, help='Spectrograph arm')
+    parser.add_argument('--arm', type=str, choices=['red', 'blue'], default=config.DEFAULT_DATA_ARM, help='Spectrograph arm (single-arm only; use the retrieval prep scripts for full runs)')
     parser.add_argument('--molecfit', action='store_true', default=config.DEFAULT_USE_MOLECFIT, help='Use molecfit-corrected data')
     parser.add_argument('--no-molecfit', action='store_false', dest='molecfit', help='Use uncorrected data')
     parser.add_argument('--barycorr', action='store_true', default=config.DEFAULT_BARYCORR,
@@ -957,14 +965,12 @@ def main():
 
     print(f"\nLoading PEPSI {args.arm} arm data for {args.planet} ({args.epoch})...")
     if args.arm == "full":
-        red = _load_arm("red", prefer_molecfit=True)
-        blue = _load_arm("blue", prefer_molecfit=False)
-        if red is None or blue is None:
-            print("Failed to load data for full arm (red/blue).")
-            return 1
-        result = combine_full_arms(red, blue)
-    else:
-        result = _load_arm(args.arm, prefer_molecfit=args.molecfit)
+        raise ValueError(
+            "arm='full' is not supported here. This legacy 1D collapser runs on a "
+            "single arm at a time. Run red and blue separately, or use the retrieval "
+            "prep scripts (which loop over arms automatically)."
+        )
+    result = _load_arm(args.arm, prefer_molecfit=args.molecfit)
 
     if result is None:
         print("Failed to load data!")

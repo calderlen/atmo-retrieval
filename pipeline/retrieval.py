@@ -60,10 +60,50 @@ from plotting.plot import (
 def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     data_dir = Path(data_dir)
 
-    wavelength = np.load(data_dir / "wavelength.npy")
-    data = np.load(data_dir / "data.npy")
-    sigma = np.load(data_dir / "sigma.npy")
-    phase = np.load(data_dir / "phase.npy")
+    expected_paths = {
+        "wavelength": data_dir / "wavelength.npy",
+        "data": data_dir / "data.npy",
+        "sigma": data_dir / "sigma.npy",
+        "phase": data_dir / "phase.npy",
+    }
+    missing = [path.name for path in expected_paths.values() if not path.exists()]
+    if missing:
+        transmission_spectrum_paths = [
+            data_dir / "wavelength_transmission.npy",
+            data_dir / "spectrum_transmission.npy",
+            data_dir / "uncertainty_transmission.npy",
+        ]
+        emission_spectrum_paths = [
+            data_dir / "wavelength_emission.npy",
+            data_dir / "spectrum_emission.npy",
+            data_dir / "uncertainty_emission.npy",
+        ]
+        found_transmission_spectrum = all(path.exists() for path in transmission_spectrum_paths)
+        found_emission_spectrum = all(path.exists() for path in emission_spectrum_paths)
+
+        if found_transmission_spectrum or found_emission_spectrum:
+            found_names = transmission_spectrum_paths if found_transmission_spectrum else emission_spectrum_paths
+            found_label = "transmission" if found_transmission_spectrum else "emission"
+            found_text = ", ".join(path.name for path in found_names)
+            missing_text = ", ".join(missing)
+            raise FileNotFoundError(
+                f"{data_dir} does not contain a retrieval-ready time-series bundle; missing {missing_text}. "
+                f"Found {found_label} single-spectrum products instead ({found_text}). "
+                "Use --data-format spectrum for the collapsed 1D products, or run "
+                "`python -m dataio.prepare_retrieval_timeseries ... --run-sysrem` "
+                "to generate wavelength.npy/data.npy/sigma.npy/phase.npy for a time-series retrieval."
+            )
+
+        missing_text = ", ".join(missing)
+        raise FileNotFoundError(
+            f"{data_dir} is missing the time-series files required for data_format='timeseries': "
+            f"{missing_text}."
+        )
+
+    wavelength = np.load(expected_paths["wavelength"])
+    data = np.load(expected_paths["data"])
+    sigma = np.load(expected_paths["sigma"])
+    phase = np.load(expected_paths["phase"])
     
     return wavelength, data, sigma, phase
 
@@ -1825,7 +1865,37 @@ def run_retrieval(
     apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT and data_format == "timeseries")
 
     primary_sysrem: SysremInputBundle | None = sysrem_inputs
-    
+
+    full_arm_mode = (
+        config.OBSERVING_MODE == "full"
+        and data_format == "timeseries"
+        and all(val is None for val in (wav_obs, data, sigma, phase))
+    )
+    if config.OBSERVING_MODE == "full" and not full_arm_mode:
+        if data_format != "timeseries":
+            raise ValueError(
+                "--wavelength-range full requires data_format='timeseries'; "
+                f"got {data_format!r}."
+            )
+
+    primary_component_name = "spectroscopy_red" if full_arm_mode else "spectroscopy"
+
+    if full_arm_mode:
+        arm_dirs = config.get_full_arm_data_dirs(epoch=epoch, mode=mode)
+        blue_component_spec = {
+            "name": "spectroscopy_blue",
+            "mode": mode,
+            "data_format": "timeseries",
+            "data_dir": str(arm_dirs["blue"]),
+            "apply_sysrem": apply_sysrem,
+            "phase_mode": phase_mode,
+            "radial_velocity_mode": "orbital",
+            "likelihood_kind": "matched_filter",
+            "subtract_per_exposure_mean": config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT,
+            "instrument_resolution": config.get_resolution(),
+        }
+        joint_spectra = list(joint_spectra or []) + [blue_component_spec]
+
     print("\n[1/7] Loading time-series data...")
     with _StepTimer("Step 1/7"):
         if epoch:
@@ -1847,11 +1917,23 @@ def run_retrieval(
                     )
                 print(f"  Using provided SYSREM auxiliaries: {_describe_sysrem_inputs(primary_sysrem)}")
         else:
-            resolved_data_dir = config.get_data_dir(epoch=epoch)
-            data_paths = (
-                config.get_transmission_paths(epoch=epoch) if mode == "transmission"
-                else config.get_emission_paths(epoch=epoch)
-            )
+            if full_arm_mode:
+                resolved_data_dir = arm_dirs["red"]
+                print(
+                    "  OBSERVING_MODE='full': loading red as primary, blue as "
+                    "a second spectroscopic component."
+                )
+                data_paths = (
+                    config.get_transmission_paths(epoch=epoch, arm="red")
+                    if mode == "transmission"
+                    else config.get_emission_paths(epoch=epoch, arm="red")
+                )
+            else:
+                resolved_data_dir = config.get_data_dir(epoch=epoch)
+                data_paths = (
+                    config.get_transmission_paths(epoch=epoch) if mode == "transmission"
+                    else config.get_emission_paths(epoch=epoch)
+                )
 
             if data_format == "timeseries":
                 wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
@@ -1981,7 +2063,30 @@ def run_retrieval(
             else:
                 print(f"  PHOENIX stellar spectrum: {phoenix_spectrum_path}")
 
-        shared_system = build_shared_system_config(params=model_params)
+        shared_velocity_phase_mode: PhaseMode | None = None
+        shared_velocity_component_names: tuple[str, ...] = ()
+        if full_arm_mode:
+            if phase_mode not in {"global", "linear"}:
+                raise ValueError(
+                    "--wavelength-range full requires --phase-mode in "
+                    "{'global','linear'} so dRV can be shared across arms; "
+                    f"got {phase_mode!r}."
+                )
+            shared_velocity_phase_mode = phase_mode
+            shared_velocity_component_names = (
+                primary_component_name,
+                "spectroscopy_blue",
+            )
+            print(
+                f"  Full-arm mode: sharing dRV ({phase_mode}) between "
+                f"{primary_component_name} and spectroscopy_blue."
+            )
+
+        shared_system = build_shared_system_config(
+            params=model_params,
+            shared_velocity_phase_mode=shared_velocity_phase_mode,
+            shared_velocity_component_names=shared_velocity_component_names,
+        )
 
         primary_is_timeseries = (
             np.asarray(phase).size > 1
@@ -1992,13 +2097,13 @@ def run_retrieval(
         primary_likelihood_kind = "matched_filter" if primary_is_timeseries else "gaussian"
         primary_subtract_mean = config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT if primary_is_timeseries else False
         primary_sample_prefix = (
-            "spectroscopy"
+            primary_component_name
             if (joint_spectra or bandpass_constraints)
             else None
         )
 
         primary_component = _build_primary_spectroscopic_component(
-            name="spectroscopy",
+            name=primary_component_name,
             mode=mode,
             wav_obs=wav_obs,
             data=data,

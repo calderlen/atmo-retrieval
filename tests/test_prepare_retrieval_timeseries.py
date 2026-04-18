@@ -170,7 +170,9 @@ class PrepareRetrievalTimeseriesMainTests(unittest.TestCase):
     def _run_main(self, argv, *, planet_cfg, result, remove_output, phase, chunk_indices=None):
         with ExitStack() as stack:
             stack.enter_context(patch.object(sys, "argv", argv))
-            stack.enter_context(patch("dataio.prepare_retrieval_timeseries._planet_config", return_value=planet_cfg))
+            planet_mock = stack.enter_context(
+                patch("dataio.prepare_retrieval_timeseries._planet_config", return_value=planet_cfg)
+            )
             stack.enter_context(patch("dataio.prepare_retrieval_timeseries._load_data", return_value=result))
             stack.enter_context(patch("dataio.prepare_retrieval_timeseries.get_orbital_phase", return_value=phase))
             remove_mock = stack.enter_context(
@@ -187,14 +189,14 @@ class PrepareRetrievalTimeseriesMainTests(unittest.TestCase):
                     )
                 )
             rc = prep.main()
-        return rc, remove_mock
+        return rc, remove_mock, planet_mock
 
     def test_main_applies_shadow_and_records_metadata(self):
         base_result = (_load_result(), {})
         corrected = base_result[0][1] - 0.25
 
-        rc, remove_mock = self._run_main(
-            self._argv(),
+        rc, remove_mock, planet_mock = self._run_main(
+            self._argv("--ephemeris", "Singh24"),
             planet_cfg=_planet_cfg(),
             result=base_result,
             remove_output=(corrected, np.full_like(corrected, 0.25), {"scaling": 1.5}),
@@ -202,8 +204,10 @@ class PrepareRetrievalTimeseriesMainTests(unittest.TestCase):
         )
 
         self.assertEqual(rc, 0)
+        planet_mock.assert_called_once_with("KELT-20b", "Singh24")
         np.testing.assert_allclose(np.load(self.output_dir / "data.npy"), corrected)
         metadata = json.loads((self.output_dir / "timeseries_prep.json").read_text())
+        self.assertEqual(metadata["ephemeris"], "Singh24")
         self.assertTrue(metadata["doppler_shadow_applied"])
         self.assertEqual(metadata["doppler_shadow_skip_reason"], None)
         self.assertAlmostEqual(metadata["doppler_shadow_scaling"], 1.5)
@@ -212,7 +216,7 @@ class PrepareRetrievalTimeseriesMainTests(unittest.TestCase):
     def test_main_skips_shadow_when_required_params_are_missing(self):
         base_result = (_load_result(), {})
 
-        rc, remove_mock = self._run_main(
+        rc, remove_mock, _planet_mock = self._run_main(
             self._argv(),
             planet_cfg=_planet_cfg(lambda_angle=np.nan),
             result=base_result,
@@ -231,7 +235,7 @@ class PrepareRetrievalTimeseriesMainTests(unittest.TestCase):
     def test_main_skips_shadow_when_no_subtract_median_is_used(self):
         base_result = (_load_result(), {})
 
-        rc, remove_mock = self._run_main(
+        rc, remove_mock, _planet_mock = self._run_main(
             self._argv("--no-subtract-median"),
             planet_cfg=_planet_cfg(),
             result=base_result,
@@ -259,7 +263,7 @@ class PrepareRetrievalTimeseriesMainTests(unittest.TestCase):
             np.zeros(4, dtype=bool),
         )
 
-        rc, remove_mock = self._run_main(
+        rc, remove_mock, _planet_mock = self._run_main(
             self._argv("--run-sysrem"),
             planet_cfg=_planet_cfg(),
             result=(base, extras),

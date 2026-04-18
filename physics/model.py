@@ -61,6 +61,44 @@ CONTINUUM_SPECIES_MASSES: dict[str, float] = {
     "e-": 5.48579909065e-4,
 }
 
+
+def _debug_nonfinite_array(label: str, value: jnp.ndarray) -> None:
+    """Emit a JAX-side debug print if an array becomes non-finite."""
+    arr = jnp.asarray(value)
+    has_nonfinite = jnp.any(~jnp.isfinite(arr))
+
+    def _print(_):
+        finite_mask = jnp.isfinite(arr)
+        safe_arr = jnp.where(finite_mask, arr, jnp.nan)
+        jax.debug.print(
+            "[numerics] {label}: non-finite array detected "
+            "(any_nan={any_nan}, any_inf={any_inf}, finite_min={finite_min}, finite_max={finite_max})",
+            label=label,
+            any_nan=jnp.any(jnp.isnan(arr)),
+            any_inf=jnp.any(jnp.isinf(arr)),
+            finite_min=jnp.nanmin(safe_arr),
+            finite_max=jnp.nanmax(safe_arr),
+        )
+        return 0
+
+    jax.lax.cond(has_nonfinite, _print, lambda _: 0, operand=None)
+
+
+def _debug_nonfinite_scalar(label: str, value: jnp.ndarray) -> None:
+    """Emit a JAX-side debug print if a scalar becomes non-finite."""
+    scalar = jnp.asarray(value)
+    has_nonfinite = ~jnp.isfinite(scalar)
+
+    def _print(_):
+        jax.debug.print(
+            "[numerics] {label}: non-finite scalar detected (value={value})",
+            label=label,
+            value=scalar,
+        )
+        return 0
+
+    jax.lax.cond(has_nonfinite, _print, lambda _: 0, operand=None)
+
 # the below dataclasses are all configuration objects, they describe how to build and sample the model
 # system paramaters that are shared across all atmospheric regions and observation types in a joint retrieval
 @dataclass(frozen=True)
@@ -78,6 +116,14 @@ class SharedSystemConfig:
     Rstar_mean: float
     Rstar_std: float
     period_day: float
+    # Optional system-level velocity-offset sharing across spectroscopic
+    # components. When set, components whose name appears in
+    # ``shared_velocity_component_names`` skip their per-component dRV samples
+    # and instead evaluate the shared dRV(phase) using their own phase array.
+    # Only ``"global"`` and ``"linear"`` phase modes are supported for sharing;
+    # ``"per_exposure"`` is rejected because exposures differ per arm.
+    shared_velocity_phase_mode: PhaseMode | None = None
+    shared_velocity_component_names: tuple[str, ...] = ()
 
 # TODO: ensure these region-specific data-ignorant params in the dataclass shold be region-specific, or if some of these should be shared between atmopsheric regions
 # paramaters that are region-specific (so emission vs. transmission), but shared across all observation types in a joint retrieval.
@@ -168,6 +214,11 @@ class SharedSystemState(NamedTuple):
     Rstar: jnp.ndarray
     Rp: jnp.ndarray
     g_ref: jnp.ndarray
+    shared_dRV_0: jnp.ndarray | None = None
+    shared_dRV_slope: jnp.ndarray | None = None
+    shared_dRV_global: jnp.ndarray | None = None
+    shared_velocity_phase_mode: PhaseMode | None = None
+    shared_velocity_component_names: frozenset = frozenset()
 
 class AtmosphereState(NamedTuple):
     art: object
@@ -339,13 +390,47 @@ def _compute_cia_opacity_terms(
         if cia is None:
             continue
         logacia_matrix = cia.logacia_matrix(Tarr)
-        cia_terms[f"CIA_{cia_key}"] = art.opacity_profile_cia(
+        # exojax's CIA interpolation can emit NaNs when the runtime nu_grid
+        # extends beyond the tabulated CIA wavenumber range. Treat CIA as zero
+        # outside the database support instead of letting those NaNs poison dtau.
+        cia_nu = jnp.asarray(cia.cdb.nucia)
+        cia_nu_min = jnp.min(cia_nu)
+        cia_nu_max = jnp.max(cia_nu)
+        supported_nu = (jnp.asarray(cia.nu_grid) >= cia_nu_min) & (
+            jnp.asarray(cia.nu_grid) < cia_nu_max
+        )
+        logacia_matrix = jnp.where(supported_nu[None, :], logacia_matrix, -jnp.inf)
+        logacia_matrix = jnp.nan_to_num(
+            logacia_matrix,
+            nan=-jnp.inf,
+            posinf=-jnp.inf,
+            neginf=-jnp.inf,
+        )
+        vmr_x = jnp.nan_to_num(
+            jnp.clip(jnp.asarray(vmr_profiles[species_x]), 0.0, None),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        vmr_y = jnp.nan_to_num(
+            jnp.clip(jnp.asarray(vmr_profiles[species_y]), 0.0, None),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        dtau_cia = art.opacity_profile_cia(
             logacia_matrix,
             Tarr,
-            vmr_profiles[species_x],
-            vmr_profiles[species_y],
+            vmr_x,
+            vmr_y,
             mmw_profile[:, None],
             g,
+        )
+        cia_terms[f"CIA_{cia_key}"] = jnp.nan_to_num(
+            dtau_cia,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
 
     return cia_terms
@@ -404,18 +489,45 @@ def _compute_continuum_opacity_terms(
     if gravity_column.ndim == 1:
         gravity_column = gravity_column[:, None]
 
-    return {
-        "CONT_Hminus": layer_optical_depth_Hminus(
-            nu_grid,
-            Tarr,
-            art.pressure,
-            art.dParr,
-            vmre,
-            vmrh,
-            mmw_column,
-            gravity_column,
-        )
-    }
+    # Guard against float32 overflow in the exojax H- formulation.
+    # bound_free_absorption contains exp(alpha / (lambda_0 * T)) which blows
+    # past float32's ~3.4e38 ceiling once T drops below ~130 K, a regime the
+    # AutoMultivariateNormal guide can transiently probe during SVI init even
+    # though Guillot priors forbid it physically. Similarly, a vanishing mmw
+    # would turn the 1/mmw factor into a float32 overflow. Finally, the
+    # exojax formula takes jnp.log10(absorption_coeff) where absorption_coeff
+    # is proportional to vmre * vmrh; at zero VMR the forward pass is safely
+    # masked but the backward pass goes through 1/0 and produces NaN
+    # gradients, which numpyro's find_valid_initial_params rejects. Floor
+    # vmre and vmrh to a tiny positive so log10 and its derivative stay
+    # finite.
+    T_safe = jnp.clip(Tarr, min=500.0)
+    mmw_column = jnp.maximum(mmw_column, 1e-2)
+    # The VMR floor must keep the product
+    #   (kappa_bf + kappa_ff) * electron_pressure * hydrogen_density
+    # safely inside float32's normal range (> ~1e-38) so that log10 never
+    # sees a zero. The individual factors can get as small as
+    # (kappa_bf + kappa_ff) ~ 1e-18 and electron_pressure * hydrogen_density
+    # ~ vmre * vmrh * narr^2 * kB * T ~ vmre * vmrh * 1e13 in the thin-upper
+    # layers. A symmetric 1e-15 floor keeps the product above ~1e-20, which
+    # is 18 orders of magnitude above float32's underflow threshold, while
+    # still being a negligibly small abundance.
+    vmre_safe = jnp.maximum(vmre, 1e-15)
+    vmrh_safe = jnp.maximum(vmrh, 1e-15)
+
+    dtau_hminus = layer_optical_depth_Hminus(
+        nu_grid,
+        T_safe,
+        art.pressure,
+        art.dParr,
+        vmre_safe,
+        vmrh_safe,
+        mmw_column,
+        gravity_column,
+    )
+    dtau_hminus = jnp.where(jnp.isfinite(dtau_hminus), dtau_hminus, 0.0)
+
+    return {"CONT_Hminus": dtau_hminus}
 
 
 def _compute_opacity_terms(
@@ -483,8 +595,10 @@ def _sum_opacity_terms(
 ) -> jnp.ndarray:
     """Sum all opacity terms into total dtau."""
     dtau = jnp.zeros((art.pressure.size, nu_grid.size))
-    for dtau_term in opacity_terms.values():
+    for term_name, dtau_term in opacity_terms.items():
+        _debug_nonfinite_array(f"opacity_terms[{term_name}]", dtau_term)
         dtau = dtau + dtau_term
+        _debug_nonfinite_array(f"opacity_cumulative[{term_name}]", dtau)
     return dtau
 
 
@@ -1333,7 +1447,20 @@ def compute_model_timeseries(
     Tstar: float | None = None,
     stellar_surface_flux: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-    rt = art.run(dtau, Tarr, mmw_profile, Rp, g_ref)
+    Tarr_rt = jnp.nan_to_num(
+        jnp.clip(Tarr, min=100.0, max=8000.0),
+        nan=1500.0,
+        posinf=8000.0,
+        neginf=100.0,
+    )
+    mmw_rt = jnp.nan_to_num(
+        jnp.clip(mmw_profile, min=0.1, max=300.0),
+        nan=2.3,
+        posinf=300.0,
+        neginf=0.1,
+    )
+    rt = art.run(dtau, Tarr_rt, mmw_rt, Rp, g_ref)
+    _debug_nonfinite_array("spectroscopy.rt", rt)
 
     # Tidal locking: spin period = orbital period.
     vsini = 2.0 * jnp.pi * Rp / (period_day * 86400.0) / 1.0e5
@@ -1342,9 +1469,13 @@ def compute_model_timeseries(
 
     rv = planet_rv_kms(phase, Kp, Vsys, dRV)
     planet_ts = jax.vmap(lambda v: sop_inst.sampling(rt, v, inst_nus))(rv)
+    _debug_nonfinite_array("spectroscopy.planet_ts", planet_ts)
 
     if mode == "transmission":
-        return jnp.sqrt(planet_ts) * (Rp / Rstar)
+        # Convolution / interpolation can introduce tiny negative ringing in an
+        # otherwise non-negative transmission observable. Guard before sqrt so
+        # the likelihood does not go NaN during SVI/HMC initialization.
+        return jnp.sqrt(jnp.clip(planet_ts, 0.0, None)) * (Rp / Rstar)
 
     Fs = _resolve_emission_stellar_surface_flux(
         nu_grid=nu_grid,
@@ -1526,6 +1657,28 @@ def _sample_shared_system_state(
     Rp = numpyro.sample("Rp", dist.TruncatedNormal(shared_config.Rp_mean, shared_config.Rp_std, low=0.0)) * RJ
     g_ref = gravity_surface(Rp / RJ, Mp / MJ)
 
+    shared_dRV_0 = None
+    shared_dRV_slope = None
+    shared_dRV_global = None
+    shared_phase_mode = shared_config.shared_velocity_phase_mode
+    if shared_phase_mode is not None:
+        if shared_phase_mode == "global":
+            shared_dRV_global = numpyro.sample(
+                "shared_dRV", dist.Normal(0.0, 10.0)
+            )
+        elif shared_phase_mode == "linear":
+            shared_dRV_0 = numpyro.sample(
+                "shared_dRV_0", dist.Normal(0.0, 10.0)
+            )
+            shared_dRV_slope = numpyro.sample(
+                "shared_dRV_slope", dist.Normal(0.0, 50.0)
+            )
+        else:
+            raise ValueError(
+                "shared_velocity_phase_mode only supports 'global' or "
+                f"'linear'; got {shared_phase_mode!r}."
+            )
+
     return SharedSystemState(
         Kp=Kp,
         Vsys=Vsys,
@@ -1533,6 +1686,13 @@ def _sample_shared_system_state(
         Rstar=Rstar,
         Rp=Rp,
         g_ref=g_ref,
+        shared_dRV_0=shared_dRV_0,
+        shared_dRV_slope=shared_dRV_slope,
+        shared_dRV_global=shared_dRV_global,
+        shared_velocity_phase_mode=shared_phase_mode,
+        shared_velocity_component_names=frozenset(
+            shared_config.shared_velocity_component_names
+        ),
     )
 
 
@@ -1649,11 +1809,40 @@ def _sample_component_velocity_offset(
     phase: jnp.ndarray,
     *,
     scope_prefix: str | None = None,
+    shared_state: SharedSystemState | None = None,
 ) -> jnp.ndarray:
     if component_config.radial_velocity_mode == "none":
         return jnp.zeros_like(phase)
     if component_config.phase_mode is None:
         return jnp.zeros_like(phase)
+
+    if (
+        shared_state is not None
+        and shared_state.shared_velocity_phase_mode is not None
+        and component_config.name in shared_state.shared_velocity_component_names
+    ):
+        shared_mode = shared_state.shared_velocity_phase_mode
+        if component_config.phase_mode != shared_mode:
+            raise ValueError(
+                f"Component '{component_config.name}' declared phase_mode="
+                f"{component_config.phase_mode!r} but shares velocity with "
+                f"shared_velocity_phase_mode={shared_mode!r}. Phase modes must match."
+            )
+        if shared_mode == "global":
+            dRV = jnp.broadcast_to(shared_state.shared_dRV_global, phase.shape)
+        elif shared_mode == "linear":
+            dRV = shared_state.shared_dRV_0 + shared_state.shared_dRV_slope * phase
+        else:
+            raise ValueError(
+                f"Unsupported shared_velocity_phase_mode={shared_mode!r}."
+            )
+
+        if scope_prefix is None:
+            numpyro.deterministic("dRV_kms", dRV)
+        else:
+            with numpyro.handlers.scope(prefix=scope_prefix):
+                numpyro.deterministic("dRV_kms", dRV)
+        return dRV
 
     if scope_prefix is None:
         dRV = _sample_phase_dependent_velocity_offset(
@@ -1689,7 +1878,8 @@ def _compute_native_observable_spectrum(
     rt = art.run(dtau, Tarr, mmw_profile, Rp, g_ref)
 
     if mode == "transmission":
-        return jnp.sqrt(rt) * (Rp / Rstar)
+        # The native transmission observable is physically non-negative.
+        return jnp.sqrt(jnp.clip(rt, 0.0, None)) * (Rp / Rstar)
 
     Fs = _resolve_emission_stellar_surface_flux(
         nu_grid=nu_grid,
@@ -1855,10 +2045,12 @@ def _evaluate_spectroscopic_component(
     scope_prefix: str | None = None,
 ) -> jnp.ndarray:
     dtau = _compute_component_dtau(component_config, atmosphere_state)
+    _debug_nonfinite_array(f"spectroscopy[{component_config.name}].dtau", dtau)
     dRV = _sample_component_velocity_offset(
         component_config,
         observation_inputs.phase,
         scope_prefix=scope_prefix,
+        shared_state=shared_state,
     )
 
     if component_config.radial_velocity_mode == "none":
@@ -1892,6 +2084,7 @@ def _evaluate_spectroscopic_component(
         Tstar=component_config.Tstar,
         stellar_surface_flux=component_config.stellar_surface_flux,
     )
+    _debug_nonfinite_array(f"spectroscopy[{component_config.name}].model_ts_raw", model_ts)
     model_ts = apply_model_pipeline_corrections(
         model_ts,
         subtract_per_exposure_mean=component_config.subtract_per_exposure_mean,
@@ -1900,19 +2093,24 @@ def _evaluate_spectroscopic_component(
         V=observation_inputs.V,
         chunked_sysrem=observation_inputs.chunked_sysrem,
     )
+    _debug_nonfinite_array(f"spectroscopy[{component_config.name}].model_ts", model_ts)
 
     if component_config.likelihood_kind == "gaussian":
-        return _gaussian_log_likelihood(
+        lnL = _gaussian_log_likelihood(
             observation_inputs.data,
             model_ts,
             observation_inputs.sigma,
         )
+        _debug_nonfinite_scalar(f"spectroscopy[{component_config.name}].logL", lnL)
+        return lnL
 
     if component_config.likelihood_kind != "matched_filter":
         raise ValueError(f"Unknown spectroscopic likelihood kind: {component_config.likelihood_kind}")
 
     w_ij = 1.0 / jnp.clip(observation_inputs.sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
-    return jnp.sum(jax.vmap(_lnL_exposure)(observation_inputs.data, model_ts, w_ij))
+    lnL = jnp.sum(jax.vmap(_lnL_exposure)(observation_inputs.data, model_ts, w_ij))
+    _debug_nonfinite_scalar(f"spectroscopy[{component_config.name}].logL", lnL)
+    return lnL
 
 
 def _evaluate_bandpass_component(
@@ -2060,6 +2258,8 @@ def create_joint_retrieval_model(
 def build_shared_system_config(
     *,
     params: dict,
+    shared_velocity_phase_mode: PhaseMode | None = None,
+    shared_velocity_component_names: tuple[str, ...] = (),
 ) -> SharedSystemConfig:
     Kp_low = params.get("Kp_low")
     Kp_high = params.get("Kp_high")
@@ -2067,6 +2267,15 @@ def build_shared_system_config(
     Mp_upper_3sigma = params.get("M_p_upper_3sigma")
     if (Kp_low is not None) and (Kp_high is not None):
         Kp_bounds = (Kp_low, Kp_high)
+
+    if shared_velocity_phase_mode is not None and shared_velocity_phase_mode not in {
+        "global",
+        "linear",
+    }:
+        raise ValueError(
+            "shared_velocity_phase_mode must be 'global' or 'linear'; "
+            f"got {shared_velocity_phase_mode!r}."
+        )
 
     return SharedSystemConfig(
         Kp_mean=params["Kp"],
@@ -2082,6 +2291,8 @@ def build_shared_system_config(
         Rstar_mean=params["R_star"],
         Rstar_std=params["R_star_err"],
         period_day=params["period"],
+        shared_velocity_phase_mode=shared_velocity_phase_mode,
+        shared_velocity_component_names=tuple(shared_velocity_component_names),
     )
 
 

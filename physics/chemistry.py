@@ -687,6 +687,7 @@ class FastChemEquilibriumChemistry(CompositionSolver):
 
     def _cache_key(self, pressure_bar: np.ndarray, species_names: list[str]) -> str:
         h = hashlib.sha256()
+        h.update("v3_bar_pressure".encode())
         h.update(f"T:{self.n_temp},{self.t_min},{self.t_max}".encode())
         h.update(f"P:{pressure_bar.size},{pressure_bar.min():.6e},{pressure_bar.max():.6e}".encode())
         h.update(f"MH:{self.log_metallicity:.6f}".encode())
@@ -780,7 +781,10 @@ class FastChemEquilibriumChemistry(CompositionSolver):
 
         # Build the flat T×P arrays for FastChem input
         T_flat = np.repeat(self._T_grid, n_P)
-        P_flat = np.tile(P_grid * 1e6, n_T)  # bar → dyne/cm² (cgs)
+        # pyFastChem's Python interface expects pressure in bar, matching the
+        # upstream examples bundled with FastChem. Sending cgs here shifts the
+        # chemistry grid into an effectively 1e6-times higher pressure regime.
+        P_flat = np.tile(P_grid, n_T)
 
         metallicity_factor = 10.0 ** self.log_metallicity
 
@@ -1081,7 +1085,7 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
 
     def _hybrid_cache_key(self, pressure_bar: np.ndarray, species_names: list[str]) -> str:
         h = hashlib.sha256()
-        h.update("v2".encode())
+        h.update("v3_bar_pressure".encode())
         h.update(f"T:{self.n_temp},{self.t_min},{self.t_max}".encode())
         h.update(f"P:{pressure_bar.size},{pressure_bar.min():.6e},{pressure_bar.max():.6e}".encode())
         h.update(
@@ -1211,7 +1215,8 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         }
 
         t_flat = np.repeat(self._T_grid, self.n_pressure)
-        p_flat = np.tile(p_grid * 1e6, self.n_temp)
+        # pyFastChem expects pressure in bar here as well.
+        p_flat = np.tile(p_grid, self.n_temp)
 
         for i_mh, log_metallicity in enumerate(self._log_metallicity_grid):
             for i_co, co_ratio in enumerate(self._co_ratio_grid):

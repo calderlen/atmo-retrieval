@@ -184,6 +184,9 @@ def get_raw_hrs_dir(
     return base
 
 
+FULL_ARM_MEMBERS: tuple[str, ...] = ("red", "blue")
+
+
 def get_data_dir(
     planet: str | None = None,
     arm: str | None = None,
@@ -191,14 +194,42 @@ def get_data_dir(
     *,
     mode: str | None = None,
 ) -> Path:
-    """Get processed high-resolution data directory for a planet, arm, and optional epoch."""
+    """Get processed high-resolution data directory for a planet, arm, and optional epoch.
+
+    ``arm='full'`` is rejected: full-arm runs store red and blue under separate
+    sibling directories (``.../<epoch>/red`` and ``.../<epoch>/blue``). Use
+    :func:`get_full_arm_data_dirs` to retrieve both.
+    """
     planet_slug = _planet_slug(planet or PLANET)
     resolved_mode = _normalize_retrieval_mode(mode)
     resolved_arm = arm or OBSERVING_MODE
+    if resolved_arm == "full":
+        raise ValueError(
+            "arm='full' has no single on-disk directory; red and blue are stored "
+            "separately under <epoch>/red and <epoch>/blue. Use "
+            "get_full_arm_data_dirs() instead, or pass arm='red'/'blue'."
+        )
     base = INPUT_DIR / "hrs" / resolved_mode / planet_slug
     if epoch:
         return base / epoch / resolved_arm
     return base / resolved_arm
+
+
+def get_full_arm_data_dirs(
+    planet: str | None = None,
+    epoch: str | None = None,
+    *,
+    mode: str | None = None,
+) -> dict[str, Path]:
+    """Return per-arm data directories for a full-arm retrieval.
+
+    Returns a dict keyed by arm name ('red', 'blue') so callers can iterate over
+    spectroscopic components without hardcoding path logic.
+    """
+    return {
+        arm: get_data_dir(planet=planet, arm=arm, epoch=epoch, mode=mode)
+        for arm in FULL_ARM_MEMBERS
+    }
 
 
 def get_lowres_dir(
@@ -251,12 +282,35 @@ def get_emission_paths(planet: str | None = None, arm: str | None = None, epoch:
     }
 
 
-DATA_DIR = get_data_dir()
 RAW_HRS_DIR = get_raw_hrs_dir(mode="transmission")
 LOWRES_DIR = get_lowres_dir()
 PHOT_DIR = get_phot_dir()
-TRANSMISSION_DATA = get_transmission_paths()
-EMISSION_DATA = get_emission_paths()
+
+
+def _maybe_data_dir() -> Path | None:
+    try:
+        return get_data_dir()
+    except ValueError:
+        return None
+
+
+def _maybe_transmission_paths() -> dict[str, Path] | None:
+    try:
+        return get_transmission_paths()
+    except ValueError:
+        return None
+
+
+def _maybe_emission_paths() -> dict[str, Path] | None:
+    try:
+        return get_emission_paths()
+    except ValueError:
+        return None
+
+
+DATA_DIR = _maybe_data_dir()
+TRANSMISSION_DATA = _maybe_transmission_paths()
+EMISSION_DATA = _maybe_emission_paths()
 
 # ==============================================================================
 # OUTPUT CONFIGURATION

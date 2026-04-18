@@ -20,7 +20,7 @@ from typing import Callable
 OBSERVATORY = "lbt"
 INSTRUMENT = "PEPSI"
 OBSERVING_MODE = "full"
-RESOLUTION_MODE = "hr"  # Options: "standard" (R=50k), "hr" (R=120k), "uhr" (R=270k)
+RESOLUTION_MODE = "hr"  # Options: "standard" (R=50k), "hr" (R=130k), "uhr" (R=270k)
 
 
 # ==============================================================================
@@ -53,22 +53,43 @@ def _pepsi_data_patterns(
 
     year = int(observation_epoch[0:4])
 
-    # PEPSI file extensions (order matters - try newest first)
-    pepsi_exts = ["nor", "avr"]
+    # PEPSI coadded-per-visit products come in two parallel extraction modes:
+    #   `.dxt.{ext}` — dual-beam extraction (both polarizer beams stacked).
+    #                  Preferred: ~sqrt(2) higher SNR.
+    #   `.sxt.{ext}` — single-beam extraction. Used when the observatory
+    #                  pipeline could not produce the dual-beam product (e.g.
+    #                  only one polarization recorded, or one beam flagged
+    #                  bad). Same processing stage as `.dxt.*`, lower SNR.
+    # `{ext}` is the merging/normalization variant; order matters, newest first.
+    pepsi_coadd_exts = ["nor", "avr"]
     if year >= 2024:
-        pepsi_exts.insert(0, "bwl")
+        pepsi_coadd_exts.insert(0, "bwl")
+    pepsi_coadd_extraction_modes = ("dxt", "sxt")
+
+    # Sub-exposure products (`.sxs.{ext}`) — one file per CCD readout, used as
+    # a last-resort fallback when neither coadded family was produced (e.g.
+    # KELT-9b 20240706). Treated as independent exposures downstream.
+    pepsi_sxs_exts = ["i"]
 
     patterns = []
     base_path = str(data_dir)
 
     if do_molecfit:
-        for ext in pepsi_exts:
-            patterns.append(f"{base_path}/molecfit_weak/SCIENCE_TELLURIC_CORR_{file_prefix}*.dxt.{ext}.fits")
-            patterns.append(f"{base_path}/**/SCIENCE_TELLURIC_CORR_{file_prefix}*.dxt.{ext}.fits")
+        for mode in pepsi_coadd_extraction_modes:
+            for ext in pepsi_coadd_exts:
+                patterns.append(f"{base_path}/molecfit_weak/SCIENCE_TELLURIC_CORR_{file_prefix}*.{mode}.{ext}.fits")
+                patterns.append(f"{base_path}/**/SCIENCE_TELLURIC_CORR_{file_prefix}*.{mode}.{ext}.fits")
+        for ext in pepsi_sxs_exts:
+            patterns.append(f"{base_path}/molecfit_weak/SCIENCE_TELLURIC_CORR_{file_prefix}*.sxs.{ext}.fits")
+            patterns.append(f"{base_path}/**/SCIENCE_TELLURIC_CORR_{file_prefix}*.sxs.{ext}.fits")
     else:
-        for ext in pepsi_exts:
-            patterns.append(f"{base_path}/{file_prefix}*.dxt.{ext}")
-            patterns.append(f"{base_path}/**/{file_prefix}*.dxt.{ext}")
+        for mode in pepsi_coadd_extraction_modes:
+            for ext in pepsi_coadd_exts:
+                patterns.append(f"{base_path}/{file_prefix}*.{mode}.{ext}")
+                patterns.append(f"{base_path}/**/{file_prefix}*.{mode}.{ext}")
+        for ext in pepsi_sxs_exts:
+            patterns.append(f"{base_path}/{file_prefix}*.sxs.{ext}")
+            patterns.append(f"{base_path}/**/{file_prefix}*.sxs.{ext}")
 
     return patterns
 
@@ -138,10 +159,10 @@ TELLURIC_REGIONS: dict[str, dict[str, list[tuple[float, float]]]] = {
 INSTRUMENTS: dict[str, dict[str, dict]] = {
     "lbt": {
         "PEPSI": {
-            "resolution": 120000,  # Default to HR mode
+            "resolution": 130000,  # Default to HR mode
             "resolution_modes": {
                 "standard": 50000,   # 300 µm fiber
-                "hr": 120000,        # 200 µm fiber (High Resolution)
+                "hr": 130000,        # 200 µm fiber (High Resolution)
                 "uhr": 270000,       # 100 µm fiber (Ultra-High Resolution)
             },
             "header_keys": _PEPSI_HEADER_KEYS,
@@ -224,7 +245,7 @@ def get_resolution(
         observatory: Observatory name (default: active OBSERVATORY)
         instrument: Instrument name (default: active INSTRUMENT)
         resolution_mode: Resolution mode (default: active RESOLUTION_MODE).
-            For PEPSI: "standard" (R=50k), "hr" (R=120k), "uhr" (R=270k)
+            For PEPSI: "standard" (R=50k), "hr" (R=130k), "uhr" (R=270k)
 
     Returns:
         Spectral resolution

@@ -151,6 +151,11 @@ def build_primary_diagnostic_context(
     with temporary_runtime_config(overrides):
         params = config.get_params(planet, ephemeris)
         model_params = _retrieval._coerce_model_params(params)
+        if observing_mode == "full":
+            raise NotImplementedError(
+                "Diagnostics currently do not support observing_mode='full'. "
+                "Run with 'red' or 'blue' individually."
+            )
         resolved_data_dir = config.get_data_dir(planet=planet, arm=observing_mode, epoch=epoch)
 
         wav_obs, data, sigma, phase = _retrieval.load_timeseries_data(resolved_data_dir)
