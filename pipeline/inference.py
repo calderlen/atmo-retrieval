@@ -1,4 +1,5 @@
 import os
+from time import perf_counter
 from typing import Callable
 import numpy as np
 import jax
@@ -89,9 +90,9 @@ def save_svi_outputs(
     np.save(os.path.join(output_dir, "svi_losses.npy"), losses_cpu)
     np.savez(os.path.join(output_dir, "svi_init_values.npz"), **init_cpu)
 
-    print(f"SVI params saved to {output_dir}/svi_params.npz")
-    print(f"SVI losses saved to {output_dir}/svi_losses.npy")
-    print(f"SVI init values saved to {output_dir}/svi_init_values.npz")
+    print(f"SVI params saved to {output_dir}/svi_params.npz", flush=True)
+    print(f"SVI losses saved to {output_dir}/svi_losses.npy", flush=True)
+    print(f"SVI init values saved to {output_dir}/svi_init_values.npz", flush=True)
 
 
 def build_svi_optimizer(
@@ -107,6 +108,108 @@ def build_svi_optimizer(
         return optim.Adam(schedule)
 
     return optim.Adam(lr)
+
+
+def _default_svi_report_interval(num_steps: int) -> int:
+    """Emit about twenty progress updates across the SVI run."""
+    return max(1, num_steps // 20)
+
+
+def _format_svi_loss(loss: float) -> str:
+    if np.isnan(loss):
+        return "nan"
+    if np.isposinf(loss):
+        return "inf"
+    if np.isneginf(loss):
+        return "-inf"
+    return f"{loss:.6g}"
+
+
+def _mean_finite(values: np.ndarray) -> float:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return float("nan")
+    return float(np.mean(finite))
+
+
+def _min_finite(values: np.ndarray) -> float:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return float("nan")
+    return float(np.min(finite))
+
+
+def _run_svi_with_logging(
+    svi: SVI,
+    rng_key: jax.Array,
+    *,
+    num_steps: int,
+    model_inputs: dict[str, object],
+    report_interval: int | None = None,
+) -> tuple[dict, jnp.ndarray]:
+    if num_steps < 1:
+        raise ValueError("num_steps must be a positive integer.")
+
+    interval = max(1, int(report_interval or _default_svi_report_interval(num_steps)))
+    start = perf_counter()
+
+    print("  SVI: JAX compile starting; first update may take a while...", flush=True)
+    initial_result = svi.run(
+        rng_key,
+        1,
+        progress_bar=False,
+        **model_inputs,
+    )
+    initial_losses = np.atleast_1d(
+        np.asarray(jax.device_get(initial_result.losses), dtype=float)
+    )
+    loss_chunks: list[np.ndarray] = [initial_losses]
+    steps_completed = 1
+    last_result = initial_result
+    elapsed = perf_counter() - start
+    print(
+        "  SVI progress: "
+        f"{steps_completed}/{num_steps} steps ({100.0 * steps_completed / num_steps:.1f}%), "
+        f"loss={_format_svi_loss(float(initial_losses[-1]))}, elapsed={elapsed:.1f}s",
+        flush=True,
+    )
+
+    while steps_completed < num_steps:
+        chunk_steps = min(interval, num_steps - steps_completed)
+        chunk_start = steps_completed + 1
+        last_result = svi.run(
+            rng_key,
+            chunk_steps,
+            progress_bar=False,
+            init_state=last_result.state,
+            **model_inputs,
+        )
+        chunk_losses = np.atleast_1d(
+            np.asarray(jax.device_get(last_result.losses), dtype=float)
+        )
+        loss_chunks.append(chunk_losses)
+        steps_completed += chunk_steps
+        elapsed = perf_counter() - start
+        print(
+            "  SVI progress: "
+            f"{steps_completed}/{num_steps} steps ({100.0 * steps_completed / num_steps:.1f}%), "
+            f"last loss={_format_svi_loss(float(chunk_losses[-1]))}, "
+            f"avg loss [{chunk_start}-{steps_completed}]={_format_svi_loss(_mean_finite(chunk_losses))}, "
+            f"elapsed={elapsed:.1f}s",
+            flush=True,
+        )
+
+    losses_cpu = np.concatenate(loss_chunks, axis=0)
+    total_elapsed = perf_counter() - start
+    print(
+        "  SVI warm-up complete: "
+        f"final loss={_format_svi_loss(float(losses_cpu[-1]))}, "
+        f"best loss={_format_svi_loss(_min_finite(losses_cpu))}, "
+        f"elapsed={total_elapsed:.1f}s",
+        flush=True,
+    )
+
+    return last_result.params, jnp.asarray(losses_cpu)
 
 
 def run_svi(
@@ -138,15 +241,12 @@ def run_svi(
     )
     optimizer = build_svi_optimizer(lr, decay_steps=lr_decay_steps, decay_rate=lr_decay_rate)
     svi = SVI(model_c, guide, optimizer, loss=Trace_ELBO())
-
-    svi_result = svi.run(
+    params, losses = _run_svi_with_logging(
+        svi,
         rng_key,
-        num_steps,
-        **model_inputs,
+        num_steps=num_steps,
+        model_inputs=model_inputs,
     )
-
-    params = svi_result.params
-    losses = svi_result.losses
 
     svi_median = guide[-1].median(params)
     Mp_init = Mp_upper_3sigma / 3.0 if Mp_upper_3sigma is not None else Mp_mean
