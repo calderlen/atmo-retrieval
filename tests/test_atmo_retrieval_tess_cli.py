@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import sys
 import tempfile
 import types
@@ -361,6 +362,53 @@ class AtmoRetrievalTessCliTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "must be one of"):
             module._parse_tess_quality_bitmask("badmask")
+
+    def test_tee_stream_mirrors_terminal_output_to_log(self):
+        fake_modules = self._fake_modules()
+        with patch.dict(sys.modules, fake_modules, clear=False):
+            module = self._load_module(fake_modules)
+
+        terminal_stream = io.StringIO()
+        log_stream = io.StringIO()
+        tee = module._TeeStream(terminal_stream, log_stream, "stdout")
+
+        self.assertEqual(tee.write("hello\n"), len("hello\n"))
+        tee.flush()
+
+        self.assertEqual(terminal_stream.getvalue(), "hello\n")
+        self.assertEqual(log_stream.getvalue(), "hello\n")
+
+    def test_run_transcript_log_captures_stdout_and_stderr(self):
+        fake_modules = self._fake_modules()
+        with patch.dict(sys.modules, fake_modules, clear=False):
+            module = self._load_module(fake_modules)
+
+        stdout_stream = io.StringIO()
+        stderr_stream = io.StringIO()
+        args = types.SimpleNamespace(
+            epoch=["20200101"],
+            mode="transmission",
+            planet="KELT-20b",
+        )
+
+        with patch.object(sys, "stdout", stdout_stream), patch.object(sys, "stderr", stderr_stream):
+            transcript = module._start_run_transcript_log(fake_modules["config"], args)
+            try:
+                print("stdout progress")
+                print("stderr warning", file=sys.stderr)
+            finally:
+                transcript.close()
+
+        log_files = sorted((Path(fake_modules["config"].DIR_SAVE) / "logs").glob("*.log"))
+        self.assertEqual(len(log_files), 1)
+        log_text = log_files[0].read_text()
+
+        self.assertIn("Run terminal log:", stdout_stream.getvalue())
+        self.assertIn("stdout progress", stdout_stream.getvalue())
+        self.assertIn("stderr warning", stderr_stream.getvalue())
+        self.assertIn("Run terminal log:", log_text)
+        self.assertIn("stdout progress", log_text)
+        self.assertIn("stderr warning", log_text)
 
     def test_tess_fit_rejects_emission_mode(self):
         fake_modules = self._fake_modules()

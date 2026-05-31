@@ -1,9 +1,12 @@
 import argparse
+from datetime import datetime
 import importlib.util
 import math
+from pathlib import Path
 import re
 import sys
 import os
+import traceback
 import warnings
 
 warnings.filterwarnings("once")
@@ -32,6 +35,160 @@ from pipeline.retrieval_binned import run_phase_binned_retrieval
 
 
 TESS_BTJD_OFFSET = 2457000.0
+
+
+class _TeeStream:
+    """Mirror a Python text stream into the active run transcript."""
+
+    def __init__(self, stream, log_file, stream_name: str):
+        self._stream = stream
+        self._log_file = log_file
+        self._stream_name = stream_name
+        self._log_failed = False
+
+    def write(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+
+        result = self._stream.write(text)
+        if not self._log_failed:
+            try:
+                self._log_file.write(text)
+            except Exception as exc:
+                self._log_failed = True
+                try:
+                    self._stream.write(
+                        f"\nWarning: run transcript {self._stream_name} write failed: {exc}\n"
+                    )
+                except Exception:
+                    pass
+        self.flush()
+        return result if result is not None else len(text)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        if not self._log_failed:
+            try:
+                self._log_file.flush()
+            except Exception:
+                self._log_failed = True
+
+    def isatty(self):
+        return bool(getattr(self._stream, "isatty", lambda: False)())
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", None)
+
+    @property
+    def errors(self):
+        return getattr(self._stream, "errors", None)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+class _RunTranscriptLog:
+    def __init__(self, log_path: Path, log_file, original_stdout, original_stderr):
+        self.log_path = log_path
+        self._log_file = log_file
+        self._original_stdout = original_stdout
+        self._original_stderr = original_stderr
+        self._stdout_tee = _TeeStream(original_stdout, log_file, "stdout")
+        self._stderr_tee = _TeeStream(original_stderr, log_file, "stderr")
+        self.enabled = True
+
+    def start(self):
+        sys.stdout = self._stdout_tee
+        sys.stderr = self._stderr_tee
+
+    def write_exception(self):
+        if not self.enabled:
+            return
+        try:
+            self._log_file.write("\nUnhandled exception:\n")
+            self._log_file.write(traceback.format_exc())
+            self._log_file.flush()
+        except Exception:
+            pass
+
+    def close(self):
+        if not self.enabled:
+            return
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            if sys.stdout is self._stdout_tee:
+                sys.stdout = self._original_stdout
+            if sys.stderr is self._stderr_tee:
+                sys.stderr = self._original_stderr
+            try:
+                self._log_file.close()
+            finally:
+                self.enabled = False
+
+
+class _NoopTranscriptLog:
+    enabled = False
+    log_path = None
+
+    def write_exception(self):
+        return None
+
+    def close(self):
+        return None
+
+
+def _compact_filename_slug(value, *, default: str = "run") -> str:
+    text = str(value or "").strip()
+    slug = re.sub(r"[^A-Za-z0-9]+", "", text).lower()
+    return slug or default
+
+
+def _filename_slug(value, *, default: str = "run") -> str:
+    text = str(value or "").strip()
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower()
+    return slug or default
+
+
+def _start_run_transcript_log(runtime_config, args):
+    try:
+        log_dir = Path(runtime_config.DIR_SAVE) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        epochs = getattr(args, "epoch", None) or []
+        if isinstance(epochs, str):
+            epoch_text = epochs
+        else:
+            epoch_text = "_".join(str(epoch) for epoch in epochs) or "noepoch"
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        planet_part = _compact_filename_slug(
+            getattr(runtime_config, "PLANET", getattr(args, "planet", None)),
+            default="planet",
+        )
+        mode_part = _filename_slug(
+            getattr(args, "mode", getattr(runtime_config, "RETRIEVAL_MODE", None)),
+            default="mode",
+        )
+        epoch_part = _filename_slug(epoch_text, default="noepoch")
+        log_path = log_dir / f"{planet_part}_{mode_part}_{epoch_part}_{timestamp}.log"
+
+        log_file = log_path.open("a", encoding="utf-8", buffering=1)
+        transcript = _RunTranscriptLog(log_path, log_file, sys.stdout, sys.stderr)
+        transcript.start()
+        print(f"Run terminal log: {log_path}", flush=True)
+        return transcript
+    except Exception as exc:
+        print(f"Warning: failed to start run transcript log: {exc}", file=sys.stderr, flush=True)
+        return _NoopTranscriptLog()
 
 
 def _normalize_epoch_args(raw_epochs) -> list[str]:
@@ -1089,23 +1246,7 @@ def print_config_summary(config, args):
     print("="*70 + "\n")
 
 
-def main():
-    parser = create_parser()
-    args = parser.parse_args()
-    args.epoch = _normalize_epoch_args(args.epoch)
-    primary_epoch = args.epoch[0]
-
-    runtime_config = config
-    runtime_config.apply_runtime_profile(args.profile)
-
-    # Load config
-    if args.config:
-        print(f"Loading custom config: {args.config}")
-        custom_config = load_custom_config(args.config)
-        runtime_config = apply_custom_config(custom_config)
-    # Apply CLI overrides
-    runtime_config = apply_cli_overrides(args)
-
+def _run_configured_retrieval(runtime_config, args, primary_epoch):
     if len(args.epoch) > 1 and (args.phase_bin or args.all_phase_bins):
         raise ValueError(
             "Phase-binned retrievals only support a single --epoch. "
@@ -1205,6 +1346,33 @@ def main():
         )
 
     return 0
+
+
+def main():
+    parser = create_parser()
+    args = parser.parse_args()
+    args.epoch = _normalize_epoch_args(args.epoch)
+    primary_epoch = args.epoch[0]
+
+    runtime_config = config
+    runtime_config.apply_runtime_profile(args.profile)
+
+    # Load config
+    if args.config:
+        print(f"Loading custom config: {args.config}")
+        custom_config = load_custom_config(args.config)
+        runtime_config = apply_custom_config(custom_config)
+    # Apply CLI overrides
+    runtime_config = apply_cli_overrides(args)
+
+    transcript_log = _start_run_transcript_log(runtime_config, args)
+    try:
+        return _run_configured_retrieval(runtime_config, args, primary_epoch)
+    except BaseException:
+        transcript_log.write_exception()
+        raise
+    finally:
+        transcript_log.close()
 
 
 if __name__ == "__main__":
