@@ -12,7 +12,7 @@ import numpy as np
 from scipy.optimize import least_squares
 
 import config
-from config.instrument_config import get_resolution
+import config_utils
 from typing import Optional
 
 # Speed of light in km/s
@@ -322,7 +322,7 @@ def remove_doppler_shadow(
     v_grid = (wave - wave_ref) / wave_ref * C_KMS
 
     # Get instrument resolution
-    R = get_resolution()
+    R = config_utils.get_resolution()
 
     # Compute shadow model
     shadow_profiles, baseline = compute_doppler_shadow(

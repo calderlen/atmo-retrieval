@@ -46,8 +46,8 @@ import numpyro.distributions as dist
 import pyfastchem
 from exojax.database import molinfo
 
-from config import chemistry_config as chem_config
-from config import numerics_config as numerics_config
+import config as chem_config
+import config as numerics_config
 
 logger = logging.getLogger(__name__)
 

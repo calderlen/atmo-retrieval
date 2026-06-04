@@ -9,7 +9,7 @@ import numpy as np
 from scipy import stats
 
 import config
-from config.planets_config import PHASE_BINS, get_params
+import config_utils
 from dataio.collapse_transmission_timeseries_to_1d import summarize_phase_coverage
 from pipeline.retrieval import (
     _describe_sysrem_inputs,
@@ -31,7 +31,7 @@ def run_phase_binned_retrieval(
     **retrieval_kwargs,
 ) -> dict[str, dict]:
     if phase_bins is None:
-        phase_bins = list(PHASE_BINS.keys())
+        phase_bins = list(config.PHASE_BINS.keys())
     if base_output_dir is None:
         base_output_dir = config.DEFAULT_PHASE_BINNED_OUTPUT_DIR
     if mode != "transmission":
@@ -47,12 +47,12 @@ def run_phase_binned_retrieval(
             "--phase-bin / --all-phase-bins."
         )
 
-    resolved_data_dir = config.get_data_dir(epoch=epoch)
+    resolved_data_dir = config_utils.get_data_dir(epoch=epoch)
 
     wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
 
     phase = _normalize_phase(phase)
-    params = retrieval_kwargs.get("params", get_params())
+    params = retrieval_kwargs.get("params", config_utils.get_params())
     apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT)
 
     sysrem_inputs = None
@@ -78,7 +78,7 @@ def run_phase_binned_retrieval(
         info = coverage["bins"].get(bin_name, {})
         count = info.get("count", config.DEFAULT_BIN_INFO_COUNT)
         if count > 0:
-            print(f"  {bin_name} ({PHASE_BINS[bin_name]}): {count} exposures")
+            print(f"  {bin_name} ({config.PHASE_BINS[bin_name]}): {count} exposures")
             print(f"    Phase range: {info['phase_min']:.4f} to {info['phase_max']:.4f}")
         else:
             print(f"  {bin_name}: NO EXPOSURES (will skip)")
@@ -94,7 +94,7 @@ def run_phase_binned_retrieval(
             continue
         
         print(f"\n{'='*70}")
-        print(f"Running retrieval for phase bin: {bin_name} ({PHASE_BINS[bin_name]})")
+        print(f"Running retrieval for phase bin: {bin_name} ({config.PHASE_BINS[bin_name]})")
         print(f"{'='*70}")
         
         # Filter data to this phase bin
@@ -225,7 +225,7 @@ def compare_phase_posteriors(
                 samples_a = samples_by_bin[bin_a]
                 samples_b = samples_by_bin[bin_b]
                 
-                # Kolmogorov-Smirnov test
+                # Kolmogorov-Smirnov comparison
                 ks_stat, ks_pval = stats.ks_2samp(samples_a, samples_b)
                 param_stats[f"ks_{bin_a}_vs_{bin_b}"] = {
                     "statistic": float(ks_stat),
@@ -259,14 +259,14 @@ def compare_phase_posteriors(
                 std = param_stats[f"{bin_name}_std"]
                 print(f"  {bin_name}: {mean:.3f} +/- {std:.3f}")
         
-        # Print KS test results
+        # Print KS comparison results
         for i, bin_a in enumerate(bin_list):
             for bin_b in bin_list[i+1:]:
                 key = f"ks_{bin_a}_vs_{bin_b}"
                 if key in param_stats:
                     pval = param_stats[key]["p_value"]
                     sig = "***" if pval < 0.001 else "**" if pval < 0.01 else "*" if pval < 0.05 else ""
-                    print(f"  KS test {bin_a} vs {bin_b}: p = {pval:.4f} {sig}")
+                    print(f"  KS comparison {bin_a} vs {bin_b}: p = {pval:.4f} {sig}")
     
     print("=" * 70 + "\n")
     
@@ -324,7 +324,7 @@ def detect_asymmetry(
     significance_threshold: float = 2.0,
 ) -> dict:
     if "T12" not in posteriors or "T34" not in posteriors:
-        return {"error": "Need both T12 and T34 bins for asymmetry test"}
+        return {"error": "Need both T12 and T34 bins for asymmetry comparison"}
     
     samples_ingress = posteriors["T12"]["samples"][param]
     samples_egress = posteriors["T34"]["samples"][param]

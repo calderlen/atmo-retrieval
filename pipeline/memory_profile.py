@@ -12,6 +12,7 @@ from typing import Iterable, cast
 import os
 
 import config
+import config_utils
 from opacities import load_atomic_opacities, load_molecular_opacities, setup_cia_opacities
 from exojax.rt import ArtEmisPure, ArtTransPure
 from physics.grid_setup import setup_wavenumber_grid
@@ -299,7 +300,7 @@ def run_memory_profile(
 
         component_results: dict[str, ProfileResult] = {}
         for arm in ("red", "blue"):
-            arm_wav_min, arm_wav_max = config.get_wavelength_range(mode=arm)
+            arm_wav_min, arm_wav_max = config_utils.get_wavelength_range(mode=arm)
             print(f"\n=== {arm.upper()} arm ===")
             component_results[arm] = _run_single_memory_profile_for_range(
                 mode=mode,
@@ -323,7 +324,7 @@ def run_memory_profile(
         print("Done.")
         return result
 
-    wav_min, wav_max = config.get_wavelength_range()
+    wav_min, wav_max = config_utils.get_wavelength_range()
     if wav_min_override is not None and wav_max_override is not None:
         wav_min, wav_max = wav_min_override, wav_max_override
     result = _run_single_memory_profile_for_range(
@@ -351,15 +352,15 @@ def run_memory_sweep(
     print("-" * 70)
     print(f"Mode: {mode}")
     if config.OBSERVING_MODE == "full":
-        red_wav_min, red_wav_max = config.get_wavelength_range(mode="red")
-        blue_wav_min, blue_wav_max = config.get_wavelength_range(mode="blue")
+        red_wav_min, red_wav_max = config_utils.get_wavelength_range(mode="red")
+        blue_wav_min, blue_wav_max = config_utils.get_wavelength_range(mode="blue")
         print(
             "Arm ranges: "
             f"red {red_wav_min:.2f}-{red_wav_max:.2f} Angstrom, "
             f"blue {blue_wav_min:.2f}-{blue_wav_max:.2f} Angstrom"
         )
     else:
-        base_wav_min, base_wav_max = config.get_wavelength_range()
+        base_wav_min, base_wav_max = config_utils.get_wavelength_range()
         print(f"Base range: {base_wav_min:.2f}-{base_wav_max:.2f} Angstrom")
 
     for nfree in nfree_values:

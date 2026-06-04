@@ -14,6 +14,7 @@ import numpy as np
 from numpyro.infer import SVI, Trace_ELBO
 
 import config
+import config_utils
 from physics.chemistry import ConstantVMR, FastChemHybridChemistry, FreeVMR
 from physics.model import compute_atmospheric_state_from_posterior
 from pipeline import retrieval as _retrieval
@@ -60,11 +61,11 @@ def temporary_runtime_config(overrides: dict[str, Any]):
             previous[name] = _deepcopy_or_value(getattr(config, name))
     try:
         for name, value in overrides.items():
-            config.set_runtime_config(name, _deepcopy_or_value(value))
+            config_utils.set_runtime_config(name, _deepcopy_or_value(value))
         yield
     finally:
         for name, value in previous.items():
-            config.set_runtime_config(name, _deepcopy_or_value(value))
+            config_utils.set_runtime_config(name, _deepcopy_or_value(value))
 
 
 def _filter_species_map(
@@ -174,18 +175,18 @@ def build_diagnostic_context(
     )
 
     with temporary_runtime_config(overrides):
-        params = config.get_params(planet, ephemeris)
+        params = config_utils.get_params(planet, ephemeris)
         model_params = _retrieval._coerce_model_params(params)
         shared_art = _retrieval._build_art_for_mode(mode)
         shared_region_name = _retrieval._default_region_name_for_mode(mode)
-        instrument_resolution = config.get_resolution(resolution_mode=resolution_mode)
+        instrument_resolution = config_utils.get_resolution(resolution_mode=resolution_mode)
         apply_sysrem_enabled = (
             bool(config.APPLY_SYSREM_DEFAULT) if apply_sysrem is None else bool(apply_sysrem)
         )
         subtract_per_exposure_mean = bool(config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT)
 
         if observing_mode == "full":
-            arm_dirs = config.get_full_arm_data_dirs(epoch=epoch, mode=mode)
+            arm_dirs = config_utils.get_full_arm_data_dirs(epoch=epoch, mode=mode)
             component_specs = [
                 _build_timeseries_component_spec(
                     name="spectroscopy_red",
@@ -214,7 +215,7 @@ def build_diagnostic_context(
                 shared_velocity_component_names=tuple(str(spec["name"]) for spec in component_specs),
             )
         else:
-            resolved_data_dir = config.get_data_dir(
+            resolved_data_dir = config_utils.get_data_dir(
                 planet=planet,
                 arm=observing_mode,
                 epoch=epoch,

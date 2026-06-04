@@ -25,15 +25,14 @@ from typing import Any
 import numpy as np
 
 import config
-from config.planets_config import EPHEMERIS, get_params
+import config_utils
+from config import EPHEMERIS, FULL_ARM_MEMBERS
+from config_utils import get_params
 from dataio.collapse_transmission_timeseries_to_1d import (
     get_orbital_phase,
     get_pepsi_data,
     get_sysrem_chunk_indices,
 )
-
-
-FULL_ARM_MEMBERS: tuple[str, ...] = ("red", "blue")
 
 
 EMISSION_PHASE_BINS = {
@@ -47,11 +46,11 @@ EMISSION_PHASE_BINS = {
 
 
 def _output_dir_for(planet: str, epoch: str, arm: str) -> Path:
-    return config.get_data_dir(planet=planet, epoch=epoch, arm=arm, mode="emission")
+    return config_utils.get_data_dir(planet=planet, epoch=epoch, arm=arm, mode="emission")
 
 
 def _raw_input_dir_for(planet: str, epoch: str) -> Path:
-    return config.get_raw_hrs_dir(planet=planet, epoch=epoch, mode="emission")
+    return config_utils.get_raw_hrs_dir(planet=planet, epoch=epoch, mode="emission")
 
 
 def _planet_config(planet: str, ephemeris: str) -> dict[str, Any]:
@@ -370,7 +369,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--ephemeris",
         type=str,
         default=EPHEMERIS,
-        help="Ephemeris key from config.planets_config (default: %(default)s)",
+        help="Ephemeris key from config (default: %(default)s)",
     )
     parser.add_argument(
         "--arm",

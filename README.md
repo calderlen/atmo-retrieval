@@ -108,17 +108,8 @@ modules:
 ```text
 .
 ├── atmo_retrieval.py
-├── config
-│   ├── __init__.py
-│   ├── chemistry_config.py
-│   ├── data_config.py
-│   ├── inference_config.py
-│   ├── instrument_config.py
-│   ├── model_config.py
-│   ├── paths_config.py
-│   ├── planets_config.py
-│   ├── photometry_config.py
-│   └── tellurics_config.py
+├── config.py
+├── config_utils.py
 ├── opacities
 │   ├── __init__.py
 │   ├── atomic_sources.py
@@ -146,7 +137,6 @@ modules:
 │   ├── __init__.py
 │   ├── aliasing.py
 │   └── plot.py
-└── tests
 ```
 
 ## expected input directory structure

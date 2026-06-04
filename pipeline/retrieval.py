@@ -22,6 +22,7 @@ from exojax.utils.astrofunc import gravity_jupiter as gravity_surface
 from exojax.utils.constants import RJ, Rs
 
 import config
+import config_utils
 from dataio.load import (
     load_nasa_archive_spectrum,
     load_observed_spectrum,
@@ -620,14 +621,9 @@ def _normalize_phase(phase: np.ndarray) -> np.ndarray:
 
     phase_min = float(np.nanmin(phase))
     phase_max = float(np.nanmax(phase))
-    median = float(np.nanmedian(phase))
-
-    if 0.0 <= phase_min and phase_max <= 1.0 and abs(median - 0.5) < 0.2:
-        print("  Phase appears centered on 0.5; shifting to mid-transit at 0.0")
-        phase = phase - 0.5
 
     if phase_min < -0.5 or phase_max > 0.5:
-        phase = (phase + 0.5) % 1.0 - 0.5
+        phase = 0.5 - ((0.5 - phase) % 1.0)
 
     return phase
 
@@ -1572,7 +1568,7 @@ def _load_joint_spectroscopic_component(
     region_name = _normalize_region_name(spec.get("region_name"), component_mode)
     name = str(spec.get("name", f"{component_mode}_component"))
     data_format = str(spec.get("data_format", "spectrum")).lower().strip()
-    instrument_resolution = float(spec.get("instrument_resolution", config.get_resolution()))
+    instrument_resolution = float(spec.get("instrument_resolution", config_utils.get_resolution()))
     radial_velocity_mode = str(spec.get("radial_velocity_mode", "orbital" if data_format == "timeseries" else "none"))
     likelihood_kind = str(spec.get("likelihood_kind", "matched_filter" if data_format == "timeseries" else "gaussian"))
     phase_mode = spec.get("phase_mode", config.DEFAULT_PHASE_MODE if radial_velocity_mode == "orbital" else None)
@@ -1909,12 +1905,12 @@ def run_retrieval(
         raise ValueError("chemistry_model must be passed explicitly.")
 
     # Create timestamped output directory
-    base_dir = config.DIR_SAVE or config.get_output_dir()
-    output_dir = config.create_timestamped_dir(base_dir)
+    base_dir = config.DIR_SAVE or config_utils.get_output_dir()
+    output_dir = config_utils.create_timestamped_dir(base_dir)
     print(f"\nOutput directory: {output_dir}")
 
     # Save run configuration
-    config.save_run_config(
+    config_utils.save_run_config(
         output_dir=output_dir,
         mode=mode,
         pt_profile=pt_profile,
@@ -1928,7 +1924,7 @@ def run_retrieval(
     )
 
     # Get planet parameters
-    params = config.get_params()
+    params = config_utils.get_params()
     print(f"\nTarget: {config.PLANET} ({config.EPHEMERIS})")
 
     apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT and data_format == "timeseries")
@@ -1950,7 +1946,7 @@ def run_retrieval(
     primary_component_name = "spectroscopy_red" if full_arm_mode else "spectroscopy"
 
     if full_arm_mode:
-        arm_dirs = config.get_full_arm_data_dirs(epoch=primary_epoch, mode=mode)
+        arm_dirs = config_utils.get_full_arm_data_dirs(epoch=primary_epoch, mode=mode)
         blue_component_spec = {
             "name": "spectroscopy_blue",
             "mode": mode,
@@ -1961,7 +1957,7 @@ def run_retrieval(
             "radial_velocity_mode": "orbital",
             "likelihood_kind": "matched_filter",
             "subtract_per_exposure_mean": config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT,
-            "instrument_resolution": config.get_resolution(),
+            "instrument_resolution": config_utils.get_resolution(),
         }
         joint_spectra = list(joint_spectra or []) + [blue_component_spec]
 
@@ -1996,15 +1992,15 @@ def run_retrieval(
                     "a second spectroscopic component."
                 )
                 data_paths = (
-                    config.get_transmission_paths(epoch=primary_epoch, arm="red")
+                    config_utils.get_transmission_paths(epoch=primary_epoch, arm="red")
                     if mode == "transmission"
-                    else config.get_emission_paths(epoch=primary_epoch, arm="red")
+                    else config_utils.get_emission_paths(epoch=primary_epoch, arm="red")
                 )
             else:
-                resolved_data_dir = config.get_data_dir(epoch=primary_epoch)
+                resolved_data_dir = config_utils.get_data_dir(epoch=primary_epoch)
                 data_paths = (
-                    config.get_transmission_paths(epoch=primary_epoch) if mode == "transmission"
-                    else config.get_emission_paths(epoch=primary_epoch)
+                    config_utils.get_transmission_paths(epoch=primary_epoch) if mode == "transmission"
+                    else config_utils.get_emission_paths(epoch=primary_epoch)
                 )
 
             if data_format == "timeseries":
@@ -2062,7 +2058,7 @@ def run_retrieval(
     # Setup instrumental resolution
     print("\n[2/7] Setting up instrumental resolution...")
     with _StepTimer("Step 2/7"):
-        Rinst = config.get_resolution()
+        Rinst = config_utils.get_resolution()
         print(f"  Instrument resolving power: R = {Rinst:.0f}")
 
     nu_grid = None
@@ -2081,7 +2077,7 @@ def run_retrieval(
                 "red and blue components build arm-specific grids in step 6."
             )
         else:
-            wav_min, wav_max = config.get_wavelength_range()
+            wav_min, wav_max = config_utils.get_wavelength_range()
             nu_grid, _wav_grid, _res_high = setup_wavenumber_grid(
                 wav_min - config.WAV_MIN_OFFSET,
                 wav_max + config.WAV_MAX_OFFSET,

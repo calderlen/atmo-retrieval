@@ -22,15 +22,20 @@ from astropy.coordinates import SkyCoord, EarthLocation
 import astropy.units as u
 
 import config
-from config.instrument_config import (
+import config_utils
+from config import (
+    EPHEMERIS,
     OBSERVATORY,
+    PHASE_BINS,
+    PLANETS,
+    TELLURIC_REGIONS,
+)
+from config_utils import (
     get_data_patterns,
     get_header_keys,
     get_fits_columns,
     get_resolution,
-    TELLURIC_REGIONS,
 )
-from config.planets_config import PHASE_BINS, PLANETS, EPHEMERIS
 from dataio.horus import remove_doppler_shadow as _remove_shadow
 
 
@@ -596,7 +601,7 @@ def get_pepsi_data(
     ckms = 2.9979e5
 
     if data_dir is None:
-        data_dir = config.get_raw_hrs_dir(
+        data_dir = config_utils.get_raw_hrs_dir(
             planet=planet_name,
             epoch=observation_epoch,
             mode="transmission",
@@ -946,7 +951,7 @@ def main():
             args.epoch,
             args.planet,
             prefer_molecfit,
-            config.get_raw_hrs_dir(planet=args.planet, epoch=args.epoch, mode="transmission"),
+            config_utils.get_raw_hrs_dir(planet=args.planet, epoch=args.epoch, mode="transmission"),
             barycentric_correction=args.barycorr,
             apply_introduced_shift=args.introduced_shift if prefer_molecfit else False,
         )
@@ -957,7 +962,7 @@ def main():
                 args.epoch,
                 args.planet,
                 False,
-                config.get_raw_hrs_dir(planet=args.planet, epoch=args.epoch, mode="transmission"),
+                config_utils.get_raw_hrs_dir(planet=args.planet, epoch=args.epoch, mode="transmission"),
                 barycentric_correction=args.barycorr,
                 apply_introduced_shift=False,
             )
@@ -1043,7 +1048,7 @@ def main():
     if args.output_dir is None:
         planet_dir = args.planet.lower().replace('-', '')
         args.output_dir = str(
-            config.get_data_dir(
+            config_utils.get_data_dir(
                 planet=args.planet,
                 epoch=args.epoch,
                 arm=args.arm,

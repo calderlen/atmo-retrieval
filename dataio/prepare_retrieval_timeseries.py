@@ -25,7 +25,9 @@ from typing import Any
 import numpy as np
 
 import config
-from config.planets_config import EPHEMERIS, PHASE_BINS, get_params
+import config_utils
+from config import EPHEMERIS, FULL_ARM_MEMBERS, PHASE_BINS
+from config_utils import get_params
 from dataio.collapse_transmission_timeseries_to_1d import (
     compute_contact_phases,
     get_orbital_phase,
@@ -36,15 +38,12 @@ from dataio.collapse_transmission_timeseries_to_1d import (
 from dataio.horus import remove_doppler_shadow
 
 
-FULL_ARM_MEMBERS: tuple[str, ...] = ("red", "blue")
-
-
 def _output_dir_for(planet: str, epoch: str, arm: str) -> Path:
-    return config.get_data_dir(planet=planet, epoch=epoch, arm=arm, mode="transmission")
+    return config_utils.get_data_dir(planet=planet, epoch=epoch, arm=arm, mode="transmission")
 
 
 def _raw_input_dir_for(planet: str, epoch: str) -> Path:
-    return config.get_raw_hrs_dir(planet=planet, epoch=epoch, mode="transmission")
+    return config_utils.get_raw_hrs_dir(planet=planet, epoch=epoch, mode="transmission")
 
 
 def _nearest_transit_midpoint(jd: np.ndarray, reference_epoch: float, period: float) -> float:
@@ -409,7 +408,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--ephemeris",
         type=str,
         default=EPHEMERIS,
-        help="Ephemeris key from config.planets_config (default: %(default)s)",
+        help="Ephemeris key from config (default: %(default)s)",
     )
     parser.add_argument(
         "--arm",

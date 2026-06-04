@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 
-from config import numerics_config as numerics_config
+import config as numerics_config
 
 
 def isothermal_profile(art: object, T0: float) -> jnp.ndarray:

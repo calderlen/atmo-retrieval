@@ -29,6 +29,7 @@ warnings.filterwarnings("once")
 #os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import config
+import config_utils
 from pipeline.retrieval import (
     make_bandpass_constraints_from_tbl,
     make_joint_spectrum_component_from_tbl,
@@ -255,14 +256,14 @@ def _build_multi_epoch_joint_spectra(
     component_specs: list[dict[str, object]] = []
     for epoch in epochs[1:]:
         if config.OBSERVING_MODE == "full":
-            arm_dirs = config.get_full_arm_data_dirs(epoch=epoch, mode=mode)
+            arm_dirs = config_utils.get_full_arm_data_dirs(epoch=epoch, mode=mode)
             arm_entries = (
                 ("red", arm_dirs["red"]),
                 ("blue", arm_dirs["blue"]),
             )
         else:
             arm_entries = (
-                (str(config.OBSERVING_MODE), config.get_data_dir(epoch=epoch)),
+                (str(config.OBSERVING_MODE), config_utils.get_data_dir(epoch=epoch)),
             )
 
         for arm_label, data_dir in arm_entries:
@@ -277,7 +278,7 @@ def _build_multi_epoch_joint_spectra(
                     "radial_velocity_mode": radial_velocity_mode,
                     "likelihood_kind": likelihood_kind,
                     "subtract_per_exposure_mean": subtract_per_exposure_mean,
-                    "instrument_resolution": config.get_resolution(),
+                    "instrument_resolution": config_utils.get_resolution(),
                 }
             )
 
@@ -314,11 +315,11 @@ def create_parser():
     config_group.add_argument(
         "--profile",
         type=str,
-        choices=config.list_runtime_profiles(),
-        default=config.get_runtime_profile_name(),
+        choices=config_utils.list_runtime_profiles(),
+        default=config_utils.get_runtime_profile_name(),
         help=(
             "Named runtime profile for machine-specific defaults "
-            f"(default: {config.get_runtime_profile_name()}, env: {config.CONFIG_PROFILE_ENVVAR})"
+            f"(default: {config_utils.get_runtime_profile_name()}, env: {config.CONFIG_PROFILE_ENVVAR})"
         ),
     )
     config_group.add_argument("--output", type=str, default=None, help="Output directory (default: output/{planet}/{ephemeris}/{mode})")
@@ -633,7 +634,7 @@ def create_parser():
     inference_group.add_argument(
         "--quick",
         action="store_true",
-        help="Quick test mode (100 SVI steps, 100 MCMC samples)"
+        help="Quick mode (100 SVI steps, 100 MCMC samples)"
     )
 
     # Opacity options
@@ -817,7 +818,7 @@ def load_custom_config(config_path):
 def apply_custom_config(custom_config):
     for name in dir(custom_config):
         if name.isupper():
-            config.set_runtime_config(name, getattr(custom_config, name))
+            config_utils.set_runtime_config(name, getattr(custom_config, name))
 
     return config
 
@@ -828,40 +829,40 @@ def apply_cli_overrides(args):
 
     # Planet and ephemeris selection
     if args.planet:
-        config.set_runtime_config("PLANET", args.planet)
+        config_utils.set_runtime_config("PLANET", args.planet)
     if args.ephemeris:
-        config.set_runtime_config("EPHEMERIS", args.ephemeris)
+        config_utils.set_runtime_config("EPHEMERIS", args.ephemeris)
 
     # Retrieval mode and observing mode must be synced before derived paths are built.
     if args.mode:
-        config.set_runtime_config("RETRIEVAL_MODE", args.mode)
+        config_utils.set_runtime_config("RETRIEVAL_MODE", args.mode)
     if args.wavelength_range:
-        config.set_runtime_config("OBSERVING_MODE", args.wavelength_range)
+        config_utils.set_runtime_config("OBSERVING_MODE", args.wavelength_range)
     if args.resolution_mode:
-        config.set_runtime_config("RESOLUTION_MODE", args.resolution_mode)
+        config_utils.set_runtime_config("RESOLUTION_MODE", args.resolution_mode)
 
     # Validate planet/ephemeris combination
-    params = config.get_params()  # Will raise if invalid
+    params = config_utils.get_params()  # Will raise if invalid
 
     # Chemistry model
     if args.chemistry_model:
-        config.set_runtime_config("CHEMISTRY_MODEL_DEFAULT", args.chemistry_model)
+        config_utils.set_runtime_config("CHEMISTRY_MODEL_DEFAULT", args.chemistry_model)
     if args.fastchem_parameter_file:
-        config.set_runtime_config("FASTCHEM_PARAMETER_FILE", args.fastchem_parameter_file)
+        config_utils.set_runtime_config("FASTCHEM_PARAMETER_FILE", args.fastchem_parameter_file)
     if args.nlayer is not None:
         if args.nlayer < 1:
             raise ValueError("--nlayer must be >= 1.")
-        config.set_runtime_config("NLAYER", args.nlayer)
+        config_utils.set_runtime_config("NLAYER", args.nlayer)
     if args.n_spectral_points is not None:
         if args.n_spectral_points < 1:
             raise ValueError("--n-spectral-points must be >= 1.")
-        config.set_runtime_config("N_SPECTRAL_POINTS", args.n_spectral_points)
+        config_utils.set_runtime_config("N_SPECTRAL_POINTS", args.n_spectral_points)
 
     # Output directory (auto-set based on planet/ephemeris/mode)
     if args.output:
-        config.set_runtime_config("DIR_SAVE", args.output)
+        config_utils.set_runtime_config("DIR_SAVE", args.output)
     else:
-        config.set_runtime_config("DIR_SAVE", config.get_output_dir())
+        config_utils.set_runtime_config("DIR_SAVE", config_utils.get_output_dir())
     os.makedirs(config.DIR_SAVE, exist_ok=True)
 
     # HITRAN credentials (for HITEMP downloads)
@@ -874,28 +875,28 @@ def apply_cli_overrides(args):
     # NOTE: --wavelength-range full has no single on-disk DATA_DIR because the
     # red and blue arms are stored separately and loaded as two spectroscopic
     # components. Leave DATA_DIR unset in that case; run_retrieval() reads per-
-    # arm directories via config.get_full_arm_data_dirs().
+    # arm directories via config_utils.get_full_arm_data_dirs().
     if config.OBSERVING_MODE == "full":
-        config.set_runtime_config("DATA_DIR", None)
-        config.set_runtime_config("TRANSMISSION_DATA", None)
-        config.set_runtime_config("EMISSION_DATA", None)
+        config_utils.set_runtime_config("DATA_DIR", None)
+        config_utils.set_runtime_config("TRANSMISSION_DATA", None)
+        config_utils.set_runtime_config("EMISSION_DATA", None)
     else:
-        config.set_runtime_config("DATA_DIR", config.get_data_dir(epoch=primary_epoch))
-        config.set_runtime_config(
+        config_utils.set_runtime_config("DATA_DIR", config_utils.get_data_dir(epoch=primary_epoch))
+        config_utils.set_runtime_config(
             "TRANSMISSION_DATA",
-            config.get_transmission_paths(epoch=primary_epoch),
+            config_utils.get_transmission_paths(epoch=primary_epoch),
         )
-        config.set_runtime_config(
+        config_utils.set_runtime_config(
             "EMISSION_DATA",
-            config.get_emission_paths(epoch=primary_epoch),
+            config_utils.get_emission_paths(epoch=primary_epoch),
         )
 
     # Quick mode
     if args.quick:
-        config.set_runtime_config("SVI_NUM_STEPS", config.QUICK_SVI_STEPS)
-        config.set_runtime_config("MCMC_NUM_WARMUP", config.QUICK_MCMC_WARMUP)
-        config.set_runtime_config("MCMC_NUM_SAMPLES", config.QUICK_MCMC_SAMPLES)
-        config.set_runtime_config("MCMC_NUM_CHAINS", config.QUICK_MCMC_CHAINS)
+        config_utils.set_runtime_config("SVI_NUM_STEPS", config.QUICK_SVI_STEPS)
+        config_utils.set_runtime_config("MCMC_NUM_WARMUP", config.QUICK_MCMC_WARMUP)
+        config_utils.set_runtime_config("MCMC_NUM_SAMPLES", config.QUICK_MCMC_SAMPLES)
+        config_utils.set_runtime_config("MCMC_NUM_CHAINS", config.QUICK_MCMC_CHAINS)
         print(
             f"Quick mode: {config.QUICK_SVI_STEPS} SVI steps, "
             f"{config.QUICK_MCMC_SAMPLES} MCMC samples"
@@ -903,48 +904,48 @@ def apply_cli_overrides(args):
 
     # Inference parameters
     if args.svi_steps is not None:
-        config.set_runtime_config("SVI_NUM_STEPS", args.svi_steps)
+        config_utils.set_runtime_config("SVI_NUM_STEPS", args.svi_steps)
     if args.svi_learning_rate is not None:
         if args.svi_learning_rate <= 0:
             raise ValueError("--svi-learning-rate must be > 0.")
-        config.set_runtime_config("SVI_LEARNING_RATE", args.svi_learning_rate)
+        config_utils.set_runtime_config("SVI_LEARNING_RATE", args.svi_learning_rate)
     if args.no_svi_lr_decay:
-        config.set_runtime_config("SVI_LR_DECAY_STEPS", None)
-        config.set_runtime_config("SVI_LR_DECAY_RATE", None)
+        config_utils.set_runtime_config("SVI_LR_DECAY_STEPS", None)
+        config_utils.set_runtime_config("SVI_LR_DECAY_RATE", None)
     if args.svi_lr_decay_steps is not None:
         if args.svi_lr_decay_steps < 1:
             raise ValueError("--svi-lr-decay-steps must be >= 1.")
-        config.set_runtime_config("SVI_LR_DECAY_STEPS", args.svi_lr_decay_steps)
+        config_utils.set_runtime_config("SVI_LR_DECAY_STEPS", args.svi_lr_decay_steps)
     if args.svi_lr_decay_rate is not None:
         if not (0 < args.svi_lr_decay_rate < 1):
             raise ValueError("--svi-lr-decay-rate must be between 0 and 1.")
-        config.set_runtime_config("SVI_LR_DECAY_RATE", args.svi_lr_decay_rate)
+        config_utils.set_runtime_config("SVI_LR_DECAY_RATE", args.svi_lr_decay_rate)
     if (config.SVI_LR_DECAY_STEPS is None) != (config.SVI_LR_DECAY_RATE is None):
         raise ValueError(
             "SVI exponential decay requires both SVI_LR_DECAY_STEPS and "
             "SVI_LR_DECAY_RATE to be set."
         )
     if args.mcmc_warmup is not None:
-        config.set_runtime_config("MCMC_NUM_WARMUP", args.mcmc_warmup)
+        config_utils.set_runtime_config("MCMC_NUM_WARMUP", args.mcmc_warmup)
     if args.mcmc_samples is not None:
-        config.set_runtime_config("MCMC_NUM_SAMPLES", args.mcmc_samples)
+        config_utils.set_runtime_config("MCMC_NUM_SAMPLES", args.mcmc_samples)
     if args.mcmc_chains is not None:
-        config.set_runtime_config("MCMC_NUM_CHAINS", args.mcmc_chains)
+        config_utils.set_runtime_config("MCMC_NUM_CHAINS", args.mcmc_chains)
     if args.mcmc_chain_method is not None:
-        config.set_runtime_config("MCMC_CHAIN_METHOD", args.mcmc_chain_method)
+        config_utils.set_runtime_config("MCMC_CHAIN_METHOD", args.mcmc_chain_method)
     if args.require_gpu_per_chain:
-        config.set_runtime_config("MCMC_REQUIRE_GPU_PER_CHAIN", True)
+        config_utils.set_runtime_config("MCMC_REQUIRE_GPU_PER_CHAIN", True)
     if config.MCMC_REQUIRE_GPU_PER_CHAIN and config.MCMC_CHAIN_METHOD != "parallel":
         raise ValueError("--require-gpu-per-chain requires --mcmc-chain-method parallel.")
 
     # Opacity options
     if args.build_opacities:
-        config.set_runtime_config("OPA_LOAD", False)
-        config.set_runtime_config("OPA_SAVE", True)
+        config_utils.set_runtime_config("OPA_LOAD", False)
+        config_utils.set_runtime_config("OPA_SAVE", True)
     elif args.load_opacities:
-        config.set_runtime_config("OPA_LOAD", True)
+        config_utils.set_runtime_config("OPA_LOAD", True)
     if args.save_opacities:
-        config.set_runtime_config("OPA_SAVE", True)
+        config_utils.set_runtime_config("OPA_SAVE", True)
 
     # Species selection
     def _parse_csv(value: str) -> list[str]:
@@ -980,14 +981,14 @@ def apply_cli_overrides(args):
         for k, v in config.MOLPATH_EXOMOL.items():
             if k in default_mols:
                 default_molpath_exomol[k] = v
-        config.set_runtime_config("ATOMIC_SPECIES", default_atomic_species)
-        config.set_runtime_config("MOLPATH_HITEMP", default_molpath_hitemp)
-        config.set_runtime_config("MOLPATH_EXOMOL", default_molpath_exomol)
+        config_utils.set_runtime_config("ATOMIC_SPECIES", default_atomic_species)
+        config_utils.set_runtime_config("MOLPATH_HITEMP", default_molpath_hitemp)
+        config_utils.set_runtime_config("MOLPATH_EXOMOL", default_molpath_exomol)
         print(f"Using default detected species (pass --all-species for full set)")
 
     if args.no_molecules:
-        config.set_runtime_config("MOLPATH_HITEMP", {})
-        config.set_runtime_config("MOLPATH_EXOMOL", {})
+        config_utils.set_runtime_config("MOLPATH_HITEMP", {})
+        config_utils.set_runtime_config("MOLPATH_EXOMOL", {})
         if args.molecules:
             print("Warning: --no-molecules overrides --molecules.")
     elif args.molecules:
@@ -1003,11 +1004,11 @@ def apply_cli_overrides(args):
         missing = wanted - set(mol_h.keys()) - set(mol_e.keys())
         if missing:
             print(f"Warning: Unknown molecules ignored: {', '.join(sorted(missing))}")
-        config.set_runtime_config("MOLPATH_HITEMP", mol_h)
-        config.set_runtime_config("MOLPATH_EXOMOL", mol_e)
+        config_utils.set_runtime_config("MOLPATH_HITEMP", mol_h)
+        config_utils.set_runtime_config("MOLPATH_EXOMOL", mol_e)
 
     if args.no_atoms:
-        config.set_runtime_config("ATOMIC_SPECIES", {})
+        config_utils.set_runtime_config("ATOMIC_SPECIES", {})
         if args.atoms:
             print("Warning: --no-atoms overrides --atoms.")
     elif args.atoms:
@@ -1019,7 +1020,7 @@ def apply_cli_overrides(args):
         missing = wanted - set(atoms.keys())
         if missing:
             print(f"Warning: Unknown atoms ignored: {', '.join(sorted(missing))}")
-        config.set_runtime_config("ATOMIC_SPECIES", atoms)
+        config_utils.set_runtime_config("ATOMIC_SPECIES", atoms)
 
     return config
 
@@ -1173,7 +1174,7 @@ def _fit_tess_transit_constraint(args, params):
 
 
 def print_config_summary(config, args):
-    params = config.get_params()
+    params = config_utils.get_params()
     epochs = _normalize_epoch_args(args.epoch)
     
     print("\n" + "="*70)
@@ -1190,7 +1191,7 @@ def print_config_summary(config, args):
     print(f"  T_star: {params['T_star']} K")
 
     print(f"\nMode: {config.RETRIEVAL_MODE.upper()}")
-    print(f"Config profile: {config.get_runtime_profile_name()}")
+    print(f"Config profile: {config_utils.get_runtime_profile_name()}")
     print(f"Chemistry model: {args.chemistry_model}")
     if args.chemistry_model == "fastchem_hybrid_grid":
         fc_file = args.fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
@@ -1202,10 +1203,10 @@ def print_config_summary(config, args):
         print(f"Phase bins: T12, T23, T34 (all)")
     print(f"Output directory: {config.DIR_SAVE}")
     print(f"\nObserving mode: {config.OBSERVING_MODE}")
-    wav_min, wav_max = config.get_wavelength_range()
+    wav_min, wav_max = config_utils.get_wavelength_range()
     print(f"Wavelength range: {wav_min}-{wav_max} Angstroms")
     print(f"Resolution mode: {config.RESOLUTION_MODE}")
-    print(f"Resolution: R = {config.get_resolution():,}")
+    print(f"Resolution: R = {config_utils.get_resolution():,}")
     if args.fit_tess_transit:
         sectors = ", ".join(str(sector) for sector in (args.tess_sector or [])) or "all available"
         print(f"\nTESS transit fit:")
@@ -1271,7 +1272,7 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
 
     bandpass_constraints = []
     if args.fit_tess_transit:
-        bandpass_constraints.append(_fit_tess_transit_constraint(args, runtime_config.get_params()))
+        bandpass_constraints.append(_fit_tess_transit_constraint(args, config_utils.get_params()))
     for tbl_path in args.bandpass_tbl or []:
         bandpass_constraints.extend(make_bandpass_constraints_from_tbl(tbl_path))
 
@@ -1358,7 +1359,7 @@ def main():
     primary_epoch = args.epoch[0]
 
     runtime_config = config
-    runtime_config.apply_runtime_profile(args.profile)
+    config_utils.apply_runtime_profile(args.profile)
 
     # Load config
     if args.config:
