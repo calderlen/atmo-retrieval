@@ -9,6 +9,9 @@ import os
 import traceback
 import warnings
 
+os.environ.setdefault("MPLBACKEND", "Agg")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 warnings.filterwarnings("once")
 
 # JAX GPU allocator configuration. Must be set before any jax import.
