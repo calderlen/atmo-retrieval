@@ -99,6 +99,23 @@ def _debug_nonfinite_scalar(label: str, value: jnp.ndarray) -> None:
 
     jax.lax.cond(has_nonfinite, _print, lambda _: 0, operand=None)
 
+
+def _run_rt_for_mode(
+    *,
+    mode: RetrievalMode,
+    art: object,
+    dtau: jnp.ndarray,
+    Tarr_rt: jnp.ndarray,
+    mmw_rt: jnp.ndarray,
+    Rp: float | jnp.ndarray,
+    g_ref: float | jnp.ndarray,
+    nu_grid: jnp.ndarray,
+) -> jnp.ndarray:
+    if mode == "transmission":
+        return art.run(dtau, Tarr_rt, mmw_rt, Rp, g_ref)
+    if mode == "emission":
+        return art.run(dtau, Tarr_rt, nu_grid)
+
 # the below dataclasses are all configuration objects, they describe how to build and sample the model
 # system paramaters that are shared across all atmospheric regions and observation types in a joint retrieval
 @dataclass(frozen=True)
@@ -1491,7 +1508,16 @@ def compute_model_timeseries(
     _debug_nonfinite_array("spectroscopy.rt_input.mmw_rt", mmw_rt)
     _debug_nonfinite_scalar("spectroscopy.rt_input.Rp", Rp)
     _debug_nonfinite_scalar("spectroscopy.rt_input.g_ref", g_ref)
-    rt = art.run(dtau, Tarr_rt, mmw_rt, Rp, g_ref)
+    rt = _run_rt_for_mode(
+        mode=mode,
+        art=art,
+        dtau=dtau,
+        Tarr_rt=Tarr_rt,
+        mmw_rt=mmw_rt,
+        Rp=Rp,
+        g_ref=g_ref,
+        nu_grid=nu_grid,
+    )
     _debug_nonfinite_array("spectroscopy.rt", rt)
 
     # Tidal locking: spin period = orbital period.
@@ -1948,7 +1974,16 @@ def _compute_native_observable_spectrum(
     _debug_nonfinite_array("bandpass.rt_input.mmw_rt", mmw_rt)
     _debug_nonfinite_scalar("bandpass.rt_input.Rp", Rp)
     _debug_nonfinite_scalar("bandpass.rt_input.g_ref", g_ref)
-    rt = art.run(dtau, Tarr_rt, mmw_rt, Rp, g_ref)
+    rt = _run_rt_for_mode(
+        mode=mode,
+        art=art,
+        dtau=dtau,
+        Tarr_rt=Tarr_rt,
+        mmw_rt=mmw_rt,
+        Rp=Rp,
+        g_ref=g_ref,
+        nu_grid=nu_grid,
+    )
     _debug_nonfinite_array("bandpass.rt", rt)
 
     if mode == "transmission":
