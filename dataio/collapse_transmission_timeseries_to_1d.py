@@ -536,6 +536,8 @@ _INTRODUCED_SHIFTS_MPS = {
     "20230615": -32400.0,
     "20231023": -97000.0,
     "20231106": -84700.0,
+    "20241126": -105800.0,
+    "20251002": -89100.0,
     "20240114": -112100.0,
     "20220926": -65000.0,
     "20240312": -75200.0,
@@ -777,6 +779,9 @@ def get_pepsi_data(
         print("Subtracting median spectrum (stellar line removal)...")
         fluxin, errorin, median_flux = subtract_median_spectrum(fluxin, errorin)
 
+    pre_sysrem_flux = fluxin.copy()
+    pre_sysrem_error = errorin.copy()
+
     # Step 4: SYSREM systematics removal
     U_sysrem = None
     no_tellurics = None
@@ -818,6 +823,8 @@ def get_pepsi_data(
     if subtract_median or run_sysrem or remove_doppler_shadow:
         extras = {
             'median_flux': median_flux,
+            'pre_sysrem_flux': pre_sysrem_flux,
+            'pre_sysrem_error': pre_sysrem_error,
             'U_sysrem': U_sysrem,
             'no_tellurics': no_tellurics,
             'n_systematics_used': n_systematics_used,

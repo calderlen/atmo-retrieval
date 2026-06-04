@@ -110,6 +110,23 @@ def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, 
     return wavelength, data, sigma, phase
 
 
+def load_pre_sysrem_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray] | None:
+    data_dir = Path(data_dir)
+    data_path = data_dir / "pre_sysrem_data.npy"
+    sigma_path = data_dir / "pre_sysrem_sigma.npy"
+
+    if not data_path.exists() and not sigma_path.exists():
+        return None
+    if not data_path.exists() or not sigma_path.exists():
+        print(
+            "  Warning: incomplete pre-SYSREM diagnostic bundle in "
+            f"{data_dir}; expected both pre_sysrem_data.npy and pre_sysrem_sigma.npy."
+        )
+        return None
+
+    return np.load(data_path), np.load(sigma_path)
+
+
 def _normalize_phoenix_spectrum_path(path: str | Path) -> str:
     candidate = Path(path).expanduser()
     if not candidate.is_absolute():
@@ -966,6 +983,8 @@ class SpectroscopicComponentBundle:
     wav_obs: np.ndarray
     data: np.ndarray
     sigma: np.ndarray
+    pre_sysrem_data: np.ndarray | None
+    pre_sysrem_sigma: np.ndarray | None
     phase: np.ndarray
     sysrem: SysremInputBundle | None
     inst_nus: np.ndarray
@@ -1144,6 +1163,8 @@ def _build_in_memory_timeseries_component_spec(
     likelihood_kind: str,
     subtract_per_exposure_mean: bool,
     region_name: str | None = None,
+    pre_sysrem_data: np.ndarray | None = None,
+    pre_sysrem_sigma: np.ndarray | None = None,
 ) -> dict[str, Any]:
     spec: dict[str, Any] = {
         "name": name,
@@ -1154,6 +1175,8 @@ def _build_in_memory_timeseries_component_spec(
         "sigma": np.asarray(sigma),
         "phase": np.asarray(phase),
         "sysrem": sysrem,
+        "pre_sysrem_data": None if pre_sysrem_data is None else np.asarray(pre_sysrem_data),
+        "pre_sysrem_sigma": None if pre_sysrem_sigma is None else np.asarray(pre_sysrem_sigma),
         "instrument_resolution": float(instrument_resolution),
         "apply_sysrem": bool(apply_sysrem),
         "phase_mode": phase_mode,
@@ -1223,6 +1246,8 @@ def _build_primary_spectroscopic_component(
     likelihood_kind: str,
     subtract_per_exposure_mean: bool,
     sample_prefix: str | None = None,
+    pre_sysrem_data: np.ndarray | None = None,
+    pre_sysrem_sigma: np.ndarray | None = None,
 ) -> SpectroscopicComponentBundle:
     mode = _normalize_retrieval_mode(mode)
     stellar_surface_flux = _load_phoenix_surface_flux_on_grid(
@@ -1269,6 +1294,8 @@ def _build_primary_spectroscopic_component(
         wav_obs=np.asarray(wav_obs),
         data=np.asarray(data),
         sigma=np.asarray(sigma),
+        pre_sysrem_data=None if pre_sysrem_data is None else np.asarray(pre_sysrem_data),
+        pre_sysrem_sigma=None if pre_sysrem_sigma is None else np.asarray(pre_sysrem_sigma),
         phase=np.asarray(phase),
         sysrem=sysrem,
         inst_nus=np.asarray(inst_nus),
@@ -1586,6 +1613,8 @@ def _load_joint_spectroscopic_component(
     Rstar = spec.get("R_star", default_rstar)
     phoenix_spectrum_path = spec.get("phoenix_spectrum_path", default_phoenix_spectrum_path)
     phoenix_cache_dir = spec.get("phoenix_cache_dir", default_phoenix_cache_dir)
+    pre_sysrem_data = None
+    pre_sysrem_sigma = None
 
     if "tbl_path" in spec:
         wav_obs, spectrum, uncertainty, _meta = load_nasa_archive_spectrum(
@@ -1601,6 +1630,9 @@ def _load_joint_spectroscopic_component(
         data = np.asarray(spec["data"])
         sigma = np.asarray(spec["sigma"])
         phase = np.asarray(spec.get("phase", np.zeros((1 if data.ndim == 1 else data.shape[0],), dtype=float)))
+        if spec.get("pre_sysrem_data") is not None and spec.get("pre_sysrem_sigma") is not None:
+            pre_sysrem_data = np.asarray(spec["pre_sysrem_data"])
+            pre_sysrem_sigma = np.asarray(spec["pre_sysrem_sigma"])
         if spec.get("sysrem") is not None:
             sysrem_spec = spec["sysrem"]
             if isinstance(sysrem_spec, SysremInputBundle):
@@ -1622,6 +1654,9 @@ def _load_joint_spectroscopic_component(
         data_dir = Path(spec["data_dir"])
         if data_format == "timeseries":
             wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
+            pre_sysrem_bundle = load_pre_sysrem_timeseries_data(data_dir)
+            if pre_sysrem_bundle is not None:
+                pre_sysrem_data, pre_sysrem_sigma = pre_sysrem_bundle
             phase = _normalize_phase(phase)
             if apply_sysrem:
                 sysrem = _validate_sysrem_inputs(
@@ -1651,7 +1686,27 @@ def _load_joint_spectroscopic_component(
             "SYSREM inputs were provided."
         )
 
+    inst_nus_before_prepare = wav2nu(np.asarray(wav_obs), "AA")
+    sort_idx_for_prepare = None
+    if inst_nus_before_prepare.size > 1 and np.any(np.diff(inst_nus_before_prepare) <= 0):
+        sort_idx_for_prepare = np.argsort(inst_nus_before_prepare)
+
     wav_obs, data, sigma, inst_nus = _prepare_observed_spectrum_arrays(wav_obs, data, sigma)
+    if pre_sysrem_data is not None and pre_sysrem_sigma is not None:
+        pre_sysrem_data = np.asarray(pre_sysrem_data)
+        pre_sysrem_sigma = np.asarray(pre_sysrem_sigma)
+        if pre_sysrem_data.shape != data.shape or pre_sysrem_sigma.shape != sigma.shape:
+            raise ValueError(
+                f"Pre-SYSREM diagnostic arrays for component '{name}' must match "
+                f"data/sigma shape {data.shape}; got {pre_sysrem_data.shape} and {pre_sysrem_sigma.shape}."
+            )
+        if sort_idx_for_prepare is not None:
+            if pre_sysrem_data.ndim == 2:
+                pre_sysrem_data = pre_sysrem_data[:, sort_idx_for_prepare]
+                pre_sysrem_sigma = pre_sysrem_sigma[:, sort_idx_for_prepare]
+            else:
+                pre_sysrem_data = pre_sysrem_data[sort_idx_for_prepare]
+                pre_sysrem_sigma = pre_sysrem_sigma[sort_idx_for_prepare]
     if phase.ndim == 0:
         phase = np.asarray([float(phase)])
     if data_format == "timeseries":
@@ -1710,6 +1765,8 @@ def _load_joint_spectroscopic_component(
         wav_obs=np.asarray(wav_obs),
         data=np.asarray(data),
         sigma=np.asarray(sigma),
+        pre_sysrem_data=None if pre_sysrem_data is None else np.asarray(pre_sysrem_data),
+        pre_sysrem_sigma=None if pre_sysrem_sigma is None else np.asarray(pre_sysrem_sigma),
         phase=np.asarray(phase),
         sysrem=sysrem,
         inst_nus=np.asarray(inst_nus_component),
@@ -1930,6 +1987,8 @@ def run_retrieval(
     apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT and data_format == "timeseries")
 
     primary_sysrem: SysremInputBundle | None = sysrem_inputs
+    primary_pre_sysrem_data: np.ndarray | None = None
+    primary_pre_sysrem_sigma: np.ndarray | None = None
 
     full_arm_mode = (
         config.OBSERVING_MODE == "full"
@@ -2005,6 +2064,9 @@ def run_retrieval(
 
             if data_format == "timeseries":
                 wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
+                pre_sysrem_bundle = load_pre_sysrem_timeseries_data(resolved_data_dir)
+                if pre_sysrem_bundle is not None:
+                    primary_pre_sysrem_data, primary_pre_sysrem_sigma = pre_sysrem_bundle
                 phase = _normalize_phase(phase)
                 print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
                 print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
@@ -2041,6 +2103,19 @@ def run_retrieval(
 
         # Convert to wavenumber
         inst_nus = wav2nu(wav_obs, "AA")
+        if primary_pre_sysrem_data is not None and primary_pre_sysrem_sigma is not None:
+            primary_pre_sysrem_data = np.asarray(primary_pre_sysrem_data)
+            primary_pre_sysrem_sigma = np.asarray(primary_pre_sysrem_sigma)
+            if (
+                primary_pre_sysrem_data.shape != np.asarray(data).shape
+                or primary_pre_sysrem_sigma.shape != np.asarray(sigma).shape
+            ):
+                raise ValueError(
+                    "Pre-SYSREM diagnostic arrays must match the primary "
+                    f"data/sigma shape {np.asarray(data).shape}; got "
+                    f"{primary_pre_sysrem_data.shape} and {primary_pre_sysrem_sigma.shape}."
+                )
+
         # Ensure wavenumber grid and data are in ascending order
         if inst_nus.size > 1 and np.any(np.diff(inst_nus) <= 0):
             sort_idx = np.argsort(inst_nus)
@@ -2052,6 +2127,13 @@ def run_retrieval(
             else:
                 data = data[sort_idx]
                 sigma = sigma[sort_idx]
+            if primary_pre_sysrem_data is not None and primary_pre_sysrem_sigma is not None:
+                if primary_pre_sysrem_data.ndim == 2:
+                    primary_pre_sysrem_data = primary_pre_sysrem_data[:, sort_idx]
+                    primary_pre_sysrem_sigma = primary_pre_sysrem_sigma[:, sort_idx]
+                else:
+                    primary_pre_sysrem_data = primary_pre_sysrem_data[sort_idx]
+                    primary_pre_sysrem_sigma = primary_pre_sysrem_sigma[sort_idx]
 
         _preflight_spectrum_checks(wav_obs, data, sigma, phase, inst_nus)
 
@@ -2188,6 +2270,8 @@ def run_retrieval(
                 likelihood_kind=primary_likelihood_kind,
                 subtract_per_exposure_mean=primary_subtract_mean,
                 region_name=primary_region_name,
+                pre_sysrem_data=primary_pre_sysrem_data,
+                pre_sysrem_sigma=primary_pre_sysrem_sigma,
             )
             primary_component = _load_joint_spectroscopic_component(
                 primary_component_spec,
@@ -2231,6 +2315,8 @@ def run_retrieval(
                 likelihood_kind=primary_likelihood_kind,
                 subtract_per_exposure_mean=primary_subtract_mean,
                 sample_prefix=primary_sample_prefix,
+                pre_sysrem_data=primary_pre_sysrem_data,
+                pre_sysrem_sigma=primary_pre_sysrem_sigma,
             )
         observation_configs: list[object] = [primary_component.observation_config]
         observations_payload: dict[str, object] = {primary_component.name: primary_component.observation_inputs}
@@ -2422,6 +2508,13 @@ def run_retrieval(
                                 component.data,
                                 component.sigma,
                             )
+                            component_pre_obs_mean = None
+                            component_pre_obs_err = None
+                            if component.pre_sysrem_data is not None and component.pre_sysrem_sigma is not None:
+                                component_pre_obs_mean, component_pre_obs_err = _summarize_observed_spectrum(
+                                    component.pre_sysrem_data,
+                                    component.pre_sysrem_sigma,
+                                )
                             component_wav_obs_nm = np.asarray(component.wav_obs) / 10.0
                             svi_model_ts, _ = _compute_model_timeseries_for_plot(
                                 posterior_samples=svi_samples_for_plots,
@@ -2441,6 +2534,8 @@ def run_retrieval(
                                         rp_err=component_obs_err,
                                         rp_hmc=np.atleast_2d(svi_line),
                                         rp_svi=svi_line,
+                                        rp_pre_sysrem=component_pre_obs_mean,
+                                        rp_pre_sysrem_err=component_pre_obs_err,
                                         save_path=os.path.join(
                                             output_dir,
                                             _component_output_filename(
@@ -2600,6 +2695,13 @@ def run_retrieval(
                 component.data,
                 component.sigma,
             )
+            component_pre_obs_mean = None
+            component_pre_obs_err = None
+            if component.pre_sysrem_data is not None and component.pre_sysrem_sigma is not None:
+                component_pre_obs_mean, component_pre_obs_err = _summarize_observed_spectrum(
+                    component.pre_sysrem_data,
+                    component.pre_sysrem_sigma,
+                )
 
             hmc_model_ts, atmo_state = _compute_model_timeseries_for_plot(
                 posterior_samples=posterior_np,
@@ -2640,6 +2742,8 @@ def run_retrieval(
                             rp_err=component_obs_err,
                             rp_hmc=np.asarray(hmc_plot),
                             rp_svi=np.asarray(svi_line),
+                            rp_pre_sysrem=component_pre_obs_mean,
+                            rp_pre_sysrem_err=component_pre_obs_err,
                             save_path=os.path.join(
                                 output_dir,
                                 _component_output_filename(

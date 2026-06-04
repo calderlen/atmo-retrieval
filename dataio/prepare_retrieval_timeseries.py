@@ -12,7 +12,9 @@ time-series retrieval path:
 
 Optional auxiliary products are also written when available, including
 ``jd.npy``, ``snr.npy``, ``exptime.npy``, ``airmass.npy``, and SYSREM
-approximations compatible with the current retrieval loader.
+approximations compatible with the current retrieval loader. When SYSREM is
+enabled, ``pre_sysrem_data.npy`` and ``pre_sysrem_sigma.npy`` preserve the
+selected spectra just before SYSREM for diagnostics.
 """
 
 from __future__ import annotations
@@ -161,6 +163,18 @@ def _sanitize_columns(
     data: np.ndarray,
     sigma: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    column_indices = _valid_sorted_column_indices(wavelength, data, sigma)
+    wavelength = np.asarray(wavelength, dtype=float)
+    data = np.asarray(data, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    return wavelength[column_indices], data[:, column_indices], sigma[:, column_indices]
+
+
+def _valid_sorted_column_indices(
+    wavelength: np.ndarray,
+    data: np.ndarray,
+    sigma: np.ndarray,
+) -> np.ndarray:
     wavelength = np.asarray(wavelength, dtype=float)
     data = np.asarray(data, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
@@ -185,15 +199,9 @@ def _sanitize_columns(
     if not np.any(valid):
         raise ValueError("No valid spectral columns remain after masking.")
 
-    wavelength = wavelength[valid]
-    data = data[:, valid]
-    sigma = sigma[:, valid]
-
-    sort_idx = np.argsort(wavelength)
-    wavelength = wavelength[sort_idx]
-    data = data[:, sort_idx]
-    sigma = sigma[:, sort_idx]
-    return wavelength, data, sigma
+    valid_indices = np.flatnonzero(valid)
+    sort_idx = np.argsort(wavelength[valid_indices])
+    return valid_indices[sort_idx]
 
 
 def _shadow_status(
@@ -558,9 +566,20 @@ def _process_arm(
     airmass = np.asarray(airmass)[selection]
     data = np.asarray(data)[selection]
     sigma = np.asarray(sigma)[selection]
+    pre_sysrem_data = extras.get("pre_sysrem_flux")
+    pre_sysrem_sigma = extras.get("pre_sysrem_error")
+    if pre_sysrem_data is not None and pre_sysrem_sigma is not None:
+        pre_sysrem_data = np.asarray(pre_sysrem_data, dtype=float)[selection]
+        pre_sysrem_sigma = np.asarray(pre_sysrem_sigma, dtype=float)[selection]
 
     wave_1d = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave)
-    wave_1d, data, sigma = _sanitize_columns(wave_1d, data, sigma)
+    column_indices = _valid_sorted_column_indices(wave_1d, data, sigma)
+    wave_1d = np.asarray(wave_1d, dtype=float)[column_indices]
+    data = data[:, column_indices]
+    sigma = sigma[:, column_indices]
+    if pre_sysrem_data is not None and pre_sysrem_sigma is not None:
+        pre_sysrem_data = pre_sysrem_data[:, column_indices]
+        pre_sysrem_sigma = pre_sysrem_sigma[:, column_indices]
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -572,6 +591,9 @@ def _process_arm(
     np.save(output_dir / "snr.npy", snr)
     np.save(output_dir / "exptime.npy", exptime)
     np.save(output_dir / "airmass.npy", airmass)
+    if args.run_sysrem and pre_sysrem_data is not None and pre_sysrem_sigma is not None:
+        np.save(output_dir / "pre_sysrem_data.npy", pre_sysrem_data)
+        np.save(output_dir / "pre_sysrem_sigma.npy", pre_sysrem_sigma)
 
     if args.run_sysrem:
         U_full = extras.get("U_sysrem")
@@ -625,6 +647,8 @@ def _process_arm(
     )
     if args.run_sysrem:
         print("  Saved chunk-aware SYSREM auxiliaries: U_sysrem.npz")
+        if pre_sysrem_data is not None and pre_sysrem_sigma is not None:
+            print("  Saved pre-SYSREM diagnostic arrays: pre_sysrem_data.npy, pre_sysrem_sigma.npy")
 
 
 def main() -> int:

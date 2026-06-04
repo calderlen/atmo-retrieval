@@ -69,6 +69,71 @@ def plot_svi_loss(loss_values: np.ndarray, save_path: str) -> None:
     print(f"SVI loss plot saved to {save_path}")
 
 
+def _bin_observed_spectrum(
+    wavelength: np.ndarray,
+    values: np.ndarray,
+    errors: np.ndarray,
+    max_bins: int = 300,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    wavelength = np.asarray(wavelength, dtype=float).reshape(-1)
+    values = np.asarray(values, dtype=float).reshape(-1)
+    errors = np.asarray(errors, dtype=float).reshape(-1)
+
+    if not (wavelength.size == values.size == errors.size):
+        raise ValueError(
+            "wavelength, values, and errors must have the same flattened length "
+            f"(got {wavelength.size}, {values.size}, {errors.size})."
+        )
+
+    valid = np.isfinite(wavelength) & np.isfinite(values) & np.isfinite(errors)
+    if not np.any(valid):
+        return np.array([]), np.array([]), np.array([])
+
+    wavelength = wavelength[valid]
+    values = values[valid]
+    errors = errors[valid]
+
+    sort_idx = np.argsort(wavelength)
+    wavelength = wavelength[sort_idx]
+    values = values[sort_idx]
+    errors = errors[sort_idx]
+
+    n_bins = min(max_bins, wavelength.size)
+    index_bins = np.array_split(np.arange(wavelength.size), n_bins)
+
+    binned_wavelength = []
+    binned_values = []
+    binned_errors = []
+
+    for indices in index_bins:
+        if indices.size == 0:
+            continue
+
+        wave_bin = wavelength[indices]
+        value_bin = values[indices]
+        error_bin = errors[indices]
+        positive_error = error_bin > 0.0
+
+        if np.any(positive_error):
+            weights = 1.0 / np.square(error_bin[positive_error])
+            binned_wavelength.append(float(np.average(wave_bin[positive_error], weights=weights)))
+            binned_values.append(float(np.average(value_bin[positive_error], weights=weights)))
+            binned_errors.append(float(np.sqrt(1.0 / np.sum(weights))))
+        else:
+            binned_wavelength.append(float(np.mean(wave_bin)))
+            binned_values.append(float(np.mean(value_bin)))
+            if value_bin.size > 1:
+                binned_errors.append(float(np.std(value_bin) / np.sqrt(value_bin.size)))
+            else:
+                binned_errors.append(np.nan)
+
+    return (
+        np.asarray(binned_wavelength),
+        np.asarray(binned_values),
+        np.asarray(binned_errors),
+    )
+
+
 def plot_transmission_spectrum(
     wavelength_nm: np.ndarray,
     rp_obs: np.ndarray,
@@ -76,27 +141,156 @@ def plot_transmission_spectrum(
     rp_hmc: np.ndarray,
     rp_svi: np.ndarray,
     save_path: str,
+    rp_pre_sysrem: np.ndarray | None = None,
+    rp_pre_sysrem_err: np.ndarray | None = None,
 ) -> None:
     rp_hmc_np = np.asarray(rp_hmc)
     mean = rp_hmc_np.mean(axis=0)
     std = rp_hmc_np.std(axis=0)
     rp_svi_np = np.asarray(rp_svi)
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.errorbar(
-        wavelength_nm, rp_obs, yerr=rp_err,
-        fmt=".", ms=2, color="k", ecolor="0.3", elinewidth=0.5, alpha=0.6, label="Observed",
+    wavelength_np = np.asarray(wavelength_nm, dtype=float)
+    sort_idx = np.argsort(wavelength_np)
+    wavelength_sorted = wavelength_np[sort_idx]
+    obs_sorted = np.asarray(rp_obs, dtype=float)[sort_idx]
+    err_sorted = np.asarray(rp_err, dtype=float)[sort_idx]
+    mean_sorted = np.asarray(mean, dtype=float)[sort_idx]
+    std_sorted = np.asarray(std, dtype=float)[sort_idx]
+    svi_sorted = rp_svi_np[sort_idx]
+
+    bin_wavelength, bin_obs, bin_err = _bin_observed_spectrum(
+        wavelength_sorted,
+        obs_sorted,
+        err_sorted,
     )
-    ax.fill_between(wavelength_nm, mean - std, mean + std, color="C0", alpha=0.25, label="HMC ±1σ")
-    ax.plot(wavelength_nm, mean, color="C0", lw=1.5, label="HMC mean")
-    ax.plot(wavelength_nm, rp_svi_np, color="C3", lw=1.5, ls="--", label="SVI median")
-    ax.set_xlabel("Wavelength [nm]", fontsize=12)
+    if bin_wavelength.size:
+        model_valid = np.isfinite(wavelength_sorted) & np.isfinite(mean_sorted)
+        if np.count_nonzero(model_valid) >= 2:
+            bin_model = np.interp(bin_wavelength, wavelength_sorted[model_valid], mean_sorted[model_valid])
+        else:
+            bin_model = np.full_like(bin_obs, np.nan)
+        bin_residual = bin_obs - bin_model
+    else:
+        bin_residual = np.array([])
+
+    has_pre_sysrem = rp_pre_sysrem is not None and rp_pre_sysrem_err is not None
+    if has_pre_sysrem:
+        pre_sorted = np.asarray(rp_pre_sysrem, dtype=float)[sort_idx]
+        pre_err_sorted = np.asarray(rp_pre_sysrem_err, dtype=float)[sort_idx]
+        pre_bin_wavelength, pre_bin_obs, pre_bin_err = _bin_observed_spectrum(
+            wavelength_sorted,
+            pre_sorted,
+            pre_err_sorted,
+        )
+        fig, axes = plt.subplots(
+            3,
+            1,
+            figsize=(11, 9),
+            sharex=True,
+            gridspec_kw={"height_ratios": [2, 3, 1]},
+        )
+        ax_pre, ax, ax_resid = axes
+
+        ax_pre.plot(
+            wavelength_sorted,
+            pre_sorted,
+            ".",
+            ms=1.0,
+            color="k",
+            alpha=0.08,
+            label="Pre-SYSREM raw",
+            zorder=1,
+        )
+        if pre_bin_wavelength.size:
+            ax_pre.errorbar(
+                pre_bin_wavelength,
+                pre_bin_obs,
+                yerr=pre_bin_err,
+                fmt="o",
+                ms=2.5,
+                color="k",
+                ecolor="0.2",
+                elinewidth=0.6,
+                alpha=0.85,
+                label="Pre-SYSREM binned",
+                zorder=3,
+            )
+        ax_pre.set_ylabel(r"$R_p/R_\star$", fontsize=12)
+        ax_pre.set_title("Before SYSREM / Systematics Correction", fontsize=12)
+        ax_pre.legend(fontsize=9, loc="upper right")
+        ax_pre.grid(True, alpha=0.3)
+    else:
+        fig, (ax, ax_resid) = plt.subplots(
+            2,
+            1,
+            figsize=(11, 7),
+            sharex=True,
+            gridspec_kw={"height_ratios": [3, 1]},
+        )
+
+    ax.plot(
+        wavelength_sorted,
+        obs_sorted,
+        ".",
+        ms=1.0,
+        color="k",
+        alpha=0.08,
+        label="Observed raw",
+        zorder=1,
+    )
+    if bin_wavelength.size:
+        ax.errorbar(
+            bin_wavelength,
+            bin_obs,
+            yerr=bin_err,
+            fmt="o",
+            ms=2.5,
+            color="k",
+            ecolor="0.2",
+            elinewidth=0.6,
+            alpha=0.85,
+            label="Observed binned",
+            zorder=4,
+        )
+    ax.fill_between(
+        wavelength_sorted,
+        mean_sorted - std_sorted,
+        mean_sorted + std_sorted,
+        color="C0",
+        alpha=0.25,
+        label="HMC ±1σ",
+        zorder=2,
+    )
+    ax.plot(wavelength_sorted, mean_sorted, color="C0", lw=1.7, label="HMC mean", zorder=5)
+    ax.plot(wavelength_sorted, svi_sorted, color="C3", lw=1.5, ls="--", label="SVI median", zorder=6)
     ax.set_ylabel(r"$R_p/R_\star$", fontsize=12)
-    ax.set_title("Transmission Spectrum", fontsize=13)
-    ax.legend(fontsize=10)
+    if has_pre_sysrem:
+        ax.set_title("After SYSREM / Model-Space Comparison", fontsize=12)
+    else:
+        ax.set_title("Transmission Spectrum", fontsize=13)
+    ax.legend(fontsize=10, loc="upper right")
     ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=200)
+
+    if bin_wavelength.size:
+        ax_resid.errorbar(
+            bin_wavelength,
+            bin_residual,
+            yerr=bin_err,
+            fmt="o",
+            ms=2.5,
+            color="k",
+            ecolor="0.2",
+            elinewidth=0.6,
+            alpha=0.85,
+            zorder=3,
+        )
+    ax_resid.axhline(0.0, color="0.35", lw=1.0, ls="--", zorder=2)
+    ax_resid.set_xlabel("Wavelength [nm]", fontsize=12)
+    ax_resid.set_ylabel("Obs - HMC", fontsize=11)
+    ax_resid.set_title("Residual: Corrected Observed - HMC Mean", fontsize=11)
+    ax_resid.grid(True, alpha=0.3)
+    fig.subplots_adjust(hspace=0.32 if has_pre_sysrem else 0.22)
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Transmission spectrum plot saved to {save_path}")
 
