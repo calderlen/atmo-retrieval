@@ -468,6 +468,37 @@ def _default_corner_variables(sample_dict: dict) -> list[str]:
     return selected[:16]
 
 
+def _filter_corner_datasets(
+    datasets: list[tuple[np.ndarray, str, dict]],
+    labels: list[str],
+) -> tuple[list[tuple[np.ndarray, str, dict]], list[str]]:
+    keep = np.ones(len(labels), dtype=bool)
+    dropped = []
+
+    for i, label in enumerate(labels):
+        for data, _color, _extra_kwargs in datasets:
+            col = np.asarray(data[:, i], dtype=float)
+            if col.size < 2 or np.any(~np.isfinite(col)) or np.min(col) == np.max(col):
+                keep[i] = False
+                dropped.append(label)
+                break
+
+    if dropped:
+        print(
+            "Skipping corner column(s) with non-finite values or no dynamic range: "
+            + ", ".join(dropped)
+        )
+
+    if not np.any(keep):
+        return [], []
+
+    filtered = []
+    for data, color, extra_kwargs in datasets:
+        filtered.append((data[:, keep], color, extra_kwargs))
+
+    return filtered, [label for label, use_col in zip(labels, keep) if use_col]
+
+
 def plot_corner(
     hmc_samples: dict | None = None,
     svi_samples: dict | None = None,
@@ -494,6 +525,11 @@ def plot_corner(
 
     if not datasets or labels is None:
         print("No data for corner plot; skipping.")
+        return
+
+    datasets, labels = _filter_corner_datasets(datasets, labels)
+    if not datasets or not labels:
+        print("No corner columns with finite dynamic range; skipping.")
         return
 
     fig = None
