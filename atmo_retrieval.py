@@ -677,8 +677,8 @@ def create_parser():
         "--pt-profile",
         type=str,
         choices=["guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline", "gp"],
-        default=config.PT_PROFILE_DEFAULT,
-        help=f"P-T profile type (default: {config.PT_PROFILE_DEFAULT})"
+        default=None,
+        help="P-T profile type (default: mode-specific)"
     )
     model_group.add_argument(
         "--chemistry-model",
@@ -781,7 +781,7 @@ def create_parser():
     exec_group.add_argument(
         "--svi-only",
         action="store_true",
-        help="Run only SVI, skip MCMC"
+        help="Run only SVI diagnostic approximation, skip MCMC"
     )
     exec_group.add_argument(
         "--no-plots",
@@ -793,6 +793,39 @@ def create_parser():
         type=int,
         default=42,
         help="Random seed (default: 42)"
+    )
+
+    diagnostics_group = parser.add_argument_group("Diagnostics")
+    diagnostics_save_group = diagnostics_group.add_mutually_exclusive_group()
+    diagnostics_save_group.add_argument(
+        "--save-mcmc-diagnostics",
+        dest="save_mcmc_diagnostics",
+        action="store_true",
+        help="Save chain-grouped posterior samples and structured NumPyro MCMC diagnostics",
+    )
+    diagnostics_save_group.add_argument(
+        "--no-save-mcmc-diagnostics",
+        dest="save_mcmc_diagnostics",
+        action="store_false",
+        help="Disable structured MCMC diagnostic artifacts",
+    )
+    parser.set_defaults(save_mcmc_diagnostics=True)
+    diagnostics_group.add_argument(
+        "--sigma-scale",
+        type=float,
+        default=1.0,
+        help="Multiply spectroscopic uncertainty arrays by this factor for diagnostic runs",
+    )
+    diagnostics_group.add_argument(
+        "--no-sysrem",
+        action="store_true",
+        help="Disable SYSREM model/data correction for this run",
+    )
+    diagnostics_group.add_argument(
+        "--diagnostic-label",
+        type=str,
+        default=None,
+        help="Append a clean diagnostic label directory under the normal output base",
     )
 
     # Info
@@ -937,6 +970,12 @@ def apply_cli_overrides(args):
         config_utils.set_runtime_config("MCMC_REQUIRE_GPU_PER_CHAIN", True)
     if config.MCMC_REQUIRE_GPU_PER_CHAIN and config.MCMC_CHAIN_METHOD != "parallel":
         raise ValueError("--require-gpu-per-chain requires --mcmc-chain-method parallel.")
+
+    # Diagnostic controls
+    if args.sigma_scale <= 0 or not math.isfinite(float(args.sigma_scale)):
+        raise ValueError("--sigma-scale must be a finite positive number.")
+    if args.no_sysrem:
+        config_utils.set_runtime_config("APPLY_SYSREM_DEFAULT", False)
 
     # Opacity options
     if args.build_opacities:
@@ -1235,11 +1274,22 @@ def print_config_summary(config, args):
         print(f"  MCMC chain method: {config.MCMC_CHAIN_METHOD}")
         if config.MCMC_REQUIRE_GPU_PER_CHAIN:
             print("  MCMC GPU policy: require >= 1 visible GPU per chain")
+    else:
+        print("  SVI-only: approximate diagnostic posterior; production runs should use MCMC/NUTS")
     print(f"  Vsys handling: fixed at systemic velocity = {params['RV_abs']} km/s")
+    print(f"  Save MCMC diagnostics: {args.save_mcmc_diagnostics}")
+    print(f"  Spectroscopic sigma scale: {args.sigma_scale:g}")
+    if args.no_sysrem:
+        print("  SYSREM: disabled by --no-sysrem")
+    if args.diagnostic_label:
+        print(f"  Diagnostic label: {args.diagnostic_label}")
 
     print(f"\nAtmosphere:")
+    pressure_top, pressure_btm = config_utils.get_pressure_bounds_for_mode(config.RETRIEVAL_MODE)
+    pt_profile = config_utils.resolve_pt_profile_for_mode(config.RETRIEVAL_MODE, args.pt_profile)
     print(f"  Layers: {config.NLAYER}")
-    print(f"  Pressure: {config.PRESSURE_TOP:.1e} - {config.PRESSURE_BTM:.1e} bar")
+    print(f"  Pressure: {pressure_top:.1e} - {pressure_btm:.1e} bar")
+    print(f"  P-T profile: {pt_profile}")
     print(f"  Temperature: {config.T_LOW}-{config.T_HIGH} K")
     print(f"  Spectral grid points: {config.N_SPECTRAL_POINTS:,}")
 
@@ -1257,6 +1307,13 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             "Run a standard joint retrieval to combine epochs."
         )
 
+    diagnostic_run_kwargs = {
+        "save_mcmc_diagnostics": args.save_mcmc_diagnostics,
+        "sigma_scale": args.sigma_scale,
+        "diagnostic_label": args.diagnostic_label,
+        "apply_sysrem_override": False if args.no_sysrem else None,
+    }
+
     joint_spectra = _build_multi_epoch_joint_spectra(
         epochs=args.epoch,
         mode=args.mode,
@@ -1266,6 +1323,8 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
 
     # Print configuration summary
     print_config_summary(runtime_config, args)
+
+    pt_profile = config_utils.resolve_pt_profile_for_mode(args.mode, args.pt_profile)
 
     for tbl_path in args.joint_spectrum_tbl or []:
         joint_spectra.append(make_joint_spectrum_component_from_tbl(tbl_path))
@@ -1286,13 +1345,14 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             no_plots=args.no_plots,
-            pt_profile=args.pt_profile or runtime_config.PT_PROFILE_DEFAULT,
+            pt_profile=pt_profile,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
             seed=args.seed,
             joint_spectra=joint_spectra or None,
             bandpass_constraints=bandpass_constraints or None,
+            **diagnostic_run_kwargs,
         )
 
     elif args.phase_bin:
@@ -1304,13 +1364,14 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             no_plots=args.no_plots,
-            pt_profile=args.pt_profile or runtime_config.PT_PROFILE_DEFAULT,
+            pt_profile=pt_profile,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
             seed=args.seed,
             joint_spectra=joint_spectra or None,
             bandpass_constraints=bandpass_constraints or None,
+            **diagnostic_run_kwargs,
         )
 
     elif args.mode == "transmission":
@@ -1321,7 +1382,7 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             no_plots=args.no_plots,
-            pt_profile=args.pt_profile or runtime_config.PT_PROFILE_DEFAULT,
+            pt_profile=pt_profile,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
@@ -1329,6 +1390,7 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             joint_spectra=joint_spectra or None,
             bandpass_constraints=bandpass_constraints or None,
             phoenix_spectrum_path=args.phoenix_spectrum_path,
+            **diagnostic_run_kwargs,
         )
 
     elif args.mode == "emission":
@@ -1339,7 +1401,7 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             no_plots=args.no_plots,
-            pt_profile=args.pt_profile or runtime_config.PT_PROFILE_DEFAULT,
+            pt_profile=pt_profile,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
@@ -1347,6 +1409,7 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             joint_spectra=joint_spectra or None,
             bandpass_constraints=bandpass_constraints or None,
             phoenix_spectrum_path=args.phoenix_spectrum_path,
+            **diagnostic_run_kwargs,
         )
 
     return 0

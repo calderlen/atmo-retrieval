@@ -53,7 +53,11 @@ def run_phase_binned_retrieval(
 
     phase = _normalize_phase(phase)
     params = retrieval_kwargs.get("params", config_utils.get_params())
-    apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT)
+    apply_sysrem_override = retrieval_kwargs.get("apply_sysrem_override")
+    apply_sysrem_default = (
+        config.APPLY_SYSREM_DEFAULT if apply_sysrem_override is None else apply_sysrem_override
+    )
+    apply_sysrem = bool(apply_sysrem_default)
 
     sysrem_inputs = None
     if apply_sysrem:

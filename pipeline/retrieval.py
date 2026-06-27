@@ -46,6 +46,14 @@ from physics.model import (
     create_joint_retrieval_model,
 )
 from pipeline.inference import run_svi
+from pipeline.mcmc_diagnostics import (
+    DEFAULT_MCMC_EXTRA_FIELDS,
+    get_extra_fields_by_chain,
+    get_samples_by_chain,
+    sanitize_diagnostic_label,
+    save_chain_grouped_posterior,
+    write_mcmc_diagnostics,
+)
 from dataio.bandpass import load_tess_bandpass
 from plotting.plot import (
     plot_svi_loss,
@@ -1084,16 +1092,17 @@ def _default_region_name_for_mode(mode: str) -> str:
 
 def _build_art_for_mode(mode: str) -> object:
     mode = _normalize_retrieval_mode(mode)
+    pressure_top, pressure_btm = config_utils.get_pressure_bounds_for_mode(mode)
     if mode == "transmission":
         art = ArtTransPure(
-            pressure_top=config.PRESSURE_TOP,
-            pressure_btm=config.PRESSURE_BTM,
+            pressure_top=pressure_top,
+            pressure_btm=pressure_btm,
             nlayer=config.NLAYER,
         )
     else:
         art = ArtEmisPure(
-            pressure_top=config.PRESSURE_TOP,
-            pressure_btm=config.PRESSURE_BTM,
+            pressure_top=pressure_top,
+            pressure_btm=pressure_btm,
             nlayer=config.NLAYER,
         )
     art.change_temperature_range(config.T_LOW, config.T_HIGH)
@@ -1590,6 +1599,7 @@ def _load_joint_spectroscopic_component(
     default_rstar: float | None,
     default_phoenix_spectrum_path: str | Path | None,
     default_phoenix_cache_dir: str | Path | None,
+    default_sigma_scale: float = 1.0,
 ) -> SpectroscopicComponentBundle:
     component_mode = _normalize_retrieval_mode(spec.get("mode", default_mode))
     region_name = _normalize_region_name(spec.get("region_name"), component_mode)
@@ -1613,6 +1623,7 @@ def _load_joint_spectroscopic_component(
     Rstar = spec.get("R_star", default_rstar)
     phoenix_spectrum_path = spec.get("phoenix_spectrum_path", default_phoenix_spectrum_path)
     phoenix_cache_dir = spec.get("phoenix_cache_dir", default_phoenix_cache_dir)
+    sigma_scale = _validate_sigma_scale(spec.get("sigma_scale", default_sigma_scale))
     pre_sysrem_data = None
     pre_sysrem_sigma = None
 
@@ -1692,6 +1703,7 @@ def _load_joint_spectroscopic_component(
         sort_idx_for_prepare = np.argsort(inst_nus_before_prepare)
 
     wav_obs, data, sigma, inst_nus = _prepare_observed_spectrum_arrays(wav_obs, data, sigma)
+    sigma = _scale_spectroscopic_sigma(sigma, sigma_scale)
     if pre_sysrem_data is not None and pre_sysrem_sigma is not None:
         pre_sysrem_data = np.asarray(pre_sysrem_data)
         pre_sysrem_sigma = np.asarray(pre_sysrem_sigma)
@@ -1707,6 +1719,7 @@ def _load_joint_spectroscopic_component(
             else:
                 pre_sysrem_data = pre_sysrem_data[sort_idx_for_prepare]
                 pre_sysrem_sigma = pre_sysrem_sigma[sort_idx_for_prepare]
+        pre_sysrem_sigma = _scale_spectroscopic_sigma(pre_sysrem_sigma, sigma_scale)
     if phase.ndim == 0:
         phase = np.asarray([float(phase)])
     if data_format == "timeseries":
@@ -1926,6 +1939,25 @@ class _StepTimer:
         return False
 
 
+def _validate_sigma_scale(sigma_scale: float) -> float:
+    try:
+        scale = float(sigma_scale)
+    except Exception as exc:
+        raise ValueError("sigma_scale must be a finite positive number.") from exc
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("sigma_scale must be a finite positive number.")
+    return scale
+
+
+def _scale_spectroscopic_sigma(
+    sigma: np.ndarray,
+    sigma_scale: float,
+) -> np.ndarray:
+    if sigma_scale == 1.0:
+        return np.asarray(sigma)
+    return np.asarray(sigma, dtype=float) * sigma_scale
+
+
 def run_retrieval(
     mode: str = "transmission",
     epoch: str | Sequence[str] | None = None,
@@ -1951,9 +1983,14 @@ def run_retrieval(
     atmosphere_regions: list[dict[str, Any]] | None = None,
     phoenix_spectrum_path: str | Path | None = None,
     phoenix_cache_dir: str | Path | None = None,
+    save_mcmc_diagnostics: bool = True,
+    sigma_scale: float = 1.0,
+    diagnostic_label: str | None = None,
+    apply_sysrem_override: bool | None = None,
 ) -> None:
     retrieval_start = perf_counter()
     mode = _normalize_retrieval_mode(mode)
+    sigma_scale = _validate_sigma_scale(sigma_scale)
     epochs = _normalize_epoch_values(epoch)
     primary_epoch = epochs[0] if epochs else None
     if pt_profile is None:
@@ -1963,6 +2000,9 @@ def run_retrieval(
 
     # Create timestamped output directory
     base_dir = config.DIR_SAVE or config_utils.get_output_dir()
+    sanitized_label = sanitize_diagnostic_label(diagnostic_label)
+    if sanitized_label is not None:
+        base_dir = Path(base_dir) / sanitized_label
     output_dir = config_utils.create_timestamped_dir(base_dir)
     print(f"\nOutput directory: {output_dir}")
 
@@ -1978,13 +2018,18 @@ def run_retrieval(
         epoch=epochs or None,
         phoenix_spectrum_path=None if phoenix_spectrum_path is None else str(phoenix_spectrum_path),
         phoenix_cache_dir=None if phoenix_cache_dir is None else str(phoenix_cache_dir),
+        save_mcmc_diagnostics=save_mcmc_diagnostics,
+        sigma_scale=sigma_scale,
+        diagnostic_label=sanitized_label,
+        apply_sysrem_override=apply_sysrem_override,
     )
 
     # Get planet parameters
     params = config_utils.get_params()
     print(f"\nTarget: {config.PLANET} ({config.EPHEMERIS})")
 
-    apply_sysrem = bool(config.APPLY_SYSREM_DEFAULT and data_format == "timeseries")
+    apply_sysrem_default = config.APPLY_SYSREM_DEFAULT if apply_sysrem_override is None else apply_sysrem_override
+    apply_sysrem = bool(apply_sysrem_default and data_format == "timeseries")
 
     primary_sysrem: SysremInputBundle | None = sysrem_inputs
     primary_pre_sysrem_data: np.ndarray | None = None
@@ -2135,6 +2180,12 @@ def run_retrieval(
                     primary_pre_sysrem_data = primary_pre_sysrem_data[sort_idx]
                     primary_pre_sysrem_sigma = primary_pre_sysrem_sigma[sort_idx]
 
+        sigma = _scale_spectroscopic_sigma(sigma, sigma_scale)
+        if primary_pre_sysrem_sigma is not None:
+            primary_pre_sysrem_sigma = _scale_spectroscopic_sigma(primary_pre_sysrem_sigma, sigma_scale)
+        if sigma_scale != 1.0:
+            print(f"  Applied spectroscopic sigma scale: x{sigma_scale:g}")
+
         _preflight_spectrum_checks(wav_obs, data, sigma, phase, inst_nus)
 
     # Setup instrumental resolution
@@ -2175,8 +2226,9 @@ def run_retrieval(
     print("\n[4/7] Initializing primary atmospheric RT...")
     with _StepTimer("Step 4/7"):
         primary_art = _build_art_for_mode(mode)
+        pressure_top, pressure_btm = config_utils.get_pressure_bounds_for_mode(mode)
         print(f"  {config.NLAYER} atmospheric layers")
-        print(f"  Pressure range: {config.PRESSURE_TOP:.1e} - {config.PRESSURE_BTM:.1e} bar")
+        print(f"  Pressure range: {pressure_top:.1e} - {pressure_btm:.1e} bar")
         print(f"  Temperature range: {config.T_LOW:.0f} - {config.T_HIGH:.0f} K")
 
     # Load opacities
@@ -2283,6 +2335,7 @@ def run_retrieval(
                 default_rstar=model_params["R_star"],
                 default_phoenix_spectrum_path=phoenix_spectrum_path,
                 default_phoenix_cache_dir=phoenix_cache_dir,
+                default_sigma_scale=1.0,
             )
         else:
             primary_component = _build_primary_spectroscopic_component(
@@ -2334,6 +2387,7 @@ def run_retrieval(
                     default_rstar=model_params["R_star"],
                     default_phoenix_spectrum_path=phoenix_spectrum_path,
                     default_phoenix_cache_dir=phoenix_cache_dir,
+                    default_sigma_scale=sigma_scale,
                 )
                 if component.name in observations_payload:
                     raise ValueError(f"Duplicate joint component name: {component.name}")
@@ -2469,6 +2523,10 @@ def run_retrieval(
 
             if svi_only:
                 if not no_plots:
+                    print(
+                        "  SVI-only outputs are approximate diagnostics; "
+                        "use MCMC/NUTS after SVI warm-up for production posterior inference."
+                    )
                     print("  Generating corner plots from SVI posterior...")
                     rng_key, rng_key_plot = random.split(rng_key)
                     svi_samples_for_plots = _sample_svi_posterior(
@@ -2561,7 +2619,10 @@ def run_retrieval(
                                             ),
                                         ),
                                     )
-                print("  SVI complete (svi_only=True); skipping MCMC.")
+                print(
+                    "  SVI complete (svi_only=True); skipping MCMC. "
+                    "Treat posterior products as approximate diagnostics."
+                )
                 return
 
         print(f"\n  Running HMC-NUTS sampling...")
@@ -2589,9 +2650,12 @@ def run_retrieval(
         )
 
         rng_key, rng_key_ = random.split(rng_key)
+        mcmc_run_kwargs = dict(model_inputs)
+        if save_mcmc_diagnostics:
+            mcmc_run_kwargs["extra_fields"] = DEFAULT_MCMC_EXTRA_FIELDS
         mcmc.run(
             rng_key_,
-            **model_inputs,
+            **mcmc_run_kwargs,
         )
     
     mcmc.print_summary()
@@ -2601,8 +2665,32 @@ def run_retrieval(
         with redirect_stdout(f):
             mcmc.print_summary()
     
+    posterior_sample_by_chain, diagnostics_warnings = get_samples_by_chain(mcmc)
+    save_chain_grouped_posterior(output_dir, posterior_sample_by_chain)
+
     posterior_sample = mcmc.get_samples()
     jnp.savez(os.path.join(output_dir, "posterior_sample"), **posterior_sample)
+
+    if save_mcmc_diagnostics:
+        mcmc_extra_fields, extra_warnings = get_extra_fields_by_chain(mcmc)
+        diagnostics_warnings.extend(extra_warnings)
+        diagnostics_summary = write_mcmc_diagnostics(
+            output_dir,
+            posterior_by_chain=posterior_sample_by_chain,
+            extra_fields=mcmc_extra_fields,
+            num_chains=int(config.MCMC_NUM_CHAINS),
+            num_samples=int(config.MCMC_NUM_SAMPLES),
+            max_tree_depth=int(config.MCMC_MAX_TREE_DEPTH),
+            warnings=diagnostics_warnings,
+            diagnostic_label=sanitized_label,
+        )
+        flags = diagnostics_summary.get("warning_flags", {})
+        flagged = ", ".join(name for name, value in flags.items() if value)
+        print(
+            "  MCMC diagnostics saved to "
+            f"{os.path.join(output_dir, 'diagnostics')}"
+            + (f" (flags: {flagged})" if flagged else "")
+        )
 
     posterior_np: dict[str, np.ndarray] | None = None
     svi_samples_for_plots: dict[str, np.ndarray] | None = None
@@ -2816,6 +2904,7 @@ def run_retrieval(
                         Tarr=np.array(atmo_state['Tarr']),
                         pressure=np.array(atmo_state['pressure']),
                         dParr=np.array(atmo_state['dParr']),
+                        mode=component.mode,
                         save_path=os.path.join(
                             output_dir,
                             _component_output_filename(
@@ -2839,6 +2928,7 @@ def run_retrieval(
                             Tarr=np.array(atmo_state['Tarr']),
                             pressure=np.array(atmo_state['pressure']),
                             dParr=np.array(atmo_state['dParr']),
+                            mode=component.mode,
                             save_path=os.path.join(
                                 output_dir,
                                 _component_output_filename(
@@ -2857,6 +2947,7 @@ def run_retrieval(
                             Tarr=np.array(atmo_state['Tarr']),
                             pressure=np.array(atmo_state['pressure']),
                             dParr=np.array(atmo_state['dParr']),
+                            mode=component.mode,
                             save_path=os.path.join(
                                 output_dir,
                                 _component_output_filename(

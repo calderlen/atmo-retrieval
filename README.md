@@ -14,6 +14,14 @@ pip install jax numpyro exojax astropy matplotlib corner
 python -m atmo_retrieval --planet KELT-20b --mode transmission --epoch 20250601
 ```
 
+Mode-specific atmospheric defaults are explicit: transmission uses a
+`1e-8`-`1` bar grid with a Guillot P-T profile, while emission uses a
+`1e-4`-`1` bar grid with a p-spline P-T profile. Pass `--pt-profile` to override
+the mode default for a run.
+
+SVI is used as a warm start for NUTS/HMC. `--svi-only` outputs are approximate
+diagnostics, not production posterior samples.
+
 Low-resolution inputs are passed explicitly:
 - use `--joint-spectrum-tbl path/to/file.tbl` for multi-bin low-res spectra
 - use `--bandpass-tbl path/to/file.tbl` for single-band / sparse broadband constraints

@@ -67,7 +67,7 @@ echo "PYTHONUNBUFFERED=${PYTHONUNBUFFERED}"
   --mcmc-chain-method sequential \
   --mcmc-warmup 2000 \
   --mcmc-samples 2000 \
-  --svi-steps 8000 \
+  --svi-steps 2000 \
   --svi-learning-rate 0.001 \
   --svi-lr-decay-steps 2000 \
   --svi-lr-decay-rate 0.5

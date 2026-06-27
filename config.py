@@ -1326,8 +1326,9 @@ INSTRUMENTS: dict[str, dict[str, dict]] = {
 
 RETRIEVAL_MODE = "transmission"  # Options: "transmission", "emission"
 
-# Default P-T profile
-PT_PROFILE_DEFAULT = "guillot"  # Options: "guillot", "isothermal", "free`"
+# Mode-specific default P-T profiles
+TRANSMISSION_PT_PROFILE_DEFAULT = "guillot"
+EMISSION_PT_PROFILE_DEFAULT = "pspline"
 
 # ==============================================================================
 # ATMOSPHERIC RT PARAMETERS
@@ -1336,9 +1337,11 @@ PT_PROFILE_DEFAULT = "guillot"  # Options: "guillot", "isothermal", "free`"
 DIFFMODE = 0
 NLAYER = 10 # number of atmospheric layers (runtime profiles below override)
 
-# Pressure range [bar]
-PRESSURE_TOP = 1e-8 
-PRESSURE_BTM = 1e0
+# Mode-specific pressure ranges [bar]
+TRANSMISSION_PRESSURE_TOP = 1e-8
+TRANSMISSION_PRESSURE_BTM = 1e0
+EMISSION_PRESSURE_TOP = 1e-4
+EMISSION_PRESSURE_BTM = 1e0
 
 # Temperature range [K]
 # Sets PreModit auto_trange, ART layer T clipping, and FastChem T clipping.

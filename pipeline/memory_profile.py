@@ -150,16 +150,17 @@ def _run_single_memory_profile_for_range(
 
     print("\n[2/4] Initializing atmospheric RT...")
     nl = nlayer if nlayer is not None else config.NLAYER
+    pressure_top, pressure_btm = config_utils.get_pressure_bounds_for_mode(mode)
     if mode == "transmission":
         art = ArtTransPure(
-            pressure_top=config.PRESSURE_TOP,
-            pressure_btm=config.PRESSURE_BTM,
+            pressure_top=pressure_top,
+            pressure_btm=pressure_btm,
             nlayer=nl,
         )
     elif mode == "emission":
         art = ArtEmisPure(
-            pressure_top=config.PRESSURE_TOP,
-            pressure_btm=config.PRESSURE_BTM,
+            pressure_top=pressure_top,
+            pressure_btm=pressure_btm,
             nlayer=nl,
         )
     else:

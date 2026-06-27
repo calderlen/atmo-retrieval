@@ -10,6 +10,15 @@ from pathlib import Path
 import config
 
 
+_REMOVED_RUNTIME_CONFIG_NAMES = frozenset(
+    {
+        "PRESSURE" + "_TOP",
+        "PRESSURE" + "_BTM",
+        "PT" + "_PROFILE" + "_DEFAULT",
+    }
+)
+
+
 def get_params(planet: str | None = None, ephemeris: str | None = None) -> dict:
     """Get planet parameters for the specified planet and ephemeris."""
     planet = planet or config.PLANET
@@ -105,6 +114,42 @@ def get_resolution(
     if "resolution_modes" in instrument_config and res_mode in instrument_config["resolution_modes"]:
         return instrument_config["resolution_modes"][res_mode]
     return instrument_config["resolution"]
+
+
+def _normalize_retrieval_mode(mode: str | None = None) -> str:
+    normalized = str(mode or config.RETRIEVAL_MODE).strip().lower()
+    if normalized not in {"transmission", "emission"}:
+        raise ValueError(f"Unsupported retrieval mode: {mode!r}")
+    return normalized
+
+
+def get_pressure_bounds_for_mode(mode: str | None = None) -> tuple[float, float]:
+    """Return the atmospheric pressure range in bar for a retrieval mode."""
+    normalized = _normalize_retrieval_mode(mode)
+    if normalized == "transmission":
+        return (
+            config.TRANSMISSION_PRESSURE_TOP,
+            config.TRANSMISSION_PRESSURE_BTM,
+        )
+    return (
+        config.EMISSION_PRESSURE_TOP,
+        config.EMISSION_PRESSURE_BTM,
+    )
+
+
+def get_pt_profile_default_for_mode(mode: str | None = None) -> str:
+    """Return the default P-T profile for a retrieval mode."""
+    normalized = _normalize_retrieval_mode(mode)
+    if normalized == "transmission":
+        return config.TRANSMISSION_PT_PROFILE_DEFAULT
+    return config.EMISSION_PT_PROFILE_DEFAULT
+
+
+def resolve_pt_profile_for_mode(mode: str | None = None, pt_profile: str | None = None) -> str:
+    """Return an explicit P-T profile or the default for the retrieval mode."""
+    if pt_profile is not None:
+        return pt_profile
+    return get_pt_profile_default_for_mode(mode)
 
 
 def get_wavelength_range(
@@ -313,6 +358,10 @@ def create_timestamped_dir(base_dir: str | Path) -> Path:
 
 def set_runtime_config(name: str, value) -> None:
     """Update a config variable at module scope."""
+    if name in _REMOVED_RUNTIME_CONFIG_NAMES:
+        raise ValueError(
+            f"{name} was removed. Use explicit mode-specific atmospheric config names."
+        )
     setattr(config, name, value)
 
 
@@ -359,6 +408,10 @@ def save_run_config(
     epoch: str | list[str] | tuple[str, ...] | None = None,
     phoenix_spectrum_path: str | None = None,
     phoenix_cache_dir: str | None = None,
+    save_mcmc_diagnostics: bool = True,
+    sigma_scale: float = 1.0,
+    diagnostic_label: str | None = None,
+    apply_sysrem_override: bool | None = None,
 ) -> None:
     """Save run configuration to log file."""
     import jax
@@ -414,6 +467,8 @@ def save_run_config(
         f.write(f"Mode: {mode}\n")
         f.write(f"Config profile: {get_runtime_profile_name()}\n")
         f.write(f"P-T profile: {pt_profile}\n")
+        if diagnostic_label is not None:
+            f.write(f"Diagnostic label: {diagnostic_label}\n")
         if chemistry_model is not None:
             f.write(f"Chemistry model: {chemistry_model}\n")
         if phoenix_spectrum_path is not None:
@@ -439,8 +494,9 @@ def save_run_config(
 
         f.write("ATMOSPHERIC SETUP\n")
         f.write("-" * 70 + "\n")
+        pressure_top, pressure_btm = get_pressure_bounds_for_mode(mode)
         f.write(f"Layers: {config.NLAYER}\n")
-        f.write(f"Pressure range: {config.PRESSURE_TOP:.2e} - {config.PRESSURE_BTM:.2e} bar\n")
+        f.write(f"Pressure range: {pressure_top:.2e} - {pressure_btm:.2e} bar\n")
         f.write(f"Temperature range: {config.T_LOW} - {config.T_HIGH} K\n")
         f.write(f"Cloud width: {config.CLOUD_WIDTH}\n")
         f.write(f"Cloud integrated tau: {config.CLOUD_INTEGRATED_TAU}\n\n")
@@ -462,6 +518,10 @@ def save_run_config(
 
         f.write("INFERENCE PARAMETERS\n")
         f.write("-" * 70 + "\n")
+        f.write(f"Save MCMC diagnostics: {save_mcmc_diagnostics}\n")
+        f.write(f"Spectroscopic sigma scale: {sigma_scale}\n")
+        if apply_sysrem_override is not None:
+            f.write(f"SYSREM override: {apply_sysrem_override}\n")
         if not skip_svi:
             f.write(f"SVI steps: {config.SVI_NUM_STEPS:,}\n")
             f.write(f"SVI learning rate: {config.SVI_LEARNING_RATE}\n")
@@ -485,7 +545,7 @@ def save_run_config(
             f.write(f"MCMC require GPU per chain: {config.MCMC_REQUIRE_GPU_PER_CHAIN}\n")
             f.write(f"MCMC max tree depth: {config.MCMC_MAX_TREE_DEPTH}\n")
         else:
-            f.write("\nMCMC: SKIPPED (SVI only)\n")
+            f.write("\nMCMC: SKIPPED (SVI diagnostic approximation only)\n")
 
         if config.ENABLE_TELLURICS:
             f.write("\nTelluric correction: ENABLED\n")

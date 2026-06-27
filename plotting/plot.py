@@ -4,11 +4,11 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import corner
 
-from exojax.plot.atmplot import plotcf
 from physics.model import reconstruct_temperature_profile
 
 
 _CORNER_LOG10_BASES = frozenset({"kappa_ir_cgs", "gamma"})
+_HC_OVER_K_CM = 1.438776877
 
 
 def _basename(name: str) -> str:
@@ -858,11 +858,21 @@ def plot_ccf_pair(
 # CONTRIBUTION FUNCTION PLOTS
 # ==============================================================================
 
+def _normalize_contribution(raw_contribution: np.ndarray) -> np.ndarray:
+    contribution = np.nan_to_num(raw_contribution, nan=0.0, posinf=0.0, neginf=0.0)
+    contribution = np.clip(contribution, 0.0, None)
+    contribution_sum = np.sum(contribution, axis=0, keepdims=True)
+    contribution_sum = np.where(contribution_sum > 0.0, contribution_sum, 1.0)
+    return contribution / contribution_sum
+
+
 def compute_contribution_function(
+    nu_grid: np.ndarray,
     dtau: np.ndarray,
     Tarr: np.ndarray,
     pressure: np.ndarray,
     dParr: np.ndarray,
+    mode: str,
 ) -> np.ndarray:
     """Compute contribution function from optical depth.
     
@@ -871,30 +881,46 @@ def compute_contribution_function(
     it represents the source function weighted by the optical depth gradient.
     
     Args:
+        nu_grid: Wavenumber grid (cm^-1)
         dtau: Optical depth matrix, shape (n_layers, n_wavelength)
         Tarr: Temperature array per layer
         pressure: Pressure grid
         dParr: Pressure differential per layer
+        mode: Retrieval mode, either "transmission" or "emission"
         
     Returns:
         cf: Contribution function, shape (n_layers, n_wavelength)
     """
-    # Cumulative optical depth from top of atmosphere
+    mode = str(mode).lower().strip()
+    if mode not in {"transmission", "emission"}:
+        raise ValueError(f"Unsupported contribution-function mode: {mode!r}")
+
+    dtau = np.asarray(dtau, dtype=float)
+    Tarr = np.asarray(Tarr, dtype=float)
+    pressure = np.asarray(pressure, dtype=float)
+    dParr = np.asarray(dParr, dtype=float)
+    nu_grid = np.asarray(nu_grid, dtype=float)
+
+    if dtau.ndim != 2:
+        raise ValueError(f"dtau must be 2D, got shape {dtau.shape}.")
+    if dtau.shape != (pressure.size, nu_grid.size):
+        raise ValueError(
+            "dtau shape must match (n_pressure, n_wavenumber); "
+            f"got {dtau.shape}, pressure={pressure.size}, nu_grid={nu_grid.size}."
+        )
+
     tau_cumsum = np.cumsum(dtau, axis=0)
-    
-    # Transmission: exp(-tau)
-    transmission = np.exp(-tau_cumsum)
-    
-    # Contribution function: dtau/dP * exp(-tau)
-    # This represents the fractional contribution of each layer
-    cf = dtau * transmission
-    
-    # Normalize per wavelength to show fractional contribution
-    cf_sum = np.sum(cf, axis=0, keepdims=True)
-    cf_sum = np.where(cf_sum > 0, cf_sum, 1.0)  # Avoid division by zero
-    cf_normalized = cf / cf_sum
-    
-    return cf_normalized
+    escape = np.exp(-np.clip(tau_cumsum, 0.0, 700.0))
+
+    if mode == "transmission":
+        return _normalize_contribution(dtau * escape)
+
+    pressure_weight = pressure[:, None] / np.clip(dParr[:, None], 1.0e-300, None)
+    temperature = np.clip(Tarr[:, None], 1.0e-300, None)
+    nu = np.clip(nu_grid[None, :], 1.0e-300, None)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        source_weight = np.power(nu, 3) / np.expm1(_HC_OVER_K_CM * nu / temperature)
+    return _normalize_contribution(escape * dtau * pressure_weight * source_weight)
 
 
 def plot_contribution_function(
@@ -903,12 +929,12 @@ def plot_contribution_function(
     Tarr: np.ndarray,
     pressure: np.ndarray,
     dParr: np.ndarray,
+    mode: str,
     save_path: str | None = None,
     wavelength_unit: str = "AA",
     cmap: str = "viridis",
     title: str | None = None,
     figsize: tuple[float, float] = (10, 6),
-    use_exojax_plotcf: bool = False,
 ) -> np.ndarray:
     """Plot contribution function showing pressure vs wavelength.
     
@@ -921,24 +947,18 @@ def plot_contribution_function(
         Tarr: Temperature array per layer
         pressure: Pressure grid (bar)
         dParr: Pressure differential per layer
+        mode: Retrieval mode, either "transmission" or "emission"
         save_path: Path to save figure (if None, displays)
         wavelength_unit: "AA" for Angstroms, "nm" for nanometers, "um" for microns
         cmap: Colormap name
         title: Plot title (auto-generated if None)
         figsize: Figure size
-        use_exojax_plotcf: If True, use ExoJAX's built-in plotcf
         
     Returns:
         cf: Computed contribution function array
     """
-    # Try to use ExoJAX's built-in contribution function if requested
-    if use_exojax_plotcf:
-        cf = plotcf(nu_grid, dtau, Tarr, pressure, dParr)
-        print("Used ExoJAX plotcf for contribution function")
-        return cf
-    
     # Compute contribution function
-    cf = compute_contribution_function(dtau, Tarr, pressure, dParr)
+    cf = compute_contribution_function(nu_grid, dtau, Tarr, pressure, dParr, mode=mode)
     
     # Convert wavenumber to desired wavelength unit
     if wavelength_unit == "AA":
@@ -996,6 +1016,7 @@ def plot_contribution_per_species(
     Tarr: np.ndarray,
     pressure: np.ndarray,
     dParr: np.ndarray,
+    mode: str,
     save_path: str | None = None,
     wavelength_unit: str = "AA",
     cmap: str = "viridis",
@@ -1014,6 +1035,7 @@ def plot_contribution_per_species(
         Tarr: Temperature array per layer
         pressure: Pressure grid (bar)
         dParr: Pressure differential per layer
+        mode: Retrieval mode, either "transmission" or "emission"
         save_path: Path to save figure
         wavelength_unit: "AA", "nm", "um", or "cm-1"
         cmap: Colormap name
@@ -1069,7 +1091,7 @@ def plot_contribution_per_species(
         ax = axes[row, col]
         
         # Compute contribution function for this species
-        cf = compute_contribution_function(dtau, Tarr, pressure, dParr)
+        cf = compute_contribution_function(nu_grid, dtau, Tarr, pressure, dParr, mode=mode)
         if flip_wave:
             cf = cf[:, ::-1]
         cf_dict[species] = cf
@@ -1108,6 +1130,7 @@ def plot_contribution_combined(
     Tarr: np.ndarray,
     pressure: np.ndarray,
     dParr: np.ndarray,
+    mode: str,
     save_path: str | None = None,
     wavelength_unit: str = "AA",
     species_to_show: list[str] | None = None,
@@ -1125,6 +1148,7 @@ def plot_contribution_combined(
         Tarr: Temperature profile
         pressure: Pressure grid
         dParr: Pressure differentials
+        mode: Retrieval mode, either "transmission" or "emission"
         save_path: Path to save figure
         wavelength_unit: Wavelength unit for x-axis
         species_to_show: List of species to show (None = all)
@@ -1162,7 +1186,7 @@ def plot_contribution_combined(
     
     # Top panel: Total contribution function
     ax_total = fig.add_subplot(gs[0, :])
-    cf_total = compute_contribution_function(dtau, Tarr, pressure, dParr)
+    cf_total = compute_contribution_function(nu_grid, dtau, Tarr, pressure, dParr, mode=mode)
     if flip:
         cf_total = cf_total[:, ::-1]
     
@@ -1180,7 +1204,7 @@ def plot_contribution_combined(
             break
         ax = fig.add_subplot(gs[1, idx])
         
-        cf_sp = compute_contribution_function(sp_dtau, Tarr, pressure, dParr)
+        cf_sp = compute_contribution_function(nu_grid, sp_dtau, Tarr, pressure, dParr, mode=mode)
         if flip:
             cf_sp = cf_sp[:, ::-1]
         
