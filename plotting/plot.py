@@ -139,7 +139,7 @@ def plot_transmission_spectrum(
     rp_obs: np.ndarray,
     rp_err: np.ndarray,
     rp_hmc: np.ndarray,
-    rp_svi: np.ndarray,
+    rp_svi: np.ndarray | None,
     save_path: str,
     rp_pre_sysrem: np.ndarray | None = None,
     rp_pre_sysrem_err: np.ndarray | None = None,
@@ -147,7 +147,7 @@ def plot_transmission_spectrum(
     rp_hmc_np = np.asarray(rp_hmc)
     mean = rp_hmc_np.mean(axis=0)
     std = rp_hmc_np.std(axis=0)
-    rp_svi_np = np.asarray(rp_svi)
+    rp_svi_np = None if rp_svi is None else np.asarray(rp_svi)
 
     wavelength_np = np.asarray(wavelength_nm, dtype=float)
     sort_idx = np.argsort(wavelength_np)
@@ -156,7 +156,7 @@ def plot_transmission_spectrum(
     err_sorted = np.asarray(rp_err, dtype=float)[sort_idx]
     mean_sorted = np.asarray(mean, dtype=float)[sort_idx]
     std_sorted = np.asarray(std, dtype=float)[sort_idx]
-    svi_sorted = rp_svi_np[sort_idx]
+    svi_sorted = None if rp_svi_np is None else rp_svi_np[sort_idx]
 
     bin_wavelength, bin_obs, bin_err = _bin_observed_spectrum(
         wavelength_sorted,
@@ -198,7 +198,7 @@ def plot_transmission_spectrum(
             ms=1.0,
             color="k",
             alpha=0.08,
-            label="Pre-SYSREM raw",
+            label="Pre-SYSREM residuals",
             zorder=1,
         )
         if pre_bin_wavelength.size:
@@ -212,11 +212,10 @@ def plot_transmission_spectrum(
                 ecolor="0.2",
                 elinewidth=0.6,
                 alpha=0.85,
-                label="Pre-SYSREM binned",
+                label="Binned pre-SYSREM residuals",
                 zorder=3,
             )
-        ax_pre.set_ylabel(r"$R_p/R_\star$", fontsize=12)
-        ax_pre.set_title("Before SYSREM / Systematics Correction", fontsize=12)
+        ax_pre.set_ylabel("Processed residual flux", fontsize=12)
         ax_pre.legend(fontsize=9, loc="upper right")
         ax_pre.grid(True, alpha=0.3)
     else:
@@ -235,7 +234,7 @@ def plot_transmission_spectrum(
         ms=1.0,
         color="k",
         alpha=0.08,
-        label="Observed raw",
+        label="Processed residuals",
         zorder=1,
     )
     if bin_wavelength.size:
@@ -249,7 +248,7 @@ def plot_transmission_spectrum(
             ecolor="0.2",
             elinewidth=0.6,
             alpha=0.85,
-            label="Observed binned",
+            label="Binned processed residuals",
             zorder=4,
         )
     ax.fill_between(
@@ -258,16 +257,28 @@ def plot_transmission_spectrum(
         mean_sorted + std_sorted,
         color="C0",
         alpha=0.25,
-        label="HMC ±1σ",
+        label="Posterior model scatter",
         zorder=2,
     )
-    ax.plot(wavelength_sorted, mean_sorted, color="C0", lw=1.7, label="HMC mean", zorder=5)
-    ax.plot(wavelength_sorted, svi_sorted, color="C3", lw=1.5, ls="--", label="SVI median", zorder=6)
-    ax.set_ylabel(r"$R_p/R_\star$", fontsize=12)
-    if has_pre_sysrem:
-        ax.set_title("After SYSREM / Model-Space Comparison", fontsize=12)
-    else:
-        ax.set_title("Transmission Spectrum", fontsize=13)
+    ax.plot(
+        wavelength_sorted,
+        mean_sorted,
+        color="C0",
+        lw=1.7,
+        label="Processed model mean",
+        zorder=5,
+    )
+    if svi_sorted is not None:
+        ax.plot(
+            wavelength_sorted,
+            svi_sorted,
+            color="C3",
+            lw=1.5,
+            ls="--",
+            label="SVI processed model",
+            zorder=6,
+        )
+    ax.set_ylabel("Processed residual flux", fontsize=12)
     ax.legend(fontsize=10, loc="upper right")
     ax.grid(True, alpha=0.3)
 
@@ -286,8 +297,7 @@ def plot_transmission_spectrum(
         )
     ax_resid.axhline(0.0, color="0.35", lw=1.0, ls="--", zorder=2)
     ax_resid.set_xlabel("Wavelength [nm]", fontsize=12)
-    ax_resid.set_ylabel("Obs - HMC", fontsize=11)
-    ax_resid.set_title("Residual: Corrected Observed - HMC Mean", fontsize=11)
+    ax_resid.set_ylabel("Data - model", fontsize=11)
     ax_resid.grid(True, alpha=0.3)
     fig.subplots_adjust(hspace=0.32 if has_pre_sysrem else 0.22)
     fig.savefig(save_path, dpi=200, bbox_inches="tight")

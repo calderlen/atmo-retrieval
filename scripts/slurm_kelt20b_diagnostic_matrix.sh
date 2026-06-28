@@ -16,7 +16,8 @@
 set -euo pipefail
 trap 'echo "[$(date)] Failed on line $LINENO"' ERR
 
-cd "$SLURM_SUBMIT_DIR"
+SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+cd "$SUBMIT_DIR"
 
 CASES=(
   tiny_red_fe_only
@@ -55,8 +56,8 @@ export JAX_ENABLE_X64=0
 
 nvidia-smi -L || true
 
-# Cluster-specific knobs. Override these with environment variables in sbatch if needed.
-PYTHON_BIN="${PYTHON_BIN:-/path/to/osc/envs/retrieval/bin/python}"
+# Cluster/local knobs. Override these with environment variables if needed.
+PYTHON_BIN="${PYTHON_BIN:-python}"
 BANDPASS_TBL="${BANDPASS_TBL:-input/phot/transmission/kelt20b/kelt20b_tess_bandpass.tbl}"
 FASTCHEM_PARAMETER_FILE="${FASTCHEM_PARAMETER_FILE:-input/fastchem/parameters.dat}"
 
@@ -125,6 +126,11 @@ echo "Command:"
 printf '  %q' "$PYTHON_BIN" "${COMMON_ARGS[@]}" "${CASE_ARGS[@]}"
 printf '\n'
 
-/usr/bin/time -v srun --ntasks=1 "$PYTHON_BIN" "${COMMON_ARGS[@]}" "${CASE_ARGS[@]}"
+RUN_PREFIX=()
+if [[ -n "${SLURM_JOB_ID:-}" ]] && command -v srun >/dev/null 2>&1; then
+  RUN_PREFIX=(srun --ntasks=1)
+fi
+
+/usr/bin/time -v "${RUN_PREFIX[@]}" "$PYTHON_BIN" "${COMMON_ARGS[@]}" "${CASE_ARGS[@]}"
 
 echo "[$(date)] Case ${CASE_LABEL} finished"

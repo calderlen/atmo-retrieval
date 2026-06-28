@@ -2591,7 +2591,7 @@ def run_retrieval(
                                         rp_obs=component_obs_mean,
                                         rp_err=component_obs_err,
                                         rp_hmc=np.atleast_2d(svi_line),
-                                        rp_svi=svi_line,
+                                        rp_svi=None,
                                         rp_pre_sysrem=component_pre_obs_mean,
                                         rp_pre_sysrem_err=component_pre_obs_err,
                                         save_path=os.path.join(
@@ -2827,7 +2827,7 @@ def run_retrieval(
                                 rp_obs=component_obs_mean,
                                 rp_err=component_obs_err,
                                 rp_hmc=np.asarray(hmc_plot),
-                                rp_svi=np.asarray(svi_line),
+                                rp_svi=None if svi_model_ts is None else np.asarray(svi_line),
                                 rp_pre_sysrem=component_pre_obs_mean,
                                 rp_pre_sysrem_err=component_pre_obs_err,
                                 save_path=os.path.join(

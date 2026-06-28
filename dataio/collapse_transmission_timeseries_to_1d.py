@@ -74,30 +74,116 @@ def regrid_to_common_wavelength(
     wave: np.ndarray,
     flux: np.ndarray,
     error: np.ndarray,
+    *,
+    max_native_gap_factor: float = config.DEFAULT_REGRID_MAX_NATIVE_GAP_FACTOR,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Regrid all spectra to the first spectrum's wavelength grid.
 
     Corrects for sub-pixel drift between exposures by interpolating all spectra
-    onto a common wavelength grid (the first spectrum's grid).
+    onto a common wavelength grid (the first spectrum's grid). Interpolation is
+    only performed inside valid native wavelength segments; invalid pixels,
+    uncovered edges, and large native jumps are left as NaN/inf so downstream
+    export can drop them instead of treating invented edge values as data.
 
     Args:
         wave: Wavelength arrays, shape (n_spectra, npix)
         flux: Flux arrays, shape (n_spectra, npix)
         error: Error arrays, shape (n_spectra, npix)
+        max_native_gap_factor: Split native wavelength rows wherever the local
+            pixel spacing exceeds this factor times the median positive spacing.
 
     Returns:
         common_wave: Common wavelength grid, shape (npix,)
         flux: Regridded flux, shape (n_spectra, npix)
         error: Regridded error, shape (n_spectra, npix)
     """
-    common_wave = wave[0, :]
+    wave = np.asarray(wave, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+    error = np.asarray(error, dtype=float)
+
+    common_wave = wave[0, :].copy()
     n_spectra = wave.shape[0]
+    regridded_flux = np.full(flux.shape, np.nan, dtype=float)
+    regridded_error = np.full(error.shape, np.inf, dtype=float)
 
-    for i in range(1, n_spectra):
-        flux[i, :] = np.interp(common_wave, wave[i, :], flux[i, :])
-        error[i, :] = np.interp(common_wave, wave[i, :], error[i, :])
+    for i in range(n_spectra):
+        valid = (
+            np.isfinite(wave[i, :])
+            & (wave[i, :] > 0.0)
+            & np.isfinite(flux[i, :])
+            & np.isfinite(error[i, :])
+            & (error[i, :] > 0.0)
+        )
+        if np.sum(valid) < 2:
+            continue
 
-    return common_wave, flux, error
+        native_wave = wave[i, valid]
+        native_flux = flux[i, valid]
+        native_error = error[i, valid]
+
+        sort_idx = np.argsort(native_wave)
+        native_wave = native_wave[sort_idx]
+        native_flux = native_flux[sort_idx]
+        native_error = native_error[sort_idx]
+
+        native_wave, unique_idx = np.unique(native_wave, return_index=True)
+        native_flux = native_flux[unique_idx]
+        native_error = native_error[unique_idx]
+        if native_wave.size < 2:
+            continue
+
+        spacing = np.diff(native_wave)
+        positive_spacing = spacing[spacing > 0.0]
+        if positive_spacing.size == 0:
+            continue
+
+        max_gap = float(max_native_gap_factor) * float(np.median(positive_spacing))
+        segment_starts = np.r_[0, np.flatnonzero(spacing > max_gap) + 1]
+        segment_stops = np.r_[segment_starts[1:], native_wave.size]
+
+        for start, stop in zip(segment_starts, segment_stops):
+            if stop - start < 2:
+                continue
+            segment_wave = native_wave[start:stop]
+            segment_flux = native_flux[start:stop]
+            segment_error = native_error[start:stop]
+            covered = (
+                np.isfinite(common_wave)
+                & (common_wave >= segment_wave[0])
+                & (common_wave <= segment_wave[-1])
+            )
+            if not np.any(covered):
+                continue
+            regridded_flux[i, covered] = np.interp(
+                common_wave[covered],
+                segment_wave,
+                segment_flux,
+            )
+            regridded_error[i, covered] = np.interp(
+                common_wave[covered],
+                segment_wave,
+                segment_error,
+            )
+
+    return common_wave, regridded_flux, regridded_error
+
+
+def keep_finite_common_columns(
+    wave: np.ndarray,
+    flux: np.ndarray,
+    error: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Drop common-grid columns that are not valid for every exposure."""
+    wave = np.asarray(wave, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+    error = np.asarray(error, dtype=float)
+    valid = np.isfinite(wave) & (wave > 0.0)
+    valid &= np.all(np.isfinite(flux), axis=0)
+    valid &= np.all(np.isfinite(error), axis=0)
+    valid &= np.all(error > 0.0, axis=0)
+    if not np.any(valid):
+        raise ValueError("No valid common-grid columns remain after regridding.")
+    return wave[valid], flux[:, valid], error[:, valid], valid
 
 
 def subtract_median_spectrum(
@@ -198,6 +284,45 @@ def get_sysrem_deep_mask(
     return deep_mask
 
 
+def get_telluric_edge_mask(
+    wave: np.ndarray,
+    arm: str,
+    *,
+    edge_width_angstrom: float = config.DEFAULT_TELLURIC_EDGE_MASK_WIDTH_A,
+) -> np.ndarray:
+    """Return columns close to configured telluric/deep-mask boundaries."""
+    if arm == "full":
+        raise ValueError(
+            "arm='full' is not supported by get_telluric_edge_mask. "
+            "Call with 'red' or 'blue' separately."
+        )
+    wave = np.asarray(wave, dtype=float)
+    if wave.ndim != 1:
+        raise ValueError(f"Expected 1D wavelength grid, got shape {wave.shape}.")
+
+    edge_width_angstrom = float(edge_width_angstrom)
+    edge_mask = np.zeros(wave.shape[0], dtype=bool)
+    if edge_width_angstrom <= 0.0:
+        return edge_mask
+
+    telluric_config = TELLURIC_REGIONS.get(arm, {"telluric": [], "deep_mask": []})
+    boundaries: list[float] = []
+    for key in ("telluric", "deep_mask"):
+        for wmin, wmax in telluric_config[key]:
+            boundaries.extend((float(wmin), float(wmax)))
+    for boundary in sorted(set(boundaries)):
+        edge_mask |= np.abs(wave - boundary) <= edge_width_angstrom
+    return edge_mask
+
+
+def get_sysrem_ignore_mask(
+    wave: np.ndarray,
+    arm: str,
+) -> np.ndarray:
+    """Return deep telluric and boundary-halo columns to ignore in SYSREM output."""
+    return get_sysrem_deep_mask(wave, arm) | get_telluric_edge_mask(wave, arm)
+
+
 def get_sysrem_max_systematics(arm: str) -> list[int]:
     if arm == "full":
         raise ValueError(
@@ -209,6 +334,17 @@ def get_sysrem_max_systematics(arm: str) -> list[int]:
     return list(config.DEFAULT_SYSREM_MAX_SYSTEMATICS_OTHER)
 
 
+def get_sysrem_min_systematics(arm: str) -> list[int]:
+    if arm == "full":
+        raise ValueError(
+            "arm='full' is not supported by get_sysrem_min_systematics. "
+            "Call with 'red' or 'blue' separately."
+        )
+    if arm == "red":
+        return list(config.DEFAULT_SYSREM_MIN_SYSTEMATICS_RED)
+    return list(config.DEFAULT_SYSREM_MIN_SYSTEMATICS_OTHER)
+
+
 def do_sysrem(
     wave: np.ndarray,
     residual_flux: np.ndarray,
@@ -218,7 +354,8 @@ def do_sysrem(
     niter: int = 10,
     do_molecfit: bool = True,
     stop_delta_stddev: float = config.DEFAULT_SYSREM_STOP_TOL,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return_diagnostics: bool = False,
+) -> tuple[np.ndarray, ...]:
     """Run SYSREM with separate treatment for telluric and non-telluric regions.
 
     The first systematic is initialized with airmass (physically motivated for
@@ -233,6 +370,9 @@ def do_sysrem(
         niter: Number of iterations per systematic (default: 10)
         do_molecfit: If True, mask deep telluric regions (default: True)
         stop_delta_stddev: Minimum sigma improvement required to accept a component
+            after the configured minimum component count has been reached
+        return_diagnostics: If True, append per-component SYSREM attempt
+            diagnostics to the returned tuple
 
     Returns:
         corrected_flux: Systematics-corrected flux, shape (n_spectra, npix)
@@ -248,23 +388,44 @@ def do_sysrem(
     corrected_error = residual_error.copy()
 
     _, chunk_indices, _telluric_mask = get_sysrem_chunk_indices(wave, arm)
+    if do_molecfit:
+        ignore_mask = get_sysrem_ignore_mask(wave, arm)
+        corrected_flux[:, ignore_mask] = 0.0
+        corrected_error[:, ignore_mask] = 1.0
+        chunk_indices = tuple(
+            np.asarray(indices, dtype=int)[~ignore_mask[np.asarray(indices, dtype=int)]]
+            for indices in chunk_indices
+        )
+
     no_tellurics = np.asarray(chunk_indices[0], dtype=int)
     chunks = len(chunk_indices)
 
-    if do_molecfit:
-        deep_mask = get_sysrem_deep_mask(wave, arm)
-        corrected_flux[:, deep_mask] = 0.0
-        corrected_error[:, deep_mask] = 1.0
-
     max_systematics = get_sysrem_max_systematics(arm)
+    min_systematics = get_sysrem_min_systematics(arm)
 
-    # Ensure max_systematics has correct length
+    # Ensure per-chunk settings have the correct length.
     if len(max_systematics) < chunks:
         max_systematics = max_systematics + [max_systematics[-1]] * (chunks - len(max_systematics))
+    if len(min_systematics) < chunks:
+        min_systematics = min_systematics + [min_systematics[-1]] * (chunks - len(min_systematics))
+
+    for chunk, (min_n_sys, max_n_sys_chunk) in enumerate(zip(min_systematics, max_systematics)):
+        if min_n_sys < 0:
+            raise ValueError(f"SYSREM minimum systematics must be non-negative; got {min_n_sys}.")
+        if min_n_sys > max_n_sys_chunk:
+            raise ValueError(
+                f"SYSREM chunk {chunk + 1} minimum systematics ({min_n_sys}) "
+                f"exceeds maximum systematics ({max_n_sys_chunk})."
+            )
 
     max_n_sys = max(max_systematics)
     U_sysrem = np.full((n_spectra, max_n_sys, chunks), np.nan, dtype=float)
     n_systematics_used = [0] * chunks
+    sysrem_stddev_before = np.full((max_n_sys, chunks), np.nan, dtype=float)
+    sysrem_stddev_after = np.full((max_n_sys, chunks), np.nan, dtype=float)
+    sysrem_delta_stddev = np.full((max_n_sys, chunks), np.nan, dtype=float)
+    sysrem_component_attempted = np.zeros((max_n_sys, chunks), dtype=bool)
+    sysrem_component_accepted = np.zeros((max_n_sys, chunks), dtype=bool)
 
     for chunk in range(chunks):
         this_one = chunk_indices[chunk]
@@ -273,6 +434,7 @@ def do_sysrem(
 
         npixhere = len(this_one)
         n_sys_chunk = max_systematics[chunk]
+        min_sys_chunk = min_systematics[chunk]
 
         stddev_prev = np.std(corrected_flux[:, this_one])
 
@@ -297,11 +459,19 @@ def do_sysrem(
                     denominator = np.sum(a**2 / err_squared)
 
                     # Error propagation
-                    saoa = np.where(a != 0, sigma_a / np.abs(a), 0.0)
-                    eof = np.where(
-                        corrected_flux[:, pix_idx] != 0,
-                        corrected_error[:, pix_idx] / np.abs(corrected_flux[:, pix_idx]),
-                        0.0
+                    abs_a = np.abs(a)
+                    saoa = np.divide(
+                        sigma_a,
+                        abs_a,
+                        out=np.zeros_like(sigma_a),
+                        where=abs_a != 0.0,
+                    )
+                    abs_flux = np.abs(corrected_flux[:, pix_idx])
+                    eof = np.divide(
+                        corrected_error[:, pix_idx],
+                        abs_flux,
+                        out=np.zeros_like(corrected_error[:, pix_idx]),
+                        where=abs_flux != 0.0,
                     )
 
                     sigma_1 = np.abs(a * corrected_flux[:, pix_idx] / err_squared) * np.sqrt(saoa**2 + eof**2)
@@ -330,11 +500,19 @@ def do_sysrem(
                     denominator = np.sum(c**2 / err_squared)
 
                     # Error propagation
-                    scoc = np.where(c != 0, sigma_c / np.abs(c), 0.0)
-                    eof = np.where(
-                        corrected_flux[ep, pix_indices] != 0,
-                        corrected_error[ep, pix_indices] / np.abs(corrected_flux[ep, pix_indices]),
-                        0.0
+                    abs_c = np.abs(c)
+                    scoc = np.divide(
+                        sigma_c,
+                        abs_c,
+                        out=np.zeros_like(sigma_c),
+                        where=abs_c != 0.0,
+                    )
+                    abs_flux = np.abs(corrected_flux[ep, pix_indices])
+                    eof = np.divide(
+                        corrected_error[ep, pix_indices],
+                        abs_flux,
+                        out=np.zeros_like(corrected_error[ep, pix_indices]),
+                        where=abs_flux != 0.0,
                     )
 
                     sigma_1 = np.abs(c * corrected_flux[ep, pix_indices] / err_squared) * np.sqrt(scoc**2 + eof**2)
@@ -357,15 +535,38 @@ def do_sysrem(
             syserr = a[:, np.newaxis] * c[np.newaxis, :]
 
             # Error on systematic term
-            ratio_a = np.where(a != 0, sigma_a / np.abs(a), 0.0)[:, np.newaxis]
-            ratio_c = np.where(c != 0, sigma_c / np.abs(c), 0.0)[np.newaxis, :]
+            abs_a = np.abs(a)
+            abs_c = np.abs(c)
+            ratio_a = np.divide(
+                sigma_a,
+                abs_a,
+                out=np.zeros_like(sigma_a),
+                where=abs_a != 0.0,
+            )[:, np.newaxis]
+            ratio_c = np.divide(
+                sigma_c,
+                abs_c,
+                out=np.zeros_like(sigma_c),
+                where=abs_c != 0.0,
+            )[np.newaxis, :]
             sigma_syserr = np.abs(syserr) * np.sqrt(ratio_a**2 + ratio_c**2)
 
             # Stop when additional components stop improving scatter enough
             trial_flux = corrected_flux[:, this_one] - syserr
             stddev_next = np.std(trial_flux)
             delta_stddev = stddev_prev - stddev_next
-            if delta_stddev <= stop_delta_stddev:
+            sysrem_stddev_before[system, chunk] = stddev_prev
+            sysrem_stddev_after[system, chunk] = stddev_next
+            sysrem_delta_stddev[system, chunk] = delta_stddev
+            sysrem_component_attempted[system, chunk] = True
+            if (
+                n_systematics_used[chunk] >= min_sys_chunk
+                and delta_stddev <= stop_delta_stddev
+            ):
+                print(
+                    f"  SYSREM chunk {chunk + 1}/{chunks}, component {system + 1}: "
+                    f"delta_stddev={delta_stddev:.3e} <= stop_tol={stop_delta_stddev:.1e}; rejected"
+                )
                 break
 
             # Accept and apply this systematic
@@ -374,10 +575,19 @@ def do_sysrem(
             corrected_error[:, this_one] = np.sqrt(corrected_error[:, this_one]**2 + sigma_syserr**2)
             stddev_prev = stddev_next
             n_systematics_used[chunk] += 1
+            sysrem_component_accepted[system, chunk] = True
+            if n_systematics_used[chunk] <= min_sys_chunk:
+                reason = "forced minimum"
+            else:
+                reason = f"delta_stddev > stop_tol={stop_delta_stddev:.1e}"
+            print(
+                f"  SYSREM chunk {chunk + 1}/{chunks}, component {system + 1}: "
+                f"delta_stddev={delta_stddev:.3e}; accepted ({reason})"
+            )
 
         print(
             f"SYSREM chunk {chunk + 1}/{chunks}: used {n_systematics_used[chunk]} "
-            f"of max {n_sys_chunk} systematics"
+            f"of min/max {min_sys_chunk}/{n_sys_chunk} systematics"
         )
 
     # Trim trailing all-NaN columns if discovery mode stopped early.
@@ -386,6 +596,19 @@ def do_sysrem(
         U_sysrem = U_sysrem[:, :used_max, :]
     else:
         U_sysrem = U_sysrem[:, :0, :]
+
+    if return_diagnostics:
+        diagnostics = {
+            "sysrem_stddev_before": sysrem_stddev_before,
+            "sysrem_stddev_after": sysrem_stddev_after,
+            "sysrem_delta_stddev": sysrem_delta_stddev,
+            "sysrem_component_attempted": sysrem_component_attempted,
+            "sysrem_component_accepted": sysrem_component_accepted,
+            "sysrem_min_systematics": np.asarray(min_systematics, dtype=int),
+            "sysrem_max_systematics": np.asarray(max_systematics, dtype=int),
+            "sysrem_stop_delta_stddev": np.asarray(stop_delta_stddev, dtype=float),
+        }
+        return corrected_flux, corrected_error, U_sysrem, no_tellurics, diagnostics
 
     return corrected_flux, corrected_error, U_sysrem, no_tellurics
 
@@ -760,7 +983,19 @@ def get_pepsi_data(
     if regrid:
         print("Regridding spectra to common wavelength grid...")
         wave_common, fluxin, errorin = regrid_to_common_wavelength(wave, fluxin, errorin)
+        original_npix = wave_common.size
+        wave_common, fluxin, errorin, _valid_regrid_columns = keep_finite_common_columns(
+            wave_common,
+            fluxin,
+            errorin,
+        )
+        dropped_npix = original_npix - wave_common.size
+        if dropped_npix:
+            print(
+                f"  Dropped {dropped_npix} unsupported common-grid columns after regridding."
+            )
         # Replace 2D wave array with 1D common grid (broadcast back for compatibility)
+        npix = wave_common.size
         wave = np.broadcast_to(wave_common[np.newaxis, :], (n_spectra, npix)).copy()
 
     # Step 2: Sort by time
@@ -786,14 +1021,17 @@ def get_pepsi_data(
     U_sysrem = None
     no_tellurics = None
     n_systematics_used = None
+    sysrem_diagnostics = None
     if run_sysrem:
         sysrem_max_systematics = get_sysrem_max_systematics(arm)
+        sysrem_min_systematics = get_sysrem_min_systematics(arm)
         print(
-            f"Running SYSREM (adaptive) with max_systematics={sysrem_max_systematics}, "
+            f"Running SYSREM (adaptive) with min_systematics={sysrem_min_systematics}, "
+            f"max_systematics={sysrem_max_systematics}, "
             f"stop_tol={sysrem_stop_tol:.1e}..."
         )
         wave_1d = wave[0, :]  # Use first spectrum's wavelength grid
-        fluxin, errorin, U_sysrem, no_tellurics = do_sysrem(
+        sysrem_result = do_sysrem(
             wave_1d,
             fluxin,
             errorin,
@@ -801,7 +1039,9 @@ def get_pepsi_data(
             airmass,
             do_molecfit=do_molecfit,
             stop_delta_stddev=sysrem_stop_tol,
+            return_diagnostics=True,
         )
+        fluxin, errorin, U_sysrem, no_tellurics, sysrem_diagnostics = sysrem_result
         n_systematics_used = [int(np.sum(np.isfinite(U_sysrem[0, :, i]))) for i in range(U_sysrem.shape[2])]
 
     # Step 5: Doppler shadow removal
@@ -831,6 +1071,8 @@ def get_pepsi_data(
             'shadow_model': shadow_model,
             'shadow_fit_info': shadow_fit_info,
         }
+        if sysrem_diagnostics is not None:
+            extras.update(sysrem_diagnostics)
         return result, extras
 
     return result

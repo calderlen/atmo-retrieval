@@ -293,6 +293,24 @@ def _sysrem_basis_counts(U_full: np.ndarray) -> np.ndarray:
     return np.asarray(counts, dtype=int)
 
 
+def _sysrem_diagnostics_for_save(extras: dict[str, Any]) -> dict[str, np.ndarray]:
+    keys = (
+        "sysrem_stddev_before",
+        "sysrem_stddev_after",
+        "sysrem_delta_stddev",
+        "sysrem_component_attempted",
+        "sysrem_component_accepted",
+        "sysrem_min_systematics",
+        "sysrem_max_systematics",
+        "sysrem_stop_delta_stddev",
+    )
+    return {
+        key: np.asarray(extras[key])
+        for key in keys
+        if extras.get(key) is not None
+    }
+
+
 def _sysrem_chunk_vdiag_from_sigma(
     sigma: np.ndarray,
     chunk_indices: tuple[np.ndarray, ...],
@@ -605,6 +623,7 @@ def _process_arm(
         chunk_labels = _chunk_labels_from_indices(wave_1d.size, chunk_indices)
         basis_counts = _sysrem_basis_counts(U_full)
         V_chunk_diag = _sysrem_chunk_vdiag_from_sigma(sigma, chunk_indices)
+        sysrem_diagnostics = _sysrem_diagnostics_for_save(extras)
         np.savez(
             output_dir / "U_sysrem.npz",
             U_sysrem=U_full,
@@ -612,11 +631,14 @@ def _process_arm(
             basis_counts=basis_counts,
             V_chunk_diag=V_chunk_diag,
             chunk_names=np.asarray(chunk_names, dtype="U32"),
+            **sysrem_diagnostics,
         )
         print(
             "  Saved chunked SYSREM bundle: "
             f"{len(chunk_names)} chunks, basis counts={basis_counts.tolist()}"
         )
+        if "sysrem_delta_stddev" in sysrem_diagnostics:
+            print("  Saved SYSREM component diagnostics: sysrem_delta_stddev and acceptance masks")
 
     _save_metadata(
         output_dir,
