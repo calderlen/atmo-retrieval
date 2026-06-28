@@ -187,7 +187,6 @@ def common_args(args: argparse.Namespace, case: MatrixCase) -> list[str]:
         "--save-mcmc-diagnostics",
         "--diagnostic-label",
         case.name,
-        "--no-plots",
     ]
 
 

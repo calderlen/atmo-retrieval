@@ -84,7 +84,6 @@ COMMON_ARGS=(
   --svi-lr-decay-rate 0.5
   --save-mcmc-diagnostics
   --diagnostic-label "$CASE_LABEL"
-  --no-plots
 )
 
 CASE_ARGS=()

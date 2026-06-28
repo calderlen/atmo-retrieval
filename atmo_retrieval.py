@@ -784,11 +784,6 @@ def create_parser():
         help="Run only SVI diagnostic approximation, skip MCMC"
     )
     exec_group.add_argument(
-        "--no-plots",
-        action="store_true",
-        help="Skip plotting (faster)"
-    )
-    exec_group.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -1344,7 +1339,6 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             data_format=args.data_format,
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
-            no_plots=args.no_plots,
             pt_profile=pt_profile,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
@@ -1363,7 +1357,6 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             data_format=args.data_format,
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
-            no_plots=args.no_plots,
             pt_profile=pt_profile,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
@@ -1381,7 +1374,6 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             data_format=args.data_format,
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
-            no_plots=args.no_plots,
             pt_profile=pt_profile,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
@@ -1400,7 +1392,6 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             data_format=args.data_format,
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
-            no_plots=args.no_plots,
             pt_profile=pt_profile,
             phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,

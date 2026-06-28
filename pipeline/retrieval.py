@@ -1964,7 +1964,6 @@ def run_retrieval(
     data_format: str = config.DEFAULT_DATA_FORMAT,
     skip_svi: bool = False,
     svi_only: bool = False,
-    no_plots: bool = False,
     pt_profile: str | None = None,
     phase_mode: PhaseMode = "global",
     chemistry_model: str | None = None,
@@ -2522,103 +2521,102 @@ def run_retrieval(
             )
 
             if svi_only:
-                if not no_plots:
-                    print(
-                        "  SVI-only outputs are approximate diagnostics; "
-                        "use MCMC/NUTS after SVI warm-up for production posterior inference."
-                    )
-                    print("  Generating corner plots from SVI posterior...")
-                    rng_key, rng_key_plot = random.split(rng_key)
-                    svi_samples_for_plots = _sample_svi_posterior(
-                        guide=svi_guide,
-                        params=svi_params,
-                        rng_key=rng_key_plot,
-                        num_samples=max(100, int(config.MCMC_NUM_SAMPLES)),
-                    )
-                    save_retrieval_corner_plots(
-                        output_dir=str(output_dir),
-                        svi_samples=svi_samples_for_plots,
+                print(
+                    "  SVI-only outputs are approximate diagnostics; "
+                    "use MCMC/NUTS after SVI warm-up for production posterior inference."
+                )
+                print("  Generating corner plots from SVI posterior...")
+                rng_key, rng_key_plot = random.split(rng_key)
+                svi_samples_for_plots = _sample_svi_posterior(
+                    guide=svi_guide,
+                    params=svi_params,
+                    rng_key=rng_key_plot,
+                    num_samples=max(100, int(config.MCMC_NUM_SAMPLES)),
+                )
+                save_retrieval_corner_plots(
+                    output_dir=str(output_dir),
+                    svi_samples=svi_samples_for_plots,
+                )
+
+                if svi_losses is not None:
+                    plot_svi_loss(
+                        np.asarray(jax.device_get(svi_losses)),
+                        os.path.join(output_dir, "svi_loss.png"),
                     )
 
-                    if svi_losses is not None:
-                        plot_svi_loss(
-                            np.asarray(jax.device_get(svi_losses)),
-                            os.path.join(output_dir, "svi_loss.png"),
+                if svi_samples_for_plots is not None:
+                    try:
+                        plot_temperature_profile(
+                            posterior_samples=svi_samples_for_plots,
+                            art=shared_region_config.art,
+                            save_path=os.path.join(output_dir, "temperature_profile.png"),
+                            pt_profile=shared_pt_profile,
+                            sample_prefix=shared_region_sample_prefix,
+                            Tint_fixed=shared_region_config.Tint_fixed,
+                        )
+                    except Exception as exc:
+                        print(
+                            "  Skipping temperature profile plot for SVI samples: "
+                            f"{exc}"
+                        )
+                    for component in spectroscopic_components:
+                        component_obs_mean, component_obs_err = _summarize_observed_spectrum(
+                            component.data,
+                            component.sigma,
+                        )
+                        component_pre_obs_mean = None
+                        component_pre_obs_err = None
+                        if component.pre_sysrem_data is not None and component.pre_sysrem_sigma is not None:
+                            component_pre_obs_mean, component_pre_obs_err = _summarize_observed_spectrum(
+                                component.pre_sysrem_data,
+                                component.pre_sysrem_sigma,
+                            )
+                        component_wav_obs_nm = np.asarray(component.wav_obs) / 10.0
+                        svi_model_ts, _ = _compute_model_timeseries_for_plot(
+                            posterior_samples=svi_samples_for_plots,
+                            model_params=model_params,
+                            region_config=shared_region_config,
+                            component=component,
+                            region_sample_prefix=shared_region_sample_prefix,
+                            component_sample_prefix=component_sample_prefixes[component.name],
                         )
 
-                    if svi_samples_for_plots is not None:
-                        try:
-                            plot_temperature_profile(
-                                posterior_samples=svi_samples_for_plots,
-                                art=shared_region_config.art,
-                                save_path=os.path.join(output_dir, "temperature_profile.png"),
-                                pt_profile=shared_pt_profile,
-                                sample_prefix=shared_region_sample_prefix,
-                                Tint_fixed=shared_region_config.Tint_fixed,
-                            )
-                        except Exception as exc:
-                            print(
-                                "  Skipping temperature profile plot for SVI samples: "
-                                f"{exc}"
-                            )
-                        for component in spectroscopic_components:
-                            component_obs_mean, component_obs_err = _summarize_observed_spectrum(
-                                component.data,
-                                component.sigma,
-                            )
-                            component_pre_obs_mean = None
-                            component_pre_obs_err = None
-                            if component.pre_sysrem_data is not None and component.pre_sysrem_sigma is not None:
-                                component_pre_obs_mean, component_pre_obs_err = _summarize_observed_spectrum(
-                                    component.pre_sysrem_data,
-                                    component.pre_sysrem_sigma,
+                        if svi_model_ts is not None:
+                            svi_line = np.mean(np.asarray(svi_model_ts), axis=0)
+                            if mode == "transmission":
+                                plot_transmission_spectrum(
+                                    wavelength_nm=component_wav_obs_nm,
+                                    rp_obs=component_obs_mean,
+                                    rp_err=component_obs_err,
+                                    rp_hmc=np.atleast_2d(svi_line),
+                                    rp_svi=None,
+                                    rp_pre_sysrem=component_pre_obs_mean,
+                                    rp_pre_sysrem_err=component_pre_obs_err,
+                                    save_path=os.path.join(
+                                        output_dir,
+                                        _component_output_filename(
+                                            "transmission_spectrum.png",
+                                            component.name,
+                                            num_components=spectroscopic_component_count,
+                                        ),
+                                    ),
                                 )
-                            component_wav_obs_nm = np.asarray(component.wav_obs) / 10.0
-                            svi_model_ts, _ = _compute_model_timeseries_for_plot(
-                                posterior_samples=svi_samples_for_plots,
-                                model_params=model_params,
-                                region_config=shared_region_config,
-                                component=component,
-                                region_sample_prefix=shared_region_sample_prefix,
-                                component_sample_prefix=component_sample_prefixes[component.name],
-                            )
-
-                            if svi_model_ts is not None:
-                                svi_line = np.mean(np.asarray(svi_model_ts), axis=0)
-                                if mode == "transmission":
-                                    plot_transmission_spectrum(
-                                        wavelength_nm=component_wav_obs_nm,
-                                        rp_obs=component_obs_mean,
-                                        rp_err=component_obs_err,
-                                        rp_hmc=np.atleast_2d(svi_line),
-                                        rp_svi=None,
-                                        rp_pre_sysrem=component_pre_obs_mean,
-                                        rp_pre_sysrem_err=component_pre_obs_err,
-                                        save_path=os.path.join(
-                                            output_dir,
-                                            _component_output_filename(
-                                                "transmission_spectrum.png",
-                                                component.name,
-                                                num_components=spectroscopic_component_count,
-                                            ),
+                            else:
+                                plot_emission_spectrum(
+                                    wavelength_nm=component_wav_obs_nm,
+                                    fp_obs=component_obs_mean,
+                                    fp_err=component_obs_err,
+                                    fp_hmc=np.atleast_2d(svi_line),
+                                    fp_svi=svi_line,
+                                    save_path=os.path.join(
+                                        output_dir,
+                                        _component_output_filename(
+                                            "emission_spectrum.png",
+                                            component.name,
+                                            num_components=spectroscopic_component_count,
                                         ),
-                                    )
-                                else:
-                                    plot_emission_spectrum(
-                                        wavelength_nm=component_wav_obs_nm,
-                                        fp_obs=component_obs_mean,
-                                        fp_err=component_obs_err,
-                                        fp_hmc=np.atleast_2d(svi_line),
-                                        fp_svi=svi_line,
-                                        save_path=os.path.join(
-                                            output_dir,
-                                            _component_output_filename(
-                                                "emission_spectrum.png",
-                                                component.name,
-                                                num_components=spectroscopic_component_count,
-                                            ),
-                                        ),
-                                    )
+                                    ),
+                                )
                 print(
                     "  SVI complete (svi_only=True); skipping MCMC. "
                     "Treat posterior products as approximate diagnostics."
@@ -2695,80 +2693,72 @@ def run_retrieval(
     posterior_np: dict[str, np.ndarray] | None = None
     svi_samples_for_plots: dict[str, np.ndarray] | None = None
 
-    if not no_plots or compute_contribution:
-        posterior_np = {}
-        for name, values in posterior_sample.items():
-            posterior_np[name] = np.asarray(jax.device_get(values))
+    posterior_np = {}
+    for name, values in posterior_sample.items():
+        posterior_np[name] = np.asarray(jax.device_get(values))
 
-    if not no_plots:
-        if svi_params is not None and svi_guide is not None:
-            n_hmc_samples = max(100, int(config.MCMC_NUM_SAMPLES))
-            if posterior_np:
-                first_site = next(iter(posterior_np))
-                n_hmc_samples = int(np.asarray(posterior_np[first_site]).shape[0])
+    if svi_params is not None and svi_guide is not None:
+        n_hmc_samples = max(100, int(config.MCMC_NUM_SAMPLES))
+        if posterior_np:
+            first_site = next(iter(posterior_np))
+            n_hmc_samples = int(np.asarray(posterior_np[first_site]).shape[0])
 
-            rng_key, rng_key_plot = random.split(rng_key)
-            svi_samples_for_plots = _sample_svi_posterior(
-                guide=svi_guide,
-                params=svi_params,
-                rng_key=rng_key_plot,
-                num_samples=n_hmc_samples,
-            )
+        rng_key, rng_key_plot = random.split(rng_key)
+        svi_samples_for_plots = _sample_svi_posterior(
+            guide=svi_guide,
+            params=svi_params,
+            rng_key=rng_key_plot,
+            num_samples=n_hmc_samples,
+        )
 
-        if svi_losses is not None:
-            try:
-                plot_svi_loss(
-                    np.asarray(jax.device_get(svi_losses)),
-                    os.path.join(output_dir, "svi_loss.png"),
-                )
-            except Exception as exc:
-                print(f"  Warning: failed to generate SVI loss plot; continuing. ({exc})")
-
+    if svi_losses is not None:
         try:
-            plot_temperature_profile(
-                posterior_samples=posterior_np,
-                art=shared_region_config.art,
-                save_path=os.path.join(output_dir, "temperature_profile.png"),
-                pt_profile=shared_pt_profile,
-                sample_prefix=shared_region_sample_prefix,
-                Tint_fixed=shared_region_config.Tint_fixed,
+            plot_svi_loss(
+                np.asarray(jax.device_get(svi_losses)),
+                os.path.join(output_dir, "svi_loss.png"),
             )
         except Exception as exc:
-            print(
-                "  Skipping temperature profile plot for HMC samples: "
-                f"{exc}"
-            )
+            print(f"  Warning: failed to generate SVI loss plot; continuing. ({exc})")
+
+    try:
+        plot_temperature_profile(
+            posterior_samples=posterior_np,
+            art=shared_region_config.art,
+            save_path=os.path.join(output_dir, "temperature_profile.png"),
+            pt_profile=shared_pt_profile,
+            sample_prefix=shared_region_sample_prefix,
+            Tint_fixed=shared_region_config.Tint_fixed,
+        )
+    except Exception as exc:
+        print(
+            "  Skipping temperature profile plot for HMC samples: "
+            f"{exc}"
+        )
 
     component_atmo_states: dict[str, dict] = {}
-    if compute_contribution or not no_plots:
-        print("\n  Computing atmospheric state from posterior...")
+    print("\n  Computing atmospheric state from posterior...")
 
-        if posterior_np is None:
-            posterior_np = {}
-            for name, values in posterior_sample.items():
-                posterior_np[name] = np.asarray(jax.device_get(values))
+    for component in spectroscopic_components:
+        try:
+            component_atmo_states[component.name] = compute_atmospheric_state_from_posterior(
+                posterior_samples=posterior_np,
+                region_config=shared_region_config,
+                opa_mols=component.opa_mols,
+                opa_atoms=component.opa_atoms,
+                opa_cias=component.opa_cias,
+                nu_grid=component.nu_grid,
+                use_median=True,
+                sample_prefix=shared_region_sample_prefix,
+            )
+        except Exception as exc:
+            if compute_contribution:
+                raise
+            print(
+                "  Warning: unable to compute atmospheric state for "
+                f"{component.name}; skipping that component's diagnostics. ({exc})"
+            )
 
-        for component in spectroscopic_components:
-            try:
-                component_atmo_states[component.name] = compute_atmospheric_state_from_posterior(
-                    posterior_samples=posterior_np,
-                    region_config=shared_region_config,
-                    opa_mols=component.opa_mols,
-                    opa_atoms=component.opa_atoms,
-                    opa_cias=component.opa_cias,
-                    nu_grid=component.nu_grid,
-                    use_median=True,
-                    sample_prefix=shared_region_sample_prefix,
-                )
-            except Exception as exc:
-                if compute_contribution:
-                    raise
-                print(
-                    "  Warning: unable to compute atmospheric state for "
-                    f"{component.name}; skipping that component's diagnostics. ({exc})"
-                )
-
-    if not no_plots and component_atmo_states:
+    if component_atmo_states:
         print("  Plotting fitted spectrum diagnostics...")
         for component in spectroscopic_components:
             try:
@@ -2885,22 +2875,45 @@ def run_retrieval(
                 vmrHe=np.array(atmo_state['vmrHe']),
             )
 
-        if not no_plots:
-            print("  Plotting contribution function(s)...")
+        print("  Plotting contribution function(s)...")
 
-            for component in spectroscopic_components:
-                try:
-                    atmo_state = component_atmo_states.get(component.name)
-                    if atmo_state is None:
-                        continue
+        for component in spectroscopic_components:
+            try:
+                atmo_state = component_atmo_states.get(component.name)
+                if atmo_state is None:
+                    continue
 
-                    contribution_title = f"{config.PLANET} Contribution Function ({mode})"
-                    if spectroscopic_component_count > 1:
-                        contribution_title += f" [{component.name}]"
+                contribution_title = f"{config.PLANET} Contribution Function ({mode})"
+                if spectroscopic_component_count > 1:
+                    contribution_title += f" [{component.name}]"
 
-                    plot_contribution_function(
+                plot_contribution_function(
+                    nu_grid=np.array(component.nu_grid),
+                    dtau=np.array(atmo_state['dtau']),
+                    Tarr=np.array(atmo_state['Tarr']),
+                    pressure=np.array(atmo_state['pressure']),
+                    dParr=np.array(atmo_state['dParr']),
+                    mode=component.mode,
+                    save_path=os.path.join(
+                        output_dir,
+                        _component_output_filename(
+                            "contribution_function.pdf",
+                            component.name,
+                            num_components=spectroscopic_component_count,
+                        ),
+                    ),
+                    wavelength_unit="AA",
+                    title=contribution_title,
+                )
+
+                if atmo_state['dtau_per_species']:
+                    dtau_per_species_np = {}
+                    for k, v in atmo_state['dtau_per_species'].items():
+                        dtau_per_species_np[k] = np.array(v)
+
+                    plot_contribution_per_species(
                         nu_grid=np.array(component.nu_grid),
-                        dtau=np.array(atmo_state['dtau']),
+                        dtau_per_species=dtau_per_species_np,
                         Tarr=np.array(atmo_state['Tarr']),
                         pressure=np.array(atmo_state['pressure']),
                         dParr=np.array(atmo_state['dParr']),
@@ -2908,74 +2921,49 @@ def run_retrieval(
                         save_path=os.path.join(
                             output_dir,
                             _component_output_filename(
-                                "contribution_function.pdf",
+                                "contribution_per_species.pdf",
                                 component.name,
                                 num_components=spectroscopic_component_count,
                             ),
                         ),
                         wavelength_unit="AA",
-                        title=contribution_title,
                     )
 
-                    if atmo_state['dtau_per_species']:
-                        dtau_per_species_np = {}
-                        for k, v in atmo_state['dtau_per_species'].items():
-                            dtau_per_species_np[k] = np.array(v)
-
-                        plot_contribution_per_species(
-                            nu_grid=np.array(component.nu_grid),
-                            dtau_per_species=dtau_per_species_np,
-                            Tarr=np.array(atmo_state['Tarr']),
-                            pressure=np.array(atmo_state['pressure']),
-                            dParr=np.array(atmo_state['dParr']),
-                            mode=component.mode,
-                            save_path=os.path.join(
-                                output_dir,
-                                _component_output_filename(
-                                    "contribution_per_species.pdf",
-                                    component.name,
-                                    num_components=spectroscopic_component_count,
-                                ),
+                    plot_contribution_combined(
+                        nu_grid=np.array(component.nu_grid),
+                        dtau=np.array(atmo_state['dtau']),
+                        dtau_per_species=dtau_per_species_np,
+                        Tarr=np.array(atmo_state['Tarr']),
+                        pressure=np.array(atmo_state['pressure']),
+                        dParr=np.array(atmo_state['dParr']),
+                        mode=component.mode,
+                        save_path=os.path.join(
+                            output_dir,
+                            _component_output_filename(
+                                "contribution_combined.pdf",
+                                component.name,
+                                num_components=spectroscopic_component_count,
                             ),
-                            wavelength_unit="AA",
-                        )
-
-                        plot_contribution_combined(
-                            nu_grid=np.array(component.nu_grid),
-                            dtau=np.array(atmo_state['dtau']),
-                            dtau_per_species=dtau_per_species_np,
-                            Tarr=np.array(atmo_state['Tarr']),
-                            pressure=np.array(atmo_state['pressure']),
-                            dParr=np.array(atmo_state['dParr']),
-                            mode=component.mode,
-                            save_path=os.path.join(
-                                output_dir,
-                                _component_output_filename(
-                                    "contribution_combined.pdf",
-                                    component.name,
-                                    num_components=spectroscopic_component_count,
-                                ),
-                            ),
-                            wavelength_unit="AA",
-                        )
-                except Exception as exc:
-                    print(
-                        "  Warning: failed to generate contribution plot for "
-                        f"{component.name}; continuing. ({exc})"
+                        ),
+                        wavelength_unit="AA",
                     )
+            except Exception as exc:
+                print(
+                    "  Warning: failed to generate contribution plot for "
+                    f"{component.name}; continuing. ({exc})"
+                )
 
-            print(f"  Contribution function plots saved to {output_dir}/")
+        print(f"  Contribution function plots saved to {output_dir}/")
 
-    if not no_plots:
-        print("\n  Generating corner plots...")
-        try:
-            save_retrieval_corner_plots(
-                output_dir=str(output_dir),
-                hmc_samples=posterior_np,
-                svi_samples=svi_samples_for_plots,
-            )
-        except Exception as exc:
-            print(f"  Warning: failed to generate corner plots; continuing. ({exc})")
+    print("\n  Generating corner plots...")
+    try:
+        save_retrieval_corner_plots(
+            output_dir=str(output_dir),
+            hmc_samples=posterior_np,
+            svi_samples=svi_samples_for_plots,
+        )
+    except Exception as exc:
+        print(f"  Warning: failed to generate corner plots; continuing. ({exc})")
     
     print("\n" + "="*70)
     print("RETRIEVAL COMPLETE")
