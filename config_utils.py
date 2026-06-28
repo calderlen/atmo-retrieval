@@ -410,6 +410,8 @@ def save_run_config(
     phoenix_cache_dir: str | None = None,
     save_mcmc_diagnostics: bool = True,
     sigma_scale: float = 1.0,
+    spectral_stride: int = 1,
+    spectral_offset: int = 0,
     diagnostic_label: str | None = None,
     apply_sysrem_override: bool | None = None,
 ) -> None:
@@ -520,6 +522,8 @@ def save_run_config(
         f.write("-" * 70 + "\n")
         f.write(f"Save MCMC diagnostics: {save_mcmc_diagnostics}\n")
         f.write(f"Spectroscopic sigma scale: {sigma_scale}\n")
+        f.write(f"Spectral stride: {spectral_stride}\n")
+        f.write(f"Spectral offset: {spectral_offset}\n")
         if apply_sysrem_override is not None:
             f.write(f"SYSREM override: {apply_sysrem_override}\n")
         if not skip_svi:

@@ -639,6 +639,140 @@ def _subset_sysrem_inputs(
     )
 
 
+def _validate_spectral_subset(
+    spectral_stride: int,
+    spectral_offset: int,
+) -> tuple[int, int]:
+    try:
+        stride = int(spectral_stride)
+        offset = int(spectral_offset)
+    except Exception as exc:
+        raise ValueError("spectral_stride and spectral_offset must be integers.") from exc
+    if stride < 1:
+        raise ValueError("spectral_stride must be >= 1.")
+    if offset < 0:
+        raise ValueError("spectral_offset must be >= 0.")
+    if offset >= stride:
+        raise ValueError("spectral_offset must be smaller than spectral_stride.")
+    return stride, offset
+
+
+def _spectral_subset_indices(
+    n_wave: int,
+    spectral_stride: int,
+    spectral_offset: int,
+) -> np.ndarray:
+    stride, offset = _validate_spectral_subset(spectral_stride, spectral_offset)
+    indices = np.arange(offset, int(n_wave), stride, dtype=int)
+    if indices.size < 2:
+        raise ValueError(
+            "Spectral thinning left fewer than two wavelength pixels; "
+            f"n_wave={n_wave}, stride={stride}, offset={offset}."
+        )
+    return indices
+
+
+def _take_spectral_axis(array: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    arr = np.asarray(array)
+    if arr.ndim == 1:
+        return arr[indices]
+    return arr[:, indices]
+
+
+def _subset_sysrem_wavelengths(
+    sysrem: SysremInputBundle | None,
+    indices: np.ndarray,
+    n_wave: int,
+) -> SysremInputBundle | None:
+    if sysrem is None or not sysrem.is_chunked:
+        return sysrem
+
+    selected = np.asarray(indices, dtype=int)
+    old_to_new = np.full((int(n_wave),), -1, dtype=int)
+    old_to_new[selected] = np.arange(selected.size, dtype=int)
+
+    new_chunk_indices: list[np.ndarray] = []
+    new_u_chunks: list[np.ndarray] = []
+    new_v_chunks: list[np.ndarray] = []
+    for chunk_indices, U_chunk, V_chunk in zip(
+        sysrem.chunk_indices or (),
+        sysrem.U_chunks or (),
+        sysrem.V_chunks or (),
+    ):
+        remapped = old_to_new[np.asarray(chunk_indices, dtype=int)]
+        remapped = remapped[remapped >= 0]
+        if remapped.size == 0:
+            continue
+        new_chunk_indices.append(np.sort(remapped).astype(int))
+        new_u_chunks.append(np.asarray(U_chunk))
+        new_v_chunks.append(np.asarray(V_chunk))
+
+    if not new_chunk_indices:
+        raise ValueError("Spectral thinning removed all chunked SYSREM wavelength columns.")
+
+    return SysremInputBundle(
+        chunk_indices=tuple(new_chunk_indices),
+        U_chunks=tuple(new_u_chunks),
+        V_chunks=tuple(new_v_chunks),
+    )
+
+
+def _remap_sysrem_wavelength_sort(
+    sysrem: SysremInputBundle | None,
+    sort_idx: np.ndarray | None,
+) -> SysremInputBundle | None:
+    if sysrem is None or not sysrem.is_chunked or sort_idx is None:
+        return sysrem
+
+    sort_idx = np.asarray(sort_idx, dtype=int)
+    old_to_new = np.empty_like(sort_idx)
+    old_to_new[sort_idx] = np.arange(sort_idx.size, dtype=int)
+    return SysremInputBundle(
+        chunk_indices=tuple(
+            np.sort(old_to_new[np.asarray(chunk_indices, dtype=int)]).astype(int)
+            for chunk_indices in (sysrem.chunk_indices or ())
+        ),
+        U_chunks=tuple(np.asarray(U_chunk) for U_chunk in (sysrem.U_chunks or ())),
+        V_chunks=tuple(np.asarray(V_chunk) for V_chunk in (sysrem.V_chunks or ())),
+    )
+
+
+def _apply_spectral_thinning(
+    *,
+    wav_obs: np.ndarray,
+    data: np.ndarray,
+    sigma: np.ndarray,
+    sysrem: SysremInputBundle | None,
+    pre_sysrem_data: np.ndarray | None,
+    pre_sysrem_sigma: np.ndarray | None,
+    spectral_stride: int,
+    spectral_offset: int,
+    component_name: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, SysremInputBundle | None, np.ndarray | None, np.ndarray | None]:
+    stride, offset = _validate_spectral_subset(spectral_stride, spectral_offset)
+    if stride == 1 and offset == 0:
+        return wav_obs, data, sigma, sysrem, pre_sysrem_data, pre_sysrem_sigma
+
+    n_wave = int(np.asarray(wav_obs).size)
+    indices = _spectral_subset_indices(n_wave, stride, offset)
+    thinned_sysrem = _subset_sysrem_wavelengths(sysrem, indices, n_wave)
+    thinned_pre_data = None if pre_sysrem_data is None else _take_spectral_axis(pre_sysrem_data, indices)
+    thinned_pre_sigma = None if pre_sysrem_sigma is None else _take_spectral_axis(pre_sysrem_sigma, indices)
+    print(
+        f"  Applied spectral thinning to {component_name}: "
+        f"kept {indices.size}/{n_wave} pixels "
+        f"(stride={stride}, offset={offset})"
+    )
+    return (
+        np.asarray(wav_obs)[indices],
+        _take_spectral_axis(data, indices),
+        _take_spectral_axis(sigma, indices),
+        thinned_sysrem,
+        thinned_pre_data,
+        thinned_pre_sigma,
+    )
+
+
 def _normalize_phase(phase: np.ndarray) -> np.ndarray:
     phase = np.asarray(phase)
     if phase.size == 0:
@@ -1600,6 +1734,8 @@ def _load_joint_spectroscopic_component(
     default_phoenix_spectrum_path: str | Path | None,
     default_phoenix_cache_dir: str | Path | None,
     default_sigma_scale: float = 1.0,
+    default_spectral_stride: int = 1,
+    default_spectral_offset: int = 0,
 ) -> SpectroscopicComponentBundle:
     component_mode = _normalize_retrieval_mode(spec.get("mode", default_mode))
     region_name = _normalize_region_name(spec.get("region_name"), component_mode)
@@ -1624,6 +1760,10 @@ def _load_joint_spectroscopic_component(
     phoenix_spectrum_path = spec.get("phoenix_spectrum_path", default_phoenix_spectrum_path)
     phoenix_cache_dir = spec.get("phoenix_cache_dir", default_phoenix_cache_dir)
     sigma_scale = _validate_sigma_scale(spec.get("sigma_scale", default_sigma_scale))
+    spectral_stride, spectral_offset = _validate_spectral_subset(
+        spec.get("spectral_stride", default_spectral_stride),
+        spec.get("spectral_offset", default_spectral_offset),
+    )
     pre_sysrem_data = None
     pre_sysrem_sigma = None
 
@@ -1697,12 +1837,25 @@ def _load_joint_spectroscopic_component(
             "SYSREM inputs were provided."
         )
 
+    wav_obs, data, sigma, sysrem, pre_sysrem_data, pre_sysrem_sigma = _apply_spectral_thinning(
+        wav_obs=wav_obs,
+        data=data,
+        sigma=sigma,
+        sysrem=sysrem,
+        pre_sysrem_data=pre_sysrem_data,
+        pre_sysrem_sigma=pre_sysrem_sigma,
+        spectral_stride=spectral_stride,
+        spectral_offset=spectral_offset,
+        component_name=name,
+    )
+
     inst_nus_before_prepare = wav2nu(np.asarray(wav_obs), "AA")
     sort_idx_for_prepare = None
     if inst_nus_before_prepare.size > 1 and np.any(np.diff(inst_nus_before_prepare) <= 0):
         sort_idx_for_prepare = np.argsort(inst_nus_before_prepare)
 
     wav_obs, data, sigma, inst_nus = _prepare_observed_spectrum_arrays(wav_obs, data, sigma)
+    sysrem = _remap_sysrem_wavelength_sort(sysrem, sort_idx_for_prepare)
     sigma = _scale_spectroscopic_sigma(sigma, sigma_scale)
     if pre_sysrem_data is not None and pre_sysrem_sigma is not None:
         pre_sysrem_data = np.asarray(pre_sysrem_data)
@@ -1984,12 +2137,15 @@ def run_retrieval(
     phoenix_cache_dir: str | Path | None = None,
     save_mcmc_diagnostics: bool = True,
     sigma_scale: float = 1.0,
+    spectral_stride: int = 1,
+    spectral_offset: int = 0,
     diagnostic_label: str | None = None,
     apply_sysrem_override: bool | None = None,
 ) -> None:
     retrieval_start = perf_counter()
     mode = _normalize_retrieval_mode(mode)
     sigma_scale = _validate_sigma_scale(sigma_scale)
+    spectral_stride, spectral_offset = _validate_spectral_subset(spectral_stride, spectral_offset)
     epochs = _normalize_epoch_values(epoch)
     primary_epoch = epochs[0] if epochs else None
     if pt_profile is None:
@@ -2019,6 +2175,8 @@ def run_retrieval(
         phoenix_cache_dir=None if phoenix_cache_dir is None else str(phoenix_cache_dir),
         save_mcmc_diagnostics=save_mcmc_diagnostics,
         sigma_scale=sigma_scale,
+        spectral_stride=spectral_stride,
+        spectral_offset=spectral_offset,
         diagnostic_label=sanitized_label,
         apply_sysrem_override=apply_sysrem_override,
     )
@@ -2143,10 +2301,6 @@ def run_retrieval(
                     "Choose from {'timeseries', 'spectrum'}."
                 )
 
-        print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
-
-        # Convert to wavenumber
-        inst_nus = wav2nu(wav_obs, "AA")
         if primary_pre_sysrem_data is not None and primary_pre_sysrem_sigma is not None:
             primary_pre_sysrem_data = np.asarray(primary_pre_sysrem_data)
             primary_pre_sysrem_sigma = np.asarray(primary_pre_sysrem_sigma)
@@ -2159,6 +2313,22 @@ def run_retrieval(
                     f"data/sigma shape {np.asarray(data).shape}; got "
                     f"{primary_pre_sysrem_data.shape} and {primary_pre_sysrem_sigma.shape}."
                 )
+
+        wav_obs, data, sigma, primary_sysrem, primary_pre_sysrem_data, primary_pre_sysrem_sigma = _apply_spectral_thinning(
+            wav_obs=wav_obs,
+            data=data,
+            sigma=sigma,
+            sysrem=primary_sysrem,
+            pre_sysrem_data=primary_pre_sysrem_data,
+            pre_sysrem_sigma=primary_pre_sysrem_sigma,
+            spectral_stride=spectral_stride,
+            spectral_offset=spectral_offset,
+            component_name=primary_component_name,
+        )
+        print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
+
+        # Convert to wavenumber
+        inst_nus = wav2nu(wav_obs, "AA")
 
         # Ensure wavenumber grid and data are in ascending order
         if inst_nus.size > 1 and np.any(np.diff(inst_nus) <= 0):
@@ -2178,6 +2348,7 @@ def run_retrieval(
                 else:
                     primary_pre_sysrem_data = primary_pre_sysrem_data[sort_idx]
                     primary_pre_sysrem_sigma = primary_pre_sysrem_sigma[sort_idx]
+            primary_sysrem = _remap_sysrem_wavelength_sort(primary_sysrem, sort_idx)
 
         sigma = _scale_spectroscopic_sigma(sigma, sigma_scale)
         if primary_pre_sysrem_sigma is not None:
@@ -2335,6 +2506,8 @@ def run_retrieval(
                 default_phoenix_spectrum_path=phoenix_spectrum_path,
                 default_phoenix_cache_dir=phoenix_cache_dir,
                 default_sigma_scale=1.0,
+                default_spectral_stride=1,
+                default_spectral_offset=0,
             )
         else:
             primary_component = _build_primary_spectroscopic_component(
@@ -2387,6 +2560,8 @@ def run_retrieval(
                     default_phoenix_spectrum_path=phoenix_spectrum_path,
                     default_phoenix_cache_dir=phoenix_cache_dir,
                     default_sigma_scale=sigma_scale,
+                    default_spectral_stride=spectral_stride,
+                    default_spectral_offset=spectral_offset,
                 )
                 if component.name in observations_payload:
                     raise ValueError(f"Duplicate joint component name: {component.name}")

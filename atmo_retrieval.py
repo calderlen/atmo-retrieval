@@ -812,6 +812,21 @@ def create_parser():
         help="Multiply spectroscopic uncertainty arrays by this factor for diagnostic runs",
     )
     diagnostics_group.add_argument(
+        "--spectral-stride",
+        type=int,
+        default=1,
+        help=(
+            "Keep every Nth spectroscopic wavelength pixel after loading "
+            "for effective-independent-pixel diagnostic runs"
+        ),
+    )
+    diagnostics_group.add_argument(
+        "--spectral-offset",
+        type=int,
+        default=0,
+        help="Starting offset for --spectral-stride diagnostic thinning",
+    )
+    diagnostics_group.add_argument(
         "--no-sysrem",
         action="store_true",
         help="Disable SYSREM model/data correction for this run",
@@ -969,6 +984,12 @@ def apply_cli_overrides(args):
     # Diagnostic controls
     if args.sigma_scale <= 0 or not math.isfinite(float(args.sigma_scale)):
         raise ValueError("--sigma-scale must be a finite positive number.")
+    if args.spectral_stride < 1:
+        raise ValueError("--spectral-stride must be >= 1.")
+    if args.spectral_offset < 0:
+        raise ValueError("--spectral-offset must be >= 0.")
+    if args.spectral_offset >= args.spectral_stride:
+        raise ValueError("--spectral-offset must be smaller than --spectral-stride.")
     if args.no_sysrem:
         config_utils.set_runtime_config("APPLY_SYSREM_DEFAULT", False)
 
@@ -1274,6 +1295,11 @@ def print_config_summary(config, args):
     print(f"  Vsys handling: fixed at systemic velocity = {params['RV_abs']} km/s")
     print(f"  Save MCMC diagnostics: {args.save_mcmc_diagnostics}")
     print(f"  Spectroscopic sigma scale: {args.sigma_scale:g}")
+    if args.spectral_stride != 1 or args.spectral_offset != 0:
+        print(
+            "  Spectral thinning: "
+            f"stride={args.spectral_stride}, offset={args.spectral_offset}"
+        )
     if args.no_sysrem:
         print("  SYSREM: disabled by --no-sysrem")
     if args.diagnostic_label:
@@ -1305,6 +1331,8 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
     diagnostic_run_kwargs = {
         "save_mcmc_diagnostics": args.save_mcmc_diagnostics,
         "sigma_scale": args.sigma_scale,
+        "spectral_stride": args.spectral_stride,
+        "spectral_offset": args.spectral_offset,
         "diagnostic_label": args.diagnostic_label,
         "apply_sysrem_override": False if args.no_sysrem else None,
     }

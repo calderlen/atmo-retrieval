@@ -120,6 +120,9 @@ def _build_timeseries_component_spec(
     apply_sysrem: bool,
     subtract_per_exposure_mean: bool,
     region_name: str,
+    sigma_scale: float = 1.0,
+    spectral_stride: int = 1,
+    spectral_offset: int = 0,
 ) -> dict[str, Any]:
     return {
         "name": name,
@@ -133,6 +136,9 @@ def _build_timeseries_component_spec(
         "likelihood_kind": "matched_filter",
         "subtract_per_exposure_mean": bool(subtract_per_exposure_mean),
         "instrument_resolution": float(instrument_resolution),
+        "sigma_scale": float(sigma_scale),
+        "spectral_stride": int(spectral_stride),
+        "spectral_offset": int(spectral_offset),
     }
 
 
@@ -155,6 +161,9 @@ def build_diagnostic_context(
     phase_mode: str = "global",
     atmosphere_regions: list[dict[str, Any]] | None = None,
     apply_sysrem: bool | None = None,
+    sigma_scale: float = 1.0,
+    spectral_stride: int = 1,
+    spectral_offset: int = 0,
     fastchem_parameter_file: str | Path | None = None,
     phoenix_spectrum_path: str | Path | None = None,
     phoenix_cache_dir: str | Path | None = None,
@@ -198,6 +207,9 @@ def build_diagnostic_context(
                     apply_sysrem=apply_sysrem_enabled,
                     subtract_per_exposure_mean=subtract_per_exposure_mean,
                     region_name=shared_region_name,
+                    sigma_scale=sigma_scale,
+                    spectral_stride=spectral_stride,
+                    spectral_offset=spectral_offset,
                 ),
                 _build_timeseries_component_spec(
                     name="spectroscopy_blue",
@@ -208,6 +220,9 @@ def build_diagnostic_context(
                     apply_sysrem=apply_sysrem_enabled,
                     subtract_per_exposure_mean=subtract_per_exposure_mean,
                     region_name=shared_region_name,
+                    sigma_scale=sigma_scale,
+                    spectral_stride=spectral_stride,
+                    spectral_offset=spectral_offset,
                 ),
             ]
             shared_system = _retrieval.build_shared_system_config(
@@ -231,6 +246,9 @@ def build_diagnostic_context(
                     apply_sysrem=apply_sysrem_enabled,
                     subtract_per_exposure_mean=subtract_per_exposure_mean,
                     region_name=shared_region_name,
+                    sigma_scale=sigma_scale,
+                    spectral_stride=spectral_stride,
+                    spectral_offset=spectral_offset,
                 )
             ]
             shared_system = _retrieval.build_shared_system_config(params=model_params)
@@ -517,6 +535,14 @@ def build_diag_config_from_run_dir(
         "molecules": molecules,
         "load_opacities": _parse_bool_token(saved.get("Opacity loading", "True")),
     }
+    if "Spectroscopic sigma scale" in saved:
+        config_payload["sigma_scale"] = float(str(saved["Spectroscopic sigma scale"]).replace(",", ""))
+    if "Spectral stride" in saved:
+        config_payload["spectral_stride"] = int(str(saved["Spectral stride"]).replace(",", ""))
+    if "Spectral offset" in saved:
+        config_payload["spectral_offset"] = int(str(saved["Spectral offset"]).replace(",", ""))
+    if "SYSREM override" in saved:
+        config_payload["apply_sysrem"] = _parse_bool_token(saved["SYSREM override"])
     if fastchem_parameter_file:
         config_payload["fastchem_parameter_file"] = str(fastchem_parameter_file)
     return config_payload
@@ -695,12 +721,15 @@ def scan_kp_drv_surface(
     best_raw_log_likelihood = -np.inf
     best_raw_indices = (0, 0)
     best_raw_params: dict[str, float] = {"Kp": float(kp_grid[0]), "dRV": float(drv_grid[0])}
+    component_sample_prefix = _get_component_sample_prefix(context, component_name)
 
     for i, kp in enumerate(kp_grid):
         for j, drv in enumerate(drv_grid):
             trial_params = dict(base_params)
             trial_params["Kp"] = float(kp)
             trial_params["dRV"] = float(drv)
+            if component_sample_prefix is not None:
+                trial_params[f"{component_sample_prefix}/dRV"] = float(drv)
             model_ts, _ = synthesize_processed_model_timeseries(
                 context,
                 trial_params,

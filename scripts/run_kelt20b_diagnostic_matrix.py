@@ -27,47 +27,42 @@ class MatrixCase:
     jax_enable_x64: bool = False
 
 
+TINY_RED_FE_ONLY_ARGS: tuple[str, ...] = (
+    "--wavelength-range",
+    "red",
+    "--atoms",
+    "Fe I",
+    "--no-molecules",
+    "--nlayer",
+    "10",
+    "--n-spectral-points",
+    "30000",
+)
+
+
 CASES: tuple[MatrixCase, ...] = (
-    MatrixCase(
-        "tiny_red_fe_only",
-        ("--wavelength-range", "red", "--atoms", "Fe I", "--no-molecules", "--nlayer", "10", "--n-spectral-points", "30000"),
-    ),
+    MatrixCase("tiny_red_fe_only", TINY_RED_FE_ONLY_ARGS),
     MatrixCase(
         "tiny_red_fe_only_no_svi",
-        (
-            "--wavelength-range",
-            "red",
-            "--atoms",
-            "Fe I",
-            "--no-molecules",
-            "--nlayer",
-            "10",
-            "--n-spectral-points",
-            "30000",
-            "--skip-svi",
-        ),
+        (*TINY_RED_FE_ONLY_ARGS, "--skip-svi"),
     ),
+    MatrixCase("tiny_red_fe_only_sigma1p5", (*TINY_RED_FE_ONLY_ARGS, "--sigma-scale", "1.5")),
+    MatrixCase("tiny_red_fe_only_sigma2", (*TINY_RED_FE_ONLY_ARGS, "--sigma-scale", "2")),
+    MatrixCase("tiny_red_fe_only_sigma3", (*TINY_RED_FE_ONLY_ARGS, "--sigma-scale", "3")),
     MatrixCase(
         "tiny_red_fe_only_sigma5",
-        (
-            "--wavelength-range",
-            "red",
-            "--atoms",
-            "Fe I",
-            "--no-molecules",
-            "--nlayer",
-            "10",
-            "--n-spectral-points",
-            "30000",
-            "--sigma-scale",
-            "5",
-        ),
+        (*TINY_RED_FE_ONLY_ARGS, "--sigma-scale", "5"),
     ),
+    MatrixCase("tiny_red_fe_only_sigma8", (*TINY_RED_FE_ONLY_ARGS, "--sigma-scale", "8")),
     MatrixCase(
         "tiny_red_fe_only_x64",
-        ("--wavelength-range", "red", "--atoms", "Fe I", "--no-molecules", "--nlayer", "10", "--n-spectral-points", "30000"),
+        TINY_RED_FE_ONLY_ARGS,
         jax_enable_x64=True,
     ),
+    MatrixCase("tiny_red_fe_only_no_sysrem", (*TINY_RED_FE_ONLY_ARGS, "--no-sysrem")),
+    MatrixCase("tiny_red_fe_only_stride2", (*TINY_RED_FE_ONLY_ARGS, "--spectral-stride", "2")),
+    MatrixCase("tiny_red_fe_only_stride4", (*TINY_RED_FE_ONLY_ARGS, "--spectral-stride", "4")),
+    MatrixCase("tiny_red_fe_only_stride8", (*TINY_RED_FE_ONLY_ARGS, "--spectral-stride", "8")),
     MatrixCase(
         "red_all_atoms",
         (
