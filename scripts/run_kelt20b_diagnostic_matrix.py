@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Run the KELT-20b diagnostic retrieval matrix without Slurm.
+"""Run KELT-20b diagnostic retrieval matrix cases without Slurm.
 
-This is the local/interactive companion to ``slurm_kelt20b_diagnostic_matrix.sh``.
-It runs the same case definitions directly with a chosen Python interpreter, so
-it is convenient on a GUI/login machine inside tmux or screen.
+It runs controlled diagnostic cases directly with a chosen Python interpreter,
+so it is convenient inside an interactive HPC allocation, tmux, or screen.
 """
 
 from __future__ import annotations
@@ -18,6 +17,17 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_EPOCH_BY_MODE = {
+    "transmission": "20190504",
+    "emission": "20210501",
+}
+DEFAULT_BANDPASS_BY_MODE = {
+    "transmission": ("input/phot/transmission/kelt20b/kelt20b_tess_bandpass.tbl",),
+    "emission": (
+        "input/phot/emission/kelt20b/KELT_20_b_3.12080_5244_1.tbl",
+        "input/phot/emission/kelt20b/KELT_20_b_3.12080_5244_3.tbl",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -139,7 +149,12 @@ def resolve_cases(selectors: list[str], run_all: bool) -> list[MatrixCase]:
 
 
 def common_args(args: argparse.Namespace, case: MatrixCase) -> list[str]:
-    return [
+    bandpass_args: list[str] = []
+    for tbl_path in args.bandpass_tbl:
+        bandpass_args.extend(["--bandpass-tbl", tbl_path])
+    diagnostic_label = f"{args.diagnostic_label_prefix}{case.name}"
+
+    command_args = [
         "-m",
         "atmo_retrieval",
         "--profile",
@@ -147,11 +162,10 @@ def common_args(args: argparse.Namespace, case: MatrixCase) -> list[str]:
         "--planet",
         args.planet,
         "--mode",
-        "transmission",
+        args.mode,
         "--epoch",
         args.epoch,
-        "--bandpass-tbl",
-        args.bandpass_tbl,
+        *bandpass_args,
         "--data-format",
         "timeseries",
         "--chemistry-model",
@@ -181,8 +195,11 @@ def common_args(args: argparse.Namespace, case: MatrixCase) -> list[str]:
         str(args.svi_lr_decay_rate),
         "--save-mcmc-diagnostics",
         "--diagnostic-label",
-        case.name,
+        diagnostic_label,
     ]
+    if args.phoenix_spectrum_path:
+        command_args.extend(["--phoenix-spectrum-path", args.phoenix_spectrum_path])
+    return command_args
 
 
 def run_case(case: MatrixCase, args: argparse.Namespace) -> int:
@@ -224,11 +241,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=8, help="Thread env var value for BLAS/OpenMP libraries.")
     parser.add_argument("--profile", default="hpc", help="Runtime profile passed to atmo_retrieval.")
     parser.add_argument("--planet", default="KELT-20b", help="Planet passed to atmo_retrieval.")
-    parser.add_argument("--epoch", default="20190504", help="Epoch passed to atmo_retrieval.")
+    parser.add_argument(
+        "--mode",
+        choices=("transmission", "emission"),
+        default="transmission",
+        help="Retrieval mode passed to atmo_retrieval.",
+    )
+    parser.add_argument(
+        "--epoch",
+        default=None,
+        help=(
+            "Epoch passed to atmo_retrieval. Defaults to 20190504 for "
+            "transmission and 20210501 for emission."
+        ),
+    )
     parser.add_argument(
         "--bandpass-tbl",
-        default="input/phot/transmission/kelt20b/kelt20b_tess_bandpass.tbl",
-        help="TESS bandpass table path.",
+        action="append",
+        default=None,
+        help=(
+            "Bandpass/eclipse table path. Pass multiple times to include multiple "
+            "constraints. Defaults are mode-specific for KELT-20b."
+        ),
+    )
+    parser.add_argument(
+        "--no-bandpass-tbl",
+        action="store_true",
+        help="Do not include default bandpass/eclipse constraints.",
+    )
+    parser.add_argument(
+        "--phoenix-spectrum-path",
+        default=None,
+        help=(
+            "Optional local two-column PHOENIX spectrum path for emission mode. "
+            "If omitted, atmo_retrieval uses its normal chromatic/cache path."
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-label-prefix",
+        default="",
+        help="Prefix added to each diagnostic label, useful for epoch/mode loops.",
     )
     parser.add_argument(
         "--fastchem-parameter-file",
@@ -248,6 +300,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.epoch is None:
+        args.epoch = DEFAULT_EPOCH_BY_MODE[args.mode]
+    if args.bandpass_tbl is None:
+        args.bandpass_tbl = [] if args.no_bandpass_tbl else list(DEFAULT_BANDPASS_BY_MODE[args.mode])
+    elif args.no_bandpass_tbl:
+        raise SystemExit("--no-bandpass-tbl cannot be combined with --bandpass-tbl.")
 
     if args.list:
         for idx, case in enumerate(CASES):
