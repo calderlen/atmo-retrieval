@@ -155,6 +155,7 @@ def build_diagnostic_context(
     phase_mode: str = "global",
     atmosphere_regions: list[dict[str, Any]] | None = None,
     apply_sysrem: bool | None = None,
+    fastchem_parameter_file: str | Path | None = None,
     phoenix_spectrum_path: str | Path | None = None,
     phoenix_cache_dir: str | Path | None = None,
 ) -> DiagnosticContext:
@@ -267,7 +268,9 @@ def build_diagnostic_context(
             observation_configs=observation_configs,
             default_pt_profile=pt_profile,
             default_chemistry_model=chemistry_model,
-            default_fastchem_parameter_file=None,
+            default_fastchem_parameter_file=(
+                None if fastchem_parameter_file is None else str(fastchem_parameter_file)
+            ),
             atmosphere_regions=atmosphere_regions,
         )
         model_c = _retrieval.create_joint_retrieval_model(
@@ -493,8 +496,13 @@ def build_diag_config_from_run_dir(
         *saved.get("molecules_hitemp", []),
         *saved.get("molecules_exomol", []),
     ]
+    fastchem_parameter_file = saved.get("FastChem parameter file")
+    if not fastchem_parameter_file and str(resolved_chemistry_model) == "fastchem_hybrid_grid":
+        default_fastchem_path = Path("input/fastchem/parameters.dat")
+        if default_fastchem_path.exists():
+            fastchem_parameter_file = str(default_fastchem_path)
 
-    return {
+    config_payload = {
         "planet": str(saved["Planet"]),
         "ephemeris": str(saved["Ephemeris"]),
         "epoch": str(resolved_epoch),
@@ -509,6 +517,9 @@ def build_diag_config_from_run_dir(
         "molecules": molecules,
         "load_opacities": _parse_bool_token(saved.get("Opacity loading", "True")),
     }
+    if fastchem_parameter_file:
+        config_payload["fastchem_parameter_file"] = str(fastchem_parameter_file)
+    return config_payload
 
 
 def default_kp_drv_grids(
