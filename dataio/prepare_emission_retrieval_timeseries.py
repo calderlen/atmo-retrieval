@@ -29,6 +29,8 @@ import config_utils
 from config import EPHEMERIS, FULL_ARM_MEMBERS
 from config_utils import get_params
 from dataio.collapse_transmission_timeseries_to_1d import (
+    arm_edge_trim_metadata,
+    get_arm_edge_trim_mask,
     get_orbital_phase,
     get_pepsi_data,
     get_sysrem_chunk_indices,
@@ -86,6 +88,7 @@ def _load_single_arm(
         regrid=regrid,
         subtract_median=subtract_median,
         run_sysrem=run_sysrem,
+        data_mode="emission",
     )
     if result is None and prefer_molecfit:
         print(f"  No molecfit files for {arm}; retrying with raw files.")
@@ -100,6 +103,7 @@ def _load_single_arm(
             regrid=regrid,
             subtract_median=subtract_median,
             run_sysrem=run_sysrem,
+            data_mode="emission",
         )
     if result is None:
         raise FileNotFoundError(
@@ -150,6 +154,11 @@ def _sanitize_columns(
     wavelength: np.ndarray,
     data: np.ndarray,
     sigma: np.ndarray,
+    *,
+    arm: str | None = None,
+    planet: str | None = None,
+    mode: str | None = None,
+    epoch: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     wavelength = np.asarray(wavelength, dtype=float)
     data = np.asarray(data, dtype=float)
@@ -171,6 +180,14 @@ def _sanitize_columns(
     valid &= np.all(np.isfinite(data), axis=0)
     valid &= np.all(np.isfinite(sigma), axis=0)
     valid &= np.all(sigma > 0.0, axis=0)
+    if arm is not None:
+        valid &= ~get_arm_edge_trim_mask(
+            wavelength,
+            arm,
+            planet=planet,
+            mode=mode,
+            epoch=epoch,
+        )
 
     if not np.any(valid):
         raise ValueError("No valid spectral columns remain after masking.")
@@ -341,6 +358,7 @@ def _save_metadata(
     run_sysrem: bool,
     regrid: bool,
     planet_params: dict[str, Any],
+    arm_edge_trim: dict[str, float | int],
 ) -> None:
     phase_01 = _phase_mod_1(phase)
     metadata: dict[str, Any] = {
@@ -364,6 +382,7 @@ def _save_metadata(
         "regrid": bool(regrid),
         "subtract_median": bool(subtract_median),
         "run_sysrem": bool(run_sysrem),
+        "arm_edge_trim": arm_edge_trim,
     }
     if _is_valid_numeric(planet_params.get("duration")) and _is_valid_numeric(planet_params.get("period")):
         metadata["eclipse_half_width_phase"] = _eclipse_half_width_phase(planet_params)
@@ -601,7 +620,22 @@ def _process_arm(
     sigma = np.asarray(sigma, dtype=float)[selection]
 
     wave_1d = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave)
-    wave_1d, data, sigma = _sanitize_columns(wave_1d, data, sigma)
+    edge_trim_info = arm_edge_trim_metadata(
+        wave_1d,
+        arm,
+        planet=args.planet,
+        mode="emission",
+        epoch=args.epoch,
+    )
+    wave_1d, data, sigma = _sanitize_columns(
+        wave_1d,
+        data,
+        sigma,
+        arm=arm,
+        planet=args.planet,
+        mode="emission",
+        epoch=args.epoch,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -654,6 +688,7 @@ def _process_arm(
         run_sysrem=args.run_sysrem,
         regrid=args.regrid,
         planet_params=planet_cfg,
+        arm_edge_trim=edge_trim_info,
     )
 
     phase_01 = _phase_mod_1(phase)
@@ -668,6 +703,13 @@ def _process_arm(
         f"phase(mod1): {float(np.min(phase_01)):.5f} to {float(np.max(phase_01)):.5f}; "
         f"wavelength range: {float(np.min(wave_1d)):.1f} to {float(np.max(wave_1d)):.1f} A"
     )
+    if edge_trim_info["n_trimmed_columns"]:
+        print(
+            "  Applied arm-edge trim: "
+            f"left={edge_trim_info['left_trim_A']:.1f} A, "
+            f"right={edge_trim_info['right_trim_A']:.1f} A, "
+            f"columns={edge_trim_info['n_trimmed_columns']}"
+        )
     if args.run_sysrem:
         print("  Saved chunk-aware SYSREM auxiliaries: U_sysrem.npz")
 

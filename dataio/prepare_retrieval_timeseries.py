@@ -31,7 +31,9 @@ import config_utils
 from config import EPHEMERIS, FULL_ARM_MEMBERS, PHASE_BINS
 from config_utils import get_params
 from dataio.collapse_transmission_timeseries_to_1d import (
+    arm_edge_trim_metadata,
     compute_contact_phases,
+    get_arm_edge_trim_mask,
     get_orbital_phase,
     get_pepsi_data,
     get_phase_bin_mask,
@@ -87,6 +89,7 @@ def _load_single_arm(
         regrid=regrid,
         subtract_median=subtract_median,
         run_sysrem=run_sysrem,
+        data_mode="transmission",
     )
     if result is None and prefer_molecfit:
         print(f"  No molecfit files for {arm}; retrying with raw files.")
@@ -101,6 +104,7 @@ def _load_single_arm(
             regrid=regrid,
             subtract_median=subtract_median,
             run_sysrem=run_sysrem,
+            data_mode="transmission",
         )
     if result is None:
         raise FileNotFoundError(
@@ -162,8 +166,21 @@ def _sanitize_columns(
     wavelength: np.ndarray,
     data: np.ndarray,
     sigma: np.ndarray,
+    *,
+    arm: str | None = None,
+    planet: str | None = None,
+    mode: str | None = None,
+    epoch: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    column_indices = _valid_sorted_column_indices(wavelength, data, sigma)
+    column_indices = _valid_sorted_column_indices(
+        wavelength,
+        data,
+        sigma,
+        arm=arm,
+        planet=planet,
+        mode=mode,
+        epoch=epoch,
+    )
     wavelength = np.asarray(wavelength, dtype=float)
     data = np.asarray(data, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
@@ -174,6 +191,11 @@ def _valid_sorted_column_indices(
     wavelength: np.ndarray,
     data: np.ndarray,
     sigma: np.ndarray,
+    *,
+    arm: str | None = None,
+    planet: str | None = None,
+    mode: str | None = None,
+    epoch: str | None = None,
 ) -> np.ndarray:
     wavelength = np.asarray(wavelength, dtype=float)
     data = np.asarray(data, dtype=float)
@@ -195,6 +217,14 @@ def _valid_sorted_column_indices(
     valid &= np.all(np.isfinite(data), axis=0)
     valid &= np.all(np.isfinite(sigma), axis=0)
     valid &= np.all(sigma > 0.0, axis=0)
+    if arm is not None:
+        valid &= ~get_arm_edge_trim_mask(
+            wavelength,
+            arm,
+            planet=planet,
+            mode=mode,
+            epoch=epoch,
+        )
 
     if not np.any(valid):
         raise ValueError("No valid spectral columns remain after masking.")
@@ -391,6 +421,7 @@ def _save_metadata(
     run_sysrem: bool,
     regrid: bool,
     doppler_shadow_status: dict[str, Any],
+    arm_edge_trim: dict[str, float | int],
 ) -> None:
     contacts_serialized: dict[str, float] = {}
     for k, v in contacts.items():
@@ -414,6 +445,7 @@ def _save_metadata(
         "doppler_shadow_applied": bool(doppler_shadow_status.get("applied", False)),
         "doppler_shadow_skip_reason": doppler_shadow_status.get("skip_reason"),
         "doppler_shadow_scaling": doppler_shadow_status.get("scaling"),
+        "arm_edge_trim": arm_edge_trim,
     }
     (output_dir / "timeseries_prep.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",
@@ -591,7 +623,22 @@ def _process_arm(
         pre_sysrem_sigma = np.asarray(pre_sysrem_sigma, dtype=float)[selection]
 
     wave_1d = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave)
-    column_indices = _valid_sorted_column_indices(wave_1d, data, sigma)
+    edge_trim_info = arm_edge_trim_metadata(
+        wave_1d,
+        arm,
+        planet=args.planet,
+        mode="transmission",
+        epoch=args.epoch,
+    )
+    column_indices = _valid_sorted_column_indices(
+        wave_1d,
+        data,
+        sigma,
+        arm=arm,
+        planet=args.planet,
+        mode="transmission",
+        epoch=args.epoch,
+    )
     wave_1d = np.asarray(wave_1d, dtype=float)[column_indices]
     data = data[:, column_indices]
     sigma = sigma[:, column_indices]
@@ -655,6 +702,7 @@ def _process_arm(
         run_sysrem=args.run_sysrem,
         regrid=args.regrid,
         doppler_shadow_status=doppler_shadow_status,
+        arm_edge_trim=edge_trim_info,
     )
 
     print(f"\nSaved retrieval-ready time-series products (arm={arm}):")
@@ -667,6 +715,13 @@ def _process_arm(
         f"  Phase range: {float(np.min(phase)):.5f} to {float(np.max(phase)):.5f}; "
         f"wavelength range: {float(np.min(wave_1d)):.1f} to {float(np.max(wave_1d)):.1f} A"
     )
+    if edge_trim_info["n_trimmed_columns"]:
+        print(
+            "  Applied arm-edge trim: "
+            f"left={edge_trim_info['left_trim_A']:.1f} A, "
+            f"right={edge_trim_info['right_trim_A']:.1f} A, "
+            f"columns={edge_trim_info['n_trimmed_columns']}"
+        )
     if args.run_sysrem:
         print("  Saved chunk-aware SYSREM auxiliaries: U_sysrem.npz")
         if pre_sysrem_data is not None and pre_sysrem_sigma is not None:

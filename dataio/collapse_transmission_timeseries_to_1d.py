@@ -315,12 +315,199 @@ def get_telluric_edge_mask(
     return edge_mask
 
 
+def _trim_lookup_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+
+def _lookup_trim_mapping(mapping: dict, key: str | None):
+    if key is None or not isinstance(mapping, dict):
+        return None
+    if key in mapping:
+        return mapping[key]
+    normalized = _trim_lookup_key(key)
+    for candidate, value in mapping.items():
+        if _trim_lookup_key(candidate) == normalized:
+            return value
+    return None
+
+
+def _get_epoch_arm_edge_trim_widths(
+    arm: str,
+    *,
+    planet: str | None = None,
+    mode: str | None = None,
+    epoch: str | None = None,
+):
+    table = getattr(config, "DEFAULT_EPOCH_ARM_EDGE_TRIM_A", {})
+    if not isinstance(table, dict) or epoch is None:
+        return None
+
+    candidates = []
+    planet_table = _lookup_trim_mapping(table, planet)
+    if isinstance(planet_table, dict):
+        mode_table = _lookup_trim_mapping(planet_table, mode)
+        if isinstance(mode_table, dict):
+            candidates.append(_lookup_trim_mapping(mode_table, epoch))
+        candidates.append(_lookup_trim_mapping(planet_table, epoch))
+    mode_table = _lookup_trim_mapping(table, mode)
+    if isinstance(mode_table, dict):
+        candidates.append(_lookup_trim_mapping(mode_table, epoch))
+    candidates.append(_lookup_trim_mapping(table, epoch))
+
+    for epoch_table in candidates:
+        if not isinstance(epoch_table, dict):
+            continue
+        raw_widths = _lookup_trim_mapping(epoch_table, arm)
+        if raw_widths is not None:
+            return raw_widths
+    return None
+
+
+def _coerce_edge_trim_widths(raw_widths) -> tuple[float, float]:
+    if isinstance(raw_widths, dict):
+        left = raw_widths.get("left", 0.0)
+        right = raw_widths.get("right", 0.0)
+    else:
+        left, right = raw_widths
+    return max(float(left), 0.0), max(float(right), 0.0)
+
+
+def get_arm_edge_trim_widths(
+    arm: str,
+    *,
+    planet: str | None = None,
+    mode: str | None = None,
+    epoch: str | None = None,
+) -> tuple[float, float]:
+    """Return configured left/right arm-edge trim widths in Angstroms."""
+    raw_widths = _get_epoch_arm_edge_trim_widths(
+        arm,
+        planet=planet,
+        mode=mode,
+        epoch=epoch,
+    )
+    if raw_widths is None:
+        raw_widths = getattr(config, "DEFAULT_ARM_EDGE_TRIM_A", {}).get(arm, (0.0, 0.0))
+    return _coerce_edge_trim_widths(raw_widths)
+
+
+def get_arm_edge_trim_mask(
+    wave: np.ndarray,
+    arm: str,
+    *,
+    planet: str | None = None,
+    mode: str | None = None,
+    epoch: str | None = None,
+) -> np.ndarray:
+    """Return configured unstable arm-edge columns to drop or ignore."""
+    if arm == "full":
+        raise ValueError(
+            "arm='full' is not supported by get_arm_edge_trim_mask. "
+            "Call with 'red' or 'blue' separately."
+        )
+    wave = np.asarray(wave, dtype=float)
+    if wave.ndim != 1:
+        raise ValueError(f"Expected 1D wavelength grid, got shape {wave.shape}.")
+
+    finite = np.isfinite(wave)
+    edge_mask = np.zeros(wave.shape[0], dtype=bool)
+    if not np.any(finite):
+        return edge_mask
+
+    left_width, right_width = get_arm_edge_trim_widths(
+        arm,
+        planet=planet,
+        mode=mode,
+        epoch=epoch,
+    )
+    if left_width <= 0.0 and right_width <= 0.0:
+        return edge_mask
+
+    lo = float(np.nanmin(wave[finite]))
+    hi = float(np.nanmax(wave[finite]))
+    if left_width > 0.0:
+        edge_mask |= finite & (wave < lo + left_width)
+    if right_width > 0.0:
+        edge_mask |= finite & (wave > hi - right_width)
+    return edge_mask
+
+
+def arm_edge_trim_metadata(
+    wave: np.ndarray,
+    arm: str,
+    *,
+    planet: str | None = None,
+    mode: str | None = None,
+    epoch: str | None = None,
+) -> dict[str, float | int | str]:
+    """Describe the configured arm-edge trim for a wavelength grid."""
+    wave = np.asarray(wave, dtype=float)
+    finite = np.isfinite(wave)
+    left_width, right_width = get_arm_edge_trim_widths(
+        arm,
+        planet=planet,
+        mode=mode,
+        epoch=epoch,
+    )
+    if not np.any(finite):
+        return {
+            "left_trim_A": left_width,
+            "right_trim_A": right_width,
+            "planet": planet or "",
+            "mode": mode or "",
+            "epoch": epoch or "",
+            "raw_min_A": float("nan"),
+            "raw_max_A": float("nan"),
+            "keep_min_A": float("nan"),
+            "keep_max_A": float("nan"),
+            "n_trimmed_columns": 0,
+        }
+
+    lo = float(np.nanmin(wave[finite]))
+    hi = float(np.nanmax(wave[finite]))
+    trim_mask = get_arm_edge_trim_mask(
+        wave,
+        arm,
+        planet=planet,
+        mode=mode,
+        epoch=epoch,
+    )
+    return {
+        "left_trim_A": left_width,
+        "right_trim_A": right_width,
+        "planet": planet or "",
+        "mode": mode or "",
+        "epoch": epoch or "",
+        "raw_min_A": lo,
+        "raw_max_A": hi,
+        "keep_min_A": lo + left_width,
+        "keep_max_A": hi - right_width,
+        "n_trimmed_columns": int(np.count_nonzero(trim_mask)),
+    }
+
+
 def get_sysrem_ignore_mask(
     wave: np.ndarray,
     arm: str,
+    *,
+    planet: str | None = None,
+    mode: str | None = None,
+    epoch: str | None = None,
 ) -> np.ndarray:
-    """Return deep telluric and boundary-halo columns to ignore in SYSREM output."""
-    return get_sysrem_deep_mask(wave, arm) | get_telluric_edge_mask(wave, arm)
+    """Return data-quality columns to ignore in SYSREM output."""
+    return (
+        get_sysrem_deep_mask(wave, arm)
+        | get_telluric_edge_mask(wave, arm)
+        | get_arm_edge_trim_mask(
+            wave,
+            arm,
+            planet=planet,
+            mode=mode,
+            epoch=epoch,
+        )
+    )
 
 
 def get_sysrem_max_systematics(arm: str) -> list[int]:
@@ -355,6 +542,9 @@ def do_sysrem(
     do_molecfit: bool = True,
     stop_delta_stddev: float = config.DEFAULT_SYSREM_STOP_TOL,
     return_diagnostics: bool = False,
+    planet_name: str | None = None,
+    data_mode: str | None = None,
+    observation_epoch: str | None = None,
 ) -> tuple[np.ndarray, ...]:
     """Run SYSREM with separate treatment for telluric and non-telluric regions.
 
@@ -388,8 +578,16 @@ def do_sysrem(
     corrected_error = residual_error.copy()
 
     _, chunk_indices, _telluric_mask = get_sysrem_chunk_indices(wave, arm)
+    ignore_mask = get_arm_edge_trim_mask(
+        wave,
+        arm,
+        planet=planet_name,
+        mode=data_mode,
+        epoch=observation_epoch,
+    )
     if do_molecfit:
-        ignore_mask = get_sysrem_ignore_mask(wave, arm)
+        ignore_mask |= get_sysrem_deep_mask(wave, arm) | get_telluric_edge_mask(wave, arm)
+    if np.any(ignore_mask):
         corrected_flux[:, ignore_mask] = 0.0
         corrected_error[:, ignore_mask] = 1.0
         chunk_indices = tuple(
@@ -801,6 +999,7 @@ def get_pepsi_data(
     shadow_params: dict | None = None,
     *,
     sysrem_stop_tol: float = config.DEFAULT_SYSREM_STOP_TOL,
+    data_mode: str = "transmission",
 ) -> tuple[np.ndarray, ...] | None:
     """Load and preprocess spectroscopic data from configured instrument.
 
@@ -818,6 +1017,8 @@ def get_pepsi_data(
         remove_doppler_shadow: Remove Doppler shadow (RM effect)
         shadow_params: Dict with 'phase', 'planet_params', 'stellar_params' for shadow removal
         sysrem_stop_tol: Minimum sigma-improvement required to keep a SYSREM component
+        data_mode: Data family ('transmission' or 'emission') for context-specific
+            edge-trim lookup
 
     Returns:
         Tuple of arrays: (wave, flux, error, jd, snr, exptime, airmass, n_spectra, npix)
@@ -829,7 +1030,7 @@ def get_pepsi_data(
         data_dir = config_utils.get_raw_hrs_dir(
             planet=planet_name,
             epoch=observation_epoch,
-            mode="transmission",
+            mode=data_mode,
         )
 
     # Get config for this instrument
@@ -1040,6 +1241,9 @@ def get_pepsi_data(
             do_molecfit=do_molecfit,
             stop_delta_stddev=sysrem_stop_tol,
             return_diagnostics=True,
+            planet_name=planet_name,
+            data_mode=data_mode,
+            observation_epoch=observation_epoch,
         )
         fluxin, errorin, U_sysrem, no_tellurics, sysrem_diagnostics = sysrem_result
         n_systematics_used = [int(np.sum(np.isfinite(U_sysrem[0, :, i]))) for i in range(U_sysrem.shape[2])]

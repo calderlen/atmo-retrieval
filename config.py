@@ -1813,6 +1813,40 @@ DEFAULT_SYSREM_MIN_SYSTEMATICS_OTHER = [1]
 DEFAULT_SYSREM_STOP_TOL = 5e-5
 DEFAULT_REGRID_MAX_NATIVE_GAP_FACTOR = 5.0
 DEFAULT_TELLURIC_EDGE_MASK_WIDTH_A = 3.0
+DEFAULT_ARM_EDGE_TRIM_A = {
+    # Fallback PEPSI edge trims: left/right widths in Angstroms.
+    "blue": (18.0, 20.0),
+    "red": (40.0, 20.0),
+}
+DEFAULT_EPOCH_ARM_EDGE_TRIM_A = {
+    # Notebook-derived first-accepted edge trims for KELT-20b emission nights.
+    # These are relative to each epoch-arm wavelength grid, not common global
+    # wavelength limits across all blue or red setups.
+    "kelt20b": {
+        "emission": {
+            "20210501": {
+                "blue": (10.0, 0.0),
+                "red": (20.0, 20.0),
+            },
+            "20210518": {
+                "blue": (10.0, 0.0),
+                "red": (20.0, 20.0),
+            },
+            "20230430": {
+                "blue": (20.0, 5.0),
+                "red": (10.0, 20.0),
+            },
+            "20230615": {
+                "blue": (10.0, 0.0),
+                "red": (0.0, 20.0),
+            },
+            "20240516": {
+                "blue": (10.0, 30.0),
+                "red": (50.0, 5.0),
+            },
+        },
+    },
+}
 
 # ==============================================================================
 # PHOTOMETRY DEFAULTS
