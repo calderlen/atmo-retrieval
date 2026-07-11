@@ -50,6 +50,19 @@ TINY_RED_FE_ONLY_ARGS: tuple[str, ...] = (
 )
 
 
+TINY_BLUE_FE_ONLY_ARGS: tuple[str, ...] = (
+    "--wavelength-range",
+    "blue",
+    "--atoms",
+    "Fe I",
+    "--no-molecules",
+    "--nlayer",
+    "10",
+    "--n-spectral-points",
+    "30000",
+)
+
+
 CASES: tuple[MatrixCase, ...] = (
     MatrixCase("tiny_red_fe_only", TINY_RED_FE_ONLY_ARGS),
     MatrixCase(
@@ -78,6 +91,42 @@ CASES: tuple[MatrixCase, ...] = (
         (
             "--wavelength-range",
             "red",
+            "--atoms",
+            "Fe I,Ni I,Cr I,Na I",
+            "--no-molecules",
+            "--nlayer",
+            "20",
+            "--n-spectral-points",
+            "50000",
+        ),
+    ),
+    MatrixCase("tiny_blue_fe_only", TINY_BLUE_FE_ONLY_ARGS),
+    MatrixCase(
+        "tiny_blue_fe_only_no_svi",
+        (*TINY_BLUE_FE_ONLY_ARGS, "--skip-svi"),
+    ),
+    MatrixCase("tiny_blue_fe_only_sigma1p5", (*TINY_BLUE_FE_ONLY_ARGS, "--sigma-scale", "1.5")),
+    MatrixCase("tiny_blue_fe_only_sigma2", (*TINY_BLUE_FE_ONLY_ARGS, "--sigma-scale", "2")),
+    MatrixCase("tiny_blue_fe_only_sigma3", (*TINY_BLUE_FE_ONLY_ARGS, "--sigma-scale", "3")),
+    MatrixCase(
+        "tiny_blue_fe_only_sigma5",
+        (*TINY_BLUE_FE_ONLY_ARGS, "--sigma-scale", "5"),
+    ),
+    MatrixCase("tiny_blue_fe_only_sigma8", (*TINY_BLUE_FE_ONLY_ARGS, "--sigma-scale", "8")),
+    MatrixCase(
+        "tiny_blue_fe_only_x64",
+        TINY_BLUE_FE_ONLY_ARGS,
+        jax_enable_x64=True,
+    ),
+    MatrixCase("tiny_blue_fe_only_no_sysrem", (*TINY_BLUE_FE_ONLY_ARGS, "--no-sysrem")),
+    MatrixCase("tiny_blue_fe_only_stride2", (*TINY_BLUE_FE_ONLY_ARGS, "--spectral-stride", "2")),
+    MatrixCase("tiny_blue_fe_only_stride4", (*TINY_BLUE_FE_ONLY_ARGS, "--spectral-stride", "4")),
+    MatrixCase("tiny_blue_fe_only_stride8", (*TINY_BLUE_FE_ONLY_ARGS, "--spectral-stride", "8")),
+    MatrixCase(
+        "blue_all_atoms",
+        (
+            "--wavelength-range",
+            "blue",
             "--atoms",
             "Fe I,Ni I,Cr I,Na I",
             "--no-molecules",

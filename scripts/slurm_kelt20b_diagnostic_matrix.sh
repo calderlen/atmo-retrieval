@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --cluster ascend
 #SBATCH --partition=gpu
-#SBATCH --array=0-14
+#SBATCH --array=0-27
 #SBATCH --mail-type=END,FAIL
 #SBATCH --output=%x_%A_%a.out
 #SBATCH --error=%x_%A_%a.err
@@ -33,6 +33,19 @@ CASES=(
   tiny_red_fe_only_stride4
   tiny_red_fe_only_stride8
   red_all_atoms
+  tiny_blue_fe_only
+  tiny_blue_fe_only_no_svi
+  tiny_blue_fe_only_sigma1p5
+  tiny_blue_fe_only_sigma2
+  tiny_blue_fe_only_sigma3
+  tiny_blue_fe_only_sigma5
+  tiny_blue_fe_only_sigma8
+  tiny_blue_fe_only_x64
+  tiny_blue_fe_only_no_sysrem
+  tiny_blue_fe_only_stride2
+  tiny_blue_fe_only_stride4
+  tiny_blue_fe_only_stride8
+  blue_all_atoms
   full_arm_all_atoms
   full_arm_no_sysrem
 )
@@ -135,6 +148,46 @@ case "$CASE_LABEL" in
     ;;
   red_all_atoms)
     CASE_ARGS=(--wavelength-range red --atoms "Fe I,Ni I,Cr I,Na I" --no-molecules --nlayer 20 --n-spectral-points 50000)
+    ;;
+  tiny_blue_fe_only)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000)
+    ;;
+  tiny_blue_fe_only_no_svi)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000 --skip-svi)
+    ;;
+  tiny_blue_fe_only_sigma1p5)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000 --sigma-scale 1.5)
+    ;;
+  tiny_blue_fe_only_sigma2)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000 --sigma-scale 2)
+    ;;
+  tiny_blue_fe_only_sigma3)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000 --sigma-scale 3)
+    ;;
+  tiny_blue_fe_only_sigma5)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000 --sigma-scale 5)
+    ;;
+  tiny_blue_fe_only_sigma8)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000 --sigma-scale 8)
+    ;;
+  tiny_blue_fe_only_x64)
+    export JAX_ENABLE_X64=1
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000)
+    ;;
+  tiny_blue_fe_only_no_sysrem)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000 --no-sysrem)
+    ;;
+  tiny_blue_fe_only_stride2)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000 --spectral-stride 2)
+    ;;
+  tiny_blue_fe_only_stride4)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000 --spectral-stride 4)
+    ;;
+  tiny_blue_fe_only_stride8)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I" --no-molecules --nlayer 10 --n-spectral-points 30000 --spectral-stride 8)
+    ;;
+  blue_all_atoms)
+    CASE_ARGS=(--wavelength-range blue --atoms "Fe I,Ni I,Cr I,Na I" --no-molecules --nlayer 20 --n-spectral-points 50000)
     ;;
   full_arm_all_atoms)
     CASE_ARGS=(--wavelength-range full --atoms "Fe I,Ni I,Cr I,Na I" --no-molecules --nlayer 20 --n-spectral-points 70000)
