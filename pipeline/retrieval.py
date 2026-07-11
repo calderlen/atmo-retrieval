@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 from collections.abc import Sequence
 from contextlib import redirect_stdout
@@ -28,6 +29,7 @@ from dataio.load import (
     load_observed_spectrum,
     parse_nasa_archive_tbl,
 )
+from dataio.collapse_transmission_timeseries_to_1d import get_sysrem_deep_mask
 from physics.chemistry import ConstantVMR, FastChemHybridChemistry, FreeVMR
 from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from opacities import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
@@ -65,6 +67,46 @@ from plotting.plot import (
     plot_contribution_combined,
     save_retrieval_corner_plots,
 )
+
+
+def _load_timeseries_metadata(data_dir: Path) -> dict[str, Any]:
+    path = data_dir / "timeseries_prep.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Could not parse {path}: {exc}") from exc
+
+
+def _validate_no_deep_telluric_columns(
+    data_dir: Path,
+    wavelength: np.ndarray,
+    *,
+    metadata: dict[str, Any],
+) -> None:
+    arm = metadata.get("arm")
+    if not arm:
+        arm = data_dir.name if data_dir.name in {"blue", "red"} else None
+    candidate_arms = (str(arm),) if arm in {"blue", "red"} else ("red", "blue")
+
+    wave = np.asarray(wavelength, dtype=float)
+    for candidate_arm in candidate_arms:
+        deep_mask = get_sysrem_deep_mask(wave, candidate_arm)
+        n_deep = int(np.count_nonzero(deep_mask))
+        if not n_deep:
+            continue
+
+        deep_wave = wave[deep_mask]
+        raise ValueError(
+            f"{data_dir} still contains {n_deep} configured {candidate_arm}-arm "
+            f"deep-telluric wavelength columns "
+            f"({float(np.nanmin(deep_wave)) / 10.0:.3f}-"
+            f"{float(np.nanmax(deep_wave)) / 10.0:.3f} nm). "
+            "This usually means the prepared time-series bundle is stale relative to the current "
+            "deep-mask configuration. Regenerate it with the relevant "
+            "`python -m dataio.prepare_*_retrieval_timeseries ... --run-sysrem` command."
+        )
 
 
 def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -114,7 +156,9 @@ def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, 
     data = np.load(expected_paths["data"])
     sigma = np.load(expected_paths["sigma"])
     phase = np.load(expected_paths["phase"])
-    
+    metadata = _load_timeseries_metadata(data_dir)
+    _validate_no_deep_telluric_columns(data_dir, wavelength, metadata=metadata)
+
     return wavelength, data, sigma, phase
 
 

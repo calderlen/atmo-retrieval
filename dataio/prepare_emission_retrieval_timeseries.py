@@ -30,10 +30,11 @@ from config import EPHEMERIS, FULL_ARM_MEMBERS
 from config_utils import get_params
 from dataio.collapse_transmission_timeseries_to_1d import (
     arm_edge_trim_metadata,
-    get_arm_edge_trim_mask,
     get_orbital_phase,
     get_pepsi_data,
+    get_sysrem_deep_mask,
     get_sysrem_chunk_indices,
+    get_sysrem_ignore_mask,
 )
 
 
@@ -181,7 +182,7 @@ def _sanitize_columns(
     valid &= np.all(np.isfinite(sigma), axis=0)
     valid &= np.all(sigma > 0.0, axis=0)
     if arm is not None:
-        valid &= ~get_arm_edge_trim_mask(
+        valid &= ~get_sysrem_ignore_mask(
             wavelength,
             arm,
             planet=planet,
@@ -359,6 +360,7 @@ def _save_metadata(
     regrid: bool,
     planet_params: dict[str, Any],
     arm_edge_trim: dict[str, float | int],
+    spectral_column_masking: dict[str, Any],
 ) -> None:
     phase_01 = _phase_mod_1(phase)
     metadata: dict[str, Any] = {
@@ -383,6 +385,7 @@ def _save_metadata(
         "subtract_median": bool(subtract_median),
         "run_sysrem": bool(run_sysrem),
         "arm_edge_trim": arm_edge_trim,
+        "spectral_column_masking": spectral_column_masking,
     }
     if _is_valid_numeric(planet_params.get("duration")) and _is_valid_numeric(planet_params.get("period")):
         metadata["eclipse_half_width_phase"] = _eclipse_half_width_phase(planet_params)
@@ -620,6 +623,15 @@ def _process_arm(
     sigma = np.asarray(sigma, dtype=float)[selection]
 
     wave_1d = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave)
+    raw_n_columns = int(wave_1d.size)
+    sysrem_ignore_mask = get_sysrem_ignore_mask(
+        wave_1d,
+        arm,
+        planet=args.planet,
+        mode="emission",
+        epoch=args.epoch,
+    )
+    deep_telluric_mask = get_sysrem_deep_mask(wave_1d, arm)
     edge_trim_info = arm_edge_trim_metadata(
         wave_1d,
         arm,
@@ -636,6 +648,18 @@ def _process_arm(
         mode="emission",
         epoch=args.epoch,
     )
+    spectral_column_masking = {
+        "n_input_columns": raw_n_columns,
+        "n_output_columns": int(wave_1d.size),
+        "n_dropped_columns": int(raw_n_columns - wave_1d.size),
+        "n_sysrem_ignore_columns_dropped": int(np.count_nonzero(sysrem_ignore_mask)),
+        "n_deep_telluric_columns_dropped": int(np.count_nonzero(deep_telluric_mask)),
+        "mask_components": [
+            "deep_telluric",
+            "telluric_region_edges",
+            "arm_edges",
+        ],
+    }
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -689,6 +713,7 @@ def _process_arm(
         regrid=args.regrid,
         planet_params=planet_cfg,
         arm_edge_trim=edge_trim_info,
+        spectral_column_masking=spectral_column_masking,
     )
 
     phase_01 = _phase_mod_1(phase)
@@ -709,6 +734,12 @@ def _process_arm(
             f"left={edge_trim_info['left_trim_A']:.1f} A, "
             f"right={edge_trim_info['right_trim_A']:.1f} A, "
             f"columns={edge_trim_info['n_trimmed_columns']}"
+        )
+    if spectral_column_masking["n_sysrem_ignore_columns_dropped"]:
+        print(
+            "  Dropped SYSREM-ignore columns before export: "
+            f"{spectral_column_masking['n_sysrem_ignore_columns_dropped']} "
+            f"(deep telluric={spectral_column_masking['n_deep_telluric_columns_dropped']})"
         )
     if args.run_sysrem:
         print("  Saved chunk-aware SYSREM auxiliaries: U_sysrem.npz")
