@@ -47,7 +47,10 @@ def run_phase_binned_retrieval(
             "--phase-bin / --all-phase-bins."
         )
 
-    resolved_data_dir = config_utils.get_data_dir(epoch=epoch)
+    resolved_data_dir = config_utils.get_timeseries_data_dir(
+        epoch=epoch,
+        mode=mode,
+    )
 
     wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
 
@@ -182,7 +185,7 @@ def compare_phase_posteriors(
         # Filter to interesting parameters
         params_to_compare = []
         for p in all_params:
-            if p.startswith("dRV") or p.startswith("logVMR") or p == "Kp":
+            if p == "v_sys" or p.startswith("logVMR") or p == "Kp":
                 params_to_compare.append(p)
     
     comparison = {
@@ -205,7 +208,7 @@ def compare_phase_posteriors(
             if isinstance(post, dict) and "samples" in post:
                 if param in post["samples"]:
                     samples = post["samples"][param]
-                    # Handle array-valued samples (e.g., per-exposure dRV)
+                    # Reduce any array-valued diagnostic samples to one value per draw.
                     if samples.ndim > 1:
                         samples = samples.mean(axis=-1)  # Take mean across exposures
                     samples_by_bin[bin_name] = samples
@@ -324,7 +327,7 @@ def compare_phase_posteriors(
 
 def detect_asymmetry(
     posteriors: dict[str, dict],
-    param: str = "dRV",
+    param: str = "v_sys",
     significance_threshold: float = 2.0,
 ) -> dict:
     if "T12" not in posteriors or "T34" not in posteriors:

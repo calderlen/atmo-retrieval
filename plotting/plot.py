@@ -1,5 +1,9 @@
 import os
 import numpy as np
+from plotting.style import configure_matplotlib
+
+configure_matplotlib()
+
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import corner
@@ -438,15 +442,13 @@ def _default_corner_variables(sample_dict: dict) -> list[str]:
         return []
 
     priority = [
-        "Kp", "dRV", "dRV_0", "dRV_slope",
+        "Kp", "v_sys",
         "Rp", "Mp", "Rstar",
         "T0", "T_bottom", "T_top", "Tirr", "log10_kappa_ir_cgs", "log10_gamma",
         "T_deep", "log_P_trans", "delta_P",
         "log_metallicity", "C_O_ratio",
     ]
-    skip_names = {
-        "dRV_mean", "dRV_std", "dRV_at_ingress", "dRV_at_egress",
-    }
+    skip_names: set[str] = set()
 
     corner_ready = {}
     for name, values in sample_dict.items():
@@ -668,7 +670,7 @@ def create_transmission_plots(
 def plot_phase_trace(
     posteriors: dict,
     phase: np.ndarray,
-    param: str = "dRV",
+    param: str = "v_sys",
     save_path: str | None = None,
     show_exposures: bool = True,
 ) -> None:

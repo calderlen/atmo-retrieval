@@ -32,7 +32,9 @@ from config import EPHEMERIS, FULL_ARM_MEMBERS, PHASE_BINS
 from config_utils import get_params
 from dataio.collapse_transmission_timeseries_to_1d import (
     arm_edge_trim_metadata,
+    build_out_of_transit_residuals,
     compute_contact_phases,
+    do_sysrem,
     get_orbital_phase,
     get_pepsi_data,
     get_phase_bin_mask,
@@ -43,8 +45,25 @@ from dataio.collapse_transmission_timeseries_to_1d import (
 from dataio.horus import remove_doppler_shadow
 
 
-def _output_dir_for(planet: str, epoch: str, arm: str) -> Path:
-    return config_utils.get_data_dir(planet=planet, epoch=epoch, arm=arm, mode="transmission")
+def _output_dir_for(
+    planet: str,
+    epoch: str,
+    arm: str,
+    product_kind: str,
+) -> Path:
+    if product_kind == "collapse-source":
+        return config_utils.get_collapse_source_dir(
+            planet=planet,
+            epoch=epoch,
+            arm=arm,
+            mode="transmission",
+        )
+    return config_utils.get_timeseries_data_dir(
+        planet=planet,
+        epoch=epoch,
+        arm=arm,
+        mode="transmission",
+    )
 
 
 def _raw_input_dir_for(planet: str, epoch: str) -> Path:
@@ -424,12 +443,15 @@ def _save_metadata(
     doppler_shadow_status: dict[str, Any],
     arm_edge_trim: dict[str, float | int],
     spectral_column_masking: dict[str, Any],
+    product_kind: str,
+    out_of_transit_master_division: bool,
 ) -> None:
     contacts_serialized: dict[str, float] = {}
     for k, v in contacts.items():
         contacts_serialized[k] = float(v)
     metadata = {
         "planet": planet,
+        "product_kind": product_kind,
         "ephemeris": ephemeris,
         "epoch": epoch,
         "arm": arm,
@@ -444,6 +466,9 @@ def _save_metadata(
         "regrid": bool(regrid),
         "subtract_median": bool(subtract_median),
         "run_sysrem": bool(run_sysrem),
+        "out_of_transit_master_division": bool(
+            out_of_transit_master_division
+        ),
         "doppler_shadow_applied": bool(doppler_shadow_status.get("applied", False)),
         "doppler_shadow_skip_reason": doppler_shadow_status.get("skip_reason"),
         "doppler_shadow_scaling": doppler_shadow_status.get("scaling"),
@@ -486,12 +511,23 @@ def create_parser() -> argparse.ArgumentParser:
         help="Which exposures to keep in the exported cube (default: full in-transit)",
     )
     parser.add_argument(
+        "--product-kind",
+        choices=["timeseries", "collapse-source"],
+        default="timeseries",
+        help=(
+            "Write a phase-selected retrieval cube or the all-exposure "
+            "out-of-transit-referenced cube used to build a collapsed 1D "
+            "spectrum (default: timeseries)."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
         help=(
             "Output directory "
-            "(default: input/hrs/transmission/<planet>/<epoch>/<arm>). "
+            "(default: the product-kind subdirectory under "
+            "input/hrs/transmission/<planet>/<epoch>/<arm>). "
             "Not allowed with --arm full, since red and blue are written separately."
         ),
     )
@@ -576,6 +612,7 @@ def _process_arm(
     reference_epoch = planet_cfg["epoch"]
 
     print(f"\nLoading PEPSI {arm} data for {args.planet} ({args.epoch})...")
+    collapse_source = args.product_kind == "collapse-source"
     result, extras = _load_data(
         arm=arm,
         epoch=args.epoch,
@@ -584,8 +621,8 @@ def _process_arm(
         barycorr=args.barycorr,
         introduced_shift=args.introduced_shift,
         regrid=args.regrid,
-        subtract_median=args.subtract_median,
-        run_sysrem=args.run_sysrem,
+        subtract_median=False if collapse_source else args.subtract_median,
+        run_sysrem=False if collapse_source else args.run_sysrem,
     )
 
     wave, data, sigma, jd, snr, exptime, airmass, n_spectra, npix = result
@@ -595,13 +632,70 @@ def _process_arm(
     phase = np.asarray(get_orbital_phase(np.asarray(jd), t0, period, ra, dec), dtype=float)
     wave_1d_full = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave, dtype=float)
     data = np.asarray(data, dtype=float)
-    data, doppler_shadow_status = _apply_default_doppler_shadow(
-        data,
-        wave_1d_full,
-        phase,
-        planet_cfg=planet_cfg,
-        subtract_median=args.subtract_median,
-    )
+    sigma = np.asarray(sigma, dtype=float)
+    if collapse_source:
+        contacts = compute_contact_phases(planet_cfg)
+        out_transit = (
+            (phase < contacts["T1"])
+            | (phase > contacts["T4"])
+        )
+        full_transit = (
+            (phase >= contacts["T2"])
+            & (phase <= contacts["T3"])
+        )
+        source_rows = out_transit | full_transit
+        phase = phase[source_rows]
+        jd = np.asarray(jd)[source_rows]
+        snr = np.asarray(snr)[source_rows]
+        exptime = np.asarray(exptime)[source_rows]
+        airmass = np.asarray(airmass)[source_rows]
+        data = data[source_rows]
+        sigma = sigma[source_rows]
+        out_transit = out_transit[source_rows]
+        data, sigma = build_out_of_transit_residuals(
+            data,
+            sigma,
+            out_transit,
+        )
+        extras = {
+            "pre_sysrem_flux": np.asarray(data, dtype=float).copy(),
+            "pre_sysrem_error": np.asarray(sigma, dtype=float).copy(),
+        }
+        if args.run_sysrem:
+            sysrem_result = do_sysrem(
+                wave_1d_full,
+                data,
+                sigma,
+                arm,
+                np.asarray(airmass, dtype=float),
+                do_molecfit=bool(args.molecfit and arm == "red"),
+                stop_delta_stddev=config.DEFAULT_SYSREM_STOP_TOL,
+                return_diagnostics=True,
+                planet_name=args.planet,
+                data_mode="transmission",
+                observation_epoch=args.epoch,
+            )
+            data, sigma, U_sysrem, no_tellurics, diagnostics = sysrem_result
+            extras.update(
+                {
+                    "U_sysrem": U_sysrem,
+                    "no_tellurics": no_tellurics,
+                    **diagnostics,
+                }
+            )
+        doppler_shadow_status = {
+            "applied": False,
+            "skip_reason": "disabled_for_collapsed_1d_source",
+            "scaling": None,
+        }
+    else:
+        data, doppler_shadow_status = _apply_default_doppler_shadow(
+            data,
+            wave_1d_full,
+            phase,
+            planet_cfg=planet_cfg,
+            subtract_median=args.subtract_median,
+        )
     selection = _phase_selection_mask(
         phase,
         phase_bin=args.phase_bin,
@@ -709,6 +803,15 @@ def _process_arm(
         )
         if "sysrem_delta_stddev" in sysrem_diagnostics:
             print("  Saved SYSREM component diagnostics: sysrem_delta_stddev and acceptance masks")
+    else:
+        # Conditional products from an earlier SYSREM run must not survive
+        # beside a newly exported non-SYSREM cube.
+        for filename in (
+            "U_sysrem.npz",
+            "pre_sysrem_data.npy",
+            "pre_sysrem_sigma.npy",
+        ):
+            (output_dir / filename).unlink(missing_ok=True)
 
     contacts = compute_contact_phases(planet_cfg)
     _save_metadata(
@@ -722,15 +825,22 @@ def _process_arm(
         phase=phase,
         jd=jd,
         contacts=contacts,
-        subtract_median=args.subtract_median,
+        subtract_median=False if collapse_source else args.subtract_median,
         run_sysrem=args.run_sysrem,
         regrid=args.regrid,
         doppler_shadow_status=doppler_shadow_status,
         arm_edge_trim=edge_trim_info,
         spectral_column_masking=spectral_column_masking,
+        product_kind=args.product_kind,
+        out_of_transit_master_division=collapse_source,
     )
 
-    print(f"\nSaved retrieval-ready time-series products (arm={arm}):")
+    product_label = (
+        "transmission collapse-source"
+        if collapse_source
+        else "retrieval-ready time-series"
+    )
+    print(f"\nSaved {product_label} products (arm={arm}):")
     print(f"  Output dir: {output_dir}")
     print(f"  wavelength.npy: {wave_1d.shape}")
     print(f"  data.npy: {data.shape}")
@@ -768,6 +878,11 @@ def main() -> int:
             "Retrieval-ready time-series export requires a common wavelength grid; "
             "leave --regrid enabled."
         )
+    if args.product_kind == "collapse-source" and args.phase_bin != "all":
+        raise ValueError(
+            "--product-kind collapse-source requires --phase-bin all so the "
+            "out-of-transit reference and full SYSREM basis are preserved."
+        )
 
     if args.arm == "full":
         arms_to_run: tuple[str, ...] = FULL_ARM_MEMBERS
@@ -795,7 +910,12 @@ def main() -> int:
         if args.output_dir:
             output_dir = Path(args.output_dir)
         else:
-            output_dir = _output_dir_for(args.planet, args.epoch, arm)
+            output_dir = _output_dir_for(
+                args.planet,
+                args.epoch,
+                arm,
+                args.product_kind,
+            )
         _process_arm(
             arm=arm,
             args=args,

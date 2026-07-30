@@ -14,13 +14,11 @@ import numpyro.distributions as dist
 
 # string literals for the various model configurations
 RetrievalMode = Literal["transmission", "emission"]
-PhaseMode = Literal["global", "per_exposure", "linear"]
 PTProfileMode = Literal[
     "guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline", "gp"
 ]
 AtmosphereRegionName = Literal["terminator", "dayside"]
 RVBehavior = Literal["orbital", "none"]
-SpectroscopicLikelihood = Literal["matched_filter", "gaussian"]
 BandpassObservable = Literal["flux_ratio", "eclipse_depth", "radius_ratio", "transit_depth"]
 
 import config
@@ -123,8 +121,8 @@ class SharedSystemConfig:
     Kp_mean: float
     Kp_std: float
     Kp_bounds: tuple[float, float] | None
-    Vsys_mean: float
-    Vsys_std: float
+    v_sys_mean: float
+    v_sys_std: float
     Rp_mean: float
     Rp_std: float
     Mp_mean: float
@@ -133,14 +131,6 @@ class SharedSystemConfig:
     Rstar_mean: float
     Rstar_std: float
     period_day: float
-    # Optional system-level velocity-offset sharing across spectroscopic
-    # components. When set, components whose name appears in
-    # ``shared_velocity_component_names`` skip their per-component dRV samples
-    # and instead evaluate the shared dRV(phase) using their own phase array.
-    # Only ``"global"`` and ``"linear"`` phase modes are supported for sharing;
-    # ``"per_exposure"`` is rejected because exposures differ per arm.
-    shared_velocity_phase_mode: PhaseMode | None = None
-    shared_velocity_component_names: tuple[str, ...] = ()
 
 # TODO: ensure these region-specific data-ignorant params in the dataclass shold be region-specific, or if some of these should be shared between atmopsheric regions
 # paramaters that are region-specific (so emission vs. transmission), but shared across all observation types in a joint retrieval.
@@ -179,9 +169,7 @@ class SpectroscopicObservationConfig:
     inst_nus: jnp.ndarray
     beta_inst: float
     radial_velocity_mode: RVBehavior
-    phase_mode: PhaseMode | None
-    likelihood_kind: SpectroscopicLikelihood
-    subtract_per_exposure_mean: bool
+    subtract_weighted_global_mean: bool
     apply_sysrem: bool
     Tstar: float | None
     stellar_surface_flux: jnp.ndarray | None = None
@@ -226,16 +214,11 @@ class JointRetrievalModelConfig:
 # the computed atmospheric state for a given atmospheric region, reconstructed from the posterior samples, and the shared system state for a given retrieval sample
 class SharedSystemState(NamedTuple):
     Kp: jnp.ndarray
-    Vsys: jnp.ndarray
+    v_sys: jnp.ndarray
     Mp: jnp.ndarray
     Rstar: jnp.ndarray
     Rp: jnp.ndarray
     g_ref: jnp.ndarray
-    shared_dRV_0: jnp.ndarray | None = None
-    shared_dRV_slope: jnp.ndarray | None = None
-    shared_dRV_global: jnp.ndarray | None = None
-    shared_velocity_phase_mode: PhaseMode | None = None
-    shared_velocity_component_names: frozenset = frozenset()
 
 class AtmosphereState(NamedTuple):
     art: object
@@ -244,6 +227,8 @@ class AtmosphereState(NamedTuple):
     mmw_profile: jnp.ndarray
     mmr_mols: dict[str, jnp.ndarray]
     mmr_atoms: dict[str, jnp.ndarray]
+    mol_masses: dict[str, jnp.ndarray]
+    atom_masses: dict[str, jnp.ndarray]
     vmrH2_profile: jnp.ndarray
     vmrHe_profile: jnp.ndarray
     continuum_vmr_profiles: dict[str, jnp.ndarray]
@@ -255,6 +240,45 @@ class ChunkedSysremInputs(NamedTuple):
     V_chunks: tuple[jnp.ndarray, ...]
 
 
+class CollapsedEmissionInputs(NamedTuple):
+    """Fixed operator used to turn an emission time series into one 1D spectrum."""
+
+    source_wavelength: jnp.ndarray
+    source_inst_nus: jnp.ndarray
+    source_phase: jnp.ndarray
+    selected_exposure_indices: jnp.ndarray
+    shift_left_indices: jnp.ndarray
+    shift_fractions: jnp.ndarray
+    coadd_weights: jnp.ndarray
+    bin_indices: jnp.ndarray
+    bin_weights: jnp.ndarray
+    output_wavelength: jnp.ndarray
+    output_indices: jnp.ndarray
+    kp_reference_kms: jnp.ndarray
+    velocity_offset_reference_kms: jnp.ndarray
+    chunked_sysrem: ChunkedSysremInputs | None = None
+
+
+class CollapsedTransmissionInputs(NamedTuple):
+    """Fixed operator used to turn a transmission time series into one spectrum."""
+
+    source_wavelength: jnp.ndarray
+    source_inst_nus: jnp.ndarray
+    source_phase: jnp.ndarray
+    active_exposure_mask: jnp.ndarray
+    selected_exposure_indices: jnp.ndarray
+    shift_left_indices: jnp.ndarray
+    shift_fractions: jnp.ndarray
+    coadd_weights: jnp.ndarray
+    bin_indices: jnp.ndarray
+    bin_weights: jnp.ndarray
+    output_wavelength: jnp.ndarray
+    output_indices: jnp.ndarray
+    kp_reference_kms: jnp.ndarray
+    velocity_offset_reference_kms: jnp.ndarray
+    chunked_sysrem: ChunkedSysremInputs | None = None
+
+
 class SpectroscopicObservationInputs(NamedTuple):
     data: jnp.ndarray
     sigma: jnp.ndarray
@@ -262,6 +286,8 @@ class SpectroscopicObservationInputs(NamedTuple):
     U: jnp.ndarray | None = None
     V: jnp.ndarray | None = None
     chunked_sysrem: ChunkedSysremInputs | None = None
+    collapsed_emission: CollapsedEmissionInputs | None = None
+    collapsed_transmission: CollapsedTransmissionInputs | None = None
 
 
 class BandpassObservationInputs(NamedTuple):
@@ -289,14 +315,14 @@ def _default_region_name_for_mode(mode: RetrievalMode) -> AtmosphereRegionName:
     if mode == "emission":
         return "dayside"
 
-# compute the planet radial velocity in km/s for a given phase array, Kp, Vsys, and optional additional RV offset
+# Compute the planet radial velocity in a stellar-rest wavelength frame.
 def planet_rv_kms(
     phase: jnp.ndarray,
     Kp_kms: float,
-    Vsys_kms: float,
-    dRV_kms: float = 0.0,
+    v_sys_kms: float,
 ) -> jnp.ndarray:
-    return Kp_kms * jnp.sin(2.0 * jnp.pi * phase) + Vsys_kms + dRV_kms
+    return Kp_kms * jnp.sin(2.0 * jnp.pi * phase) + v_sys_kms
+
 
 # "Applying SYSREM not only removes the static-stellar and telluric signals in the data, but also distorts the underlying planetary spectrum. This effect must be accounted for in order to retrieve accurate parameters from the planetary spectra. We follow the methodology of N. P. Gibson et al. (2022) to apply a corresponding distortion to the model spectra. The corrected model is, from Equation (7) of N. P. Gibson et al."
 def sysrem_model_distortion(
@@ -458,10 +484,16 @@ def _compute_xs_opacity_terms(
     opa_by_species: dict[str, OpaPremodit],
     Tarr: jnp.ndarray,
     mmr_profiles: dict[str, jnp.ndarray],
-    mmw_profile: jnp.ndarray,
+    species_masses: dict[str, jnp.ndarray],
     g: jnp.ndarray,
 ) -> dict[str, jnp.ndarray]:
-    """Compute line-opacity optical-depth contributions keyed by species."""
+    """Compute line-opacity optical-depth contributions keyed by species.
+
+    ``mmr_profiles`` contains mass mixing ratios, so ExoJAX requires the
+    absorber's molecular/atomic mass in ``opacity_profile_xs``. Atmospheric
+    mean molecular weight is the corresponding mass argument only when the
+    supplied profile is a volume mixing ratio.
+    """
     xs_terms: dict[str, jnp.ndarray] = {}
     for species, mmr_profile in mmr_profiles.items():
         opa = opa_by_species.get(species)
@@ -471,7 +503,7 @@ def _compute_xs_opacity_terms(
         xs_terms[species] = art.opacity_profile_xs(
             xsmatrix,
             mmr_profile,
-            mmw_profile[:, None],
+            species_masses[species],
             g,
         )
 
@@ -556,6 +588,8 @@ def _compute_opacity_terms(
     Tarr: jnp.ndarray,
     mmr_mols: dict[str, jnp.ndarray],
     mmr_atoms: dict[str, jnp.ndarray],
+    mol_masses: dict[str, jnp.ndarray],
+    atom_masses: dict[str, jnp.ndarray],
     vmrH2_profile: jnp.ndarray,
     vmrHe_profile: jnp.ndarray,
     mmw_profile: jnp.ndarray,
@@ -578,7 +612,7 @@ def _compute_opacity_terms(
             opa_mols,
             Tarr,
             mmr_mols,
-            mmw_profile,
+            mol_masses,
             g,
         )
     )
@@ -588,7 +622,7 @@ def _compute_opacity_terms(
             opa_atoms,
             Tarr,
             mmr_atoms,
-            mmw_profile,
+            atom_masses,
             g,
         )
     )
@@ -633,6 +667,8 @@ def compute_opacity(
     Tarr: jnp.ndarray,
     mmr_mols: dict[str, jnp.ndarray],
     mmr_atoms: dict[str, jnp.ndarray],
+    mol_masses: dict[str, jnp.ndarray],
+    atom_masses: dict[str, jnp.ndarray],
     vmrH2_profile: jnp.ndarray,
     vmrHe_profile: jnp.ndarray,
     mmw_profile: jnp.ndarray,
@@ -648,6 +684,8 @@ def compute_opacity(
         Tarr,
         mmr_mols,
         mmr_atoms,
+        mol_masses,
+        atom_masses,
         vmrH2_profile,
         vmrHe_profile,
         mmw_profile,
@@ -665,6 +703,8 @@ def compute_opacity_per_species(
     Tarr: jnp.ndarray,
     mmr_mols: dict[str, jnp.ndarray],
     mmr_atoms: dict[str, jnp.ndarray],
+    mol_masses: dict[str, jnp.ndarray],
+    atom_masses: dict[str, jnp.ndarray],
     vmrH2_profile: jnp.ndarray,
     vmrHe_profile: jnp.ndarray,
     mmw_profile: jnp.ndarray,
@@ -681,6 +721,8 @@ def compute_opacity_per_species(
         Tarr,
         mmr_mols,
         mmr_atoms,
+        mol_masses,
+        atom_masses,
         vmrH2_profile,
         vmrHe_profile,
         mmw_profile,
@@ -1197,6 +1239,14 @@ def compute_atmospheric_state_from_posterior(
 
     mol_names = list(region_config.mol_names)
     atom_names = list(region_config.atom_names)
+    mol_masses = {
+        species: region_config.mol_masses[i]
+        for i, species in enumerate(region_config.mol_names)
+    }
+    atom_masses = {
+        species: region_config.atom_masses[i]
+        for i, species in enumerate(region_config.atom_names)
+    }
     Tarr = reconstruct_temperature_profile(
         params,
         art,
@@ -1315,6 +1365,8 @@ def compute_atmospheric_state_from_posterior(
         Tarr=Tarr,
         mmr_mols=mmr_mols,
         mmr_atoms=mmr_atoms,
+        mol_masses=mol_masses,
+        atom_masses=atom_masses,
         vmrH2_profile=vmrH2_profile,
         vmrHe_profile=vmrHe_profile,
         mmw_profile=mmw_profile,
@@ -1332,6 +1384,8 @@ def compute_atmospheric_state_from_posterior(
         Tarr=Tarr,
         mmr_mols=mmr_mols,
         mmr_atoms=mmr_atoms,
+        mol_masses=mol_masses,
+        atom_masses=atom_masses,
         vmrH2_profile=vmrH2_profile,
         vmrHe_profile=vmrHe_profile,
         mmw_profile=mmw_profile,
@@ -1355,33 +1409,6 @@ def compute_atmospheric_state_from_posterior(
         'mmr_atoms': mmr_atoms,  # MMR profiles used in opacity
         'params': params,
     }
-
-
-def _sample_phase_dependent_velocity_offset(
-    phase_mode: PhaseMode,
-    phase: jnp.ndarray,
-) -> jnp.ndarray:
-    n_exp = phase.shape[0]
-
-    if phase_mode == "global":
-        return numpyro.sample("dRV", dist.Normal(0.0, 10.0))
-
-    if phase_mode == "per_exposure":
-        with numpyro.plate("exposures", n_exp):
-            dRV = numpyro.sample("dRV", dist.Normal(0.0, 10.0))
-        numpyro.deterministic("dRV_mean", jnp.mean(dRV))
-        numpyro.deterministic("dRV_std", jnp.std(dRV))
-        return dRV
-
-    if phase_mode == "linear":
-        dRV_0 = numpyro.sample("dRV_0", dist.Normal(0.0, 10.0))
-        dRV_slope = numpyro.sample("dRV_slope", dist.Normal(0.0, 50.0))
-        dRV = dRV_0 + dRV_slope * phase
-        numpyro.deterministic("dRV_at_ingress", dRV_0 + dRV_slope * jnp.min(phase))
-        numpyro.deterministic("dRV_at_egress", dRV_0 + dRV_slope * jnp.max(phase))
-        return dRV
-
-    raise ValueError(f"Unknown phase_mode: {phase_mode}")
 
 
 def _sample_temperature_profile(
@@ -1462,8 +1489,7 @@ def compute_model_timeseries(
     g_ref: float | jnp.ndarray,
     phase: jnp.ndarray,
     Kp: float | jnp.ndarray,
-    Vsys: float | jnp.ndarray,
-    dRV: float | jnp.ndarray,
+    v_sys: float | jnp.ndarray,
     sop_rot: SopRotation,
     sop_inst: SopInstProfile,
     inst_nus: jnp.ndarray,
@@ -1525,30 +1551,113 @@ def compute_model_timeseries(
     rt = sop_rot.rigid_rotation(rt, vsini, 0.0, 0.0)
     rt = sop_inst.ipgauss(rt, beta_inst)
 
-    rv = planet_rv_kms(phase, Kp, Vsys, dRV)
+    rv = planet_rv_kms(phase, Kp, v_sys)
     planet_ts = jax.vmap(lambda v: sop_inst.sampling(rt, v, inst_nus))(rv)
     _debug_nonfinite_array("spectroscopy.planet_ts", planet_ts)
 
     if mode == "transmission":
-        # Convolution / interpolation can introduce tiny negative ringing in an
-        # otherwise non-negative transmission observable. Guard before sqrt so
-        # the likelihood does not go NaN during SVI/HMC initialization.
-        return jnp.sqrt(jnp.clip(planet_ts, 0.0, None)) * (Rp / Rstar)
+        # ArtTransPure returns (R_lambda / Rp)**2. Convert that directly to
+        # transit depth and then to the negative perturbation of normalized
+        # stellar flux. The prepared transmission data are flux residuals, not
+        # radius-ratio spectra.
+        transit_depth_ts = jnp.clip(planet_ts, 0.0, None) * (Rp / Rstar) ** 2
+        return -transit_depth_ts
 
     Fs = _resolve_emission_stellar_surface_flux(
         nu_grid=nu_grid,
         stellar_surface_flux=stellar_surface_flux,
         context="compute_model_timeseries",
     )
-    Fs_ts = jax.vmap(lambda v: sop_inst.sampling(Fs, v, inst_nus))(rv)
-    return planet_ts / jnp.clip(Fs_ts, config.F32_FLOOR_RECIP, None) * (Rp / Rstar) ** 2
+    # The observations and PHOENIX spectrum are in the stellar-rest frame.
+    # Only the planet follows the orbital velocity.
+    stellar_spectrum = sop_inst.sampling(Fs, 0.0, inst_nus)
+    return (
+        planet_ts
+        / jnp.clip(stellar_spectrum[None, :], config.F32_FLOOR_RECIP, None)
+        * (Rp / Rstar) ** 2
+    )
+
+
+def apply_collapsed_emission_operator(
+    model_ts: jnp.ndarray,
+    operator: CollapsedEmissionInputs,
+) -> jnp.ndarray:
+    """Apply the data's time-median subtraction and 1D collapse to a model."""
+    model_ts = jnp.asarray(model_ts)
+    if model_ts.ndim != 2:
+        raise ValueError(
+            "A collapsed-emission operator requires a 2D model time series; "
+            f"got shape {model_ts.shape}."
+        )
+
+    # ExoJAX samples on increasing wavenumber, which is decreasing wavelength.
+    # The saved collapse operator uses increasing wavelength, matching NumPy's
+    # interpolation convention in the data collapser.
+    model_wavelength_order = model_ts[:, ::-1]
+    residual_ts = model_wavelength_order - jnp.median(
+        model_wavelength_order,
+        axis=0,
+        keepdims=True,
+    )
+    if operator.chunked_sysrem is not None:
+        residual_ts = sysrem_model_distortion_chunked(
+            residual_ts,
+            operator.chunked_sysrem,
+        )
+    selected = residual_ts[operator.selected_exposure_indices]
+    exposure_indices = jnp.arange(selected.shape[0])[:, None]
+    left = selected[exposure_indices, operator.shift_left_indices]
+    right = selected[exposure_indices, operator.shift_left_indices + 1]
+    shifted = left + operator.shift_fractions * (right - left)
+    spectrum_unbinned = jnp.sum(operator.coadd_weights * shifted, axis=0)
+    retained = operator.bin_indices.shape[0]
+    spectrum_binned = jnp.zeros_like(operator.output_wavelength).at[
+        operator.bin_indices
+    ].add(operator.bin_weights * spectrum_unbinned[:retained])
+    return spectrum_binned[operator.output_indices][None, :]
+
+
+def apply_collapsed_transmission_operator(
+    model_ts: jnp.ndarray,
+    operator: CollapsedTransmissionInputs,
+) -> jnp.ndarray:
+    """Apply the data's frozen SYSREM and 1D transmission collapse."""
+    model_ts = jnp.asarray(model_ts)
+    if model_ts.ndim != 2:
+        raise ValueError(
+            "A collapsed-transmission operator requires a 2D model time "
+            f"series; got shape {model_ts.shape}."
+        )
+
+    model_wavelength_order = model_ts[:, ::-1]
+    residual_ts = (
+        model_wavelength_order
+        * operator.active_exposure_mask[:, None]
+    )
+    if operator.chunked_sysrem is not None:
+        residual_ts = sysrem_model_distortion_chunked(
+            residual_ts,
+            operator.chunked_sysrem,
+        )
+    selected = residual_ts[operator.selected_exposure_indices]
+    exposure_indices = jnp.arange(selected.shape[0])[:, None]
+    left = selected[exposure_indices, operator.shift_left_indices]
+    right = selected[exposure_indices, operator.shift_left_indices + 1]
+    shifted = left + operator.shift_fractions * (right - left)
+    spectrum_unbinned = jnp.sum(operator.coadd_weights * shifted, axis=0)
+    retained = operator.bin_indices.shape[0]
+    spectrum_binned = jnp.zeros_like(operator.output_wavelength).at[
+        operator.bin_indices
+    ].add(operator.bin_weights * spectrum_unbinned[:retained])
+    return spectrum_binned[operator.output_indices][None, :]
 
 
 def apply_model_pipeline_corrections(
     model_ts: jnp.ndarray,
     *,
-    subtract_per_exposure_mean: bool,
+    subtract_weighted_global_mean: bool = False,
     apply_sysrem: bool,
+    sigma: jnp.ndarray | None = None,
     U: jnp.ndarray | None = None,
     V: jnp.ndarray | None = None,
     chunked_sysrem: ChunkedSysremInputs | None = None,
@@ -1556,8 +1665,29 @@ def apply_model_pipeline_corrections(
     if model_ts.ndim == 1:
         model_ts = model_ts[None, :]
 
-    if subtract_per_exposure_mean:
-        model_ts = model_ts - jnp.mean(model_ts, axis=1, keepdims=True)
+    if subtract_weighted_global_mean:
+        if sigma is None:
+            raise ValueError(
+                "subtract_weighted_global_mean=True requires the observed uncertainties."
+            )
+        sigma = jnp.asarray(sigma)
+        if sigma.ndim == 1:
+            sigma = sigma[None, :]
+        if sigma.shape != model_ts.shape:
+            raise ValueError(
+                f"sigma shape {sigma.shape} does not match model shape {model_ts.shape}"
+            )
+        weights = 1.0 / jnp.clip(
+            sigma,
+            config.F32_FLOOR_RECIPSQ,
+            None,
+        ) ** 2
+        weighted_mean = jnp.sum(weights * model_ts) / jnp.clip(
+            jnp.sum(weights),
+            config.F32_FLOOR_RECIP,
+            None,
+        )
+        model_ts = model_ts - weighted_mean
 
     if apply_sysrem:
         if chunked_sysrem is not None:
@@ -1568,18 +1698,6 @@ def apply_model_pipeline_corrections(
             model_ts = sysrem_model_distortion(model_ts, U, V)
 
     return model_ts
-
-
-def _lnL_exposure(
-    f_i: jnp.ndarray,
-    m_i: jnp.ndarray,
-    w_i: jnp.ndarray,
-) -> jnp.ndarray:
-    alpha_i = jnp.sum(w_i * f_i * m_i) / (jnp.sum(w_i * m_i**2) + config.F32_FLOOR_RECIP)
-    r_i = f_i - alpha_i * m_i
-    chi2_i = jnp.sum(w_i * r_i**2)
-    norm_i = jnp.sum(jnp.log((2.0 * jnp.pi) / w_i))
-    return -0.5 * (chi2_i + norm_i)
 
 
 def _normalize_chunked_sysrem_inputs(
@@ -1647,6 +1765,8 @@ def _normalize_spectroscopic_observation_inputs(
     U = None if inputs.U is None else jnp.asarray(inputs.U)
     V = None if inputs.V is None else jnp.asarray(inputs.V)
     chunked_sysrem = inputs.chunked_sysrem
+    collapsed_emission = inputs.collapsed_emission
+    collapsed_transmission = inputs.collapsed_transmission
 
     if data.ndim == 1:
         data = data[None, :]
@@ -1670,6 +1790,187 @@ def _normalize_spectroscopic_observation_inputs(
             n_exp=data.shape[0],
             n_wave=data.shape[1],
         )
+    if collapsed_emission is not None:
+        source_wavelength = jnp.asarray(collapsed_emission.source_wavelength)
+        source_inst_nus = jnp.asarray(collapsed_emission.source_inst_nus)
+        source_phase = jnp.asarray(collapsed_emission.source_phase)
+        selected_indices = jnp.asarray(
+            collapsed_emission.selected_exposure_indices,
+            dtype=jnp.int32,
+        )
+        shift_left_indices = jnp.asarray(
+            collapsed_emission.shift_left_indices,
+            dtype=jnp.int32,
+        )
+        shift_fractions = jnp.asarray(collapsed_emission.shift_fractions)
+        coadd_weights = jnp.asarray(collapsed_emission.coadd_weights)
+        bin_indices = jnp.asarray(collapsed_emission.bin_indices, dtype=jnp.int32)
+        bin_weights = jnp.asarray(collapsed_emission.bin_weights)
+        output_wavelength = jnp.asarray(collapsed_emission.output_wavelength)
+        output_indices = jnp.asarray(
+            collapsed_emission.output_indices,
+            dtype=jnp.int32,
+        )
+
+        if source_wavelength.ndim != 1 or source_inst_nus.shape != source_wavelength.shape:
+            raise ValueError(
+                "Collapsed emission source_wavelength and source_inst_nus "
+                "must be matching 1D arrays."
+            )
+        if source_phase.ndim != 1:
+            raise ValueError("Collapsed emission source_phase must be 1D.")
+        if shift_left_indices.shape != coadd_weights.shape:
+            raise ValueError(
+                "Collapsed emission shift indices and coadd weights must "
+                "have matching shapes."
+            )
+        if shift_fractions.shape != shift_left_indices.shape:
+            raise ValueError(
+                "Collapsed emission shift indices and fractions must have "
+                "matching shapes."
+            )
+        if shift_left_indices.shape[0] != selected_indices.size:
+            raise ValueError(
+                "Collapsed emission selected exposure count does not match "
+                "the collapse operator."
+            )
+        if bin_indices.ndim != 1 or bin_weights.shape != bin_indices.shape:
+            raise ValueError(
+                "Collapsed emission bin_indices and bin_weights must be "
+                "matching 1D arrays."
+            )
+        if output_wavelength.ndim != 1:
+            raise ValueError("Collapsed emission output_wavelength must be 1D.")
+        if output_indices.shape != (data.shape[1],):
+            raise ValueError(
+                "Collapsed emission output index count must match the "
+                f"observed spectrum: {output_indices.shape} versus {data.shape[1]}."
+            )
+        collapsed_emission = CollapsedEmissionInputs(
+            source_wavelength=source_wavelength,
+            source_inst_nus=source_inst_nus,
+            source_phase=source_phase,
+            selected_exposure_indices=selected_indices,
+            shift_left_indices=shift_left_indices,
+            shift_fractions=shift_fractions,
+            coadd_weights=coadd_weights,
+            bin_indices=bin_indices,
+            bin_weights=bin_weights,
+            output_wavelength=output_wavelength,
+            output_indices=output_indices,
+            kp_reference_kms=jnp.asarray(
+                collapsed_emission.kp_reference_kms
+            ),
+            velocity_offset_reference_kms=jnp.asarray(
+                collapsed_emission.velocity_offset_reference_kms
+            ),
+            chunked_sysrem=(
+                None
+                if collapsed_emission.chunked_sysrem is None
+                else _normalize_chunked_sysrem_inputs(
+                    collapsed_emission.chunked_sysrem,
+                    n_exp=source_phase.size,
+                    n_wave=source_wavelength.size,
+                )
+            ),
+        )
+    if collapsed_transmission is not None:
+        source_wavelength = jnp.asarray(
+            collapsed_transmission.source_wavelength
+        )
+        source_inst_nus = jnp.asarray(
+            collapsed_transmission.source_inst_nus
+        )
+        source_phase = jnp.asarray(collapsed_transmission.source_phase)
+        active_mask = jnp.asarray(
+            collapsed_transmission.active_exposure_mask
+        )
+        selected_indices = jnp.asarray(
+            collapsed_transmission.selected_exposure_indices,
+            dtype=jnp.int32,
+        )
+        shift_left_indices = jnp.asarray(
+            collapsed_transmission.shift_left_indices,
+            dtype=jnp.int32,
+        )
+        shift_fractions = jnp.asarray(
+            collapsed_transmission.shift_fractions
+        )
+        coadd_weights = jnp.asarray(
+            collapsed_transmission.coadd_weights
+        )
+        bin_indices = jnp.asarray(
+            collapsed_transmission.bin_indices,
+            dtype=jnp.int32,
+        )
+        bin_weights = jnp.asarray(collapsed_transmission.bin_weights)
+        output_wavelength = jnp.asarray(
+            collapsed_transmission.output_wavelength
+        )
+        output_indices = jnp.asarray(
+            collapsed_transmission.output_indices,
+            dtype=jnp.int32,
+        )
+        if source_wavelength.ndim != 1 or source_inst_nus.shape != source_wavelength.shape:
+            raise ValueError(
+                "Collapsed transmission source_wavelength and "
+                "source_inst_nus must be matching 1D arrays."
+            )
+        if source_phase.ndim != 1 or active_mask.shape != source_phase.shape:
+            raise ValueError(
+                "Collapsed transmission source_phase and "
+                "active_exposure_mask must be matching 1D arrays."
+            )
+        if shift_left_indices.shape != coadd_weights.shape:
+            raise ValueError(
+                "Collapsed transmission shift indices and coadd weights "
+                "must have matching shapes."
+            )
+        if shift_fractions.shape != shift_left_indices.shape:
+            raise ValueError(
+                "Collapsed transmission shift indices and fractions "
+                "must have matching shapes."
+            )
+        if shift_left_indices.shape[0] != selected_indices.size:
+            raise ValueError(
+                "Collapsed transmission selected exposure count does not "
+                "match the collapse operator."
+            )
+        if output_indices.shape != (data.shape[1],):
+            raise ValueError(
+                "Collapsed transmission output index count must match the "
+                f"observed spectrum: {output_indices.shape} versus "
+                f"{data.shape[1]}."
+            )
+        collapsed_transmission = CollapsedTransmissionInputs(
+            source_wavelength=source_wavelength,
+            source_inst_nus=source_inst_nus,
+            source_phase=source_phase,
+            active_exposure_mask=active_mask,
+            selected_exposure_indices=selected_indices,
+            shift_left_indices=shift_left_indices,
+            shift_fractions=shift_fractions,
+            coadd_weights=coadd_weights,
+            bin_indices=bin_indices,
+            bin_weights=bin_weights,
+            output_wavelength=output_wavelength,
+            output_indices=output_indices,
+            kp_reference_kms=jnp.asarray(
+                collapsed_transmission.kp_reference_kms
+            ),
+            velocity_offset_reference_kms=jnp.asarray(
+                collapsed_transmission.velocity_offset_reference_kms
+            ),
+            chunked_sysrem=(
+                None
+                if collapsed_transmission.chunked_sysrem is None
+                else _normalize_chunked_sysrem_inputs(
+                    collapsed_transmission.chunked_sysrem,
+                    n_exp=source_phase.size,
+                    n_wave=source_wavelength.size,
+                )
+            ),
+        )
 
     return SpectroscopicObservationInputs(
         data=data,
@@ -1678,6 +1979,8 @@ def _normalize_spectroscopic_observation_inputs(
         U=U,
         V=V,
         chunked_sysrem=chunked_sysrem,
+        collapsed_emission=collapsed_emission,
+        collapsed_transmission=collapsed_transmission,
     )
 
 
@@ -1691,9 +1994,15 @@ def _normalize_bandpass_observation_inputs(
 
 def _sample_shared_system_state(
     shared_config: SharedSystemConfig,
+    *,
+    sample_Kp: bool,
+    sample_v_sys: bool,
 ) -> SharedSystemState:
     import math
-    if shared_config.Kp_bounds is not None:
+    if not sample_Kp:
+        Kp = jnp.asarray(shared_config.Kp_mean)
+        numpyro.deterministic("Kp", Kp)
+    elif shared_config.Kp_bounds is not None:
         Kp = numpyro.sample("Kp", dist.Uniform(*shared_config.Kp_bounds))
     elif shared_config.Kp_std is None or math.isnan(float(shared_config.Kp_std)) or shared_config.Kp_std <= 0:
         Kp = jnp.asarray(shared_config.Kp_mean)
@@ -1703,7 +2012,14 @@ def _sample_shared_system_state(
             "Kp",
             dist.TruncatedNormal(shared_config.Kp_mean, shared_config.Kp_std, low=0.0),
         )
-    Vsys = jnp.asarray(shared_config.Vsys_mean)
+    if sample_v_sys:
+        v_sys = numpyro.sample(
+            "v_sys",
+            dist.Normal(shared_config.v_sys_mean, shared_config.v_sys_std),
+        )
+    else:
+        v_sys = jnp.asarray(0.0)
+        numpyro.deterministic("v_sys", v_sys)
     if shared_config.Mp_upper_3sigma is not None:
         Mp = numpyro.sample("Mp", dist.Uniform(0.5, shared_config.Mp_upper_3sigma)) * MJ
     else:
@@ -1715,42 +2031,13 @@ def _sample_shared_system_state(
     Rp = numpyro.sample("Rp", dist.TruncatedNormal(shared_config.Rp_mean, shared_config.Rp_std, low=0.5)) * RJ
     g_ref = gravity_surface(Rp / RJ, Mp / MJ)
 
-    shared_dRV_0 = None
-    shared_dRV_slope = None
-    shared_dRV_global = None
-    shared_phase_mode = shared_config.shared_velocity_phase_mode
-    if shared_phase_mode is not None:
-        if shared_phase_mode == "global":
-            shared_dRV_global = numpyro.sample(
-                "shared_dRV", dist.Normal(0.0, 10.0)
-            )
-        elif shared_phase_mode == "linear":
-            shared_dRV_0 = numpyro.sample(
-                "shared_dRV_0", dist.Normal(0.0, 10.0)
-            )
-            shared_dRV_slope = numpyro.sample(
-                "shared_dRV_slope", dist.Normal(0.0, 50.0)
-            )
-        else:
-            raise ValueError(
-                "shared_velocity_phase_mode only supports 'global' or "
-                f"'linear'; got {shared_phase_mode!r}."
-            )
-
     return SharedSystemState(
         Kp=Kp,
-        Vsys=Vsys,
+        v_sys=v_sys,
         Mp=Mp,
         Rstar=Rstar,
         Rp=Rp,
         g_ref=g_ref,
-        shared_dRV_0=shared_dRV_0,
-        shared_dRV_slope=shared_dRV_slope,
-        shared_dRV_global=shared_dRV_global,
-        shared_velocity_phase_mode=shared_phase_mode,
-        shared_velocity_component_names=frozenset(
-            shared_config.shared_velocity_component_names
-        ),
     )
 
 
@@ -1813,6 +2100,14 @@ def _sample_atmosphere_state(
     mmr_atoms = {
         atom: comp.mmr_atoms[i] for i, atom in enumerate(region_config.atom_names)
     }
+    mol_masses = {
+        species: region_config.mol_masses[i]
+        for i, species in enumerate(region_config.mol_names)
+    }
+    atom_masses = {
+        species: region_config.atom_masses[i]
+        for i, species in enumerate(region_config.atom_names)
+    }
 
     return AtmosphereState(
         art=region_config.art,
@@ -1821,6 +2116,8 @@ def _sample_atmosphere_state(
         mmw_profile=comp.mmw_profile,
         mmr_mols=mmr_mols,
         mmr_atoms=mmr_atoms,
+        mol_masses=mol_masses,
+        atom_masses=atom_masses,
         vmrH2_profile=comp.vmrH2_profile,
         vmrHe_profile=comp.vmrHe_profile,
         continuum_vmr_profiles=comp.continuum_vmr_profiles,
@@ -1840,6 +2137,8 @@ def _compute_component_dtau(
         Tarr=atmosphere_state.Tarr,
         mmr_mols=atmosphere_state.mmr_mols,
         mmr_atoms=atmosphere_state.mmr_atoms,
+        mol_masses=atmosphere_state.mol_masses,
+        atom_masses=atmosphere_state.atom_masses,
         vmrH2_profile=atmosphere_state.vmrH2_profile,
         vmrHe_profile=atmosphere_state.vmrHe_profile,
         mmw_profile=atmosphere_state.mmw_profile,
@@ -1879,63 +2178,6 @@ def _validate_unique_sample_prefixes(
             f"{label.capitalize()} sample_prefix values must be unique. Duplicates: "
             + ", ".join(duplicates)
         )
-
-
-def _sample_component_velocity_offset(
-    component_config: SpectroscopicObservationConfig,
-    phase: jnp.ndarray,
-    *,
-    scope_prefix: str | None = None,
-    shared_state: SharedSystemState | None = None,
-) -> jnp.ndarray:
-    if component_config.radial_velocity_mode == "none":
-        return jnp.zeros_like(phase)
-    if component_config.phase_mode is None:
-        return jnp.zeros_like(phase)
-
-    if (
-        shared_state is not None
-        and shared_state.shared_velocity_phase_mode is not None
-        and component_config.name in shared_state.shared_velocity_component_names
-    ):
-        shared_mode = shared_state.shared_velocity_phase_mode
-        if component_config.phase_mode != shared_mode:
-            raise ValueError(
-                f"Component '{component_config.name}' declared phase_mode="
-                f"{component_config.phase_mode!r} but shares velocity with "
-                f"shared_velocity_phase_mode={shared_mode!r}. Phase modes must match."
-            )
-        if shared_mode == "global":
-            dRV = jnp.broadcast_to(shared_state.shared_dRV_global, phase.shape)
-        elif shared_mode == "linear":
-            dRV = shared_state.shared_dRV_0 + shared_state.shared_dRV_slope * phase
-        else:
-            raise ValueError(
-                f"Unsupported shared_velocity_phase_mode={shared_mode!r}."
-            )
-
-        if scope_prefix is None:
-            numpyro.deterministic("dRV_kms", dRV)
-        else:
-            with numpyro.handlers.scope(prefix=scope_prefix):
-                numpyro.deterministic("dRV_kms", dRV)
-        return dRV
-
-    if scope_prefix is None:
-        dRV = _sample_phase_dependent_velocity_offset(
-            component_config.phase_mode,
-            phase,
-        )
-        numpyro.deterministic("dRV_kms", dRV)
-        return dRV
-
-    with numpyro.handlers.scope(prefix=scope_prefix):
-        dRV = _sample_phase_dependent_velocity_offset(
-            component_config.phase_mode,
-            phase,
-        )
-        numpyro.deterministic("dRV_kms", dRV)
-        return dRV
 
 
 def _compute_native_observable_spectrum(
@@ -2152,26 +2394,48 @@ def _evaluate_spectroscopic_component(
     shared_config: SharedSystemConfig,
     shared_state: SharedSystemState,
     atmosphere_state: AtmosphereState,
-    *,
-    scope_prefix: str | None = None,
 ) -> jnp.ndarray:
     dtau = _compute_component_dtau(component_config, atmosphere_state)
     _debug_nonfinite_array(f"spectroscopy[{component_config.name}].dtau", dtau)
-    dRV = _sample_component_velocity_offset(
-        component_config,
-        observation_inputs.phase,
-        scope_prefix=scope_prefix,
-        shared_state=shared_state,
-    )
 
-    if component_config.radial_velocity_mode == "none":
+    collapsed_emission = observation_inputs.collapsed_emission
+    collapsed_transmission = observation_inputs.collapsed_transmission
+    if collapsed_emission is not None and collapsed_transmission is not None:
+        raise ValueError(
+            "A spectroscopic component cannot use both collapsed emission "
+            "and collapsed transmission operators."
+        )
+    collapsed_operator = (
+        collapsed_emission
+        if collapsed_emission is not None
+        else collapsed_transmission
+    )
+    if collapsed_operator is not None:
+        if component_config.mode != "emission":
+            if collapsed_transmission is None:
+                raise ValueError(
+                    "A collapsed-emission operator can only be used with "
+                    "emission mode."
+                )
+        elif collapsed_emission is None:
+            raise ValueError(
+                "A collapsed-transmission operator can only be used with "
+                "transmission mode."
+            )
+        phase = collapsed_operator.source_phase
+        Kp = collapsed_operator.kp_reference_kms
+        v_sys = collapsed_operator.velocity_offset_reference_kms
+        model_inst_nus = collapsed_operator.source_inst_nus
+    elif component_config.radial_velocity_mode == "none":
         phase = jnp.zeros_like(observation_inputs.phase)
         Kp = jnp.asarray(0.0)
-        Vsys = jnp.asarray(0.0)
+        v_sys = jnp.asarray(0.0)
+        model_inst_nus = component_config.inst_nus
     else:
         phase = observation_inputs.phase
         Kp = shared_state.Kp
-        Vsys = shared_state.Vsys
+        v_sys = shared_state.v_sys
+        model_inst_nus = component_config.inst_nus
 
     model_ts = compute_model_timeseries(
         mode=component_config.mode,
@@ -2184,11 +2448,10 @@ def _evaluate_spectroscopic_component(
         g_ref=shared_state.g_ref,
         phase=phase,
         Kp=Kp,
-        Vsys=Vsys,
-        dRV=dRV,
+        v_sys=v_sys,
         sop_rot=component_config.sop_rot,
         sop_inst=component_config.sop_inst,
-        inst_nus=component_config.inst_nus,
+        inst_nus=model_inst_nus,
         nu_grid=component_config.nu_grid,
         beta_inst=component_config.beta_inst,
         period_day=shared_config.period_day,
@@ -2196,30 +2459,32 @@ def _evaluate_spectroscopic_component(
         stellar_surface_flux=component_config.stellar_surface_flux,
     )
     _debug_nonfinite_array(f"spectroscopy[{component_config.name}].model_ts_raw", model_ts)
+    if collapsed_emission is not None:
+        model_ts = apply_collapsed_emission_operator(
+            model_ts,
+            collapsed_emission,
+        )
+    elif collapsed_transmission is not None:
+        model_ts = apply_collapsed_transmission_operator(
+            model_ts,
+            collapsed_transmission,
+        )
     model_ts = apply_model_pipeline_corrections(
         model_ts,
-        subtract_per_exposure_mean=component_config.subtract_per_exposure_mean,
+        subtract_weighted_global_mean=component_config.subtract_weighted_global_mean,
         apply_sysrem=component_config.apply_sysrem,
+        sigma=observation_inputs.sigma,
         U=observation_inputs.U,
         V=observation_inputs.V,
         chunked_sysrem=observation_inputs.chunked_sysrem,
     )
     _debug_nonfinite_array(f"spectroscopy[{component_config.name}].model_ts", model_ts)
 
-    if component_config.likelihood_kind == "gaussian":
-        lnL = _gaussian_log_likelihood(
-            observation_inputs.data,
-            model_ts,
-            observation_inputs.sigma,
-        )
-        _debug_nonfinite_scalar(f"spectroscopy[{component_config.name}].logL", lnL)
-        return lnL
-
-    if component_config.likelihood_kind != "matched_filter":
-        raise ValueError(f"Unknown spectroscopic likelihood kind: {component_config.likelihood_kind}")
-
-    w_ij = 1.0 / jnp.clip(observation_inputs.sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
-    lnL = jnp.sum(jax.vmap(_lnL_exposure)(observation_inputs.data, model_ts, w_ij))
+    lnL = _gaussian_log_likelihood(
+        observation_inputs.data,
+        model_ts,
+        observation_inputs.sigma,
+    )
     _debug_nonfinite_scalar(f"spectroscopy[{component_config.name}].logL", lnL)
     return lnL
 
@@ -2296,7 +2561,16 @@ def joint_retrieval_model(
     observations: dict[str, ObservationInputs],
 ) -> None:
     multi_observation = len(model_config.observations) > 1
-    shared_state = _sample_shared_system_state(model_config.shared_system)
+    sample_v_sys = any(
+        isinstance(component, SpectroscopicObservationConfig)
+        and component.radial_velocity_mode == "orbital"
+        for component in model_config.observations
+    )
+    shared_state = _sample_shared_system_state(
+        model_config.shared_system,
+        sample_Kp=sample_v_sys,
+        sample_v_sys=sample_v_sys,
+    )
     region_states = {}
     for region_config in model_config.atmosphere_regions:
         region_states[region_config.name] = _sample_atmosphere_state(
@@ -2324,7 +2598,6 @@ def joint_retrieval_model(
                 model_config.shared_system,
                 shared_state,
                 region_states[component_config.region_name],
-                scope_prefix=component_config.sample_prefix,
             )
         elif isinstance(component_config, BandpassObservationConfig):
             component_inputs = _normalize_bandpass_observation_inputs(component_input)
@@ -2345,7 +2618,7 @@ def joint_retrieval_model(
 
     numpyro.factor("logL", total_lnL)
     numpyro.deterministic("Kp_kms", shared_state.Kp)
-    numpyro.deterministic("Vsys_kms", shared_state.Vsys)
+    numpyro.deterministic("v_sys_kms", shared_state.v_sys)
     numpyro.deterministic("vsini_kms", 2.0 * jnp.pi * shared_state.Rp / (model_config.shared_system.period_day * 86400.0) / 1.0e5,
     )
 
@@ -2369,8 +2642,6 @@ def create_joint_retrieval_model(
 def build_shared_system_config(
     *,
     params: dict,
-    shared_velocity_phase_mode: PhaseMode | None = None,
-    shared_velocity_component_names: tuple[str, ...] = (),
 ) -> SharedSystemConfig:
     Kp_low = params.get("Kp_low")
     Kp_high = params.get("Kp_high")
@@ -2379,21 +2650,12 @@ def build_shared_system_config(
     if (Kp_low is not None) and (Kp_high is not None):
         Kp_bounds = (Kp_low, Kp_high)
 
-    if shared_velocity_phase_mode is not None and shared_velocity_phase_mode not in {
-        "global",
-        "linear",
-    }:
-        raise ValueError(
-            "shared_velocity_phase_mode must be 'global' or 'linear'; "
-            f"got {shared_velocity_phase_mode!r}."
-        )
-
     return SharedSystemConfig(
         Kp_mean=params["Kp"],
         Kp_std=params["Kp_err"],
         Kp_bounds=Kp_bounds,
-        Vsys_mean=params["RV_abs"],
-        Vsys_std=params["RV_abs_err"],
+        v_sys_mean=0.0,
+        v_sys_std=10.0,
         Rp_mean=params["R_p"],
         Rp_std=params["R_p_err"],
         Mp_mean=params["M_p"],
@@ -2402,8 +2664,6 @@ def build_shared_system_config(
         Rstar_mean=params["R_star"],
         Rstar_std=params["R_star_err"],
         period_day=params["period"],
-        shared_velocity_phase_mode=shared_velocity_phase_mode,
-        shared_velocity_component_names=tuple(shared_velocity_component_names),
     )
 
 
@@ -2499,14 +2759,10 @@ def build_spectroscopic_observation_config(
     Tstar: float | None = None,
     stellar_surface_flux: jnp.ndarray | np.ndarray | None = None,
     radial_velocity_mode: RVBehavior = "orbital",
-    phase_mode: PhaseMode | None = config.DEFAULT_PHASE_MODE,
-    likelihood_kind: SpectroscopicLikelihood = "matched_filter",
-    subtract_per_exposure_mean: bool | None = None,
+    subtract_weighted_global_mean: bool = False,
     apply_sysrem: bool | None = None,
     sample_prefix: str | None = None,
 ) -> SpectroscopicObservationConfig:
-    if subtract_per_exposure_mean is None:
-        subtract_per_exposure_mean = config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT
     if apply_sysrem is None:
         apply_sysrem = config.APPLY_SYSREM_DEFAULT
 
@@ -2528,9 +2784,6 @@ def build_spectroscopic_observation_config(
     check_grid_resolution(nu_grid, instrument_resolution)
     beta_inst = 1.0 / (instrument_resolution * 2.3548200450309493)
 
-    if radial_velocity_mode == "none":
-        phase_mode = None
-
     return SpectroscopicObservationConfig(
         name=name,
         region_name=region_name,
@@ -2544,9 +2797,7 @@ def build_spectroscopic_observation_config(
         inst_nus=inst_nus,
         beta_inst=beta_inst,
         radial_velocity_mode=radial_velocity_mode,
-        phase_mode=phase_mode,
-        likelihood_kind=likelihood_kind,
-        subtract_per_exposure_mean=subtract_per_exposure_mean,
+        subtract_weighted_global_mean=subtract_weighted_global_mean,
         apply_sysrem=apply_sysrem,
         Tstar=Tstar,
         stellar_surface_flux=stellar_surface_flux_arr,

@@ -1376,8 +1376,8 @@ LOG_GAMMA_BOUNDS = (-1.0, 1.0)
 
 DEFAULT_KP = 169.0  # planet radial velocity semi-amplitude [km/s]
 DEFAULT_KP_ERR = 20.0 
-DEFAULT_RV_ABS = 0.0 # absolute RV shift [km/s]
-DEFAULT_RV_ABS_ERR = 1.0
+DEFAULT_RV_ABS = 0.0 # absolute stellar systemic velocity metadata [km/s]; not a model shift
+DEFAULT_RV_ABS_ERR = 1.0 # metadata uncertainty [km/s]
 DEFAULT_TSTAR = 6000.0 # stellar temperature [K] 
 DEFAULT_RP_ERR = 0.1 # planet radius error (relative to Rp/Rs)
 DEFAULT_MP_ERR = 0.1 # planet mass error (relative to Mp/Ms)
@@ -1388,11 +1388,7 @@ DEFAULT_POSTERIOR_RP = 1.5 # Maximum Rp/Rs for posterior reconstruction
 DEFAULT_POSTERIOR_MP = 1.0 # Maximum Mp/Ms for posterior reconstruction
 
 # Pipeline behavior defaults
-SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT = True # Whether to subtract per-exposure mean from model and data before computing likelihood. Should be True for CCF-like likelihoods, but can be False for full-spectrum Gaussian likelihoods.
-APPLY_SYSREM_DEFAULT = True # Whether to apply SysRem-like filtering to model and data before computing likelihood. Should be True for CCF-like likelihoods, but can be False for full-spectrum Gaussian likelihoods. Requires U and V from data preprocessing.
-
-# Phase modeling defaults
-DEFAULT_PHASE_MODE = "global" 
+APPLY_SYSREM_DEFAULT = True # Apply the stored SYSREM distortion operator to the model before the Gaussian likelihood. Requires U and V from data preprocessing.
 
 # ==============================================================================
 # SPECTRAL GRID PARAMETERS
@@ -1784,7 +1780,10 @@ DEFAULT_DATA_ARM = OBSERVING_MODE
 DEFAULT_USE_MOLECFIT = True
 DEFAULT_RAW_DATA_DIR = "input/hrs/transmission/raw"
 DEFAULT_BARYCORR = False
-DEFAULT_INTRODUCED_SHIFT = True
+# The historical epoch-specific shifts have no documented physical provenance.
+# Keep the plumbing available while the old values remain commented out at their
+# definition, but never apply an introduced shift by default.
+DEFAULT_INTRODUCED_SHIFT = False
 
 # Data loading defaults
 # Default to time-series input so the main CLI and phase-binned path work without

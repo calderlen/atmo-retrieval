@@ -1,25 +1,21 @@
-#!/usr/bin/env python
-"""Collapse high-resolution transmission time series to a 1D spectrum.
+"""Shared PEPSI preprocessing and collapsed-transmission product builder.
 
-This script:
-1. Loads raw FITS files from the configured instrument
-2. Calculates transmission spectrum (in-transit / out-of-transit)
-3. Bins to desired resolution
-4. Saves wavelength, spectrum, and uncertainty as .npy files
-
-Usage:
-    python -m dataio.collapse_transmission_timeseries_to_1d --epoch 20250601 --planet KELT-20b --arm red
+The time-series preparation and retrieval paths import the helpers defined
+here. The command-line entry point consumes a dedicated full-exposure
+``collapse_source`` cube and writes a self-contained 1D retrieval product.
 """
 
 import argparse
+import json
 import os
-import sys
 import numpy as np
 from glob import glob
+from pathlib import Path
 from astropy.io import fits
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation
 import astropy.units as u
+from exojax.database.core_atom.io import air_to_vac
 
 import config
 import config_utils
@@ -45,9 +41,6 @@ def compute_contact_phases(params: dict) -> dict[str, float]:
     half_dur_phase = (duration / period) / 2
 
     tau = params["tau"]
-    if tau != tau:
-        raise ValueError("'tau' is NaN")
-
     tau_phase = tau / period
     return {
         "T1": -half_dur_phase,
@@ -245,8 +238,6 @@ def get_sysrem_chunk_indices(
         )
 
     wave = np.asarray(wave, dtype=float)
-    if wave.ndim != 1:
-        raise ValueError(f"Expected 1D wavelength grid, got shape {wave.shape}.")
 
     telluric_config = TELLURIC_REGIONS.get(arm, {"telluric": [], "deep_mask": []})
 
@@ -273,8 +264,6 @@ def get_sysrem_deep_mask(
             "Call with 'red' or 'blue' separately."
         )
     wave = np.asarray(wave, dtype=float)
-    if wave.ndim != 1:
-        raise ValueError(f"Expected 1D wavelength grid, got shape {wave.shape}.")
 
     telluric_config = TELLURIC_REGIONS.get(arm, {"telluric": [], "deep_mask": []})
 
@@ -297,8 +286,6 @@ def get_telluric_edge_mask(
             "Call with 'red' or 'blue' separately."
         )
     wave = np.asarray(wave, dtype=float)
-    if wave.ndim != 1:
-        raise ValueError(f"Expected 1D wavelength grid, got shape {wave.shape}.")
 
     edge_width_angstrom = float(edge_width_angstrom)
     edge_mask = np.zeros(wave.shape[0], dtype=bool)
@@ -408,8 +395,6 @@ def get_arm_edge_trim_mask(
             "Call with 'red' or 'blue' separately."
         )
     wave = np.asarray(wave, dtype=float)
-    if wave.ndim != 1:
-        raise ValueError(f"Expected 1D wavelength grid, got shape {wave.shape}.")
 
     finite = np.isfinite(wave)
     edge_mask = np.zeros(wave.shape[0], dtype=bool)
@@ -933,36 +918,329 @@ def summarize_phase_coverage(
 # EPOCH-SPECIFIC CORRECTIONS
 # ==============================================================================
 
-#TODO: figure out what these are and why they are here
-
+# Historical values retained only for provenance. They must not be restored
+# without recovering and documenting their physical derivation.
 _INTRODUCED_SHIFTS_MPS = {
-    "20210501": 6000.0,
-    "20210518": 3500.0,
-    "20190425": 464500.0,
-    "20190504": 6300.0,
-    "20190515": 506000.0,
-    "20190622": -54300.0,
-    "20190623": -334000.0,
-    "20190625": 97800.0,
-    "20210303": -174600.0,
-    "20220208": -141300.0,
-    "20210628": -57200.0,
-    "20211031": -94200.0,
-    "20220929": -38600.0,
-    "20221202": -96100.0,
-    "20230327": -23900.0,
-    "20180703": -61800.0,
-    "20230430": -19900.0,
-    "20220925": -117200.0,
-    "20230615": -32400.0,
-    "20231023": -97000.0,
-    "20231106": -84700.0,
-    "20241126": -105800.0,
-    "20251002": -89100.0,
-    "20240114": -112100.0,
-    "20220926": -65000.0,
-    "20240312": -75200.0,
+    # "20210501": 6000.0,
+    # "20210518": 3500.0,
+    # "20190425": 464500.0,
+    # "20190504": 6300.0,
+    # "20190515": 506000.0,
+    # "20190622": -54300.0,
+    # "20190623": -334000.0,
+    # "20190625": 97800.0,
+    # "20210303": -174600.0,
+    # "20220208": -141300.0,
+    # "20210628": -57200.0,
+    # "20211031": -94200.0,
+    # "20220929": -38600.0,
+    # "20221202": -96100.0,
+    # "20230327": -23900.0,
+    # "20180703": -61800.0,
+    # "20230430": -19900.0,
+    # "20220925": -117200.0,
+    # "20230615": -32400.0,
+    # "20231023": -97000.0,
+    # "20231106": -84700.0,
+    # "20241126": -105800.0,
+    # "20251002": -89100.0,
+    # "20240114": -112100.0,
+    # "20220926": -65000.0,
+    # "20240312": -75200.0,
 }
+
+_MOLECFIT_CORRECTED_PREFIX = "SCIENCE_TELLURIC_CORR_"
+_MOLECFIT_FITS_SUFFIX = ".fits"
+_MAX_PIXEL_SPACING_RATIO_DEVIATION = 1.0e-3
+_SPEED_OF_LIGHT_MPS = 299792458.0
+_SPEED_OF_LIGHT_KMS = _SPEED_OF_LIGHT_MPS / 1000.0
+
+
+def _wavelength_angstrom(data, column_config: dict) -> np.ndarray:
+    """Read a configured FITS wavelength column and return Angstroms."""
+    wavelength = np.asarray(data[column_config["wave"]], dtype=float).copy()
+    unit = str(column_config["wave_unit"]).lower()
+    if unit == "micron":
+        wavelength *= 10000.0
+    elif unit != "angstrom":
+        raise ValueError(f"Unsupported PEPSI wavelength unit: {unit!r}")
+    return wavelength
+
+
+def _air_wavelength_to_vacuum(wavelength_air: np.ndarray) -> np.ndarray:
+    """Convert valid air wavelengths in Angstroms to vacuum."""
+    wavelength_vacuum = np.asarray(wavelength_air, dtype=float).copy()
+    valid = np.isfinite(wavelength_vacuum) & (wavelength_vacuum > 0.0)
+    wavelength_vacuum[valid] = np.asarray(
+        air_to_vac(wavelength_vacuum[valid]),
+        dtype=float,
+    )
+    return wavelength_vacuum
+
+
+def _molecfit_raw_product_name(molecfit_path: str | os.PathLike[str]) -> str:
+    """Return the original PEPSI product name encoded in a Molecfit output."""
+    name = Path(molecfit_path).name
+    if not name.startswith(_MOLECFIT_CORRECTED_PREFIX) or not name.endswith(
+        _MOLECFIT_FITS_SUFFIX
+    ):
+        raise ValueError(
+            "Could not identify the original PEPSI exposure from Molecfit file "
+            f"{name!r}."
+        )
+    raw_name = name[
+        len(_MOLECFIT_CORRECTED_PREFIX) : -len(_MOLECFIT_FITS_SUFFIX)
+    ]
+    if not raw_name:
+        raise ValueError(f"Molecfit filename {name!r} has no source product name.")
+    return raw_name
+
+
+def _resolve_molecfit_raw_product(
+    molecfit_path: str | os.PathLike[str],
+    data_dir: str | os.PathLike[str],
+) -> Path | None:
+    """Locate the exact raw PEPSI product paired with a Molecfit output, if present."""
+    molecfit_path = Path(molecfit_path)
+    data_root = Path(data_dir)
+    raw_name = _molecfit_raw_product_name(molecfit_path)
+
+    direct_candidates = (
+        molecfit_path.parent / raw_name,
+        molecfit_path.parent.parent / raw_name,
+        data_root / raw_name,
+    )
+    matches: dict[str, Path] = {}
+    for candidate in direct_candidates:
+        if candidate.is_file():
+            matches[str(candidate.resolve())] = candidate
+    if not matches and data_root.is_dir():
+        for candidate in data_root.rglob(raw_name):
+            if candidate.is_file():
+                matches[str(candidate.resolve())] = candidate
+
+    if not matches:
+        return None
+    if len(matches) > 1:
+        locations = ", ".join(sorted(matches))
+        raise RuntimeError(
+            f"Found multiple possible raw products for '{molecfit_path.name}': "
+            f"{locations}"
+        )
+    return next(iter(matches.values()))
+
+
+def _finite_header_velocity_mps(header, key: str) -> float | None:
+    """Return a finite FITS velocity value in m/s, or None when unavailable."""
+    if key not in header:
+        return None
+    try:
+        value = float(header[key])
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _molecfit_stellar_rest_correction_mps(header) -> tuple[float, tuple[str, ...]]:
+    """Recover the topocentric-vacuum to stellar-rest velocity correction.
+
+    PEPSI/Molecfit products span several generations of FITS headers. Newer
+    products directly record ``LABORVEL``. Other products record its opposite
+    as ``SSTVEL`` (observer plus stellar velocity), while older files split the
+    same information between ``OBSVEL``/``SSBVEL`` and ``RADVEL``.
+    """
+    labor_velocity = _finite_header_velocity_mps(header, "LABORVEL")
+    if labor_velocity is not None:
+        return labor_velocity, ("LABORVEL",)
+
+    star_observer_velocity = _finite_header_velocity_mps(header, "SSTVEL")
+    if star_observer_velocity is not None:
+        return -star_observer_velocity, ("SSTVEL",)
+
+    observer_key = None
+    observer_velocity = _finite_header_velocity_mps(header, "OBSVEL")
+    if observer_velocity is not None:
+        observer_key = "OBSVEL"
+    else:
+        observer_velocity = _finite_header_velocity_mps(header, "SSBVEL")
+        if observer_velocity is not None:
+            observer_key = "SSBVEL"
+
+    if observer_velocity is None or observer_key is None:
+        raise ValueError(
+            "Cannot place Molecfit wavelengths in the stellar rest frame: "
+            "none of LABORVEL, SSTVEL, OBSVEL, or SSBVEL is available."
+        )
+
+    radial_velocity = _finite_header_velocity_mps(header, "RADVEL")
+    if radial_velocity is None:
+        # The observer term places the spectrum in the barycentric frame. An
+        # absolute stellar-rest zero point cannot be reconstructed when the
+        # older product omits RADVEL.
+        return -observer_velocity, (observer_key,)
+    return -(observer_velocity + radial_velocity), (observer_key, "RADVEL")
+
+
+def _shift_wavelength_velocity_mps(
+    wavelength: np.ndarray,
+    correction_velocity_mps: float,
+) -> np.ndarray:
+    """Apply the repository's wavelength Doppler convention."""
+    beta = float(correction_velocity_mps) / _SPEED_OF_LIGHT_MPS
+    return np.asarray(wavelength, dtype=float) / (1.0 - beta)
+
+
+def _validate_one_to_one_wavelength_ordering(
+    reference_wave: np.ndarray,
+    candidate_wave: np.ndarray,
+    *,
+    reference_label: str,
+    candidate_label: str,
+) -> None:
+    """Verify that two wavelength arrays retain the same one-to-one pixel order."""
+    reference_wave = np.asarray(reference_wave, dtype=float)
+    candidate_wave = np.asarray(candidate_wave, dtype=float)
+    if reference_wave.ndim != 1 or candidate_wave.ndim != 1:
+        raise ValueError(
+            f"{reference_label} and {candidate_label} wavelengths must be 1D."
+        )
+    if reference_wave.size != candidate_wave.size:
+        raise ValueError(
+            f"{reference_label} and {candidate_label} pixel counts differ: "
+            f"{reference_wave.size} != {candidate_wave.size}."
+        )
+    if reference_wave.size < 2:
+        raise ValueError("PEPSI wavelength arrays must contain at least two pixels.")
+    if not np.all(np.isfinite(reference_wave)) or not np.all(
+        np.isfinite(candidate_wave)
+    ):
+        raise ValueError(
+            f"{reference_label} and {candidate_label} wavelengths must be finite."
+        )
+
+    reference_step = np.diff(reference_wave)
+    candidate_step = np.diff(candidate_wave)
+    same_increasing_order = np.all(reference_step > 0.0) and np.all(
+        candidate_step > 0.0
+    )
+    same_decreasing_order = np.all(reference_step < 0.0) and np.all(
+        candidate_step < 0.0
+    )
+    if not (same_increasing_order or same_decreasing_order):
+        raise ValueError(
+            f"{reference_label} and {candidate_label} do not have the same "
+            "strictly monotonic pixel ordering."
+        )
+
+    spacing_ratio = candidate_step / reference_step
+    median_ratio = float(np.median(spacing_ratio))
+    if not np.isfinite(median_ratio) or median_ratio <= 0.0:
+        raise ValueError(
+            f"{reference_label} and {candidate_label} have incompatible pixel spacing."
+        )
+    maximum_relative_deviation = float(
+        np.max(np.abs(spacing_ratio / median_ratio - 1.0))
+    )
+    if maximum_relative_deviation > _MAX_PIXEL_SPACING_RATIO_DEVIATION:
+        raise ValueError(
+            f"{candidate_label} does not preserve the pixel-spacing structure of "
+            f"{reference_label}; maximum relative spacing-ratio deviation is "
+            f"{maximum_relative_deviation:.3e}."
+        )
+
+
+def _canonical_molecfit_wavelength(
+    *,
+    molecfit_path: str | os.PathLike[str],
+    molecfit_data,
+    molecfit_header,
+    data_dir: str | os.PathLike[str],
+    raw_column_config: dict,
+    molecfit_column_config: dict,
+    jd_header_key: str,
+) -> tuple[np.ndarray, Path | None, float, tuple[str, ...]]:
+    """Place a Molecfit topocentric-vacuum grid in the stellar rest frame.
+
+    When the original PEPSI exposure is available, it is used to verify the
+    one-to-one flux-pixel mapping. It is not required to reconstruct the final
+    coordinate because the necessary rest-frame velocity is retained in the
+    Molecfit FITS header.
+    """
+    raw_path = _resolve_molecfit_raw_product(molecfit_path, data_dir)
+    molecfit_wave = _wavelength_angstrom(
+        molecfit_data,
+        molecfit_column_config,
+    )
+    correction_mps, correction_keys = _molecfit_stellar_rest_correction_mps(
+        molecfit_header
+    )
+    canonical_wave = _shift_wavelength_velocity_mps(molecfit_wave, correction_mps)
+
+    if raw_path is not None:
+        with fits.open(raw_path) as raw_hdu:
+            raw_data = raw_hdu[1].data
+            raw_header = raw_hdu[0].header.copy()
+            raw_air_wave = _wavelength_angstrom(raw_data, raw_column_config)
+            raw_flux = np.asarray(
+                raw_data[raw_column_config["flux"]],
+                dtype=float,
+            ).copy()
+
+        if raw_air_wave.size != len(molecfit_data):
+            raise ValueError(
+                f"Raw product '{raw_path.name}' and Molecfit output "
+                f"'{Path(molecfit_path).name}' have different pixel counts: "
+                f"{raw_air_wave.size} != {len(molecfit_data)}."
+            )
+
+        if jd_header_key in raw_header and jd_header_key in molecfit_header:
+            raw_jd = float(raw_header[jd_header_key])
+            molecfit_jd = float(molecfit_header[jd_header_key])
+            if not np.isclose(raw_jd, molecfit_jd, rtol=0.0, atol=1.0e-5):
+                raise ValueError(
+                    f"Raw product '{raw_path.name}' and Molecfit output "
+                    f"'{Path(molecfit_path).name}' have inconsistent {jd_header_key}: "
+                    f"{raw_jd} != {molecfit_jd}."
+                )
+
+        _validate_one_to_one_wavelength_ordering(
+            _air_wavelength_to_vacuum(raw_air_wave),
+            molecfit_wave,
+            reference_label=f"vacuum-converted raw grid '{raw_path.name}'",
+            candidate_label=f"Molecfit output grid '{Path(molecfit_path).name}'",
+        )
+
+        molecfit_input_path = raw_path.with_name(raw_path.name + ".fits")
+        if molecfit_input_path.is_file():
+            with fits.open(molecfit_input_path) as input_hdu:
+                input_data = input_hdu[1].data
+                input_wave = _wavelength_angstrom(
+                    input_data,
+                    molecfit_column_config,
+                )
+                input_flux = np.asarray(
+                    input_data[molecfit_column_config["flux"]],
+                    dtype=float,
+                ).copy()
+            _validate_one_to_one_wavelength_ordering(
+                canonical_wave,
+                input_wave,
+                reference_label=f"stellar-rest Molecfit grid '{Path(molecfit_path).name}'",
+                candidate_label=f"Molecfit input grid '{molecfit_input_path.name}'",
+            )
+            if input_flux.shape != raw_flux.shape or not np.allclose(
+                input_flux,
+                raw_flux,
+                rtol=1.0e-7,
+                atol=1.0e-10,
+                equal_nan=True,
+            ):
+                raise ValueError(
+                    f"Molecfit input '{molecfit_input_path.name}' does not preserve "
+                    f"the flux-pixel ordering of raw product '{raw_path.name}'."
+                )
+
+    return canonical_wave, raw_path, correction_mps, correction_keys
 
 
 def _get_barycentric_velocity_mps(
@@ -1007,7 +1285,8 @@ def get_pepsi_data(
         arm: Spectrograph arm ('red' or 'blue')
         observation_epoch: Observation date (YYYYMMDD)
         planet_name: Planet name
-        do_molecfit: Use molecfit-corrected files
+        do_molecfit: Use Molecfit-corrected flux/error on a vacuum,
+            stellar-rest wavelength grid reconstructed from its FITS header
         data_dir: Epoch-specific raw exposure directory
         barycentric_correction: Apply barycentric velocity correction
         apply_introduced_shift: Apply epoch-specific wavelength shift
@@ -1036,6 +1315,7 @@ def get_pepsi_data(
     # Get config for this instrument
     header_keys = get_header_keys()
     col_cfg = get_fits_columns(molecfit=do_molecfit)
+    raw_col_cfg = get_fits_columns(molecfit=False)
 
     # Get file patterns from instrument config
     patterns = get_data_patterns(
@@ -1045,7 +1325,7 @@ def get_pepsi_data(
     spectra_files = []
     matched_pattern = None
     for pattern in patterns:
-        spectra_files = glob(pattern, recursive=True)
+        spectra_files = sorted(glob(pattern, recursive=True))
         if spectra_files:
             matched_pattern = pattern
             break
@@ -1071,39 +1351,77 @@ def get_pepsi_data(
     i = 0
     jd, snr_spectra, exptime = np.zeros(n_spectra), np.zeros(n_spectra), np.zeros(n_spectra)
     airmass = np.zeros(n_spectra)
-    missing_header_counts: dict[str, int] = {}
 
     for spectrum in spectra_files:
-        hdu = fits.open(spectrum)
-        data, header = hdu[1].data, hdu[0].header
+        with fits.open(spectrum) as hdu:
+            data = hdu[1].data.copy()
+            header = hdu[0].header.copy()
 
         # Get column names from instrument config
-        wave_tag, flux_tag, error_tag = col_cfg["wave"], col_cfg["flux"], col_cfg["error"]
+        flux_tag, error_tag = col_cfg["flux"], col_cfg["error"]
+        loaded_wave = _wavelength_angstrom(data, col_cfg)
+        if do_molecfit:
+            loaded_wave, raw_path, rest_correction_mps, rest_correction_keys = (
+                _canonical_molecfit_wavelength(
+                    molecfit_path=spectrum,
+                    molecfit_data=data,
+                    molecfit_header=header,
+                    data_dir=data_dir,
+                    raw_column_config=raw_col_cfg,
+                    molecfit_column_config=col_cfg,
+                    jd_header_key=header_keys["jd"],
+                )
+            )
+            if i == 0:
+                keys = ", ".join(rest_correction_keys)
+                observer_only = (
+                    len(rest_correction_keys) == 1
+                    and rest_correction_keys[0] in {"OBSVEL", "SSBVEL"}
+                )
+                destination_frame = (
+                    "barycentric (stellar RADVEL unavailable)"
+                    if observer_only
+                    else "stellar rest"
+                )
+                validation = (
+                    f" Raw product '{raw_path.name}' validates the pixel mapping."
+                    if raw_path is not None
+                    else " Original raw product unavailable; using FITS-header reconstruction."
+                )
+                print(
+                    "Molecfit wavelength mapping: topocentric vacuum -> "
+                    f"{destination_frame} using {keys} "
+                    f"(correction={rest_correction_mps:.3f} m/s)."
+                    f"{validation}"
+                )
+                if observer_only:
+                    print(
+                        "Warning: this legacy Molecfit header has no stellar RADVEL; "
+                        "the global v_sys must absorb any residual absolute zero point."
+                    )
+        else:
+            loaded_wave = _air_wavelength_to_vacuum(loaded_wave)
 
         if i == 0:
-            npix = len(data[wave_tag])
+            npix = loaded_wave.size
             wave = np.zeros((n_spectra, npix))
             fluxin = np.zeros((n_spectra, npix))
             errorin = np.zeros((n_spectra, npix))
 
         # Handle inconsistent pixel numbers
-        npixhere = len(data[wave_tag])
+        npixhere = loaded_wave.size
         if npixhere >= npix:
-            wave[i, :] = data[wave_tag][0:npix]
+            wave[i, :] = loaded_wave[0:npix]
             fluxin[i, :] = data[flux_tag][0:npix]
             errorin[i, :] = data[error_tag][0:npix]
         else:
-            wave[i, 0:npixhere] = data[wave_tag]
+            wave[i, 0:npixhere] = loaded_wave
             fluxin[i, 0:npixhere] = data[flux_tag]
             errorin[i, 0:npixhere] = data[error_tag]
 
         # Raw files have variance, need sqrt for uncertainty
         if col_cfg.get("error") == "Var":
             errorin[i, :] = np.sqrt(errorin[i, :])
-
-        # Convert wavelength units if needed
-        if col_cfg["wave_unit"] == "micron":
-            wave[i, :] *= 10000.0  # microns -> Angstroms
 
         introduced_shift = 0.0
         if do_molecfit and apply_introduced_shift:
@@ -1130,51 +1448,27 @@ def get_pepsi_data(
         elif barycentric_correction and i == 0:
             print("Velocity correction: no RADVEL/OBSVEL/SSBVEL found; skipping")
 
-        # JD-OBS is load-bearing (phase calculation, exposure ordering) so we
-        # still hard-fail if it is missing. SNR/EXPTIME/AIRMASS are bookkeeping;
-        # fall back to NaN and report once at the end so the run isn't derailed
-        # by inconsistent producer metadata (some PEPSI molecfit outputs omit
-        # SNR on most exposures).
         jd[i] = header[header_keys["jd"]]  # mid-exposure time
 
         snr_key = header_keys["snr"]
-        if snr_key in header:
-            snr_spectra[i] = header[snr_key]
-        else:
-            snr_spectra[i] = np.nan
-            missing_header_counts[snr_key] = missing_header_counts.get(snr_key, 0) + 1
+        snr_spectra[i] = header[snr_key]
 
         exptime_key = header_keys["exptime"]
-        if exptime_key in header:
-            exptime_val = header[exptime_key]
-            if isinstance(exptime_val, str):
-                exptime_strings = exptime_val.split(':')
-                exptime[i] = (
-                    float(exptime_strings[0]) * 3600.
-                    + float(exptime_strings[1]) * 60.
-                    + float(exptime_strings[2])
-                )
-            else:
-                exptime[i] = float(exptime_val)
+        exptime_val = header[exptime_key]
+        if isinstance(exptime_val, str):
+            exptime_strings = exptime_val.split(':')
+            exptime[i] = (
+                float(exptime_strings[0]) * 3600.
+                + float(exptime_strings[1]) * 60.
+                + float(exptime_strings[2])
+            )
         else:
-            exptime[i] = np.nan
-            missing_header_counts[exptime_key] = missing_header_counts.get(exptime_key, 0) + 1
+            exptime[i] = float(exptime_val)
 
         airmass_key = header_keys["airmass"]
-        if airmass_key in header:
-            airmass[i] = header[airmass_key]
-        else:
-            airmass[i] = np.nan
-            missing_header_counts[airmass_key] = missing_header_counts.get(airmass_key, 0) + 1
+        airmass[i] = header[airmass_key]
 
-        hdu.close()
         i += 1
-
-    if missing_header_counts:
-        summary = ", ".join(
-            f"{k}: {v}/{n_spectra}" for k, v in sorted(missing_header_counts.items())
-        )
-        print(f"Warning: missing FITS header keys on some exposures ({summary}); using NaN.")
 
     # ====================
     # Preprocessing pipeline
@@ -1302,6 +1596,48 @@ def get_orbital_phase(
     return orbital_phase
 
 
+def build_out_of_transit_residuals(
+    flux: np.ndarray,
+    error: np.ndarray,
+    out_transit: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Divide every exposure by a shared out-of-transit master and subtract one."""
+    flux = np.asarray(flux, dtype=float)
+    error = np.asarray(error, dtype=float)
+    out_transit = np.asarray(out_transit, dtype=bool)
+    n_out = int(np.count_nonzero(out_transit))
+
+    master_out = np.median(flux[out_transit], axis=0)
+    # Large-sample variance of the median is pi/2 times the variance of the
+    # mean. This remains a diagonal approximation to the shared-master error.
+    master_error = (
+        np.sqrt(np.pi / 2.0)
+        * np.sqrt(np.sum(error[out_transit] ** 2, axis=0))
+        / n_out
+    )
+    valid_master = (
+        np.isfinite(master_out)
+        & (master_out != 0.0)
+        & np.isfinite(master_error)
+        & (master_error >= 0.0)
+    )
+    residual = np.full_like(flux, np.nan, dtype=float)
+    residual_error = np.full_like(error, np.inf, dtype=float)
+    residual[:, valid_master] = (
+        flux[:, valid_master] / master_out[None, valid_master] - 1.0
+    )
+    residual_error[:, valid_master] = np.sqrt(
+        (error[:, valid_master] / master_out[None, valid_master]) ** 2
+        + (
+            flux[:, valid_master]
+            * master_error[None, valid_master]
+            / master_out[None, valid_master] ** 2
+        )
+        ** 2
+    )
+    return residual, residual_error
+
+
 def calculate_transmission_spectrum(
     wave: np.ndarray,
     flux: np.ndarray,
@@ -1310,9 +1646,30 @@ def calculate_transmission_spectrum(
     transit_params: dict,
     RA: str,
     Dec: str,
+    Kp_kms: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Calculate transmission spectrum from in-transit and out-of-transit exposures."""
-    # Calculate orbital phase with light travel time correction
+    """Extract a planet-rest-frame differential transmission spectrum.
+
+    The returned spectrum is the inverse-variance coadd of full-transit (T23)
+    fractional flux residuals,
+
+        flux / median(flux_out_of_transit) - 1,
+
+    after shifting each exposure into the planet rest frame using the fixed
+    orbital semi-amplitude ``Kp_kms``. Absorption is therefore negative.
+    """
+    wave = np.asarray(wave, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+    error = np.asarray(error, dtype=float)
+    jd = np.asarray(jd, dtype=float)
+
+    wave_grid = wave
+
+    order = np.argsort(wave_grid)
+    wave_grid = wave_grid[order]
+    flux = flux[:, order]
+    error = error[:, order]
+
     orbital_phase = get_orbital_phase(
         jd,
         transit_params['T0'],
@@ -1321,42 +1678,73 @@ def calculate_transmission_spectrum(
         Dec
     )
 
-    # Identify in-transit and out-of-transit exposures
-    half_duration = transit_params['duration'] / 2.0
+    contacts = compute_contact_phases(transit_params)
+    t23 = (orbital_phase >= contacts["T2"]) & (orbital_phase <= contacts["T3"])
+    out_transit = (orbital_phase < contacts["T1"]) | (orbital_phase > contacts["T4"])
 
-    in_transit = np.abs(orbital_phase) <= half_duration / transit_params['period']
-    out_transit = ~in_transit
-
-    print(f"In-transit: {np.sum(in_transit)} exposures")
+    print(f"Full-transit (T23): {np.sum(t23)} exposures")
     print(f"Out-of-transit: {np.sum(out_transit)} exposures")
     print(f"Orbital phase range: {orbital_phase.min():.4f} to {orbital_phase.max():.4f}")
 
-    if np.sum(in_transit) == 0 or np.sum(out_transit) == 0:
-        raise ValueError("Need both in-transit and out-of-transit exposures!")
+    residual, residual_error = build_out_of_transit_residuals(
+        flux,
+        error,
+        out_transit,
+    )
 
-    # Use median wavelength grid (they should all be similar)
-    wave_grid = np.median(wave, axis=0)
+    t23_phase = orbital_phase[t23]
+    planet_velocity = Kp_kms * np.sin(2.0 * np.pi * t23_phase)
+    t23_residual = residual[t23]
+    t23_error = residual_error[t23]
 
-    # Calculate transmission spectrum: in-transit / out-of-transit
-    flux_in = np.median(flux[in_transit], axis=0)
-    flux_out = np.median(flux[out_transit], axis=0)
+    shifted_residual = np.full_like(t23_residual, np.nan)
+    shifted_error = np.full_like(t23_error, np.inf)
+    for i, velocity_kms in enumerate(planet_velocity):
+        beta = velocity_kms / _SPEED_OF_LIGHT_KMS
+        doppler_factor = np.sqrt((1.0 + beta) / (1.0 - beta))
+        observed_wavelength = wave_grid * doppler_factor
+        shifted_residual[i] = np.interp(
+            observed_wavelength,
+            wave_grid,
+            t23_residual[i],
+            left=np.nan,
+            right=np.nan,
+        )
+        shifted_error[i] = np.interp(
+            observed_wavelength,
+            wave_grid,
+            t23_error[i],
+            left=np.inf,
+            right=np.inf,
+        )
 
-    # Error propagation
-    error_in = np.sqrt(np.sum(error[in_transit]**2, axis=0)) / np.sum(in_transit)
-    error_out = np.sqrt(np.sum(error[out_transit]**2, axis=0)) / np.sum(out_transit)
+    valid_shifted = (
+        np.isfinite(shifted_residual)
+        & np.isfinite(shifted_error)
+        & (shifted_error > 0.0)
+    )
+    full_coverage = np.all(valid_shifted, axis=0)
+    if not np.any(full_coverage):
+        raise ValueError(
+            "No wavelength columns retain coverage from every T23 exposure "
+            "after shifting into the planet rest frame."
+        )
 
-    # Transmission = F_in / F_out (relative depth)
-    # This gives the transit depth as a function of wavelength
-    transmission = flux_in / flux_out
-    transmission_err = transmission * np.sqrt((error_in / flux_in)**2 + (error_out / flux_out)**2)
+    wave_grid = wave_grid[full_coverage]
+    shifted_residual = shifted_residual[:, full_coverage]
+    shifted_error = shifted_error[:, full_coverage]
+    weights = 1.0 / shifted_error**2
+    weight_sum = np.sum(weights, axis=0)
+    spectrum = np.sum(weights * shifted_residual, axis=0) / weight_sum
+    spectrum_error = np.sqrt(1.0 / weight_sum)
 
-    return wave_grid, transmission, transmission_err, orbital_phase, in_transit, out_transit
+    return wave_grid, spectrum, spectrum_error, orbital_phase, t23, out_transit
 
 
 def bin_spectrum(
-    wave: np.ndarray, flux: np.ndarray, error: np.ndarray, bin_size: int = config.DEFAULT_BIN_SIZE
+    wave: np.ndarray, flux: np.ndarray, error: np.ndarray, bin_size: int = 1
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Bin spectrum to lower resolution."""
+    """Inverse-variance bin a 1D spectrum."""
     npix = len(wave)
     n_bins = npix // bin_size
 
@@ -1368,162 +1756,255 @@ def bin_spectrum(
         idx_start = i * bin_size
         idx_end = (i + 1) * bin_size
 
-        wave_binned[i] = np.mean(wave[idx_start:idx_end])
-        flux_binned[i] = np.mean(flux[idx_start:idx_end])
-        error_binned[i] = np.sqrt(np.sum(error[idx_start:idx_end]**2)) / bin_size
+        wave_chunk = wave[idx_start:idx_end]
+        flux_chunk = flux[idx_start:idx_end]
+        error_chunk = error[idx_start:idx_end]
+        valid = (
+            np.isfinite(wave_chunk)
+            & np.isfinite(flux_chunk)
+            & np.isfinite(error_chunk)
+            & (error_chunk > 0.0)
+        )
+        if not np.any(valid):
+            wave_binned[i] = np.nan
+            flux_binned[i] = np.nan
+            error_binned[i] = np.inf
+            continue
+        weights = 1.0 / error_chunk[valid] ** 2
+        weight_sum = np.sum(weights)
+        wave_binned[i] = np.sum(weights * wave_chunk[valid]) / weight_sum
+        flux_binned[i] = np.sum(weights * flux_chunk[valid]) / weight_sum
+        error_binned[i] = np.sqrt(1.0 / weight_sum)
 
     return wave_binned, flux_binned, error_binned
-def main():
-    parser = argparse.ArgumentParser(description='Prepare PEPSI data for retrieval')
-    parser.add_argument('--epoch', type=str, required=True, help='Observation epoch (YYYYMMDD)')
-    parser.add_argument('--planet', type=str, default=config.DEFAULT_DATA_PLANET, help='Planet name')
-    parser.add_argument('--arm', type=str, choices=['red', 'blue'], default=config.DEFAULT_DATA_ARM, help='Spectrograph arm (single-arm only; use the retrieval prep scripts for full runs)')
-    parser.add_argument('--molecfit', action='store_true', default=config.DEFAULT_USE_MOLECFIT, help='Use molecfit-corrected data')
-    parser.add_argument('--no-molecfit', action='store_false', dest='molecfit', help='Use uncorrected data')
-    parser.add_argument('--barycorr', action='store_true', default=config.DEFAULT_BARYCORR,
-                        help='Apply barycentric correction to wavelength grid')
-    parser.add_argument('--no-barycorr', action='store_false', dest='barycorr',
-                        help='Disable barycentric correction')
-    parser.add_argument('--introduced-shift', action='store_true', default=config.DEFAULT_INTRODUCED_SHIFT,
-                        help='Apply epoch-specific Molecfit shift (default)')
-    parser.add_argument('--no-introduced-shift', action='store_false', dest='introduced_shift',
-                        help='Disable epoch-specific Molecfit shift')
-    parser.add_argument(
-        '--output-dir',
-        type=str,
-        default=None,
-        help='Output directory (default: input/hrs/transmission/<planet>/<epoch>/<arm>)',
+
+
+def collapsed_transmission_dir(
+    *,
+    planet: str,
+    epoch: str,
+    arm: str,
+) -> Path:
+    """Return the standard directory for a collapsed transmission product."""
+    return config_utils.get_collapsed_transmission_dir(
+        planet=planet,
+        epoch=epoch,
+        arm=arm,
     )
-    parser.add_argument('--bin-size', type=int, default=config.DEFAULT_BIN_SIZE, help='Spectral binning (pixels)')
 
-    args = parser.parse_args()
 
-    def _load_arm(arm: str, prefer_molecfit: bool = True):
-        result = get_pepsi_data(
-            arm,
-            args.epoch,
-            args.planet,
-            prefer_molecfit,
-            config_utils.get_raw_hrs_dir(planet=args.planet, epoch=args.epoch, mode="transmission"),
-            barycentric_correction=args.barycorr,
-            apply_introduced_shift=args.introduced_shift if prefer_molecfit else False,
-        )
-        if result is None and prefer_molecfit:
-            print(f"  No molecfit files for {arm} arm; retrying with raw files...")
-            result = get_pepsi_data(
-                arm,
-                args.epoch,
-                args.planet,
-                False,
-                config_utils.get_raw_hrs_dir(planet=args.planet, epoch=args.epoch, mode="transmission"),
-                barycentric_correction=args.barycorr,
-                apply_introduced_shift=False,
-            )
-        return result
-
-    print(f"\nLoading PEPSI {args.arm} arm data for {args.planet} ({args.epoch})...")
-    if args.arm == "full":
-        raise ValueError(
-            "arm='full' is not supported here. This legacy 1D collapser runs on a "
-            "single arm at a time. Run red and blue separately, or use the retrieval "
-            "prep scripts (which loop over arms automatically)."
-        )
-    result = _load_arm(args.arm, prefer_molecfit=args.molecfit)
-
-    if result is None:
-        print("Failed to load data!")
-        return 1
-
-    wave, flux, error, jd, snr, exptime, airmass, n_spectra, npix = result
-
-    print(f"Loaded {n_spectra} spectra with {npix} pixels each")
-    print(f"Wavelength range: {wave.min():.1f} - {wave.max():.1f} Angstroms")
-    print(f"JD range: {jd.min():.4f} - {jd.max():.4f}")
-
-    # Calculate transmission spectrum using planet config
-    planet_config = PLANETS[args.planet][EPHEMERIS]
-
-    period = planet_config.get('period')
-    duration = planet_config.get('duration')
-    ra = planet_config.get('RA')
-    dec = planet_config.get('Dec')
-    config_epoch = planet_config.get('epoch')
-
-    # Calculate T0 closest to observation
-    if config_epoch and period:
-        obs_mid = (jd.min() + jd.max()) / 2
-        n_orbits = round((obs_mid - config_epoch) / period)
-        t0 = config_epoch + n_orbits * period
-        print(f"  Transit midpoint T0 = {t0:.6f} BJD (orbit {n_orbits} from reference epoch)")
-    else:
-        t0 = None
-
-    missing = []
-    if not t0: missing.append('epoch')
-    if not period: missing.append('period')
-    if not duration: missing.append('duration')
-    if not ra: missing.append('RA')
-    if not dec: missing.append('Dec')
-    if missing:
-        print(f"ERROR: Missing parameters in config for {args.planet}: {', '.join(missing)}")
-        return 1
-
-    print("\nCalculating transmission spectrum...")
-    transit_params = {
-        'T0': t0,
-        'period': period,
-        'duration': duration,
+def _load_transmission_collapse_source(
+    data_dir: Path,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict,
+]:
+    expected = {
+        "wavelength": data_dir / "wavelength.npy",
+        "data": data_dir / "data.npy",
+        "sigma": data_dir / "sigma.npy",
+        "phase": data_dir / "phase.npy",
     }
+    missing = [path.name for path in expected.values() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"{data_dir} is missing transmission collapse-source files: "
+            f"{', '.join(missing)}."
+        )
+    metadata_path = data_dir / "timeseries_prep.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"{data_dir} is missing timeseries_prep.json."
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Could not parse {metadata_path}: {exc}") from exc
+    if metadata.get("product_kind") != "collapse-source":
+        raise ValueError(
+            f"{data_dir} is not a collapse-source product."
+        )
+    if metadata.get("phase_bin") != "all":
+        raise ValueError(
+            f"{data_dir} must be prepared with phase_bin='all'."
+        )
+    if metadata.get("out_of_transit_master_division") is not True:
+        raise ValueError(
+            f"{data_dir} was not prepared using out-of-transit master division."
+        )
 
-    wave_combined, flux_combined, error_combined, _, in_transit, out_transit = calculate_transmission_spectrum(
-        wave, flux, error, jd, transit_params, ra, dec
+    wavelength = np.asarray(np.load(expected["wavelength"]), dtype=float)
+    data = np.asarray(np.load(expected["data"]), dtype=float)
+    sigma = np.asarray(np.load(expected["sigma"]), dtype=float)
+    phase = np.asarray(np.load(expected["phase"]), dtype=float)
+    return wavelength, data, sigma, phase, metadata
+
+
+def collapse_transmission_epoch_arm(
+    *,
+    planet: str,
+    ephemeris: str,
+    epoch: str,
+    arm: str,
+    kp_kms: float,
+    bin_size: int = 1,
+) -> dict:
+    """Build one SYSREM-aware, full-transit 1D spectrum."""
+    from dataio.collapse_emission_timeseries_to_1d import (
+        build_emission_collapse_operator,
+        collapse_selected_emission_exposures,
+        load_frozen_sysrem_arrays,
     )
 
-    print(f"Successfully calculated transmission spectrum")
-    print(f"Used {np.sum(in_transit)} in-transit and {np.sum(out_transit)} out-of-transit exposures")
+    params = config_utils.get_params(planet, ephemeris)
+    source_dir = config_utils.get_collapse_source_dir(
+        planet=planet,
+        epoch=epoch,
+        arm=arm,
+        mode="transmission",
+    )
+    output_dir = collapsed_transmission_dir(
+        planet=planet,
+        epoch=epoch,
+        arm=arm,
+    )
+    wavelength, data, sigma, phase, source_metadata = (
+        _load_transmission_collapse_source(source_dir)
+    )
+    contacts = compute_contact_phases(params)
+    t23 = (
+        (phase >= contacts["T2"])
+        & (phase <= contacts["T3"])
+    )
+    selected_indices = np.flatnonzero(t23)
 
-    # Bin to lower resolution
-    if args.bin_size > 1:
-        print(f"\nBinning by factor of {args.bin_size}...")
-        wave_binned, flux_binned, error_binned = bin_spectrum(
-            wave_combined, flux_combined, error_combined, args.bin_size
+    selected_phase = phase[selected_indices]
+    selected_sigma = sigma[selected_indices]
+    fixed = build_emission_collapse_operator(
+        wavelength,
+        selected_sigma,
+        selected_phase,
+        kp_kms=kp_kms,
+        bin_size=bin_size,
+    )
+    wavelength_1d, spectrum_1d, uncertainty_1d = (
+        collapse_selected_emission_exposures(
+            wavelength,
+            data[selected_indices],
+            selected_sigma,
+            selected_phase,
+            kp_kms=kp_kms,
+            bin_size=bin_size,
         )
-    else:
-        wave_binned, flux_binned, error_binned = wave_combined, flux_combined, error_combined
+    )
+    frozen_sysrem = load_frozen_sysrem_arrays(source_dir)
+    if source_metadata.get("run_sysrem") is True and frozen_sysrem is None:
+        raise FileNotFoundError(
+            f"{source_dir} declares run_sysrem=true but U_sysrem.npz is missing."
+        )
 
-    # Keep wavelength in Angstroms (no conversion)
-    wave_angstrom = wave_binned
+    output_dir.mkdir(parents=True, exist_ok=True)
+    np.save(output_dir / "wavelength_transmission.npy", wavelength_1d)
+    np.save(output_dir / "spectrum_transmission.npy", spectrum_1d)
+    np.save(
+        output_dir / "uncertainty_transmission.npy",
+        uncertainty_1d,
+    )
+    operator_name = "transmission_collapse_operator.npz"
+    np.savez(
+        output_dir / operator_name,
+        schema_version=np.asarray(1, dtype=np.int32),
+        source_wavelength=wavelength,
+        source_phase=phase,
+        active_exposure_mask=t23.astype(float),
+        selected_exposure_indices=selected_indices.astype(np.int32),
+        shift_left_indices=fixed["shift_left_indices"],
+        shift_fractions=fixed["shift_fractions"],
+        coadd_weights=fixed["coadd_weights"],
+        bin_indices=fixed["bin_indices"],
+        bin_weights=fixed["bin_weights"],
+        output_wavelength=fixed["output_wavelength"],
+        kp_reference_kms=np.asarray(kp_kms, dtype=float),
+        velocity_offset_reference_kms=np.asarray(0.0, dtype=float),
+        has_sysrem=np.asarray(frozen_sysrem is not None, dtype=bool),
+        **({} if frozen_sysrem is None else frozen_sysrem),
+    )
+    metadata = {
+        "schema_version": 1,
+        "product_kind": "collapsed_transmission_spectrum",
+        "observable_kind": "continuum_removed_negative_transmission_flux",
+        "model_preprocessing": (
+            "t23_visibility_then_frozen_sysrem_then_planet_frame_"
+            "inverse_variance_coadd_then_subtract_inverse_variance_"
+            "weighted_constant"
+        ),
+        "planet": planet,
+        "ephemeris": ephemeris,
+        "epoch": epoch,
+        "arm": arm,
+        "kp_reference_kms": float(kp_kms),
+        "velocity_offset_reference_kms": 0.0,
+        "source_data_dir": str(source_dir),
+        "source_run_sysrem": source_metadata.get("run_sysrem"),
+        "n_source_exposures": int(phase.size),
+        "n_selected_exposures": int(selected_indices.size),
+        "selected_exposure_indices": selected_indices.tolist(),
+        "bin_size": int(bin_size),
+        "collapse_operator_file": operator_name,
+        "n_output_wavelengths": int(wavelength_1d.size),
+    }
+    (output_dir / "collapse_metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return metadata
 
-    print(f"Final spectrum: {len(wave_angstrom)} points")
-    print(f"Wavelength range: {wave_angstrom.min():.1f} - {wave_angstrom.max():.1f} Angstroms")
 
-    # Setup output directory
-    if args.output_dir is None:
-        planet_dir = args.planet.lower().replace('-', '')
-        args.output_dir = str(
-            config_utils.get_data_dir(
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Collapse dedicated transmission source cubes into SYSREM-aware "
+            "full-transit 1D spectra."
+        )
+    )
+    parser.add_argument("--planet", required=True)
+    parser.add_argument("--ephemeris", default=EPHEMERIS)
+    parser.add_argument("--epoch", nargs="+", required=True)
+    parser.add_argument(
+        "--arm",
+        choices=["red", "blue", "full"],
+        default=config.DEFAULT_DATA_ARM,
+    )
+    parser.add_argument("--kp-kms", type=float, default=None)
+    parser.add_argument("--bin-size", type=int, default=1)
+    return parser
+
+
+def main() -> int:
+    args = create_parser().parse_args()
+    params = config_utils.get_params(args.planet, args.ephemeris)
+    kp_kms = params.get("Kp") if args.kp_kms is None else args.kp_kms
+    arms = config.FULL_ARM_MEMBERS if args.arm == "full" else (args.arm,)
+    for epoch in args.epoch:
+        for arm in arms:
+            result = collapse_transmission_epoch_arm(
                 planet=args.planet,
-                epoch=args.epoch,
-                arm=args.arm,
-                mode="transmission",
+                ephemeris=args.ephemeris,
+                epoch=str(epoch),
+                arm=arm,
+                kp_kms=float(kp_kms),
+                bin_size=int(args.bin_size),
             )
-        )
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Save as .npy files (wavelength in Angstroms)
-    np.save(f"{args.output_dir}/wavelength_transmission.npy", wave_angstrom)
-    np.save(f"{args.output_dir}/spectrum_transmission.npy", flux_binned)
-    np.save(f"{args.output_dir}/uncertainty_transmission.npy", error_binned)
-
-    print(f"\nSaved files to {args.output_dir}:")
-    print(f"  - wavelength_transmission.npy ({len(wave_angstrom)} points, Angstroms)")
-    print(f"  - spectrum_transmission.npy")
-    print(f"  - uncertainty_transmission.npy")
-    print("\nTransmission spectrum saved successfully.")
-
+            print(
+                f"READY {epoch}/{arm}/full_transit: "
+                f"{result['n_selected_exposures']} exposures, "
+                f"{result['n_output_wavelengths']} wavelengths"
+            )
     return 0
 
 
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__ == "__main__":
+    raise SystemExit(main())

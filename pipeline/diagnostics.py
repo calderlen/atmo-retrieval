@@ -9,6 +9,10 @@ from typing import Any, Iterable
 
 import jax
 from jax import random
+from plotting.style import configure_matplotlib
+
+configure_matplotlib()
+
 import matplotlib.pyplot as plt
 import numpy as np
 from numpyro.infer import SVI, Trace_ELBO
@@ -41,7 +45,6 @@ class DiagnosticContext:
     observation_configs: tuple[object, ...]
     spectroscopic_component_names: tuple[str, ...]
     spectroscopic_components: dict[str, _retrieval.SpectroscopicComponentBundle]
-    component_sample_prefixes: dict[str, str | None]
     model_c: Any
     model_inputs: dict[str, object]
 
@@ -116,9 +119,7 @@ def _build_timeseries_component_spec(
     mode: str,
     data_dir: Path,
     instrument_resolution: float,
-    phase_mode: str,
     apply_sysrem: bool,
-    subtract_per_exposure_mean: bool,
     region_name: str,
     sigma_scale: float = 1.0,
     spectral_stride: int = 1,
@@ -131,10 +132,7 @@ def _build_timeseries_component_spec(
         "data_format": "timeseries",
         "data_dir": str(data_dir),
         "apply_sysrem": bool(apply_sysrem),
-        "phase_mode": phase_mode,
         "radial_velocity_mode": "orbital",
-        "likelihood_kind": "matched_filter",
-        "subtract_per_exposure_mean": bool(subtract_per_exposure_mean),
         "instrument_resolution": float(instrument_resolution),
         "sigma_scale": float(sigma_scale),
         "spectral_stride": int(spectral_stride),
@@ -158,7 +156,6 @@ def build_diagnostic_context(
     molecules: Iterable[str] | None = None,
     load_opacities: bool = True,
     data_format: str = "timeseries",
-    phase_mode: str = "global",
     atmosphere_regions: list[dict[str, Any]] | None = None,
     apply_sysrem: bool | None = None,
     sigma_scale: float = 1.0,
@@ -193,19 +190,19 @@ def build_diagnostic_context(
         apply_sysrem_enabled = (
             bool(config.APPLY_SYSREM_DEFAULT) if apply_sysrem is None else bool(apply_sysrem)
         )
-        subtract_per_exposure_mean = bool(config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT)
 
         if observing_mode == "full":
-            arm_dirs = config_utils.get_full_arm_data_dirs(epoch=epoch, mode=mode)
+            arm_dirs = config_utils.get_full_arm_timeseries_dirs(
+                epoch=epoch,
+                mode=mode,
+            )
             component_specs = [
                 _build_timeseries_component_spec(
                     name="spectroscopy_red",
                     mode=mode,
                     data_dir=Path(arm_dirs["red"]),
                     instrument_resolution=instrument_resolution,
-                    phase_mode=phase_mode,
                     apply_sysrem=apply_sysrem_enabled,
-                    subtract_per_exposure_mean=subtract_per_exposure_mean,
                     region_name=shared_region_name,
                     sigma_scale=sigma_scale,
                     spectral_stride=spectral_stride,
@@ -216,25 +213,20 @@ def build_diagnostic_context(
                     mode=mode,
                     data_dir=Path(arm_dirs["blue"]),
                     instrument_resolution=instrument_resolution,
-                    phase_mode=phase_mode,
                     apply_sysrem=apply_sysrem_enabled,
-                    subtract_per_exposure_mean=subtract_per_exposure_mean,
                     region_name=shared_region_name,
                     sigma_scale=sigma_scale,
                     spectral_stride=spectral_stride,
                     spectral_offset=spectral_offset,
                 ),
             ]
-            shared_system = _retrieval.build_shared_system_config(
-                params=model_params,
-                shared_velocity_phase_mode=phase_mode,
-                shared_velocity_component_names=tuple(str(spec["name"]) for spec in component_specs),
-            )
+            shared_system = _retrieval.build_shared_system_config(params=model_params)
         else:
-            resolved_data_dir = config_utils.get_data_dir(
+            resolved_data_dir = config_utils.get_timeseries_data_dir(
                 planet=planet,
                 arm=observing_mode,
                 epoch=epoch,
+                mode=mode,
             )
             component_specs = [
                 _build_timeseries_component_spec(
@@ -242,9 +234,7 @@ def build_diagnostic_context(
                     mode=mode,
                     data_dir=Path(resolved_data_dir),
                     instrument_resolution=instrument_resolution,
-                    phase_mode=phase_mode,
                     apply_sysrem=apply_sysrem_enabled,
-                    subtract_per_exposure_mean=subtract_per_exposure_mean,
                     region_name=shared_region_name,
                     sigma_scale=sigma_scale,
                     spectral_stride=spectral_stride,
@@ -314,10 +304,6 @@ def build_diagnostic_context(
         observation_configs=tuple(observation_configs),
         spectroscopic_component_names=tuple(spectroscopic_components.keys()),
         spectroscopic_components=dict(spectroscopic_components),
-        component_sample_prefixes={
-            component.name: component.observation_config.sample_prefix
-            for component in loaded_components
-        },
         model_c=model_c,
         model_inputs={"observations": observations_payload},
     )
@@ -336,13 +322,6 @@ def _get_spectroscopic_component(
         ) from exc
 
 
-def _get_component_sample_prefix(
-    context: DiagnosticContext,
-    component_name: str,
-) -> str | None:
-    return context.component_sample_prefixes.get(str(component_name))
-
-
 def default_named_params_for_context(context: DiagnosticContext) -> dict[str, float]:
     region = context.shared_region_config
     params: dict[str, float] = {
@@ -350,7 +329,7 @@ def default_named_params_for_context(context: DiagnosticContext) -> dict[str, fl
         "Mp": float(context.model_params["M_p"]),
         "Rstar": float(context.model_params["R_star"]),
         "Rp": float(context.model_params["R_p"]),
-        "dRV": 0.0,
+        "v_sys": 0.0,
     }
 
     if region.pt_profile == "guillot":
@@ -548,12 +527,12 @@ def build_diag_config_from_run_dir(
     return config_payload
 
 
-def default_kp_drv_grids(
+def default_kp_vsys_grids(
     context: DiagnosticContext,
     *,
     num_kp: int = 11,
-    num_drv: int = 17,
-    drv_bounds: tuple[float, float] = (-20.0, 20.0),
+    num_vsys: int = 17,
+    v_sys_bounds: tuple[float, float] = (-20.0, 20.0),
 ) -> tuple[np.ndarray, np.ndarray]:
     kp_low = context.model_params.get("Kp_low")
     kp_high = context.model_params.get("Kp_high")
@@ -561,8 +540,12 @@ def default_kp_drv_grids(
         kp_grid = np.linspace(float(kp_low), float(kp_high), int(num_kp))
     else:
         kp_grid = np.linspace(0.0, 220.0, int(num_kp))
-    drv_grid = np.linspace(float(drv_bounds[0]), float(drv_bounds[1]), int(num_drv))
-    return kp_grid, drv_grid
+    v_sys_grid = np.linspace(
+        float(v_sys_bounds[0]),
+        float(v_sys_bounds[1]),
+        int(num_vsys),
+    )
+    return kp_grid, v_sys_grid
 
 
 def _normal_logpdf(value: float, mean: float, std: float) -> float:
@@ -591,9 +574,8 @@ def _truncated_normal_logpdf(
 def _shared_system_log_prior(
     context: DiagnosticContext,
     *,
-    component_name: str,
     kp: float,
-    drv: float,
+    v_sys: float,
 ) -> float:
     kp_low = context.model_params.get("Kp_low")
     kp_high = context.model_params.get("Kp_high")
@@ -612,10 +594,8 @@ def _shared_system_log_prior(
             low=0.0,
         )
 
-    component = _get_spectroscopic_component(context, component_name)
-    phase_mode = getattr(component.observation_config, "phase_mode", "global")
-    drv_log_prior = _normal_logpdf(drv, 0.0, 10.0) if phase_mode == "global" else 0.0
-    return float(kp_log_prior + drv_log_prior)
+    v_sys_log_prior = _normal_logpdf(v_sys, 0.0, 10.0)
+    return float(kp_log_prior + v_sys_log_prior)
 
 
 def synthesize_processed_model_timeseries(
@@ -627,7 +607,6 @@ def synthesize_processed_model_timeseries(
 ) -> tuple[np.ndarray, dict[str, Any]]:
     params = merge_named_params(context, named_params)
     component = _get_spectroscopic_component(context, component_name)
-    component_sample_prefix = _get_component_sample_prefix(context, component_name)
 
     if atmo_state is None:
         atmo_state = compute_atmospheric_state_from_posterior(
@@ -650,7 +629,6 @@ def synthesize_processed_model_timeseries(
         model_params=context.model_params,
         region_config=context.shared_region_config,
         component=component,
-        component_sample_prefix=component_sample_prefix,
     )
     return np.asarray(model_ts), atmo_state
 
@@ -659,45 +637,37 @@ def spectroscopic_log_likelihood(
     data: np.ndarray,
     model_ts: np.ndarray,
     sigma: np.ndarray,
-    *,
-    likelihood_kind: str = "matched_filter",
 ) -> float:
     data = np.asarray(data, dtype=float)
     model_ts = np.asarray(model_ts, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
 
-    if likelihood_kind == "gaussian":
-        resid = data - model_ts
-        return float(-0.5 * np.sum( np.square(resid / np.clip(sigma, config.F32_FLOOR_RECIPSQ, None)) + np.log(2.0 * np.pi * np.square(np.clip(sigma, config.F32_FLOOR_RECIPSQ, None)))))
-
-    if likelihood_kind != "matched_filter":
-        raise ValueError(f"Unsupported likelihood kind: {likelihood_kind}")
-
-    w_ij = 1.0 / np.clip(sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
-    numerator = np.sum(w_ij * data * model_ts, axis=1)
-    denominator = np.sum(w_ij * np.square(model_ts), axis=1) + config.F32_FLOOR_RECIP
-    alpha = numerator / denominator
-    resid = data - alpha[:, None] * model_ts
-    chi2 = np.sum(w_ij * np.square(resid), axis=1)
-    norm = np.sum(np.log((2.0 * np.pi) / w_ij), axis=1)
-    return float(np.sum(-0.5 * (chi2 + norm)))
+    sigma_safe = np.clip(sigma, config.F32_FLOOR_RECIPSQ, None)
+    resid = data - model_ts
+    return float(
+        -0.5
+        * np.sum(
+            np.square(resid / sigma_safe)
+            + np.log(2.0 * np.pi * np.square(sigma_safe))
+        )
+    )
 
 
-def scan_kp_drv_surface(
+def scan_kp_vsys_surface(
     context: DiagnosticContext,
     *,
     component_name: str,
     base_params: dict[str, Any],
     kp_grid: np.ndarray,
-    drv_grid: np.ndarray,
+    v_sys_grid: np.ndarray,
     data_override: np.ndarray | None = None,
     include_log_prior: bool = False,
 ) -> dict[str, Any]:
     kp_grid = np.asarray(kp_grid, dtype=float)
-    drv_grid = np.asarray(drv_grid, dtype=float)
-    log_likelihood = np.empty((kp_grid.size, drv_grid.size), dtype=float)
-    log_prior = np.zeros((kp_grid.size, drv_grid.size), dtype=float)
-    surface = np.empty((kp_grid.size, drv_grid.size), dtype=float)
+    v_sys_grid = np.asarray(v_sys_grid, dtype=float)
+    log_likelihood = np.empty((kp_grid.size, v_sys_grid.size), dtype=float)
+    log_prior = np.zeros((kp_grid.size, v_sys_grid.size), dtype=float)
+    surface = np.empty((kp_grid.size, v_sys_grid.size), dtype=float)
 
     base_params = merge_named_params(context, base_params)
     _, atmo_state = synthesize_processed_model_timeseries(
@@ -713,23 +683,19 @@ def scan_kp_drv_surface(
         else np.asarray(component.data, dtype=float)
     )
     sigma = np.asarray(component.sigma, dtype=float)
-    likelihood_kind = str(component.observation_config.likelihood_kind)
 
     best_surface_value = -np.inf
     best_indices = (0, 0)
-    best_params: dict[str, float] = {"Kp": float(kp_grid[0]), "dRV": float(drv_grid[0])}
+    best_params: dict[str, float] = {"Kp": float(kp_grid[0]), "v_sys": float(v_sys_grid[0])}
     best_raw_log_likelihood = -np.inf
     best_raw_indices = (0, 0)
-    best_raw_params: dict[str, float] = {"Kp": float(kp_grid[0]), "dRV": float(drv_grid[0])}
-    component_sample_prefix = _get_component_sample_prefix(context, component_name)
+    best_raw_params: dict[str, float] = {"Kp": float(kp_grid[0]), "v_sys": float(v_sys_grid[0])}
 
     for i, kp in enumerate(kp_grid):
-        for j, drv in enumerate(drv_grid):
+        for j, v_sys in enumerate(v_sys_grid):
             trial_params = dict(base_params)
             trial_params["Kp"] = float(kp)
-            trial_params["dRV"] = float(drv)
-            if component_sample_prefix is not None:
-                trial_params[f"{component_sample_prefix}/dRV"] = float(drv)
+            trial_params["v_sys"] = float(v_sys)
             model_ts, _ = synthesize_processed_model_timeseries(
                 context,
                 trial_params,
@@ -740,14 +706,12 @@ def scan_kp_drv_surface(
                 observed,
                 model_ts,
                 sigma,
-                likelihood_kind=likelihood_kind,
             )
             prior = (
                 _shared_system_log_prior(
                     context,
-                    component_name=component_name,
                     kp=float(kp),
-                    drv=float(drv),
+                    v_sys=float(v_sys),
                 )
                 if include_log_prior
                 else 0.0
@@ -759,15 +723,15 @@ def scan_kp_drv_surface(
             if logl > best_raw_log_likelihood:
                 best_raw_log_likelihood = logl
                 best_raw_indices = (i, j)
-                best_raw_params = {"Kp": float(kp), "dRV": float(drv)}
+                best_raw_params = {"Kp": float(kp), "v_sys": float(v_sys)}
             if score > best_surface_value:
                 best_surface_value = score
                 best_indices = (i, j)
-                best_params = {"Kp": float(kp), "dRV": float(drv)}
+                best_params = {"Kp": float(kp), "v_sys": float(v_sys)}
 
     return {
         "kp_grid": kp_grid,
-        "drv_grid": drv_grid,
+        "v_sys_grid": v_sys_grid,
         "log_likelihood": log_likelihood,
         "log_prior": log_prior if include_log_prior else None,
         "surface": surface,
@@ -784,7 +748,7 @@ def scan_kp_drv_surface(
     }
 
 
-def plot_kp_drv_surface(
+def plot_kp_vsys_surface(
     scan_result: dict[str, Any],
     *,
     ax: plt.Axes | None = None,
@@ -794,7 +758,7 @@ def plot_kp_drv_surface(
         _, ax = plt.subplots(figsize=(6, 5))
 
     kp_grid = np.asarray(scan_result["kp_grid"])
-    drv_grid = np.asarray(scan_result["drv_grid"])
+    v_sys_grid = np.asarray(scan_result["v_sys_grid"])
     surface = np.asarray(scan_result.get("surface", scan_result["log_likelihood"]), dtype=float)
     surface = np.where(np.isfinite(surface), surface, np.nan)
     surface_label = str(scan_result.get("surface_label", "log L"))
@@ -803,40 +767,28 @@ def plot_kp_drv_surface(
         surface,
         origin="lower",
         aspect="auto",
-        extent=[drv_grid.min(), drv_grid.max(), kp_grid.min(), kp_grid.max()],
+        extent=[v_sys_grid.min(), v_sys_grid.max(), kp_grid.min(), kp_grid.max()],
         cmap=cmap,
     )
     best = scan_result["best_params"]
     ax.scatter(
-        [best["dRV"]],
+        [best["v_sys"]],
         [best["Kp"]],
         c="tab:red",
         s=40,
         marker="x",
-        label=f"best: Kp={best['Kp']:.1f}, dRV={best['dRV']:.1f}",
+        label=f"best: Kp={best['Kp']:.1f}, v_sys={best['v_sys']:.1f}",
     )
-    ax.set_xlabel("dRV [km/s]")
+    ax.set_xlabel("v_sys [km/s]")
     ax.set_ylabel("Kp [km/s]")
     ax.set_title(
-        "Kp-dRV Prior-Weighted Surface"
+        "Kp-v_sys Prior-Weighted Surface"
         if scan_result.get("include_log_prior")
-        else "Kp-dRV Log-Likelihood Surface"
+        else "Kp-v_sys Log-Likelihood Surface"
     )
     ax.legend(loc="best")
     plt.colorbar(im, ax=ax, label=surface_label)
     return ax
-
-
-def _matched_filter_scale(
-    data: np.ndarray,
-    model: np.ndarray,
-    sigma: np.ndarray,
-) -> np.ndarray:
-    """Compute per-exposure matched-filter scaling alpha = sum(w*d*m)/sum(w*m^2)."""
-    w = 1.0 / np.clip(sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
-    num = np.sum(w * data * model, axis=1)
-    den = np.sum(w * np.square(model), axis=1) + config.F32_FLOOR_RECIP
-    return num / den
 
 
 def plot_processed_timeseries_comparison(
@@ -920,14 +872,13 @@ def plot_processed_timeseries_comparison(
         m1 = model_arrays[model_labels[0]]
         m2 = model_arrays[model_labels[1]]
 
-        # ── Row 2: matched-filter-scaled residuals ──
+        # ── Row 2: direct data-minus-model residuals ──
         resid_labels = []
         resid_arrays = []
         for mlabel, marr in model_arrays.items():
-            alpha = _matched_filter_scale(observed, marr, sigma)
-            resid = observed - alpha[:, None] * marr
+            resid = observed - marr
             resid_arrays.append(resid)
-            resid_labels.append(f"Obs − α·{mlabel}")
+            resid_labels.append(f"Obs − {mlabel}")
 
         # Shared color scale across residuals
         all_resid = np.concatenate(resid_arrays, axis=0)
@@ -971,7 +922,6 @@ def plot_processed_timeseries_comparison(
         # ── Row 3: cross-correlation-style 1D summaries ──
         # Collapse wavelength dimension to show phase-dependent signal strength
         for idx, (mlabel, marr) in enumerate(model_arrays.items()):
-            alpha = _matched_filter_scale(observed, marr, sigma)
             # Per-exposure cross-correlation SNR
             w = 1.0 / np.clip(sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
             ccf = np.sum(w * observed * marr, axis=1) / np.sqrt(np.sum(w * np.square(marr), axis=1) + config.F32_FLOOR_RECIP)
@@ -1003,7 +953,7 @@ def run_post_sysrem_injection_recovery(
     component_name: str,
     inject_params: dict[str, Any],
     kp_grid: np.ndarray,
-    drv_grid: np.ndarray,
+    v_sys_grid: np.ndarray,
     injection_scale: float = 1.0,
     include_log_prior: bool = False,
 ) -> dict[str, Any]:
@@ -1018,12 +968,12 @@ def run_post_sysrem_injection_recovery(
         injected_model,
         dtype=float,
     )
-    scan = scan_kp_drv_surface(
+    scan = scan_kp_vsys_surface(
         context,
         component_name=component_name,
         base_params=inject_params,
         kp_grid=kp_grid,
-        drv_grid=drv_grid,
+        v_sys_grid=v_sys_grid,
         data_override=injected_data,
         include_log_prior=include_log_prior,
     )
@@ -1048,7 +998,7 @@ def run_multiseed_svi(
 ) -> list[dict[str, Any]]:
     tracked = tuple(
         tracked_params
-        or ("Kp", "Tirr", "dRV", "gamma", "kappa_ir_cgs")
+        or ("Kp", "Tirr", "v_sys", "gamma", "kappa_ir_cgs")
     )
     results: list[dict[str, Any]] = []
 
@@ -1103,7 +1053,7 @@ def run_multiseed_svi(
 def plot_multiseed_summary(
     results: list[dict[str, Any]],
     *,
-    parameters: Iterable[str] = ("Kp", "Tirr", "dRV"),
+    parameters: Iterable[str] = ("Kp", "Tirr", "v_sys"),
 ) -> tuple[plt.Figure, np.ndarray]:
     params = tuple(parameters)
     fig, axes = plt.subplots(1, len(params), figsize=(4.5 * len(params), 3.8))

@@ -277,6 +277,56 @@ def get_full_arm_data_dirs(
     }
 
 
+def get_timeseries_data_dir(
+    planet: str | None = None,
+    arm: str | None = None,
+    epoch: str | None = None,
+    *,
+    mode: str | None = None,
+) -> Path:
+    """Get the retrieval-ready, phase-selected time-series directory."""
+    return get_data_dir(
+        planet=planet,
+        arm=arm,
+        epoch=epoch,
+        mode=mode,
+    ) / "timeseries"
+
+
+def get_collapse_source_dir(
+    planet: str | None = None,
+    arm: str | None = None,
+    epoch: str | None = None,
+    *,
+    mode: str | None = None,
+) -> Path:
+    """Get the full-exposure source-cube directory used by 1D collapsers."""
+    return get_data_dir(
+        planet=planet,
+        arm=arm,
+        epoch=epoch,
+        mode=mode,
+    ) / "collapse_source"
+
+
+def get_full_arm_timeseries_dirs(
+    planet: str | None = None,
+    epoch: str | None = None,
+    *,
+    mode: str | None = None,
+) -> dict[str, Path]:
+    """Return retrieval-ready time-series directories for both arms."""
+    return {
+        arm: get_timeseries_data_dir(
+            planet=planet,
+            arm=arm,
+            epoch=epoch,
+            mode=mode,
+        )
+        for arm in config.FULL_ARM_MEMBERS
+    }
+
+
 def get_lowres_dir(
     planet: str | None = None,
     *,
@@ -311,9 +361,13 @@ def get_transmission_paths(
     planet: str | None = None,
     arm: str | None = None,
     epoch: str | None = None,
+    *,
+    collapsed: bool = False,
 ) -> dict[str, Path]:
     """Get paths to transmission data files."""
     data_dir = get_data_dir(planet, arm=arm, epoch=epoch, mode="transmission")
+    if collapsed:
+        data_dir = data_dir / "collapsed" / "full_transit"
     return {
         "wavelength": data_dir / "wavelength_transmission.npy",
         "spectrum": data_dir / "spectrum_transmission.npy",
@@ -321,18 +375,61 @@ def get_transmission_paths(
     }
 
 
+def get_collapsed_transmission_dir(
+    planet: str | None = None,
+    arm: str | None = None,
+    epoch: str | None = None,
+) -> Path:
+    """Get the directory for a collapsed full-transit spectrum."""
+    return get_transmission_paths(
+        planet=planet,
+        arm=arm,
+        epoch=epoch,
+        collapsed=True,
+    )["wavelength"].parent
+
+
 def get_emission_paths(
     planet: str | None = None,
     arm: str | None = None,
     epoch: str | None = None,
+    *,
+    selection: str | None = None,
 ) -> dict[str, Path]:
     """Get paths to emission data files."""
     data_dir = get_data_dir(planet, arm=arm, epoch=epoch, mode="emission")
+    if selection is not None:
+        selection_name = str(selection).strip().lower().replace("-", "_")
+        if selection_name in {"full", "full_transit"}:
+            selection_name = "full_emission"
+        if selection_name not in {
+            "full_emission",
+            "pre_eclipse",
+            "post_eclipse",
+        }:
+            raise ValueError(f"Unsupported collapsed emission selection: {selection!r}")
+        data_dir = data_dir / "collapsed" / selection_name
     return {
         "wavelength": data_dir / "wavelength_emission.npy",
         "spectrum": data_dir / "spectrum_emission.npy",
         "uncertainty": data_dir / "uncertainty_emission.npy",
     }
+
+
+def get_collapsed_emission_dir(
+    planet: str | None = None,
+    arm: str | None = None,
+    epoch: str | None = None,
+    *,
+    selection: str,
+) -> Path:
+    """Get the directory for one phase-selected collapsed emission spectrum."""
+    return get_emission_paths(
+        planet=planet,
+        arm=arm,
+        epoch=epoch,
+        selection=selection,
+    )["wavelength"].parent
 
 
 def get_output_dir(
@@ -414,6 +511,7 @@ def save_run_config(
     spectral_offset: int = 0,
     diagnostic_label: str | None = None,
     apply_sysrem_override: bool | None = None,
+    emission_selection: str | None = None,
 ) -> None:
     """Save run configuration to log file."""
     import jax
@@ -457,12 +555,17 @@ def save_run_config(
             f.write(f"Epoch: {epoch_values[0]}\n")
             if len(epoch_values) > 1:
                 f.write(f"Epochs: {', '.join(epoch_values)}\n")
+        if emission_selection is not None:
+            f.write(f"Collapsed emission selection: {emission_selection}\n")
         f.write(f"Period: {params['period']}\n")
         f.write(f"R_p: {params['R_p']}\n")
         f.write(f"M_p: {params['M_p']}\n")
         f.write(f"R_star: {params['R_star']}\n")
         f.write(f"T_star: {params['T_star']}\n")
-        f.write(f"Systemic velocity (fixed): {params.get('RV_abs')}\n\n")
+        f.write(
+            "Absolute stellar systemic velocity (metadata only): "
+            f"{params.get('RV_abs')}\n\n"
+        )
 
         f.write("RETRIEVAL CONFIGURATION\n")
         f.write("-" * 70 + "\n")
@@ -529,7 +632,7 @@ def save_run_config(
         if not skip_svi:
             f.write(f"SVI steps: {config.SVI_NUM_STEPS:,}\n")
             f.write(f"SVI learning rate: {config.SVI_LEARNING_RATE}\n")
-            f.write("Vsys handling: fixed at systemic velocity\n")
+            f.write("Velocity offset: global v_sys ~ Normal(0, 10 km/s) in stellar-rest frame\n")
             if config.SVI_LR_DECAY_STEPS is not None and config.SVI_LR_DECAY_RATE is not None:
                 f.write(
                     "SVI LR schedule: "

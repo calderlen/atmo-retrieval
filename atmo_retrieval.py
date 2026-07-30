@@ -1,6 +1,7 @@
 import argparse
 from datetime import datetime
 import importlib.util
+import json
 import math
 from pathlib import Path
 import re
@@ -30,6 +31,10 @@ warnings.filterwarnings("once")
 
 import config
 import config_utils
+from dataio.collapse_emission_timeseries_to_1d import (
+    EMISSION_COLLAPSE_SELECTIONS,
+    canonicalize_emission_selection,
+)
 from pipeline.retrieval import (
     make_bandpass_constraints_from_tbl,
     make_joint_spectrum_component_from_tbl,
@@ -237,7 +242,7 @@ def _build_multi_epoch_joint_spectra(
     epochs: list[str],
     mode: str,
     data_format: str,
-    phase_mode: str,
+    emission_selection: str | None = None,
 ) -> list[dict[str, object]]:
     if len(epochs) <= 1:
         return []
@@ -246,27 +251,70 @@ def _build_multi_epoch_joint_spectra(
         getattr(config, "APPLY_SYSREM_DEFAULT", False)
         and data_format == "timeseries"
     )
-    subtract_per_exposure_mean = bool(
-        getattr(config, "SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT", False)
-        and data_format == "timeseries"
-    )
     radial_velocity_mode = "orbital" if data_format == "timeseries" else "none"
-    likelihood_kind = "matched_filter" if data_format == "timeseries" else "gaussian"
 
     component_specs: list[dict[str, object]] = []
     for epoch in epochs[1:]:
         if config.OBSERVING_MODE == "full":
-            arm_dirs = config_utils.get_full_arm_data_dirs(epoch=epoch, mode=mode)
+            if data_format == "timeseries":
+                arm_dirs = config_utils.get_full_arm_timeseries_dirs(
+                    epoch=epoch,
+                    mode=mode,
+                )
+            elif mode == "transmission":
+                arm_dirs = {
+                    arm: config_utils.get_collapsed_transmission_dir(
+                        epoch=epoch,
+                        arm=arm,
+                    )
+                    for arm in config.FULL_ARM_MEMBERS
+                }
+            else:
+                arm_dirs = config_utils.get_full_arm_data_dirs(
+                    epoch=epoch,
+                    mode=mode,
+                )
             arm_entries = (
                 ("red", arm_dirs["red"]),
                 ("blue", arm_dirs["blue"]),
             )
         else:
             arm_entries = (
-                (str(config.OBSERVING_MODE), config_utils.get_data_dir(epoch=epoch)),
+                (
+                    str(config.OBSERVING_MODE),
+                    (
+                        config_utils.get_timeseries_data_dir(
+                            epoch=epoch,
+                            mode=mode,
+                        )
+                        if data_format == "timeseries"
+                        else (
+                            config_utils.get_collapsed_transmission_dir(
+                                epoch=epoch,
+                                arm=config.OBSERVING_MODE,
+                            )
+                            if mode == "transmission"
+                            else config_utils.get_data_dir(
+                                epoch=epoch,
+                                mode=mode,
+                            )
+                        )
+                    ),
+                ),
             )
 
         for arm_label, data_dir in arm_entries:
+            if (
+                mode == "emission"
+                and data_format == "spectrum"
+                and emission_selection is not None
+            ):
+                data_dir = config_utils.get_collapsed_emission_dir(
+                    planet=config.PLANET,
+                    epoch=epoch,
+                    arm=arm_label,
+                    selection=emission_selection,
+                )
             component_specs.append(
                 {
                     "name": f"spectroscopy_{arm_label}_{epoch}",
@@ -274,15 +322,166 @@ def _build_multi_epoch_joint_spectra(
                     "data_format": data_format,
                     "data_dir": str(data_dir),
                     "apply_sysrem": apply_sysrem,
-                    "phase_mode": phase_mode,
                     "radial_velocity_mode": radial_velocity_mode,
-                    "likelihood_kind": likelihood_kind,
-                    "subtract_per_exposure_mean": subtract_per_exposure_mean,
+                    "subtract_weighted_global_mean": bool(
+                        data_format == "spectrum"
+                        and (
+                            mode == "transmission"
+                            or (
+                                mode == "emission"
+                                and emission_selection is not None
+                            )
+                        )
+                    ),
                     "instrument_resolution": config_utils.get_resolution(),
                 }
             )
 
     return component_specs
+
+
+def _collapsed_emission_product_status(
+    *,
+    planet: str,
+    epoch: str,
+    arm: str,
+    selection: str,
+) -> tuple[str, str, dict[str, object]]:
+    data_dir = config_utils.get_collapsed_emission_dir(
+        planet=planet,
+        epoch=epoch,
+        arm=arm,
+        selection=selection,
+    )
+    metadata_path = data_dir / "collapse_metadata.json"
+    if not metadata_path.exists():
+        return "missing", f"missing {metadata_path}", {}
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return "invalid", f"could not parse {metadata_path}: {exc}", {}
+
+    status = str(metadata.get("status", "")).strip().lower()
+    if status == "skipped":
+        reason = str(metadata.get("skip_reason", "no eligible exposures"))
+        return "skipped", reason, metadata
+    if status != "ready":
+        return "invalid", f"{metadata_path} has unknown status {status!r}", metadata
+
+    expected_identity = {
+        "planet": planet,
+        "epoch": epoch,
+        "arm": arm,
+        "selection": selection,
+    }
+    mismatches = [
+        f"{key}={metadata.get(key)!r} (expected {expected!r})"
+        for key, expected in expected_identity.items()
+        if metadata.get(key) != expected
+    ]
+    if mismatches:
+        return (
+            "invalid",
+            f"{metadata_path} identity mismatch: " + ", ".join(mismatches),
+            metadata,
+        )
+    if metadata.get("source_subtract_median") is False:
+        return (
+            "invalid",
+            f"{metadata_path} came from a non-median-subtracted cube",
+            metadata,
+        )
+
+    paths = config_utils.get_emission_paths(
+        planet=planet,
+        epoch=epoch,
+        arm=arm,
+        selection=selection,
+    )
+    missing = [path.name for path in paths.values() if not path.exists()]
+    if missing:
+        return "invalid", f"{data_dir} is missing " + ", ".join(missing), metadata
+    return "ready", f"{metadata.get('n_selected_exposures', '?')} exposures", metadata
+
+
+def _resolve_selected_emission_epochs(
+    epochs: list[str],
+    *,
+    selection: str,
+) -> list[str]:
+    observing_mode = str(config.OBSERVING_MODE)
+    if observing_mode == "full":
+        arms = tuple(config.FULL_ARM_MEMBERS)
+    elif observing_mode in {"red", "blue"}:
+        arms = (observing_mode,)
+    else:
+        raise ValueError(
+            "--emission-selection supports --wavelength-range red, blue, or full; "
+            f"got {observing_mode!r}."
+        )
+
+    eligible: list[str] = []
+    reference_kp_kms: float | None = None
+    print(f"\nResolving collapsed emission selection: {selection}")
+    for epoch in epochs:
+        results = {
+            arm: _collapsed_emission_product_status(
+                planet=config.PLANET,
+                epoch=epoch,
+                arm=arm,
+                selection=selection,
+            )
+            for arm in arms
+        }
+        statuses = {status for status, _detail, _metadata in results.values()}
+        detail = "; ".join(
+            f"{arm}={status} ({message})"
+            for arm, (status, message, _metadata) in results.items()
+        )
+        if statuses == {"ready"}:
+            for arm, (_status, _message, metadata) in results.items():
+                try:
+                    kp_kms = float(metadata["kp_reference_kms"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Collapsed emission metadata for {epoch}/{arm}/{selection} "
+                        "does not contain a valid kp_reference_kms."
+                    ) from exc
+                if not math.isfinite(kp_kms) or kp_kms <= 0.0:
+                    raise ValueError(
+                        f"Invalid kp_reference_kms={kp_kms!r} for "
+                        f"{epoch}/{arm}/{selection}."
+                    )
+                if reference_kp_kms is None:
+                    reference_kp_kms = kp_kms
+                elif not math.isclose(
+                    kp_kms,
+                    reference_kp_kms,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-9,
+                ):
+                    raise ValueError(
+                        "All collapsed emission components in one retrieval must "
+                        "use the same Kp reference; found "
+                        f"{reference_kp_kms:g} and {kp_kms:g} km/s."
+                    )
+            eligible.append(epoch)
+            print(f"  INCLUDE {epoch}: {detail}")
+            continue
+        if statuses == {"skipped"}:
+            print(f"  SKIP    {epoch}: {detail}")
+            continue
+        raise FileNotFoundError(
+            f"Collapsed emission products for {epoch} are incomplete: {detail}. "
+            "Run `python -m dataio.collapse_emission_timeseries_to_1d` for all "
+            "requested epochs and arms."
+        )
+
+    if not eligible:
+        raise ValueError(
+            f"No requested epochs contain eligible {selection} emission exposures."
+        )
+    return eligible
 
 
 def create_parser():
@@ -350,6 +549,18 @@ def create_parser():
         choices=["timeseries", "spectrum"],
         default=config.DEFAULT_DATA_FORMAT,
         help=f"Data format to load (default: {config.DEFAULT_DATA_FORMAT})",
+    )
+    data_group.add_argument(
+        "--emission-selection",
+        type=canonicalize_emission_selection,
+        choices=EMISSION_COLLAPSE_SELECTIONS,
+        default=None,
+        help=(
+            "Load phase-selected collapsed emission spectra. Requires "
+            "--mode emission --data-format spectrum. Choices: "
+            + ", ".join(EMISSION_COLLAPSE_SELECTIONS)
+            + ". The alias full-transit maps to full_emission."
+        ),
     )
     data_group.add_argument("--wavelength-range", type=str, choices=["blue", "green", "red", "full"], default=None, help="Wavelength range mode (default: from config)")
     data_group.add_argument(
@@ -722,13 +933,6 @@ def create_parser():
     # Phase analysis options
     phase_group = parser.add_argument_group("Phase Analysis")
     phase_group.add_argument(
-        "--phase-mode",
-        type=str,
-        choices=["global", "per_exposure", "linear"],
-        default=config.DEFAULT_PHASE_MODE,
-        help=f"How to model phase-dependent velocity offset dRV (default: {config.DEFAULT_PHASE_MODE})"
-    )
-    phase_group.add_argument(
         "--phase-bin",
         type=str,
         choices=["T12", "T23", "T34"],
@@ -868,7 +1072,7 @@ def apply_custom_config(custom_config):
 
 def apply_cli_overrides(args):
     epochs = _normalize_epoch_args(args.epoch)
-    primary_epoch = epochs[0]
+    args.requested_epoch = list(epochs)
 
     # Planet and ephemeris selection
     if args.planet:
@@ -886,6 +1090,18 @@ def apply_cli_overrides(args):
 
     # Validate planet/ephemeris combination
     params = config_utils.get_params()  # Will raise if invalid
+
+    if args.emission_selection is not None:
+        if args.mode != "emission" or args.data_format != "spectrum":
+            raise ValueError(
+                "--emission-selection requires --mode emission --data-format spectrum."
+            )
+        epochs = _resolve_selected_emission_epochs(
+            epochs,
+            selection=args.emission_selection,
+        )
+        args.epoch = list(epochs)
+    primary_epoch = epochs[0]
 
     # Chemistry model
     if args.chemistry_model:
@@ -924,14 +1140,43 @@ def apply_cli_overrides(args):
         config_utils.set_runtime_config("TRANSMISSION_DATA", None)
         config_utils.set_runtime_config("EMISSION_DATA", None)
     else:
-        config_utils.set_runtime_config("DATA_DIR", config_utils.get_data_dir(epoch=primary_epoch))
+        if args.mode == "emission" and args.emission_selection is not None:
+            resolved_data_dir = config_utils.get_collapsed_emission_dir(
+                planet=config.PLANET,
+                epoch=primary_epoch,
+                arm=config.OBSERVING_MODE,
+                selection=args.emission_selection,
+            )
+        elif args.mode == "transmission" and args.data_format == "spectrum":
+            resolved_data_dir = config_utils.get_collapsed_transmission_dir(
+                planet=config.PLANET,
+                epoch=primary_epoch,
+                arm=config.OBSERVING_MODE,
+            )
+        elif args.data_format == "timeseries":
+            resolved_data_dir = config_utils.get_timeseries_data_dir(
+                epoch=primary_epoch,
+                mode=args.mode,
+            )
+        else:
+            resolved_data_dir = config_utils.get_data_dir(
+                epoch=primary_epoch,
+                mode=args.mode,
+            )
+        config_utils.set_runtime_config("DATA_DIR", resolved_data_dir)
         config_utils.set_runtime_config(
             "TRANSMISSION_DATA",
-            config_utils.get_transmission_paths(epoch=primary_epoch),
+            config_utils.get_transmission_paths(
+                epoch=primary_epoch,
+                collapsed=args.data_format == "spectrum",
+            ),
         )
         config_utils.set_runtime_config(
             "EMISSION_DATA",
-            config_utils.get_emission_paths(epoch=primary_epoch),
+            config_utils.get_emission_paths(
+                epoch=primary_epoch,
+                selection=args.emission_selection,
+            ),
         )
 
     # Quick mode
@@ -1251,7 +1496,12 @@ def print_config_summary(config, args):
     if args.chemistry_model == "fastchem_hybrid_grid":
         fc_file = args.fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
         print(f"FastChem parameter file: {fc_file}")
-    print(f"Phase mode: {args.phase_mode}")
+    if args.emission_selection:
+        print(f"Collapsed emission selection: {args.emission_selection}")
+        requested_epochs = getattr(args, "requested_epoch", epochs)
+        skipped_epochs = [epoch for epoch in requested_epochs if epoch not in epochs]
+        if skipped_epochs:
+            print(f"Selection-skipped epochs: {', '.join(skipped_epochs)}")
     if args.phase_bin:
         print(f"Phase bin: {args.phase_bin}")
     if args.all_phase_bins:
@@ -1292,7 +1542,7 @@ def print_config_summary(config, args):
             print("  MCMC GPU policy: require >= 1 visible GPU per chain")
     else:
         print("  SVI-only: approximate diagnostic posterior; production runs should use MCMC/NUTS")
-    print(f"  Vsys handling: fixed at systemic velocity = {params['RV_abs']} km/s")
+    print("  Velocity offset: global v_sys ~ Normal(0, 10 km/s) in the stellar-rest frame")
     print(f"  Save MCMC diagnostics: {args.save_mcmc_diagnostics}")
     print(f"  Spectroscopic sigma scale: {args.sigma_scale:g}")
     if args.spectral_stride != 1 or args.spectral_offset != 0:
@@ -1341,7 +1591,7 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
         epochs=args.epoch,
         mode=args.mode,
         data_format=args.data_format,
-        phase_mode=args.phase_mode,
+        emission_selection=args.emission_selection,
     )
 
     # Print configuration summary
@@ -1368,7 +1618,6 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             pt_profile=pt_profile,
-            phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
             seed=args.seed,
@@ -1386,7 +1635,6 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             pt_profile=pt_profile,
-            phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
             seed=args.seed,
@@ -1403,7 +1651,6 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             pt_profile=pt_profile,
-            phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
             seed=args.seed,
@@ -1418,10 +1665,10 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             mode="emission",
             epoch=args.epoch,
             data_format=args.data_format,
+            emission_selection=args.emission_selection,
             skip_svi=args.skip_svi,
             svi_only=args.svi_only,
             pt_profile=pt_profile,
-            phase_mode=args.phase_mode,
             chemistry_model=args.chemistry_model,
             fastchem_parameter_file=args.fastchem_parameter_file,
             seed=args.seed,
@@ -1438,7 +1685,6 @@ def main():
     parser = create_parser()
     args = parser.parse_args()
     args.epoch = _normalize_epoch_args(args.epoch)
-    primary_epoch = args.epoch[0]
 
     runtime_config = config
     config_utils.apply_runtime_profile(args.profile)
@@ -1450,6 +1696,7 @@ def main():
         runtime_config = apply_custom_config(custom_config)
     # Apply CLI overrides
     runtime_config = apply_cli_overrides(args)
+    primary_epoch = args.epoch[0]
 
     transcript_log = _start_run_transcript_log(runtime_config, args)
     try:

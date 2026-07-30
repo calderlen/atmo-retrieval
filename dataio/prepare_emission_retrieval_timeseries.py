@@ -28,6 +28,10 @@ import config
 import config_utils
 from config import EPHEMERIS, FULL_ARM_MEMBERS
 from config_utils import get_params
+from dataio.collapse_emission_timeseries_to_1d import (
+    describe_emission_selection,
+    emission_selection_mask,
+)
 from dataio.collapse_transmission_timeseries_to_1d import (
     arm_edge_trim_metadata,
     get_orbital_phase,
@@ -43,13 +47,30 @@ EMISSION_PHASE_BINS = {
     "eclipse": "narrow window centered on orbital phase 0.5",
     "dayside": "half orbit centered on orbital phase 0.5",
     "nightside": "half orbit centered on orbital phase 0.0",
-    "pre_eclipse": "orbital phases in [0.0, 0.5)",
-    "post_eclipse": "orbital phases in [0.5, 1.0)",
+    "pre_eclipse": "out-of-eclipse dayside phases before secondary eclipse",
+    "post_eclipse": "out-of-eclipse dayside phases after secondary eclipse",
 }
 
 
-def _output_dir_for(planet: str, epoch: str, arm: str) -> Path:
-    return config_utils.get_data_dir(planet=planet, epoch=epoch, arm=arm, mode="emission")
+def _output_dir_for(
+    planet: str,
+    epoch: str,
+    arm: str,
+    product_kind: str,
+) -> Path:
+    if product_kind == "collapse-source":
+        return config_utils.get_collapse_source_dir(
+            planet=planet,
+            epoch=epoch,
+            arm=arm,
+            mode="emission",
+        )
+    return config_utils.get_timeseries_data_dir(
+        planet=planet,
+        epoch=epoch,
+        arm=arm,
+        mode="emission",
+    )
 
 
 def _raw_input_dir_for(planet: str, epoch: str) -> Path:
@@ -250,9 +271,9 @@ def _phase_bin_definition(phase_bin: str, planet_params: dict[str, Any]) -> str:
     if phase_bin == "nightside":
         return "circular phase distance to 0.0 <= 0.25"
     if phase_bin == "pre_eclipse":
-        return "orbital phase mapped to [0, 1) and selected in [0.0, 0.5)"
+        return describe_emission_selection("pre_eclipse", planet_params)
     if phase_bin == "post_eclipse":
-        return "orbital phase mapped to [0, 1) and selected in [0.5, 1.0)"
+        return describe_emission_selection("post_eclipse", planet_params)
     raise ValueError(f"Unknown emission phase bin: {phase_bin}")
 
 
@@ -273,9 +294,9 @@ def _phase_selection_mask(
     if phase_bin == "nightside":
         return _circular_phase_distance(phase_01, 0.0) <= 0.25 + 1.0e-12
     if phase_bin == "pre_eclipse":
-        return phase_01 < 0.5
+        return emission_selection_mask(phase_01, "pre_eclipse", planet_params)
     if phase_bin == "post_eclipse":
-        return phase_01 >= 0.5
+        return emission_selection_mask(phase_01, "post_eclipse", planet_params)
 
     raise ValueError(f"Unknown emission phase bin: {phase_bin}")
 
@@ -361,10 +382,12 @@ def _save_metadata(
     planet_params: dict[str, Any],
     arm_edge_trim: dict[str, float | int],
     spectral_column_masking: dict[str, Any],
+    product_kind: str,
 ) -> None:
     phase_01 = _phase_mod_1(phase)
     metadata: dict[str, Any] = {
         "mode": "emission",
+        "product_kind": product_kind,
         "planet": planet,
         "ephemeris": ephemeris,
         "epoch": epoch,
@@ -426,12 +449,22 @@ def create_parser() -> argparse.ArgumentParser:
         help="Which orbital phase selection to keep in the exported cube (default: all)",
     )
     parser.add_argument(
+        "--product-kind",
+        choices=["timeseries", "collapse-source"],
+        default="timeseries",
+        help=(
+            "Write a phase-selected retrieval cube or the all-exposure source "
+            "cube used to build collapsed 1D spectra (default: timeseries)."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
         help=(
             "Output directory "
-            "(default: input/hrs/emission/<planet>/<epoch>/<arm>). "
+            "(default: the product-kind subdirectory under "
+            "input/hrs/emission/<planet>/<epoch>/<arm>). "
             "Not allowed with --arm full, since red and blue are written separately."
         ),
     )
@@ -512,6 +545,11 @@ def main() -> int:
             "Retrieval-ready time-series export requires a common wavelength grid; "
             "leave --regrid enabled."
         )
+    if args.product_kind == "collapse-source" and args.phase_bin != "all":
+        raise ValueError(
+            "--product-kind collapse-source requires --phase-bin all so the "
+            "saved SYSREM basis retains every source exposure."
+        )
 
     if args.arm == "full" and args.output_dir:
         raise ValueError(
@@ -560,7 +598,12 @@ def main() -> int:
         if args.output_dir:
             output_dir = Path(args.output_dir)
         else:
-            output_dir = _output_dir_for(args.planet, args.epoch, arm)
+            output_dir = _output_dir_for(
+                args.planet,
+                args.epoch,
+                arm,
+                args.product_kind,
+            )
         _process_arm(
             arm=arm,
             args=args,
@@ -697,6 +740,10 @@ def _process_arm(
         )
         if "sysrem_delta_stddev" in sysrem_diagnostics:
             print("  Saved SYSREM component diagnostics: sysrem_delta_stddev and acceptance masks")
+    else:
+        # Do not leave a basis from an older preparation run beside a newly
+        # exported non-SYSREM cube.
+        (output_dir / "U_sysrem.npz").unlink(missing_ok=True)
 
     _save_metadata(
         output_dir,
@@ -714,10 +761,16 @@ def _process_arm(
         planet_params=planet_cfg,
         arm_edge_trim=edge_trim_info,
         spectral_column_masking=spectral_column_masking,
+        product_kind=args.product_kind,
     )
 
     phase_01 = _phase_mod_1(phase)
-    print(f"\nSaved retrieval-ready emission time-series products (arm={arm}):")
+    product_label = (
+        "emission collapse-source"
+        if args.product_kind == "collapse-source"
+        else "retrieval-ready emission time-series"
+    )
+    print(f"\nSaved {product_label} products (arm={arm}):")
     print(f"  Output dir: {output_dir}")
     print(f"  wavelength.npy: {wave_1d.shape}")
     print(f"  data.npy: {data.shape}")

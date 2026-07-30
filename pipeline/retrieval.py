@@ -36,8 +36,11 @@ from opacities import setup_cia_opacities, load_molecular_opacities, load_atomic
 from physics.model import (
     BandpassObservationInputs,
     ChunkedSysremInputs,
+    CollapsedEmissionInputs,
+    CollapsedTransmissionInputs,
     SpectroscopicObservationInputs,
-    PhaseMode,
+    apply_collapsed_emission_operator,
+    apply_collapsed_transmission_operator,
     compute_model_timeseries,
     compute_atmospheric_state_from_posterior,
     apply_model_pipeline_corrections,
@@ -77,6 +80,299 @@ def _load_timeseries_metadata(data_dir: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise ValueError(f"Could not parse {path}: {exc}") from exc
+
+
+def _load_collapsed_emission_operator(
+    data_dir: Path,
+    target_wavelength: np.ndarray,
+) -> CollapsedEmissionInputs:
+    """Load and align the fixed preprocessing operator for a 1D emission product."""
+    metadata_path = data_dir / "collapse_metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Collapsed emission spectrum {data_dir} is missing collapse_metadata.json."
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Could not parse {metadata_path}: {exc}") from exc
+    operator_name = metadata.get(
+        "collapse_operator_file",
+        "emission_collapse_operator.npz",
+    )
+    operator_path = data_dir / str(operator_name)
+    if not operator_path.exists():
+        raise FileNotFoundError(
+            f"Collapsed emission spectrum {data_dir} is missing "
+            f"{operator_path.name}. Regenerate the collapsed product so the "
+            "forward model can receive the same time-domain preprocessing."
+        )
+
+    required = {
+        "source_wavelength",
+        "source_phase",
+        "selected_exposure_indices",
+        "shift_left_indices",
+        "shift_fractions",
+        "coadd_weights",
+        "bin_indices",
+        "bin_weights",
+        "output_wavelength",
+        "kp_reference_kms",
+        "velocity_offset_reference_kms",
+    }
+    with np.load(operator_path) as raw:
+        missing = sorted(required.difference(raw.files))
+        if missing:
+            raise ValueError(
+                f"{operator_path} is missing required arrays: {', '.join(missing)}."
+            )
+        arrays = {name: np.asarray(raw[name]) for name in raw.files}
+
+    source_wavelength = np.asarray(arrays["source_wavelength"], dtype=float)
+    output_wavelength = np.asarray(arrays["output_wavelength"], dtype=float)
+    target_wavelength = np.asarray(target_wavelength, dtype=float)
+    if source_wavelength.ndim != 1 or np.any(np.diff(source_wavelength) <= 0.0):
+        raise ValueError(
+            f"{operator_path} source_wavelength must be strictly increasing."
+        )
+    if output_wavelength.ndim != 1 or np.any(np.diff(output_wavelength) <= 0.0):
+        raise ValueError(
+            f"{operator_path} output_wavelength must be strictly increasing."
+        )
+    output_indices: list[int] = []
+    for wavelength in target_wavelength:
+        insertion = int(np.searchsorted(output_wavelength, wavelength))
+        candidates = [
+            index
+            for index in (insertion - 1, insertion)
+            if 0 <= index < output_wavelength.size
+        ]
+        if not candidates:
+            raise ValueError(
+                f"Wavelength {wavelength:.12g} is absent from {operator_path}."
+            )
+        best = min(
+            candidates,
+            key=lambda index: abs(output_wavelength[index] - wavelength),
+        )
+        if not np.isclose(
+            output_wavelength[best],
+            wavelength,
+            rtol=1.0e-10,
+            atol=1.0e-8,
+        ):
+            raise ValueError(
+                f"Wavelength {wavelength:.12g} is not represented by "
+                f"{operator_path}; closest value is {output_wavelength[best]:.12g}."
+            )
+        output_indices.append(best)
+
+    # ExoJAX requires increasing wavenumber. Reversing the increasing-wavelength
+    # source grid supplies that order; the model operator reverses it back before
+    # applying the saved wavelength-space interpolation.
+    source_inst_nus = wav2nu(source_wavelength[::-1], "AA")
+    chunked_sysrem = None
+    has_sysrem = bool(np.asarray(arrays.get("has_sysrem", False)).item())
+    if has_sysrem:
+        sysrem_required = {
+            "sysrem_U",
+            "sysrem_chunk_labels",
+            "sysrem_V_chunk_diag",
+        }
+        missing_sysrem = sorted(sysrem_required.difference(arrays))
+        if missing_sysrem:
+            raise ValueError(
+                f"{operator_path} declares has_sysrem=true but is missing: "
+                f"{', '.join(missing_sysrem)}."
+            )
+        sysrem_bundle = _validate_sysrem_inputs(
+            {
+                "U_sysrem": arrays["sysrem_U"],
+                "chunk_labels": arrays["sysrem_chunk_labels"],
+                "V_chunk_diag": arrays["sysrem_V_chunk_diag"],
+            },
+            n_exp=np.asarray(arrays["source_phase"]).size,
+        )
+        chunked_sysrem = _build_model_chunked_sysrem(sysrem_bundle)
+    return CollapsedEmissionInputs(
+        source_wavelength=jnp.asarray(source_wavelength),
+        source_inst_nus=jnp.asarray(source_inst_nus),
+        source_phase=jnp.asarray(arrays["source_phase"], dtype=float),
+        selected_exposure_indices=jnp.asarray(
+            arrays["selected_exposure_indices"],
+            dtype=jnp.int32,
+        ),
+        shift_left_indices=jnp.asarray(
+            arrays["shift_left_indices"],
+            dtype=jnp.int32,
+        ),
+        shift_fractions=jnp.asarray(arrays["shift_fractions"], dtype=float),
+        coadd_weights=jnp.asarray(arrays["coadd_weights"], dtype=float),
+        bin_indices=jnp.asarray(arrays["bin_indices"], dtype=jnp.int32),
+        bin_weights=jnp.asarray(arrays["bin_weights"], dtype=float),
+        output_wavelength=jnp.asarray(output_wavelength),
+        output_indices=jnp.asarray(output_indices, dtype=jnp.int32),
+        kp_reference_kms=jnp.asarray(arrays["kp_reference_kms"], dtype=float),
+        velocity_offset_reference_kms=jnp.asarray(
+            arrays["velocity_offset_reference_kms"],
+            dtype=float,
+        ),
+        chunked_sysrem=chunked_sysrem,
+    )
+
+
+def _load_collapsed_transmission_operator(
+    data_dir: Path,
+    target_wavelength: np.ndarray,
+) -> CollapsedTransmissionInputs:
+    """Load the frozen preprocessing operator for a 1D transmission product."""
+    metadata_path = data_dir / "collapse_metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Collapsed transmission spectrum {data_dir} is missing "
+            "collapse_metadata.json."
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Could not parse {metadata_path}: {exc}") from exc
+    operator_path = data_dir / str(
+        metadata.get(
+            "collapse_operator_file",
+            "transmission_collapse_operator.npz",
+        )
+    )
+    required = {
+        "source_wavelength",
+        "source_phase",
+        "active_exposure_mask",
+        "selected_exposure_indices",
+        "shift_left_indices",
+        "shift_fractions",
+        "coadd_weights",
+        "bin_indices",
+        "bin_weights",
+        "output_wavelength",
+        "kp_reference_kms",
+        "velocity_offset_reference_kms",
+    }
+    if not operator_path.exists():
+        raise FileNotFoundError(
+            f"Collapsed transmission spectrum {data_dir} is missing "
+            f"{operator_path.name}."
+        )
+    with np.load(operator_path) as raw:
+        missing = sorted(required.difference(raw.files))
+        if missing:
+            raise ValueError(
+                f"{operator_path} is missing required arrays: "
+                f"{', '.join(missing)}."
+            )
+        arrays = {name: np.asarray(raw[name]) for name in raw.files}
+
+    source_wavelength = np.asarray(arrays["source_wavelength"], dtype=float)
+    output_wavelength = np.asarray(arrays["output_wavelength"], dtype=float)
+    target_wavelength = np.asarray(target_wavelength, dtype=float)
+    if source_wavelength.ndim != 1 or np.any(np.diff(source_wavelength) <= 0.0):
+        raise ValueError(
+            f"{operator_path} source_wavelength must be strictly increasing."
+        )
+    if output_wavelength.ndim != 1 or np.any(np.diff(output_wavelength) <= 0.0):
+        raise ValueError(
+            f"{operator_path} output_wavelength must be strictly increasing."
+        )
+    output_indices: list[int] = []
+    for wavelength in target_wavelength:
+        insertion = int(np.searchsorted(output_wavelength, wavelength))
+        candidates = [
+            index
+            for index in (insertion - 1, insertion)
+            if 0 <= index < output_wavelength.size
+        ]
+        if not candidates:
+            raise ValueError(
+                f"Wavelength {wavelength:.12g} is absent from {operator_path}."
+            )
+        best = min(
+            candidates,
+            key=lambda index: abs(output_wavelength[index] - wavelength),
+        )
+        if not np.isclose(
+            output_wavelength[best],
+            wavelength,
+            rtol=1.0e-10,
+            atol=1.0e-8,
+        ):
+            raise ValueError(
+                f"Wavelength {wavelength:.12g} is not represented by "
+                f"{operator_path}; closest value is "
+                f"{output_wavelength[best]:.12g}."
+            )
+        output_indices.append(best)
+
+    chunked_sysrem = None
+    has_sysrem = bool(np.asarray(arrays.get("has_sysrem", False)).item())
+    if has_sysrem:
+        sysrem_required = {
+            "sysrem_U",
+            "sysrem_chunk_labels",
+            "sysrem_V_chunk_diag",
+        }
+        missing_sysrem = sorted(sysrem_required.difference(arrays))
+        if missing_sysrem:
+            raise ValueError(
+                f"{operator_path} declares has_sysrem=true but is missing: "
+                f"{', '.join(missing_sysrem)}."
+            )
+        chunked_sysrem = _build_model_chunked_sysrem(
+            _validate_sysrem_inputs(
+                {
+                    "U_sysrem": arrays["sysrem_U"],
+                    "chunk_labels": arrays["sysrem_chunk_labels"],
+                    "V_chunk_diag": arrays["sysrem_V_chunk_diag"],
+                },
+                n_exp=np.asarray(arrays["source_phase"]).size,
+            )
+        )
+
+    return CollapsedTransmissionInputs(
+        source_wavelength=jnp.asarray(source_wavelength),
+        source_inst_nus=jnp.asarray(
+            wav2nu(source_wavelength[::-1], "AA")
+        ),
+        source_phase=jnp.asarray(arrays["source_phase"], dtype=float),
+        active_exposure_mask=jnp.asarray(
+            arrays["active_exposure_mask"],
+            dtype=float,
+        ),
+        selected_exposure_indices=jnp.asarray(
+            arrays["selected_exposure_indices"],
+            dtype=jnp.int32,
+        ),
+        shift_left_indices=jnp.asarray(
+            arrays["shift_left_indices"],
+            dtype=jnp.int32,
+        ),
+        shift_fractions=jnp.asarray(
+            arrays["shift_fractions"],
+            dtype=float,
+        ),
+        coadd_weights=jnp.asarray(arrays["coadd_weights"], dtype=float),
+        bin_indices=jnp.asarray(arrays["bin_indices"], dtype=jnp.int32),
+        bin_weights=jnp.asarray(arrays["bin_weights"], dtype=float),
+        output_wavelength=jnp.asarray(output_wavelength),
+        output_indices=jnp.asarray(output_indices, dtype=jnp.int32),
+        kp_reference_kms=jnp.asarray(
+            arrays["kp_reference_kms"],
+            dtype=float,
+        ),
+        velocity_offset_reference_kms=jnp.asarray(
+            arrays["velocity_offset_reference_kms"],
+            dtype=float,
+        ),
+        chunked_sysrem=chunked_sysrem,
+    )
 
 
 def _validate_no_deep_telluric_columns(
@@ -1009,10 +1305,6 @@ def _validate_mcmc_device_layout(
         )
 
 
-def _phase_dependent_drv(params: dict[str, float], phase: np.ndarray) -> jnp.ndarray:
-    return jnp.asarray(params.get("dRV", 0.0))
-
-
 def _posterior_site_value(
     params: dict[str, float],
     site_name: str,
@@ -1033,7 +1325,6 @@ def _synthesize_timeseries_from_atmospheric_state(
     model_params: dict,
     region_config: object,
     component: "SpectroscopicComponentBundle",
-    component_sample_prefix: str | None,
 ) -> np.ndarray:
     params = atmo_state["params"]
     observation_config = component.observation_config
@@ -1049,39 +1340,33 @@ def _synthesize_timeseries_from_atmospheric_state(
     dtau = jnp.asarray(atmo_state["dtau"])
     Tarr = jnp.asarray(atmo_state["Tarr"])
     mmw_profile = jnp.asarray(atmo_state["mmw"])
+    collapsed_emission = component.observation_inputs.collapsed_emission
+    collapsed_transmission = (
+        component.observation_inputs.collapsed_transmission
+    )
+    collapsed_operator = (
+        collapsed_emission
+        if collapsed_emission is not None
+        else collapsed_transmission
+    )
     phase = np.asarray(component.phase)
-    if observation_config.radial_velocity_mode == "none":
+    if collapsed_operator is not None:
+        phase = np.asarray(collapsed_operator.source_phase)
+        Kp_kms = float(collapsed_operator.kp_reference_kms)
+        v_sys_kms = float(
+            collapsed_operator.velocity_offset_reference_kms
+        )
+        model_inst_nus = collapsed_operator.source_inst_nus
+    elif observation_config.radial_velocity_mode == "none":
         phase = np.zeros_like(phase)
         Kp_kms = 0.0
-        Vsys_kms = 0.0
-        dRV = jnp.zeros_like(jnp.asarray(phase))
+        v_sys_kms = 0.0
+        model_inst_nus = jnp.asarray(component.inst_nus)
     else:
         Kp_kms = float(params.get("Kp", model_params["Kp"]))
-        Vsys_kms = float(params.get("Vsys", model_params["RV_abs"]))
-        dRV_0 = _posterior_site_value(
-            params,
-            "dRV_0",
-            sample_prefix=component_sample_prefix,
-        )
-        dRV_slope = _posterior_site_value(
-            params,
-            "dRV_slope",
-            sample_prefix=component_sample_prefix,
-        )
-        if dRV_0 is not None and dRV_slope is not None:
-            dRV = jnp.asarray(dRV_0 + dRV_slope * phase)
-        else:
-            dRV = _phase_dependent_drv(
-                {
-                    "dRV": _posterior_site_value(
-                        params,
-                        "dRV",
-                        sample_prefix=component_sample_prefix,
-                        default=0.0,
-                    )
-                },
-                phase,
-            )
+        v_sys_kms = float(params.get("v_sys", 0.0))
+        model_inst_nus = jnp.asarray(component.inst_nus)
+
     model_ts = compute_model_timeseries(
         mode=observation_config.mode,
         art=region_config.art,
@@ -1093,20 +1378,31 @@ def _synthesize_timeseries_from_atmospheric_state(
         g_ref=g_ref,
         phase=jnp.asarray(phase),
         Kp=Kp_kms,
-        Vsys=Vsys_kms,
-        dRV=dRV,
+        v_sys=v_sys_kms,
         sop_rot=component.sop_rot,
         sop_inst=component.sop_inst,
-        inst_nus=jnp.asarray(component.inst_nus),
+        inst_nus=model_inst_nus,
         nu_grid=jnp.asarray(component.nu_grid),
         beta_inst=observation_config.beta_inst,
         period_day=float(model_params["period"]),
         Tstar=observation_config.Tstar,
+        stellar_surface_flux=observation_config.stellar_surface_flux,
     )
+    if collapsed_emission is not None:
+        model_ts = apply_collapsed_emission_operator(
+            model_ts,
+            collapsed_emission,
+        )
+    elif collapsed_transmission is not None:
+        model_ts = apply_collapsed_transmission_operator(
+            model_ts,
+            collapsed_transmission,
+        )
     model_ts = apply_model_pipeline_corrections(
         model_ts,
-        subtract_per_exposure_mean=observation_config.subtract_per_exposure_mean,
+        subtract_weighted_global_mean=observation_config.subtract_weighted_global_mean,
         apply_sysrem=observation_config.apply_sysrem,
+        sigma=jnp.asarray(component.sigma),
         U=None if component.sysrem is None or component.sysrem.U is None else jnp.asarray(component.sysrem.U),
         V=None if component.sysrem is None or component.sysrem.V is None else jnp.asarray(component.sysrem.V),
         chunked_sysrem=_build_model_chunked_sysrem(component.sysrem),
@@ -1122,7 +1418,6 @@ def _compute_model_timeseries_for_plot(
     region_config: object,
     component: "SpectroscopicComponentBundle",
     region_sample_prefix: str | None,
-    component_sample_prefix: str | None,
     atmo_state: dict | None = None,
 ) -> tuple[np.ndarray | None, dict | None]:
     try:
@@ -1143,7 +1438,6 @@ def _compute_model_timeseries_for_plot(
             model_params=model_params,
             region_config=region_config,
             component=component,
-            component_sample_prefix=component_sample_prefix,
         )
         return model_ts, atmo_state
     except Exception as exc:
@@ -1198,6 +1492,8 @@ def _build_spectroscopic_observation_inputs(
     sigma: np.ndarray,
     phase: np.ndarray,
     sysrem: SysremInputBundle | None,
+    collapsed_emission: CollapsedEmissionInputs | None = None,
+    collapsed_transmission: CollapsedTransmissionInputs | None = None,
 ) -> SpectroscopicObservationInputs:
     return SpectroscopicObservationInputs(
         data=jnp.asarray(data),
@@ -1206,6 +1502,8 @@ def _build_spectroscopic_observation_inputs(
         U=None if sysrem is None or sysrem.U is None else jnp.asarray(sysrem.U),
         V=None if sysrem is None or sysrem.V is None else jnp.asarray(sysrem.V),
         chunked_sysrem=_build_model_chunked_sysrem(sysrem),
+        collapsed_emission=collapsed_emission,
+        collapsed_transmission=collapsed_transmission,
     )
 
 
@@ -1225,6 +1523,8 @@ def _coerce_model_params(params: dict) -> dict[str, float | None]:
         "Kp_err": params.get("Kp_err", config.DEFAULT_KP_ERR),
         "Kp_low": Kp_low,
         "Kp_high": Kp_high,
+        # Retained for provenance/reporting only; the stellar-rest model does
+        # not add this absolute stellar velocity to the planet Doppler shift.
         "RV_abs": params.get("RV_abs", config.DEFAULT_RV_ABS),
         "RV_abs_err": params.get("RV_abs_err", config.DEFAULT_RV_ABS_ERR),
         "R_p": params["R_p"].nominal_value if hasattr(params["R_p"], "nominal_value") else params["R_p"],
@@ -1344,11 +1644,12 @@ def _build_in_memory_timeseries_component_spec(
     phase: np.ndarray,
     sysrem: SysremInputBundle | None,
     instrument_resolution: float,
-    phase_mode: PhaseMode,
     apply_sysrem: bool,
     radial_velocity_mode: str,
-    likelihood_kind: str,
-    subtract_per_exposure_mean: bool,
+    data_format: str = "timeseries",
+    subtract_weighted_global_mean: bool = False,
+    collapsed_emission: CollapsedEmissionInputs | None = None,
+    collapsed_transmission: CollapsedTransmissionInputs | None = None,
     region_name: str | None = None,
     pre_sysrem_data: np.ndarray | None = None,
     pre_sysrem_sigma: np.ndarray | None = None,
@@ -1356,7 +1657,7 @@ def _build_in_memory_timeseries_component_spec(
     spec: dict[str, Any] = {
         "name": name,
         "mode": mode,
-        "data_format": "timeseries",
+        "data_format": data_format,
         "wav_obs": np.asarray(wav_obs),
         "data": np.asarray(data),
         "sigma": np.asarray(sigma),
@@ -1366,10 +1667,10 @@ def _build_in_memory_timeseries_component_spec(
         "pre_sysrem_sigma": None if pre_sysrem_sigma is None else np.asarray(pre_sysrem_sigma),
         "instrument_resolution": float(instrument_resolution),
         "apply_sysrem": bool(apply_sysrem),
-        "phase_mode": phase_mode,
         "radial_velocity_mode": radial_velocity_mode,
-        "likelihood_kind": likelihood_kind,
-        "subtract_per_exposure_mean": bool(subtract_per_exposure_mean),
+        "subtract_weighted_global_mean": bool(subtract_weighted_global_mean),
+        "collapsed_emission": collapsed_emission,
+        "collapsed_transmission": collapsed_transmission,
     }
     if region_name is not None:
         spec["region_name"] = region_name
@@ -1427,11 +1728,11 @@ def _build_primary_spectroscopic_component(
     Rstar: float | None,
     phoenix_spectrum_path: str | Path | None,
     phoenix_cache_dir: str | Path | None,
-    phase_mode: PhaseMode,
     apply_sysrem: bool,
     radial_velocity_mode: str,
-    likelihood_kind: str,
-    subtract_per_exposure_mean: bool,
+    subtract_weighted_global_mean: bool,
+    collapsed_emission: CollapsedEmissionInputs | None = None,
+    collapsed_transmission: CollapsedTransmissionInputs | None = None,
     sample_prefix: str | None = None,
     pre_sysrem_data: np.ndarray | None = None,
     pre_sysrem_sigma: np.ndarray | None = None,
@@ -1464,9 +1765,7 @@ def _build_primary_spectroscopic_component(
         Tstar=Tstar,
         stellar_surface_flux=stellar_surface_flux,
         radial_velocity_mode=radial_velocity_mode,
-        phase_mode=phase_mode,
-        likelihood_kind=likelihood_kind,
-        subtract_per_exposure_mean=subtract_per_exposure_mean,
+        subtract_weighted_global_mean=subtract_weighted_global_mean,
         apply_sysrem=apply_sysrem,
         sample_prefix=sample_prefix,
     )
@@ -1475,6 +1774,8 @@ def _build_primary_spectroscopic_component(
         sigma=sigma,
         phase=phase,
         sysrem=sysrem,
+        collapsed_emission=collapsed_emission,
+        collapsed_transmission=collapsed_transmission,
     )
     return SpectroscopicComponentBundle(
         name=name,
@@ -1787,13 +2088,13 @@ def _load_joint_spectroscopic_component(
     data_format = str(spec.get("data_format", "spectrum")).lower().strip()
     instrument_resolution = float(spec.get("instrument_resolution", config_utils.get_resolution()))
     radial_velocity_mode = str(spec.get("radial_velocity_mode", "orbital" if data_format == "timeseries" else "none"))
-    likelihood_kind = str(spec.get("likelihood_kind", "matched_filter" if data_format == "timeseries" else "gaussian"))
-    phase_mode = spec.get("phase_mode", config.DEFAULT_PHASE_MODE if radial_velocity_mode == "orbital" else None)
     apply_sysrem = bool(spec.get("apply_sysrem", data_format == "timeseries" and config.APPLY_SYSREM_DEFAULT))
-    subtract_per_exposure_mean = bool(
+    subtract_weighted_global_mean = bool(
         spec.get(
-            "subtract_per_exposure_mean",
-            data_format == "timeseries" and config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT,
+            "subtract_weighted_global_mean",
+            component_mode == "transmission"
+            and data_format == "spectrum"
+            and "tbl_path" not in spec,
         )
     )
     Tstar = spec.get("Tstar", default_tstar)
@@ -1810,6 +2111,9 @@ def _load_joint_spectroscopic_component(
     )
     pre_sysrem_data = None
     pre_sysrem_sigma = None
+    collapsed_emission = spec.get("collapsed_emission")
+    collapsed_transmission = spec.get("collapsed_transmission")
+    component_data_dir: Path | None = None
 
     if "tbl_path" in spec:
         wav_obs, spectrum, uncertainty, _meta = load_nasa_archive_spectrum(
@@ -1847,6 +2151,7 @@ def _load_joint_spectroscopic_component(
             sysrem = None
     elif "data_dir" in spec:
         data_dir = Path(spec["data_dir"])
+        component_data_dir = data_dir
         if data_format == "timeseries":
             wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
             pre_sysrem_bundle = load_pre_sysrem_timeseries_data(data_dir)
@@ -1900,7 +2205,33 @@ def _load_joint_spectroscopic_component(
 
     wav_obs, data, sigma, inst_nus = _prepare_observed_spectrum_arrays(wav_obs, data, sigma)
     sysrem = _remap_sysrem_wavelength_sort(sysrem, sort_idx_for_prepare)
+    if (
+        collapsed_emission is None
+        and component_data_dir is not None
+        and component_mode == "emission"
+        and data_format == "spectrum"
+        and (component_data_dir / "collapse_metadata.json").exists()
+    ):
+        collapsed_emission = _load_collapsed_emission_operator(
+            component_data_dir,
+            wav_obs,
+        )
+        if "subtract_weighted_global_mean" not in spec:
+            subtract_weighted_global_mean = True
+    if (
+        collapsed_transmission is None
+        and component_data_dir is not None
+        and component_mode == "transmission"
+        and data_format == "spectrum"
+        and (component_data_dir / "collapse_metadata.json").exists()
+    ):
+        collapsed_transmission = _load_collapsed_transmission_operator(
+            component_data_dir,
+            wav_obs,
+        )
     sigma = _scale_spectroscopic_sigma(sigma, sigma_scale)
+    if subtract_weighted_global_mean:
+        data = _subtract_inverse_variance_weighted_constant(data, sigma)
     if pre_sysrem_data is not None and pre_sysrem_sigma is not None:
         pre_sysrem_data = np.asarray(pre_sysrem_data)
         pre_sysrem_sigma = np.asarray(pre_sysrem_sigma)
@@ -1958,9 +2289,7 @@ def _load_joint_spectroscopic_component(
         Tstar=Tstar,
         stellar_surface_flux=stellar_surface_flux,
         radial_velocity_mode=radial_velocity_mode,
-        phase_mode=phase_mode,
-        likelihood_kind=likelihood_kind,
-        subtract_per_exposure_mean=subtract_per_exposure_mean,
+        subtract_weighted_global_mean=subtract_weighted_global_mean,
         apply_sysrem=apply_sysrem,
         sample_prefix=name,
     )
@@ -1969,6 +2298,8 @@ def _load_joint_spectroscopic_component(
         sigma=sigma,
         phase=phase,
         sysrem=sysrem,
+        collapsed_emission=collapsed_emission,
+        collapsed_transmission=collapsed_transmission,
     )
     return SpectroscopicComponentBundle(
         name=name,
@@ -2155,6 +2486,31 @@ def _scale_spectroscopic_sigma(
     return np.asarray(sigma, dtype=float) * sigma_scale
 
 
+def _subtract_inverse_variance_weighted_constant(
+    values: np.ndarray,
+    sigma: np.ndarray,
+) -> np.ndarray:
+    """Project one wavelength-independent offset out of a 1D spectrum."""
+    values = np.asarray(values, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    if values.shape != sigma.shape:
+        raise ValueError(
+            f"Cannot subtract weighted constant: values shape {values.shape} "
+            f"does not match sigma shape {sigma.shape}."
+        )
+    weights = 1.0 / np.clip(
+        sigma,
+        config.F32_FLOOR_RECIPSQ,
+        None,
+    ) ** 2
+    weighted_mean = np.sum(weights * values) / np.clip(
+        np.sum(weights),
+        config.F32_FLOOR_RECIP,
+        None,
+    )
+    return values - weighted_mean
+
+
 def run_retrieval(
     mode: str = "transmission",
     epoch: str | Sequence[str] | None = None,
@@ -2162,7 +2518,6 @@ def run_retrieval(
     skip_svi: bool = False,
     svi_only: bool = False,
     pt_profile: str | None = None,
-    phase_mode: PhaseMode = "global",
     chemistry_model: str | None = None,
     fastchem_parameter_file: str | None = None,
     compute_contribution: bool = True,
@@ -2185,9 +2540,26 @@ def run_retrieval(
     spectral_offset: int = 0,
     diagnostic_label: str | None = None,
     apply_sysrem_override: bool | None = None,
+    emission_selection: str | None = None,
 ) -> None:
     retrieval_start = perf_counter()
     mode = _normalize_retrieval_mode(mode)
+    if emission_selection is not None:
+        emission_selection = str(emission_selection).strip().lower().replace("-", "_")
+        if emission_selection in {"full", "full_transit"}:
+            emission_selection = "full_emission"
+        if emission_selection not in {
+            "full_emission",
+            "pre_eclipse",
+            "post_eclipse",
+        }:
+            raise ValueError(
+                f"Unsupported collapsed emission selection: {emission_selection!r}."
+            )
+        if mode != "emission" or data_format != "spectrum":
+            raise ValueError(
+                "emission_selection requires mode='emission' and data_format='spectrum'."
+            )
     sigma_scale = _validate_sigma_scale(sigma_scale)
     spectral_stride, spectral_offset = _validate_spectral_subset(spectral_stride, spectral_offset)
     epochs = _normalize_epoch_values(epoch)
@@ -2223,6 +2595,7 @@ def run_retrieval(
         spectral_offset=spectral_offset,
         diagnostic_label=sanitized_label,
         apply_sysrem_override=apply_sysrem_override,
+        emission_selection=emission_selection,
     )
 
     # Get planet parameters
@@ -2231,37 +2604,79 @@ def run_retrieval(
 
     apply_sysrem_default = config.APPLY_SYSREM_DEFAULT if apply_sysrem_override is None else apply_sysrem_override
     apply_sysrem = bool(apply_sysrem_default and data_format == "timeseries")
+    primary_subtract_weighted_global_mean = bool(
+        data_format == "spectrum"
+        and (
+            mode == "transmission"
+            or (mode == "emission" and emission_selection is not None)
+        )
+    )
 
     primary_sysrem: SysremInputBundle | None = sysrem_inputs
     primary_pre_sysrem_data: np.ndarray | None = None
     primary_pre_sysrem_sigma: np.ndarray | None = None
+    primary_collapsed_emission: CollapsedEmissionInputs | None = None
+    primary_collapsed_transmission: CollapsedTransmissionInputs | None = None
 
     full_arm_mode = (
         config.OBSERVING_MODE == "full"
-        and data_format == "timeseries"
         and all(val is None for val in (wav_obs, data, sigma, phase))
     )
     if config.OBSERVING_MODE == "full" and not full_arm_mode:
-        if data_format != "timeseries":
-            raise ValueError(
-                "--wavelength-range full requires data_format='timeseries'; "
-                f"got {data_format!r}."
-            )
+        raise ValueError(
+            "--wavelength-range full requires loading red and blue from their "
+            "on-disk component directories; direct in-memory primary arrays are "
+            "not supported in full-arm mode."
+        )
 
     primary_component_name = "spectroscopy_red" if full_arm_mode else "spectroscopy"
 
     if full_arm_mode:
-        arm_dirs = config_utils.get_full_arm_data_dirs(epoch=primary_epoch, mode=mode)
+        arm_dirs = (
+            config_utils.get_full_arm_timeseries_dirs(
+                epoch=primary_epoch,
+                mode=mode,
+            )
+            if data_format == "timeseries"
+            else config_utils.get_full_arm_data_dirs(
+                epoch=primary_epoch,
+                mode=mode,
+            )
+        )
+        if mode == "emission" and emission_selection is not None:
+            arm_dirs = {
+                arm: config_utils.get_collapsed_emission_dir(
+                    epoch=primary_epoch,
+                    arm=arm,
+                    selection=emission_selection,
+                )
+                for arm in config.FULL_ARM_MEMBERS
+            }
+        elif mode == "transmission" and data_format == "spectrum":
+            arm_dirs = {
+                arm: config_utils.get_collapsed_transmission_dir(
+                    epoch=primary_epoch,
+                    arm=arm,
+                )
+                for arm in config.FULL_ARM_MEMBERS
+            }
         blue_component_spec = {
             "name": "spectroscopy_blue",
             "mode": mode,
-            "data_format": "timeseries",
+            "data_format": data_format,
             "data_dir": str(arm_dirs["blue"]),
             "apply_sysrem": apply_sysrem,
-            "phase_mode": phase_mode,
-            "radial_velocity_mode": "orbital",
-            "likelihood_kind": "matched_filter",
-            "subtract_per_exposure_mean": config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT,
+            "radial_velocity_mode": "orbital" if data_format == "timeseries" else "none",
+            "subtract_weighted_global_mean": bool(
+                data_format == "spectrum"
+                and (
+                    mode == "transmission"
+                    or (
+                        mode == "emission"
+                        and emission_selection is not None
+                    )
+                )
+            ),
             "instrument_resolution": config_utils.get_resolution(),
         }
         joint_spectra = list(joint_spectra or []) + [blue_component_spec]
@@ -2274,6 +2689,12 @@ def run_retrieval(
             else:
                 print(f"  Using epochs: {', '.join(epochs)}")
         if any(val is not None for val in (wav_obs, data, sigma, phase)):
+            if mode == "emission" and emission_selection is not None:
+                raise ValueError(
+                    "Collapsed 1D emission retrievals must be loaded from their "
+                    "product directory so emission_collapse_operator.npz is "
+                    "available; direct wav_obs/data/sigma arrays are insufficient."
+                )
             phase = _normalize_phase(phase)
             print(f"  Using provided data: {data.shape[0]} exposures x {data.shape[1]} wavelengths")
             print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
@@ -2297,15 +2718,54 @@ def run_retrieval(
                     "a second spectroscopic component."
                 )
                 data_paths = (
-                    config_utils.get_transmission_paths(epoch=primary_epoch, arm="red")
+                    config_utils.get_transmission_paths(
+                        epoch=primary_epoch,
+                        arm="red",
+                        collapsed=data_format == "spectrum",
+                    )
                     if mode == "transmission"
-                    else config_utils.get_emission_paths(epoch=primary_epoch, arm="red")
+                    else config_utils.get_emission_paths(
+                        epoch=primary_epoch,
+                        arm="red",
+                        selection=emission_selection,
+                    )
                 )
             else:
-                resolved_data_dir = config_utils.get_data_dir(epoch=primary_epoch)
+                if mode == "emission" and emission_selection is not None:
+                    resolved_data_dir = config_utils.get_collapsed_emission_dir(
+                        epoch=primary_epoch,
+                        arm=config.OBSERVING_MODE,
+                        selection=emission_selection,
+                    )
+                else:
+                    if mode == "transmission" and data_format == "spectrum":
+                        resolved_data_dir = (
+                            config_utils.get_collapsed_transmission_dir(
+                                epoch=primary_epoch,
+                                arm=config.OBSERVING_MODE,
+                            )
+                        )
+                    else:
+                        resolved_data_dir = (
+                            config_utils.get_timeseries_data_dir(
+                                epoch=primary_epoch,
+                                mode=mode,
+                            )
+                            if data_format == "timeseries"
+                            else config_utils.get_data_dir(
+                                epoch=primary_epoch,
+                                mode=mode,
+                            )
+                        )
                 data_paths = (
-                    config_utils.get_transmission_paths(epoch=primary_epoch) if mode == "transmission"
-                    else config_utils.get_emission_paths(epoch=primary_epoch)
+                    config_utils.get_transmission_paths(
+                        epoch=primary_epoch,
+                        collapsed=data_format == "spectrum",
+                    ) if mode == "transmission"
+                    else config_utils.get_emission_paths(
+                        epoch=primary_epoch,
+                        selection=emission_selection,
+                    )
                 )
 
             if data_format == "timeseries":
@@ -2394,7 +2854,23 @@ def run_retrieval(
                     primary_pre_sysrem_sigma = primary_pre_sysrem_sigma[sort_idx]
             primary_sysrem = _remap_sysrem_wavelength_sort(primary_sysrem, sort_idx)
 
+        if mode == "emission" and emission_selection is not None:
+            primary_collapsed_emission = _load_collapsed_emission_operator(
+                resolved_data_dir,
+                wav_obs,
+            )
+        elif mode == "transmission" and data_format == "spectrum":
+            primary_collapsed_transmission = (
+                _load_collapsed_transmission_operator(
+                    resolved_data_dir,
+                    wav_obs,
+                )
+            )
+
         sigma = _scale_spectroscopic_sigma(sigma, sigma_scale)
+        if primary_subtract_weighted_global_mean:
+            data = _subtract_inverse_variance_weighted_constant(data, sigma)
+            print("  Subtracted the inverse-variance-weighted constant from the 1D spectrum")
         if primary_pre_sysrem_sigma is not None:
             primary_pre_sysrem_sigma = _scale_spectroscopic_sigma(primary_pre_sysrem_sigma, sigma_scale)
         if sigma_scale != 1.0:
@@ -2498,22 +2974,12 @@ def run_retrieval(
             else:
                 print(f"  PHOENIX stellar spectrum: {phoenix_spectrum_path}")
 
-        if full_arm_mode:
-            if phase_mode not in {"global", "linear"}:
-                raise ValueError(
-                    "--wavelength-range full requires --phase-mode in "
-                    "{'global','linear'} so dRV can be shared across arms; "
-                    f"got {phase_mode!r}."
-                )
-
         primary_is_timeseries = (
             np.asarray(phase).size > 1
             or bool(apply_sysrem)
             or (np.asarray(data).ndim == 2 and np.asarray(data).shape[0] > 1)
         )
         primary_radial_velocity_mode = "orbital" if primary_is_timeseries else "none"
-        primary_likelihood_kind = "matched_filter" if primary_is_timeseries else "gaussian"
-        primary_subtract_mean = config.SUBTRACT_PER_EXPOSURE_MEAN_DEFAULT if primary_is_timeseries else False
         primary_sample_prefix = (
             primary_component_name
             if (joint_spectra or bandpass_constraints)
@@ -2530,11 +2996,12 @@ def run_retrieval(
                 phase=phase,
                 sysrem=primary_sysrem,
                 instrument_resolution=Rinst,
-                phase_mode=phase_mode,
                 apply_sysrem=apply_sysrem,
                 radial_velocity_mode=primary_radial_velocity_mode,
-                likelihood_kind=primary_likelihood_kind,
-                subtract_per_exposure_mean=primary_subtract_mean,
+                data_format=data_format,
+                subtract_weighted_global_mean=primary_subtract_weighted_global_mean,
+                collapsed_emission=primary_collapsed_emission,
+                collapsed_transmission=primary_collapsed_transmission,
                 region_name=primary_region_name,
                 pre_sysrem_data=primary_pre_sysrem_data,
                 pre_sysrem_sigma=primary_pre_sysrem_sigma,
@@ -2578,11 +3045,11 @@ def run_retrieval(
                 Rstar=model_params["R_star"],
                 phoenix_spectrum_path=phoenix_spectrum_path,
                 phoenix_cache_dir=phoenix_cache_dir,
-                phase_mode=phase_mode,
                 apply_sysrem=apply_sysrem,
                 radial_velocity_mode=primary_radial_velocity_mode,
-                likelihood_kind=primary_likelihood_kind,
-                subtract_per_exposure_mean=primary_subtract_mean,
+                subtract_weighted_global_mean=primary_subtract_weighted_global_mean,
+                collapsed_emission=primary_collapsed_emission,
+                collapsed_transmission=primary_collapsed_transmission,
                 sample_prefix=primary_sample_prefix,
                 pre_sysrem_data=primary_pre_sysrem_data,
                 pre_sysrem_sigma=primary_pre_sysrem_sigma,
@@ -2634,11 +3101,8 @@ def run_retrieval(
                 observation_configs.append(component.observation_config)
                 observations_payload[component.name] = component.observation_inputs
 
-        shared_velocity_phase_mode: PhaseMode | None = None
-        shared_velocity_component_names: tuple[str, ...] = ()
         if full_arm_mode:
-            shared_velocity_phase_mode = phase_mode
-            shared_velocity_component_names = tuple(
+            orbital_component_names = tuple(
                 [primary_component.name]
                 + [
                     component.name
@@ -2647,16 +3111,12 @@ def run_retrieval(
                 ]
             )
             print(
-                f"  Full-arm mode: sharing dRV ({phase_mode}) across "
-                f"{len(shared_velocity_component_names)} spectroscopic components: "
-                f"{', '.join(shared_velocity_component_names)}."
+                f"  Full-arm mode: sharing one global v_sys across "
+                f"{len(orbital_component_names)} spectroscopic components: "
+                f"{', '.join(orbital_component_names)}."
             )
 
-        shared_system = build_shared_system_config(
-            params=model_params,
-            shared_velocity_phase_mode=shared_velocity_phase_mode,
-            shared_velocity_component_names=shared_velocity_component_names,
-        )
+        shared_system = build_shared_system_config(params=model_params)
 
         atmosphere_region_configs, atmosphere_region_lookup = _build_atmosphere_regions(
             model_params=model_params,
@@ -2682,11 +3142,6 @@ def run_retrieval(
         spectroscopic_components: list[SpectroscopicComponentBundle] = [primary_component]
         spectroscopic_components.extend(auxiliary_components)
         spectroscopic_component_count = len(spectroscopic_components)
-        component_sample_prefixes = {
-            component.name: component.observation_config.sample_prefix
-            for component in spectroscopic_components
-        }
-
         component_names = [component.name for component in spectroscopic_components]
         component_names.extend(component.name for component in scalar_constraints)
         print(
@@ -2797,7 +3252,6 @@ def run_retrieval(
                             region_config=shared_region_config,
                             component=component,
                             region_sample_prefix=shared_region_sample_prefix,
-                            component_sample_prefix=component_sample_prefixes[component.name],
                         )
 
                         if svi_model_ts is not None:
@@ -3004,7 +3458,6 @@ def run_retrieval(
                     region_config=shared_region_config,
                     component=component,
                     region_sample_prefix=shared_region_sample_prefix,
-                    component_sample_prefix=component_sample_prefixes[component.name],
                     atmo_state=atmo_state,
                 )
                 component_atmo_states[component.name] = atmo_state
@@ -3017,7 +3470,6 @@ def run_retrieval(
                         region_config=shared_region_config,
                         component=component,
                         region_sample_prefix=shared_region_sample_prefix,
-                        component_sample_prefix=component_sample_prefixes[component.name],
                     )
 
                 if hmc_model_ts is not None or svi_model_ts is not None:
