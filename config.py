@@ -381,7 +381,7 @@ PLANETS = {
             "R_p": 1.891,
             "R_p_err": 0.061,
             "T_eq": nan,  # TODO: look up
-            "Kp": nan,  # TODO: look up
+            "Kp": 253.89,  # km/s; derived from 2*pi*a*sin(i)/P
             "Kp_err": nan,  # TODO: look up
             "RV_abs": nan,  # TODO: look up
             "RV_abs_err": nan,  # TODO: look up
@@ -546,7 +546,7 @@ PLANETS = {
             "R_p": 1.593,
             "R_p_err": 0.054,
             "T_eq": nan,  # TODO: look up
-            "Kp": nan,  # TODO: look up
+            "Kp": 227.73,  # km/s; derived from 2*pi*a*sin(i)/P
             "Kp_err": nan,  # TODO: look up
             "RV_abs": nan,  # TODO: look up
             "RV_abs_err": nan,  # TODO: look up
@@ -814,7 +814,7 @@ PLANETS = {
             "R_p": 1.619,
             "R_p_err": 0.021,
             "T_eq": nan,  # TODO: look up
-            "Kp": nan,  # TODO: look up
+            "Kp": 200.71,  # km/s; derived from 2*pi*a*sin(i)/P
             "Kp_err": nan,  # TODO: look up
             "RV_abs": nan,  # TODO: look up
             "RV_abs_err": nan,  # TODO: look up
@@ -979,7 +979,7 @@ PLANETS = {
             "R_p": 1.49,
             "R_p_err": 0.05,
             "T_eq": nan,  # TODO: look up
-            "Kp": nan,  # TODO: look up
+            "Kp": 186.03,  # km/s; derived from 2*pi*a*sin(i)/P
             "Kp_err": nan,  # TODO: look up
             "RV_abs": nan,  # TODO: look up
             "RV_abs_err": nan,  # TODO: look up
@@ -1090,7 +1090,7 @@ PLANETS = {
             "R_p": 1.875,
             "R_p_err": 0.053,
             "T_eq": nan,  # TODO: look up
-            "Kp": nan,  # TODO: look up
+            "Kp": 217.26,  # km/s; derived from 2*pi*a*sin(i)/P
             "Kp_err": nan,  # TODO: look up
             "RV_abs": nan,  # TODO: look up
             "RV_abs_err": nan,  # TODO: look up
@@ -1809,7 +1809,7 @@ DEFAULT_SYSREM_MAX_SYSTEMATICS_RED = [10, 10]
 DEFAULT_SYSREM_MAX_SYSTEMATICS_OTHER = [10]
 DEFAULT_SYSREM_MIN_SYSTEMATICS_RED = [1, 1]
 DEFAULT_SYSREM_MIN_SYSTEMATICS_OTHER = [1]
-DEFAULT_SYSREM_STOP_TOL = 5e-5
+DEFAULT_SYSREM_STOP_TOL = 1e-4
 DEFAULT_REGRID_MAX_NATIVE_GAP_FACTOR = 5.0
 DEFAULT_TELLURIC_EDGE_MASK_WIDTH_A = 3.0
 DEFAULT_ARM_EDGE_TRIM_A = {

@@ -1326,6 +1326,14 @@ def get_pepsi_data(
     matched_pattern = None
     for pattern in patterns:
         spectra_files = sorted(glob(pattern, recursive=True))
+        if do_molecfit:
+            current_files = [
+                path
+                for path in spectra_files
+                if not any(part.endswith("_old") for part in Path(path).parts)
+            ]
+            if current_files:
+                spectra_files = current_files
         if spectra_files:
             matched_pattern = pattern
             break
@@ -1451,7 +1459,7 @@ def get_pepsi_data(
         jd[i] = header[header_keys["jd"]]  # mid-exposure time
 
         snr_key = header_keys["snr"]
-        snr_spectra[i] = header[snr_key]
+        snr_spectra[i] = header.get(snr_key, np.nan)
 
         exptime_key = header_keys["exptime"]
         exptime_val = header[exptime_key]
@@ -1469,6 +1477,13 @@ def get_pepsi_data(
         airmass[i] = header[airmass_key]
 
         i += 1
+
+    n_missing_snr = int(np.count_nonzero(~np.isfinite(snr_spectra)))
+    if n_missing_snr:
+        print(
+            f"Warning: {n_missing_snr}/{n_spectra} spectra have no finite "
+            f"{header_keys['snr']} header; saving those snr.npy entries as NaN."
+        )
 
     # ====================
     # Preprocessing pipeline
