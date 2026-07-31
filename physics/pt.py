@@ -141,7 +141,6 @@ def pspline_knots_profile_on_grid(
 def numpyro_pspline_knots_on_art_grid(
     art: object,
     *,
-    n_knots: int = 15, #must be >= 3
     T_low: float = 100.0,
     T_high: float = 6000.0,
     inv_gamma_a: float = 1.0,
@@ -149,6 +148,7 @@ def numpyro_pspline_knots_on_art_grid(
 ) -> jnp.ndarray:
 
     p_bar = _validate_pressure_bar(art.pressure)
+    n_knots = int(p_bar.size)
 
     # Knot temperatures
     T_knots = jnp.stack([numpyro.sample(f"T_{i}", dist.Uniform(T_low, T_high)) for i in range(n_knots)])
