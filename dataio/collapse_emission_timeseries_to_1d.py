@@ -142,17 +142,39 @@ def load_frozen_sysrem_arrays(
     if not path.exists():
         return None
     with np.load(path) as raw:
+        if "projection_sigma" not in raw.files:
+            if "V_chunk_diag" in raw.files:
+                raise ValueError(
+                    f"{path} uses the retired V_chunk_diag approximation. "
+                    "Regenerate the source cube to retain per-pixel SYSREM "
+                    "projection uncertainties."
+                )
+            raise ValueError(
+                f"{path} is missing projection_sigma; regenerate the source cube."
+            )
         U = np.asarray(raw["U_sysrem"], dtype=float)
         labels = np.asarray(raw["chunk_labels"], dtype=np.int32)
         counts = np.asarray(raw["basis_counts"], dtype=np.int32)
-        vdiag = np.asarray(raw["V_chunk_diag"], dtype=float)
+        projection_sigma = np.asarray(raw["projection_sigma"], dtype=float)
     if U.ndim == 2:
         U = U[:, :, None]
+    expected_sigma_shape = (U.shape[0], labels.size)
+    if projection_sigma.shape != expected_sigma_shape:
+        raise ValueError(
+            f"{path} projection_sigma has shape {projection_sigma.shape}; "
+            f"expected {expected_sigma_shape}."
+        )
+    if np.any(~np.isfinite(projection_sigma)) or np.any(
+        projection_sigma <= 0.0
+    ):
+        raise ValueError(
+            f"{path} projection_sigma must contain finite positive values."
+        )
     return {
         "sysrem_U": U,
         "sysrem_chunk_labels": labels,
         "sysrem_basis_counts": counts,
-        "sysrem_V_chunk_diag": vdiag,
+        "sysrem_projection_sigma": projection_sigma,
     }
 
 
@@ -387,11 +409,11 @@ def collapse_epoch_arm(
     ingress, egress = emission_eclipse_boundaries(params)
 
     metadata: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "product_kind": "collapsed_emission_spectrum",
         "observable_kind": "continuum_removed_emission_line_contrast",
         "model_preprocessing": (
-            "time_median_subtraction_then_frozen_sysrem_then_"
+            "time_median_subtraction_then_frozen_per_pixel_sysrem_then_"
             "planet_frame_inverse_variance_"
             "coadd_then_subtract_inverse_variance_weighted_constant"
         ),
@@ -454,9 +476,9 @@ def collapse_epoch_arm(
     np.save(output_dir / _PRODUCT_FILENAMES[0], wavelength_1d)
     np.save(output_dir / _PRODUCT_FILENAMES[1], spectrum_1d)
     np.save(output_dir / _PRODUCT_FILENAMES[2], uncertainty_1d)
-    np.savez(
+    np.savez_compressed(
         output_dir / _PRODUCT_FILENAMES[3],
-        schema_version=np.asarray(2, dtype=np.int32),
+        schema_version=np.asarray(3, dtype=np.int32),
         source_wavelength=np.asarray(wavelength, dtype=float),
         source_phase=np.asarray(phase, dtype=float),
         selected_exposure_indices=np.asarray(selected_indices, dtype=np.int32),

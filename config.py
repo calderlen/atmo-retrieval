@@ -51,6 +51,8 @@ PLANETS = {
             "period_err": 0.00000012,
             "epoch": 2459757.811176,     # BJD_TDB
             "epoch_err": 0.000019,
+            "epoch_scale": "tdb",
+            "epoch_reference": "barycenter",
             "duration": 0.147565,        # days (T14)
             "duration_err": 0.000092,
             "tau": 0.02007,              # days (ingress/egress duration)
@@ -351,6 +353,8 @@ PLANETS = {
             "period_err": 0.00000014,
             "epoch": 2458955.970923,
             "epoch_err": 0.000050,
+            "epoch_scale": "tdb",
+            "epoch_reference": "barycenter",
             "duration": 3.8541 / 24.0,
             "duration_err": nan,  # TODO: look up
             "tau": 0.3114 / 24.0,
@@ -505,11 +509,13 @@ PLANETS = {
     },
     "WASP-33b": {
         "Ivshina22": {
-            # Ephemeris
-            "period": 1.219870,
-            "period_err": 0.000001,
-            "epoch": 2454163.22367,
-            "epoch_err": 0.00022,
+            # Ephemeris (Ivshina & Winn 2022, BJD_TDB)
+            "period": 1.21987070,
+            "period_err": 0.00000038,
+            "epoch": 2456217.48738,
+            "epoch_err": 0.00039,
+            "epoch_scale": "tdb",
+            "epoch_reference": "barycenter",
             "duration": 2.854 / 24.0,
             "duration_err": nan,  # TODO: look up
             "tau": float('nan'),  # TODO: look up
@@ -784,6 +790,8 @@ PLANETS = {
             "period_err": nan,  # TODO: look up
             "epoch": 2458926.541696,
             "epoch_err": 0.000065,
+            "epoch_scale": "tt",
+            "epoch_reference": "barycenter",
             "duration": 4.3336 / 24.0,
             "duration_err": nan,  # TODO: look up
             "tau": 0.3721 / 24.0,
@@ -884,6 +892,8 @@ PLANETS = {
             "period_err": 0.00000088,
             "epoch": 2458833.488151,
             "epoch_err": 0.000092,
+            "epoch_scale": "tdb",
+            "epoch_reference": "barycenter",
             "duration": 4.226 / 24.0,
             "duration_err": nan,  # TODO: look up
             "tau": float('nan'),  # TODO: look up
@@ -943,6 +953,8 @@ PLANETS = {
             "period_err": 0.000003,
             "epoch": 2458739.17737,
             "epoch_err": 0.00007,
+            "epoch_scale": "tdb",
+            "epoch_reference": "barycenter",
             "duration": 2.489 / 24.0,
             "duration_err": nan,  # TODO: look up
             "tau": float('nan'),  # TODO: look up
@@ -1060,6 +1072,8 @@ PLANETS = {
             "period_err": 0.00000043,
             "epoch": 2459983.791942,
             "epoch_err": 0.000066,
+            "epoch_scale": "tdb",
+            "epoch_reference": "barycenter",
             "duration": 2.3950 / 24.0,
             "duration_err": nan,  # TODO: look up
             "tau": 0.8552 / 24.0,
@@ -1226,7 +1240,9 @@ RESOLUTION_MODE = "hr"  # Options: "standard" (R=50k), "hr" (R=130k), "uhr" (R=2
 
 # Common PEPSI header keys (shared across all modes)
 _PEPSI_HEADER_KEYS = {
-    "jd": "JD-OBS",          # Mid-exposure Julian Date
+    "jd": "JD-OBS",          # UTC mid-exposure Julian Date
+    "bjd_tdb": "JD-TDB",     # Optional barycentric TDB validation value
+    "timesys": "TIMESYS",    # Optional declared JD-OBS timescale
     "snr": "SNR",            # Signal-to-noise ratio
     "exptime": "EXPTIME",    # Exposure time
     "airmass": "AIRMASS",    # Airmass
@@ -1327,8 +1343,8 @@ INSTRUMENTS: dict[str, dict[str, dict]] = {
 RETRIEVAL_MODE = "transmission"  # Options: "transmission", "emission"
 
 # Mode-specific default P-T profiles
-TRANSMISSION_PT_PROFILE_DEFAULT = "guillot"
-EMISSION_PT_PROFILE_DEFAULT = "pspline"
+TRANSMISSION_PT_PROFILE_DEFAULT = "isothermal"
+EMISSION_PT_PROFILE_DEFAULT = "guillot"
 
 # ==============================================================================
 # ATMOSPHERIC RT PARAMETERS
@@ -1340,11 +1356,19 @@ NLAYER = 10 # number of atmospheric layers (runtime profiles below override)
 # Mode-specific pressure ranges [bar]
 TRANSMISSION_PRESSURE_TOP = 1e-8
 TRANSMISSION_PRESSURE_BTM = 1e0
+# Adopt the catalog-informed transmission reference radius at the RT lower
+# boundary.  This is an explicit modeling convention, not a direct
+# observational determination of R_1bar.  Keep this tied to the configured
+# transmission boundary so changing the grid cannot silently change the
+# radius-pressure meaning.
+TRANSMISSION_REFERENCE_PRESSURE_BAR = 1.0
 EMISSION_PRESSURE_TOP = 1e-4
 EMISSION_PRESSURE_BTM = 1e0
 
 # Temperature range [K]
-# Sets PreModit auto_trange, ART layer T clipping, and FastChem T clipping.
+# Sets the common supported domain for PreMODIT, ART, and FastChem. Profiles
+# outside this interval are rejected; clipping is only used to keep JAX's
+# evaluation of a rejected proposal numerically safe.
 # [1500, 5500] gives a PreModit robust range of 1451.74 - 5825.62 K (dE=875, Tref, Twt
 # chosen by the LUT), covering Guillot upper-atmosphere draws (observed up to ~5472 K
 # under the current priors) while only increasing the LBD+xsmatrix scratch tensor by
@@ -1370,8 +1394,8 @@ LOG_KAPPA_IR_BOUNDS = (-3.0, -1.0)
 # (T_top^4 ~ (3/4) Tirr^4 gamma/sqrt(3)) - well outside PreModit's robust range
 # and FastChem's tabulated grid, producing NaN cross sections / VMRs and a
 # NaN logL. (-1, 1) covers the physical range while keeping the bulk of prior
-# mass inside [T_LOW, T_HIGH]; the clip in _sample_atmosphere_state still
-# catches the gamma > 3 tail where Guillot would overshoot.
+# mass inside [T_LOW, T_HIGH]; the model-validity check rejects the gamma > 3
+# tail where Guillot would overshoot.
 LOG_GAMMA_BOUNDS = (-1.0, 1.0)
 
 DEFAULT_KP = 169.0  # planet radial velocity semi-amplitude [km/s]
@@ -1730,8 +1754,8 @@ SOLAR_ABUNDANCE_FILE = "reference/abundances/asplund_2020_extended.dat"
 
 FASTCHEM_N_TEMP = 50
 FASTCHEM_N_PRESSURE = 50
-FASTCHEM_T_MIN = 500.0
-FASTCHEM_T_MAX = 5000.0
+FASTCHEM_T_MIN = T_LOW
+FASTCHEM_T_MAX = T_HIGH
 FASTCHEM_CACHE_DIR = "cache/fastchem"
 FASTCHEM_DATA_DIR = None  # None = use pyfastchem defaults
 FASTCHEM_PARAMETER_FILE = None  # Path to FastChem parameters.dat
@@ -1769,6 +1793,15 @@ F32_LENGTHSCALE_FLOOR = 1.0e-12 # Safe floor for GP lengthscales in standardized
 F32_STDDEV_FLOOR = 1.0e-12 # Small stabilizer for standard deviation-like scale terms.
 F64_FLOOR = 1.0e-300 # float64 underflow guard.
 TRACE_SPECIES_FLOOR = 1.0e-30 # Semantic floor for absent/trace chemistry species profiles.
+# These are numerical limits of the current ExoJAX atmospheric geometry, not
+# claims about the physically possible MMW of a gas. Fully ionized gas can
+# have MMW below one.
+MMW_RT_MIN = 1.0
+MMW_RT_MAX = 50.0
+# PreMODIT evaluates in float32. Accept at most one float32 epsilon relative to
+# the same term's positive peak; widening this guard requires an empirical
+# audit of the actual opacity databases rather than an arbitrary guess.
+PREMODIT_NEGATIVE_ROUNDOFF_RTOL = F32_EPS
 
 # ==============================================================================
 # DATA PREPARATION DEFAULTS
@@ -1779,11 +1812,6 @@ DEFAULT_DATA_PLANET = PLANET
 DEFAULT_DATA_ARM = OBSERVING_MODE
 DEFAULT_USE_MOLECFIT = True
 DEFAULT_RAW_DATA_DIR = "input/hrs/transmission/raw"
-DEFAULT_BARYCORR = False
-# The historical epoch-specific shifts have no documented physical provenance.
-# Keep the plumbing available while the old values remain commented out at their
-# definition, but never apply an introduced shift by default.
-DEFAULT_INTRODUCED_SHIFT = False
 
 # Data loading defaults
 # Default to time-series input so the main CLI and phase-binned path work without
@@ -1796,9 +1824,6 @@ DEFAULT_BIN_SIZE = 50
 # Doppler shadow fitting defaults
 DEFAULT_SHADOW_SCALING = 1.0
 DEFAULT_FIT_PARAM_FALLBACK = 1.0
-
-# Wavelength shift defaults
-DEFAULT_INTRODUCED_SHIFT_MPS = 0.0
 
 # Misc utility defaults
 DEFAULT_BIN_INFO_COUNT = 0

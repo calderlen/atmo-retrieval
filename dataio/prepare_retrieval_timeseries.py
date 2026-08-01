@@ -9,10 +9,11 @@ time-series retrieval path:
 - ``data.npy`` (2D exposure x wavelength matrix)
 - ``sigma.npy`` (2D uncertainty matrix)
 - ``phase.npy`` (1D orbital phase array, mid-transit at 0)
+- ``bjd_tdb.npy`` (1D canonical barycentric mid-exposure times)
 
 Optional auxiliary products are also written when available, including
-``jd.npy``, ``snr.npy``, ``exptime.npy``, ``airmass.npy``, and SYSREM
-approximations compatible with the current retrieval loader. When SYSREM is
+``jd.npy`` (raw UTC ``JD-OBS``), ``snr.npy``, ``exptime.npy``, ``airmass.npy``,
+and the frozen full-exposure SYSREM operator with per-pixel uncertainties. When SYSREM is
 enabled, ``pre_sysrem_data.npy`` and ``pre_sysrem_sigma.npy`` preserve the
 selected spectra just before SYSREM for diagnostics.
 """
@@ -35,6 +36,8 @@ from dataio.collapse_transmission_timeseries_to_1d import (
     build_out_of_transit_residuals,
     compute_contact_phases,
     do_sysrem,
+    get_bjd_tdb,
+    get_ephemeris_epoch_bjd_tdb,
     get_orbital_phase,
     get_pepsi_data,
     get_phase_bin_mask,
@@ -70,10 +73,14 @@ def _raw_input_dir_for(planet: str, epoch: str) -> Path:
     return config_utils.get_raw_hrs_dir(planet=planet, epoch=epoch, mode="transmission")
 
 
-def _nearest_transit_midpoint(jd: np.ndarray, reference_epoch: float, period: float) -> float:
-    obs_mid = 0.5 * (float(np.min(jd)) + float(np.max(jd)))
-    n_orbits = round((obs_mid - reference_epoch) / period)
-    return float(reference_epoch + n_orbits * period)
+def _nearest_transit_midpoint(
+    bjd_tdb: np.ndarray,
+    reference_epoch_bjd_tdb: float,
+    period: float,
+) -> float:
+    obs_mid = 0.5 * (float(np.min(bjd_tdb)) + float(np.max(bjd_tdb)))
+    n_orbits = round((obs_mid - reference_epoch_bjd_tdb) / period)
+    return float(reference_epoch_bjd_tdb + n_orbits * period)
 
 
 def _planet_config(planet: str, ephemeris: str) -> dict[str, Any]:
@@ -92,8 +99,6 @@ def _load_single_arm(
     planet: str,
     *,
     prefer_molecfit: bool,
-    barycorr: bool,
-    introduced_shift: bool,
     regrid: bool,
     subtract_median: bool,
     run_sysrem: bool,
@@ -104,8 +109,6 @@ def _load_single_arm(
         planet_name=planet,
         do_molecfit=prefer_molecfit,
         data_dir=_raw_input_dir_for(planet, epoch),
-        barycentric_correction=barycorr,
-        apply_introduced_shift=introduced_shift if prefer_molecfit else False,
         regrid=regrid,
         subtract_median=subtract_median,
         run_sysrem=run_sysrem,
@@ -119,8 +122,6 @@ def _load_single_arm(
             planet_name=planet,
             do_molecfit=False,
             data_dir=_raw_input_dir_for(planet, epoch),
-            barycentric_correction=barycorr,
-            apply_introduced_shift=False,
             regrid=regrid,
             subtract_median=subtract_median,
             run_sysrem=run_sysrem,
@@ -140,8 +141,6 @@ def _load_data(
     epoch: str,
     planet: str,
     molecfit: bool,
-    barycorr: bool,
-    introduced_shift: bool,
     regrid: bool,
     subtract_median: bool,
     run_sysrem: bool,
@@ -153,18 +152,14 @@ def _load_data(
         )
 
     prefer_molecfit = molecfit
-    apply_introduced_shift = introduced_shift
     if arm == "blue":
         prefer_molecfit = False
-        apply_introduced_shift = False
 
     return _load_single_arm(
         arm,
         epoch,
         planet,
         prefer_molecfit=prefer_molecfit,
-        barycorr=barycorr,
-        introduced_shift=apply_introduced_shift,
         regrid=regrid,
         subtract_median=subtract_median,
         run_sysrem=run_sysrem,
@@ -361,11 +356,6 @@ def _apply_default_doppler_shadow(
     )
 
 
-def _sysrem_vdiag_from_sigma(sigma: np.ndarray) -> np.ndarray:
-    exposure_sigma = np.sqrt(np.mean(np.square(sigma), axis=1))
-    return 1.0 / np.clip(exposure_sigma, config.F32_FLOOR_RECIP, None)
-
-
 def _chunk_labels_from_indices(
     n_wave: int,
     chunk_indices: tuple[np.ndarray, ...],
@@ -410,21 +400,6 @@ def _sysrem_diagnostics_for_save(extras: dict[str, Any]) -> dict[str, np.ndarray
     }
 
 
-def _sysrem_chunk_vdiag_from_sigma(
-    sigma: np.ndarray,
-    chunk_indices: tuple[np.ndarray, ...],
-) -> np.ndarray:
-    sigma = np.asarray(sigma, dtype=float)
-    v_diag = []
-    for indices in chunk_indices:
-        chunk_sigma = sigma[:, np.asarray(indices, dtype=int)]
-        if chunk_sigma.shape[1] == 0:
-            v_diag.append(np.ones((sigma.shape[0],), dtype=float))
-        else:
-            v_diag.append(_sysrem_vdiag_from_sigma(chunk_sigma))
-    return np.asarray(v_diag, dtype=float)
-
-
 def _save_metadata(
     output_dir: Path,
     *,
@@ -435,7 +410,11 @@ def _save_metadata(
     phase_bin: str,
     t0: float,
     phase: np.ndarray,
+    source_phase: np.ndarray,
+    selected_exposure_indices: np.ndarray,
     jd: np.ndarray,
+    bjd_tdb: np.ndarray,
+    time_metadata: dict[str, Any],
     contacts: dict[str, float],
     subtract_median: bool,
     run_sysrem: bool,
@@ -449,6 +428,12 @@ def _save_metadata(
     contacts_serialized: dict[str, float] = {}
     for k, v in contacts.items():
         contacts_serialized[k] = float(v)
+    model_preprocessing_steps = ["active_exposure_mask"]
+    if subtract_median:
+        model_preprocessing_steps.append("time_median_subtraction")
+    if run_sysrem:
+        model_preprocessing_steps.append("frozen_per_pixel_sysrem")
+    model_preprocessing_steps.append("exposure_selection")
     metadata = {
         "planet": planet,
         "product_kind": product_kind,
@@ -456,12 +441,23 @@ def _save_metadata(
         "epoch": epoch,
         "arm": arm,
         "phase_bin": phase_bin,
-        "t0_bjd": float(t0),
+        "t0_bjd": float(t0),  # Backward-compatible alias; now explicitly BJD_TDB.
+        "t0_bjd_tdb": float(t0),
         "n_exposures": int(phase.size),
+        "n_source_exposures": int(source_phase.size),
+        "selected_exposure_indices": np.asarray(
+            selected_exposure_indices,
+            dtype=int,
+        ).tolist(),
+        "timeseries_operator_file": "timeseries_operator.npz",
+        "model_preprocessing": "_then_".join(model_preprocessing_steps),
         "phase_min": float(np.min(phase)),
         "phase_max": float(np.max(phase)),
         "jd_min": float(np.min(jd)),
         "jd_max": float(np.max(jd)),
+        "bjd_tdb_min": float(np.min(bjd_tdb)),
+        "bjd_tdb_max": float(np.max(bjd_tdb)),
+        "time": time_metadata,
         "contacts": contacts_serialized,
         "regrid": bool(regrid),
         "subtract_median": bool(subtract_median),
@@ -544,30 +540,6 @@ def create_parser() -> argparse.ArgumentParser:
         help="Use uncorrected files",
     )
     parser.add_argument(
-        "--barycorr",
-        action="store_true",
-        default=config.DEFAULT_BARYCORR,
-        help="Apply barycentric correction",
-    )
-    parser.add_argument(
-        "--no-barycorr",
-        action="store_false",
-        dest="barycorr",
-        help="Disable barycentric correction",
-    )
-    parser.add_argument(
-        "--introduced-shift",
-        action="store_true",
-        default=config.DEFAULT_INTRODUCED_SHIFT,
-        help="Apply epoch-specific Molecfit shift correction",
-    )
-    parser.add_argument(
-        "--no-introduced-shift",
-        action="store_false",
-        dest="introduced_shift",
-        help="Disable epoch-specific Molecfit shift correction",
-    )
-    parser.add_argument(
         "--regrid",
         action="store_true",
         default=True,
@@ -610,6 +582,11 @@ def _process_arm(
     ra = planet_cfg["RA"]
     dec = planet_cfg["Dec"]
     reference_epoch = planet_cfg["epoch"]
+    reference_epoch_bjd_tdb = get_ephemeris_epoch_bjd_tdb(
+        reference_epoch,
+        planet_cfg.get("epoch_scale"),
+        planet_cfg.get("epoch_reference"),
+    )
 
     print(f"\nLoading PEPSI {arm} data for {args.planet} ({args.epoch})...")
     collapse_source = args.product_kind == "collapse-source"
@@ -618,8 +595,6 @@ def _process_arm(
         epoch=args.epoch,
         planet=args.planet,
         molecfit=args.molecfit,
-        barycorr=args.barycorr,
-        introduced_shift=args.introduced_shift,
         regrid=args.regrid,
         subtract_median=False if collapse_source else args.subtract_median,
         run_sysrem=False if collapse_source else args.run_sysrem,
@@ -628,8 +603,25 @@ def _process_arm(
     wave, data, sigma, jd, snr, exptime, airmass, n_spectra, npix = result
     print(f"Loaded {n_spectra} exposures with {npix} pixels each before selection.")
 
-    t0 = _nearest_transit_midpoint(np.asarray(jd), reference_epoch, period)
-    phase = np.asarray(get_orbital_phase(np.asarray(jd), t0, period, ra, dec), dtype=float)
+    bjd_tdb, time_metadata = get_bjd_tdb(
+        np.asarray(jd),
+        ra,
+        dec,
+        header_bjd_tdb=extras.get("header_bjd_tdb"),
+        return_diagnostics=True,
+    )
+    time_metadata.update(
+        {
+            "raw_file": "jd.npy",
+            "canonical_file": "bjd_tdb.npy",
+            "ephemeris_epoch": float(reference_epoch),
+            "ephemeris_epoch_scale": str(planet_cfg["epoch_scale"]).lower(),
+            "ephemeris_epoch_reference": planet_cfg["epoch_reference"],
+            "ephemeris_epoch_bjd_tdb": reference_epoch_bjd_tdb,
+        }
+    )
+    t0 = _nearest_transit_midpoint(bjd_tdb, reference_epoch_bjd_tdb, period)
+    phase = np.asarray(get_orbital_phase(bjd_tdb, t0, period), dtype=float)
     wave_1d_full = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave, dtype=float)
     data = np.asarray(data, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
@@ -646,6 +638,7 @@ def _process_arm(
         source_rows = out_transit | full_transit
         phase = phase[source_rows]
         jd = np.asarray(jd)[source_rows]
+        bjd_tdb = np.asarray(bjd_tdb)[source_rows]
         snr = np.asarray(snr)[source_rows]
         exptime = np.asarray(exptime)[source_rows]
         airmass = np.asarray(airmass)[source_rows]
@@ -696,6 +689,27 @@ def _process_arm(
             planet_cfg=planet_cfg,
             subtract_median=args.subtract_median,
         )
+    source_phase = np.asarray(phase, dtype=float).copy()
+    source_bjd_tdb = np.asarray(bjd_tdb, dtype=float).copy()
+    source_data = np.asarray(data, dtype=float).copy()
+    source_sigma = np.asarray(sigma, dtype=float).copy()
+    contacts = compute_contact_phases(planet_cfg)
+    if collapse_source:
+        # The dedicated collapse source intentionally omits ingress and
+        # egress, so its active model rows are the retained T23 rows.
+        active_exposure_mask = (
+            (source_phase >= contacts["T2"])
+            & (source_phase <= contacts["T3"])
+        ).astype(float)
+    else:
+        # Ordinary preparation derives its temporal median and SYSREM basis
+        # from the complete exposure sequence. Preserve the pre-existing T14
+        # model support while adding zero-valued out-of-transit source rows;
+        # likelihood-row selection is replayed only after filtering.
+        active_exposure_mask = (
+            (source_phase >= contacts["T1"])
+            & (source_phase <= contacts["T4"])
+        ).astype(float)
     selection = _phase_selection_mask(
         phase,
         phase_bin=args.phase_bin,
@@ -705,9 +719,11 @@ def _process_arm(
         raise ValueError(
             f"No exposures selected for phase_bin={args.phase_bin} (arm={arm})."
         )
+    selected_exposure_indices = np.flatnonzero(selection).astype(int)
 
     phase = np.asarray(phase)[selection]
     jd = np.asarray(jd)[selection]
+    bjd_tdb = np.asarray(bjd_tdb)[selection]
     snr = np.asarray(snr)[selection]
     exptime = np.asarray(exptime)[selection]
     airmass = np.asarray(airmass)[selection]
@@ -738,8 +754,8 @@ def _process_arm(
     )
     column_indices = _valid_sorted_column_indices(
         wave_1d,
-        data,
-        sigma,
+        source_data,
+        source_sigma,
         arm=arm,
         planet=args.planet,
         mode="transmission",
@@ -748,6 +764,7 @@ def _process_arm(
     wave_1d = np.asarray(wave_1d, dtype=float)[column_indices]
     data = data[:, column_indices]
     sigma = sigma[:, column_indices]
+    source_sigma = source_sigma[:, column_indices]
     spectral_column_masking = {
         "n_input_columns": raw_n_columns,
         "n_output_columns": int(wave_1d.size),
@@ -771,9 +788,24 @@ def _process_arm(
     np.save(output_dir / "sigma.npy", sigma)
     np.save(output_dir / "phase.npy", phase)
     np.save(output_dir / "jd.npy", jd)
+    np.save(output_dir / "bjd_tdb.npy", bjd_tdb)
     np.save(output_dir / "snr.npy", snr)
     np.save(output_dir / "exptime.npy", exptime)
     np.save(output_dir / "airmass.npy", airmass)
+    np.savez_compressed(
+        output_dir / "timeseries_operator.npz",
+        schema_version=np.asarray(1, dtype=np.int32),
+        source_wavelength=wave_1d,
+        source_phase=source_phase,
+        source_bjd_tdb=source_bjd_tdb,
+        active_exposure_mask=active_exposure_mask,
+        selected_exposure_indices=selected_exposure_indices,
+        subtract_time_median=np.asarray(
+            False if collapse_source else args.subtract_median,
+            dtype=bool,
+        ),
+        has_sysrem=np.asarray(args.run_sysrem, dtype=bool),
+    )
     if args.run_sysrem and pre_sysrem_data is not None and pre_sysrem_sigma is not None:
         np.save(output_dir / "pre_sysrem_data.npy", pre_sysrem_data)
         np.save(output_dir / "pre_sysrem_sigma.npy", pre_sysrem_sigma)
@@ -782,18 +814,22 @@ def _process_arm(
         U_full = extras.get("U_sysrem")
         if U_full is None:
             raise ValueError("SYSREM requested but U_sysrem was not returned by preprocessing.")
-        U_full = np.asarray(U_full)[selection]
+        U_full = np.asarray(U_full)
+        if U_full.shape[0] != source_phase.size:
+            raise ValueError(
+                "SYSREM basis exposure axis does not match the frozen source "
+                f"sequence: {U_full.shape[0]} versus {source_phase.size}."
+            )
         chunk_names, chunk_indices, _ = get_sysrem_chunk_indices(wave_1d, arm)
         chunk_labels = _chunk_labels_from_indices(wave_1d.size, chunk_indices)
         basis_counts = _sysrem_basis_counts(U_full)
-        V_chunk_diag = _sysrem_chunk_vdiag_from_sigma(sigma, chunk_indices)
         sysrem_diagnostics = _sysrem_diagnostics_for_save(extras)
-        np.savez(
+        np.savez_compressed(
             output_dir / "U_sysrem.npz",
             U_sysrem=U_full,
             chunk_labels=chunk_labels,
             basis_counts=basis_counts,
-            V_chunk_diag=V_chunk_diag,
+            projection_sigma=source_sigma,
             chunk_names=np.asarray(chunk_names, dtype="U32"),
             **sysrem_diagnostics,
         )
@@ -823,7 +859,11 @@ def _process_arm(
         phase_bin=args.phase_bin,
         t0=t0,
         phase=phase,
+        source_phase=source_phase,
+        selected_exposure_indices=selected_exposure_indices,
         jd=jd,
+        bjd_tdb=bjd_tdb,
+        time_metadata=time_metadata,
         contacts=contacts,
         subtract_median=False if collapse_source else args.subtract_median,
         run_sysrem=args.run_sysrem,
@@ -846,6 +886,11 @@ def _process_arm(
     print(f"  data.npy: {data.shape}")
     print(f"  sigma.npy: {sigma.shape}")
     print(f"  phase.npy: {phase.shape} ({args.phase_bin})")
+    print(
+        "  timeseries_operator.npz: "
+        f"{source_phase.size} source rows -> {phase.size} likelihood rows"
+    )
+    print("  jd.npy: raw UTC JD-OBS; bjd_tdb.npy: canonical BJD_TDB")
     print(
         f"  Phase range: {float(np.min(phase)):.5f} to {float(np.max(phase)):.5f}; "
         f"wavelength range: {float(np.min(wave_1d)):.1f} to {float(np.max(wave_1d)):.1f} A"

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
+from astropy.table import Table
 from exojax.utils.grids import wav2nu
 
 
@@ -76,6 +77,43 @@ def parse_nasa_archive_tbl(
         units_by_col: dict of column -> unit string (may be empty)
     """
     path = Path(tbl_path)
+
+    # NASA Exoplanet Archive exports use the IPAC fixed-width table format.
+    # Let Astropy handle embedded spaces in string columns, lone ``\``
+    # separators, masked values, and the multi-row header.  The former
+    # whitespace-splitting parser could not read the archived files already in
+    # input/lrs because their author, URL, and note columns contain spaces.
+    try:
+        table = Table.read(path, format="ascii.ipac")
+    except (OSError, ValueError):
+        table = None
+
+    if table is not None:
+        metadata: dict[str, str] = {}
+        keywords = table.meta.get("keywords", {})
+        for key, payload in keywords.items():
+            value = payload.get("value") if isinstance(payload, dict) else payload
+            if value is not None:
+                metadata[str(key)] = str(value)
+
+        columns = list(table.colnames)
+        units_by_col = {
+            column: str(getattr(table[column], "unit", None) or "")
+            for column in columns
+        }
+        data_by_col: dict[str, list[float | str | None]] = {}
+        for column in columns:
+            values: list[float | str | None] = []
+            for value in table[column]:
+                if np.ma.is_masked(value):
+                    values.append(None)
+                elif isinstance(value, np.generic):
+                    values.append(value.item())
+                else:
+                    values.append(value)
+            data_by_col[column] = values
+        return metadata, columns, data_by_col, units_by_col
+
     lines = path.read_text().splitlines()
 
     metadata: dict[str, str] = {}
@@ -85,6 +123,8 @@ def parse_nasa_archive_tbl(
     for line in lines:
         stripped = line.strip()
         if not stripped:
+            continue
+        if stripped == "\\":
             continue
 
         meta = _parse_metadata_line(stripped)
@@ -143,6 +183,7 @@ def _select_value_column(columns: list[str], mode: str | None) -> str:
             "SPECTRANSDEP",
             "SPECTRANDEP",
             "SPECTRANSDEPTH",
+            "PL_TRANDEP",
             "SPECDEP",
         ]
 

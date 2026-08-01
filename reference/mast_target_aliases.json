@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "targets": {
+    "KELT-20b": {
+      "archive_target_names": [
+        "HD-185603",
+        "HD-185603B",
+        "KELT-20",
+        "HD-185603--KELT-20",
+        "HD 185603b"
+      ]
+    },
+    "KELT-9b": {
+      "archive_target_names": [
+        "HD-195689",
+        "KELT-9",
+        "HD-195689--KELT-9",
+        "HD 195689"
+      ]
+    },
+    "MASCARA-1b": {
+      "archive_target_names": [
+        "HD-201585",
+        "HD-201585--MASCARA-1",
+        "HD 201585b"
+      ]
+    },
+    "TOI-1431b": {
+      "archive_target_names": [
+        "TOI-1431",
+        "MASCARA-5",
+        "HD-201033",
+        "HD 201033"
+      ]
+    },
+    "TOI-1518b": {
+      "archive_target_names": [
+        "TOI-1518",
+        "TIC-427761355",
+        "TIC 427761355"
+      ]
+    },
+    "WASP-189b": {
+      "archive_target_names": [
+        "WASP-189",
+        "HD-133112",
+        "HD 133112"
+      ]
+    },
+    "WASP-33b": {
+      "archive_target_names": [
+        "WASP-33",
+        "HD-15082",
+        "HD-15082--WASP-33",
+        "HD 15082"
+      ]
+    }
+  }
+}

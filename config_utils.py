@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import json
 import os
 import platform
 from datetime import datetime
@@ -135,6 +137,29 @@ def get_pressure_bounds_for_mode(mode: str | None = None) -> tuple[float, float]
         config.EMISSION_PRESSURE_TOP,
         config.EMISSION_PRESSURE_BTM,
     )
+
+
+def get_transmission_reference_pressure_bar() -> float:
+    """Return and validate the adopted transmission radius reference pressure.
+
+    The reference radius is passed to ExoJAX as ``radius_btm``.  Requiring the
+    adopted reference pressure to equal the configured transmission lower
+    boundary makes that radius-pressure association explicit and prevents a
+    pressure-grid change from silently changing the meaning of the radius.
+    """
+    reference_pressure_bar = float(config.TRANSMISSION_REFERENCE_PRESSURE_BAR)
+    _, pressure_btm = get_pressure_bounds_for_mode("transmission")
+    if not math.isfinite(reference_pressure_bar) or reference_pressure_bar <= 0.0:
+        raise ValueError(
+            "TRANSMISSION_REFERENCE_PRESSURE_BAR must be a finite positive pressure"
+        )
+    if not math.isclose(reference_pressure_bar, pressure_btm, rel_tol=1e-12, abs_tol=0.0):
+        raise ValueError(
+            "Transmission reference pressure must equal the transmission pressure "
+            f"lower boundary: P_ref={reference_pressure_bar:g} bar, "
+            f"P_btm={pressure_btm:g} bar"
+        )
+    return reference_pressure_bar
 
 
 def get_pt_profile_default_for_mode(mode: str | None = None) -> str:
@@ -503,7 +528,6 @@ def save_run_config(
     seed: int,
     chemistry_model: str | None = None,
     epoch: str | list[str] | tuple[str, ...] | None = None,
-    phoenix_spectrum_path: str | None = None,
     phoenix_cache_dir: str | None = None,
     save_mcmc_diagnostics: bool = True,
     sigma_scale: float = 1.0,
@@ -512,12 +536,32 @@ def save_run_config(
     diagnostic_label: str | None = None,
     apply_sysrem_override: bool | None = None,
     emission_selection: str | None = None,
+    reference_pressure_bar: float | None = None,
+    retrieval_intent: dict | None = None,
+    model_param_overrides: dict[str, float] | None = None,
 ) -> None:
     """Save run configuration to log file."""
     import jax
 
     log_path = os.path.join(output_dir, "run_config.log")
-    params = get_params()
+    params = dict(get_params())
+    if model_param_overrides:
+        params.update(model_param_overrides)
+    normalized_mode = _normalize_retrieval_mode(mode)
+    if normalized_mode == "transmission":
+        expected_reference_pressure_bar = get_transmission_reference_pressure_bar()
+        if reference_pressure_bar is None:
+            reference_pressure_bar = expected_reference_pressure_bar
+        elif not math.isclose(
+            float(reference_pressure_bar),
+            expected_reference_pressure_bar,
+            rel_tol=1e-12,
+            abs_tol=0.0,
+        ):
+            raise ValueError(
+                "reference_pressure_bar must equal the configured transmission "
+                f"boundary ({expected_reference_pressure_bar:g} bar)"
+            )
 
     epoch_values: list[str] = []
     if epoch is None:
@@ -572,14 +616,35 @@ def save_run_config(
         f.write(f"Mode: {mode}\n")
         f.write(f"Config profile: {get_runtime_profile_name()}\n")
         f.write(f"P-T profile: {pt_profile}\n")
+        if normalized_mode == "transmission":
+            f.write("Radius convention: adopted reference-radius prior\n")
+            f.write(f"R_ref prior center: {params['R_p']} R_J\n")
+            f.write(f"R_ref prior width: {params['R_p_err']} R_J\n")
+            f.write(f"Reference pressure P_ref: {reference_pressure_bar:g} bar\n")
+            f.write(
+                "RT radius input: R_ref passed as radius_btm at P_ref\n"
+            )
+            f.write(
+                "Interpretation: adopted modeling convention; not a direct "
+                "measurement of R_1bar\n"
+            )
         if diagnostic_label is not None:
             f.write(f"Diagnostic label: {diagnostic_label}\n")
         if chemistry_model is not None:
             f.write(f"Chemistry model: {chemistry_model}\n")
-        if phoenix_spectrum_path is not None:
-            f.write(f"PHOENIX spectrum: {phoenix_spectrum_path}\n")
-        if phoenix_cache_dir is not None:
-            f.write(f"PHOENIX cache dir: {phoenix_cache_dir}\n")
+        if retrieval_intent is not None:
+            f.write("Resolved retrieval intent (JSON):\n")
+            f.write(json.dumps(retrieval_intent, indent=2, sort_keys=True))
+            f.write("\n")
+        if mode == "emission":
+            f.write("PHOENIX spectrum source: auto-fetch/cache\n")
+            f.write(
+                f"PHOENIX cache dir: {phoenix_cache_dir or config.PHOENIX_CACHE_DIR}\n"
+            )
+            f.write("PHOENIX stellar rotation: applied by retrieval\n")
+            f.write("PHOENIX instrumental profile: applied by retrieval\n")
+            f.write(f"Stellar v sin(i): {params.get('v_sini_star')} km/s\n")
+            f.write("Stellar denominator velocity: 0 km/s\n")
         f.write(f"Output directory: {output_dir}\n\n")
 
         f.write("SPECTRAL SETUP\n")
@@ -602,6 +667,8 @@ def save_run_config(
         pressure_top, pressure_btm = get_pressure_bounds_for_mode(mode)
         f.write(f"Layers: {config.NLAYER}\n")
         f.write(f"Pressure range: {pressure_top:.2e} - {pressure_btm:.2e} bar\n")
+        if normalized_mode == "transmission":
+            f.write(f"Reference pressure equals RT lower boundary: {reference_pressure_bar:g} bar\n")
         f.write(f"Temperature range: {config.T_LOW} - {config.T_HIGH} K\n")
         f.write(f"Cloud width: {config.CLOUD_WIDTH}\n")
         f.write(f"Cloud integrated tau: {config.CLOUD_INTEGRATED_TAU}\n\n")

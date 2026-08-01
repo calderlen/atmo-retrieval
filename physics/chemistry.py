@@ -53,6 +53,49 @@ logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SOLAR_ABUNDANCE_FILE = _REPO_ROOT / chem_config.SOLAR_ABUNDANCE_FILE
+K_B_CGS = 1.380649e-16
+FASTCHEM_GRID_SCHEMA = "v5_particle_vmr_log_mmw"
+FASTCHEM_PARTICLE_SUM_RTOL = 5.0e-3
+FASTCHEM_PARTICLE_SUM_ATOL = 5.0e-6
+
+
+def gas_particle_density(
+    pressure_bar: np.ndarray,
+    temperature_k: np.ndarray,
+) -> np.ndarray:
+    """Ideal-gas particle number density in cm^-3 for pressure in bar."""
+    pressure = np.asarray(pressure_bar, dtype=np.float64)
+    temperature = np.asarray(temperature_k, dtype=np.float64)
+    if np.any(~np.isfinite(pressure)) or np.any(pressure <= 0.0):
+        raise ValueError("FastChem pressure values must be finite and positive.")
+    if np.any(~np.isfinite(temperature)) or np.any(temperature <= 0.0):
+        raise ValueError("FastChem temperature values must be finite and positive.")
+    return pressure * 1.0e6 / (K_B_CGS * temperature)
+
+
+def _validate_cached_log_vmr(grid: np.ndarray, label: str) -> None:
+    log_vmr = np.asarray(grid, dtype=np.float64)
+    log_floor = np.log10(numerics_config.TRACE_SPECIES_FLOOR)
+    log_upper = np.log10(1.0 + FASTCHEM_PARTICLE_SUM_RTOL + FASTCHEM_PARTICLE_SUM_ATOL)
+    if (
+        np.any(~np.isfinite(log_vmr))
+        or np.any(log_vmr < log_floor - 1.0e-12)
+        or np.any(log_vmr > log_upper)
+    ):
+        raise RuntimeError(f"Invalid cached FastChem log-VMR grid '{label}'.")
+
+
+def _save_npz_atomic(cache_file: Path, values: dict[str, np.ndarray]) -> None:
+    """Publish a completed cache in one rename, never as a partial final file."""
+    temporary_file = cache_file.with_name(
+        f".{cache_file.stem}.{os.getpid()}.tmp.npz"
+    )
+    try:
+        np.savez_compressed(temporary_file, **values)
+        os.replace(temporary_file, cache_file)
+    finally:
+        if temporary_file.exists():
+            temporary_file.unlink()
 
 
 @lru_cache(maxsize=1)
@@ -280,6 +323,8 @@ _FASTCHEM_SPECIES_MAP: dict[str, str] = {
     "H-": "H1-",
     "e-": "e-",
     "H": "H",
+    "H2": "H2",
+    "He": "He",
     # Neutral atoms ("X I" → "X")
     "Fe": "Fe", "Fe I": "Fe",
     "Na": "Na", "Na I": "Na",
@@ -490,7 +535,7 @@ class FreeVMR:
 #class DisequilibriumChemistry:
 #    pass
 
-#class ParametricMetallicityCOChemistry(CompositionSolver):
+class ParametricMetallicityCOChemistry(CompositionSolver):
 #    """Simple equilibrium-like chemistry with [M/H] and C/O as free parameters."""
 
     def __init__(
@@ -636,8 +681,10 @@ class FreeVMR:
             mmw_profile=mmw_profile,
             continuum_vmr_profiles={},
         )
+
+
 class FastChemEquilibriumChemistry(CompositionSolver):
-    """Equilibrium chemistry via FastChem2.
+    """Equilibrium chemistry via FastChem.
 
     Pre-computes a 2D VMR grid over (T, P) at grid-build time,
     then interpolates that grid in pure JAX during sampling.
@@ -657,16 +704,17 @@ class FastChemEquilibriumChemistry(CompositionSolver):
         self.fastchem_parameter_file = fastchem_parameter_file
         self.log_metallicity = float(log_metallicity)
         self.co_ratio = float(co_ratio)
-        self.n_temp = n_temp
-        self.n_pressure = n_pressure
-        self.t_min = t_min
-        self.t_max = t_max
+        self.n_temp = int(n_temp)
+        self.n_pressure = int(n_pressure)
+        self.t_min = float(t_min)
+        self.t_max = float(t_max)
         self.cache_dir = Path(cache_dir)
 
         # Grid axes (P axis set at build time from art.pressure)
-        self._T_grid = np.linspace(t_min, t_max, n_temp)
+        self._T_grid = np.linspace(self.t_min, self.t_max, self.n_temp)
 
         # Populated by build_grid()
+        # VMR grids are stored as log10(VMR); MMW remains linear.
         self._vmr_grids: dict[str, jnp.ndarray] | None = None
         self._mmw_grid: jnp.ndarray | None = None
         self._log_P_grid: np.ndarray | None = None
@@ -682,12 +730,109 @@ class FastChemEquilibriumChemistry(CompositionSolver):
         output_data = pyfastchem.FastChemOutput()
         input_data.temperature = T_flat.tolist()
         input_data.pressure = P_flat.tolist()
-        fc.calcDensities(input_data, output_data)
+        fastchem_flag = fc.calcDensities(input_data, output_data)
+        self._validate_fastchem_output(
+            output_data,
+            T_flat,
+            P_flat,
+            fastchem_flag,
+        )
         return output_data
+
+    def _validate_fastchem_output(
+        self,
+        output_data: pyfastchem.FastChemOutput,
+        temperature_k: np.ndarray,
+        pressure_bar: np.ndarray,
+        overall_flag: int,
+    ) -> None:
+        """Reject an incomplete or physically inconsistent FastChem run."""
+        expected_points = np.asarray(temperature_k).size
+        success_flag = getattr(pyfastchem, "FASTCHEM_SUCCESS", 0)
+        if overall_flag != success_flag:
+            raise RuntimeError(
+                "FastChem grid calculation failed with status "
+                f"{overall_flag!r} (success is {success_flag!r})."
+            )
+
+        point_flags = np.asarray(
+            getattr(output_data, "fastchem_flag", []),
+            dtype=np.int64,
+        )
+        if point_flags.shape != (expected_points,):
+            raise RuntimeError(
+                "FastChem returned an unexpected status shape: "
+                f"{point_flags.shape}; expected ({expected_points},)."
+            )
+        if np.any(point_flags != success_flag):
+            bad = int(np.flatnonzero(point_flags != success_flag)[0])
+            raise RuntimeError(
+                "FastChem did not converge at grid point "
+                f"{bad} (T={temperature_k[bad]:.3f} K, "
+                f"P={pressure_bar[bad]:.6e} bar, status={point_flags[bad]})."
+            )
+
+        element_conserved = np.asarray(
+            getattr(output_data, "element_conserved", []),
+        )
+        if element_conserved.ndim < 1 or element_conserved.shape[0] != expected_points:
+            raise RuntimeError(
+                "FastChem returned an unexpected element-conservation shape: "
+                f"{element_conserved.shape}; expected first dimension {expected_points}."
+            )
+        if not np.all(element_conserved == 1):
+            bad = int(np.flatnonzero(element_conserved.reshape(-1) != 1)[0])
+            raise RuntimeError(
+                "FastChem failed its element-conservation check "
+                f"(first failed entry {bad})."
+            )
+
+        number_densities = np.asarray(output_data.number_densities, dtype=np.float64)
+        if number_densities.ndim != 2 or number_densities.shape[0] != expected_points:
+            raise RuntimeError(
+                "FastChem returned an unexpected number-density shape: "
+                f"{number_densities.shape}; expected ({expected_points}, n_species)."
+            )
+        if np.any(~np.isfinite(number_densities)) or np.any(number_densities < 0.0):
+            raise RuntimeError("FastChem returned non-finite or negative gas number densities.")
+
+        element_density = np.asarray(
+            output_data.total_element_density,
+            dtype=np.float64,
+        )
+        if (
+            element_density.shape != (expected_points,)
+            or np.any(~np.isfinite(element_density))
+            or np.any(element_density < 0.0)
+        ):
+            raise RuntimeError("FastChem returned invalid total element densities.")
+
+        mmw = np.asarray(output_data.mean_molecular_weight, dtype=np.float64)
+        if mmw.shape != (expected_points,) or np.any(~np.isfinite(mmw)) or np.any(mmw <= 0.0):
+            raise RuntimeError(
+                "FastChem returned an invalid mean-molecular-weight profile "
+                f"with shape {mmw.shape}."
+            )
+
+        particle_density = gas_particle_density(pressure_bar, temperature_k)
+        summed_vmr = np.sum(number_densities, axis=1) / particle_density
+        consistent = np.isclose(
+            summed_vmr,
+            1.0,
+            rtol=FASTCHEM_PARTICLE_SUM_RTOL,
+            atol=FASTCHEM_PARTICLE_SUM_ATOL,
+        )
+        if not np.all(consistent):
+            bad = int(np.flatnonzero(~consistent)[0])
+            raise RuntimeError(
+                "FastChem gas-species number densities are inconsistent with P/(k_B T): "
+                f"sum(VMR)={summed_vmr[bad]:.8g} at T={temperature_k[bad]:.3f} K, "
+                f"P={pressure_bar[bad]:.6e} bar. The grid was not cached."
+            )
 
     def _cache_key(self, pressure_bar: np.ndarray, species_names: list[str]) -> str:
         h = hashlib.sha256()
-        h.update("v3_bar_pressure".encode())
+        h.update(FASTCHEM_GRID_SCHEMA.encode())
         h.update(f"T:{self.n_temp},{self.t_min},{self.t_max}".encode())
         h.update(f"P:{pressure_bar.size},{pressure_bar.min():.6e},{pressure_bar.max():.6e}".encode())
         h.update(f"MH:{self.log_metallicity:.6f}".encode())
@@ -718,14 +863,21 @@ class FastChemEquilibriumChemistry(CompositionSolver):
         # Try loading from cache
         if cache_file.exists():
             logger.info("Loading FastChem grid from cache: %s", cache_file)
-            data = np.load(cache_file, allow_pickle=True)
+            data = np.load(cache_file, allow_pickle=False)
+            if data["schema"].item() != FASTCHEM_GRID_SCHEMA:
+                raise RuntimeError(f"Unexpected FastChem cache schema in '{cache_file}'.")
             self._vmr_grids = {}
             for name in species_names:
-                key = f"vmr_{name}"
+                key = f"log_vmr_{name}"
                 if key in data:
+                    _validate_cached_log_vmr(data[key], key)
                     self._vmr_grids[name] = jnp.array(data[key])
-            self._vmr_grids["H2"] = jnp.array(data["vmr_H2"])
-            self._vmr_grids["He"] = jnp.array(data["vmr_He"])
+            for key in ("log_vmr_H2", "log_vmr_He"):
+                _validate_cached_log_vmr(data[key], key)
+            if np.any(~np.isfinite(data["mmw"])) or np.any(data["mmw"] <= 0.0):
+                raise RuntimeError("Invalid cached FastChem MMW grid.")
+            self._vmr_grids["H2"] = jnp.array(data["log_vmr_H2"])
+            self._vmr_grids["He"] = jnp.array(data["log_vmr_He"])
             self._mmw_grid = jnp.array(data["mmw"])
             self._species_built = list(species_names)
             return
@@ -769,6 +921,10 @@ class FastChemEquilibriumChemistry(CompositionSolver):
         # H2 and He indices
         idx_H2 = fc.getGasSpeciesIndex("H2")
         idx_He = fc.getGasSpeciesIndex("He")
+        if idx_H2 == pyfastchem.FASTCHEM_UNKNOWN_SPECIES:
+            raise RuntimeError("FastChem does not provide the required H2 gas species.")
+        if idx_He == pyfastchem.FASTCHEM_UNKNOWN_SPECIES:
+            raise RuntimeError("FastChem does not provide the required He gas species.")
 
         n_T = self.n_temp
         n_P = self.n_pressure
@@ -808,24 +964,30 @@ class FastChemEquilibriumChemistry(CompositionSolver):
         # Run FastChem
         output_data = self._run_fastchem(fc, T_flat, P_flat)
 
-        # Extract number densities → VMR
+        # Extract number densities → particle VMR. FastChem's
+        # total_element_density is an elemental-nuclei diagnostic, not the
+        # total gas-particle density that belongs in a VMR denominator.
         n_densities = np.array(output_data.number_densities)
         # n_densities shape: (n_T*n_P, n_species)
-        total_n = np.array(output_data.total_element_density)
-        # total_n shape: (n_T*n_P,)
+        total_n = gas_particle_density(P_flat, T_flat)
 
-        # VMR = n_species / n_total
+        # Store log10 VMR so interpolation preserves trace-species structure
+        # over many orders of magnitude.
         for name, sp_idx in fc_species_idx.items():
-            vmr = n_densities[:, sp_idx] / np.clip(total_n, numerics_config.F64_FLOOR, None)
-            vmr_grids_np[name][:, :] = vmr.reshape(n_T, n_P)
+            vmr = n_densities[:, sp_idx] / total_n
+            vmr_grids_np[name][:, :] = np.log10(
+                np.maximum(vmr, numerics_config.TRACE_SPECIES_FLOOR)
+            ).reshape(n_T, n_P)
 
-        if idx_H2 != pyfastchem.FASTCHEM_UNKNOWN_SPECIES:
-            vmr = n_densities[:, idx_H2] / np.clip(total_n, numerics_config.F64_FLOOR, None)
-            vmr_H2_grid[:, :] = vmr.reshape(n_T, n_P)
+        vmr = n_densities[:, idx_H2] / total_n
+        vmr_H2_grid[:, :] = np.log10(
+            np.maximum(vmr, numerics_config.TRACE_SPECIES_FLOOR)
+        ).reshape(n_T, n_P)
 
-        if idx_He != pyfastchem.FASTCHEM_UNKNOWN_SPECIES:
-            vmr = n_densities[:, idx_He] / np.clip(total_n, numerics_config.F64_FLOOR, None)
-            vmr_He_grid[:, :] = vmr.reshape(n_T, n_P)
+        vmr = n_densities[:, idx_He] / total_n
+        vmr_He_grid[:, :] = np.log10(
+            np.maximum(vmr, numerics_config.TRACE_SPECIES_FLOOR)
+        ).reshape(n_T, n_P)
 
         mmw_arr = np.array(output_data.mean_molecular_weight)
         mmw_grid_np[:, :] = mmw_arr.reshape(n_T, n_P)
@@ -839,12 +1001,13 @@ class FastChemEquilibriumChemistry(CompositionSolver):
 
         # Save to cache
         save_dict = {
-            f"vmr_{name}": np.asarray(g) for name, g in vmr_grids_np.items()
+            f"log_vmr_{name}": np.asarray(g) for name, g in vmr_grids_np.items()
         }
-        save_dict["vmr_H2"] = np.asarray(vmr_H2_grid)
-        save_dict["vmr_He"] = np.asarray(vmr_He_grid)
+        save_dict["schema"] = np.asarray(FASTCHEM_GRID_SCHEMA)
+        save_dict["log_vmr_H2"] = np.asarray(vmr_H2_grid)
+        save_dict["log_vmr_He"] = np.asarray(vmr_He_grid)
         save_dict["mmw"] = np.asarray(mmw_grid_np)
-        np.savez_compressed(cache_file, **save_dict)
+        _save_npz_atomic(cache_file, save_dict)
         logger.info("FastChem grid saved to cache: %s", cache_file)
 
     def _interp_2d(
@@ -879,6 +1042,14 @@ class FastChemEquilibriumChemistry(CompositionSolver):
         )
         return result
 
+    def _interp_2d_log_vmr(
+        self,
+        log_vmr_grid: jnp.ndarray,
+        Tarr: jnp.ndarray,
+        log_P: jnp.ndarray,
+    ) -> jnp.ndarray:
+        return jnp.power(10.0, self._interp_2d(log_vmr_grid, Tarr, log_P))
+
     def sample(
         self,
         mol_names: list[str],
@@ -907,7 +1078,7 @@ class FastChemEquilibriumChemistry(CompositionSolver):
         vmr_mols_profiles = []
         for mol in mol_names:
             if mol in self._vmr_grids:
-                vmr_prof = self._interp_2d(self._vmr_grids[mol], Tarr, log_P)
+                vmr_prof = self._interp_2d_log_vmr(self._vmr_grids[mol], Tarr, log_P)
             else:
                 vmr_prof = jnp.full(n_layers, numerics_config.TRACE_SPECIES_FLOOR)
             vmr_mols_profiles.append(vmr_prof)
@@ -915,14 +1086,14 @@ class FastChemEquilibriumChemistry(CompositionSolver):
         vmr_atoms_profiles = []
         for atom in atom_names:
             if atom in self._vmr_grids:
-                vmr_prof = self._interp_2d(self._vmr_grids[atom], Tarr, log_P)
+                vmr_prof = self._interp_2d_log_vmr(self._vmr_grids[atom], Tarr, log_P)
             else:
                 vmr_prof = jnp.full(n_layers, numerics_config.TRACE_SPECIES_FLOOR)
             vmr_atoms_profiles.append(vmr_prof)
 
         # H2 and He profiles
-        vmrH2_profile = self._interp_2d(self._vmr_grids["H2"], Tarr, log_P)
-        vmrHe_profile = self._interp_2d(self._vmr_grids["He"], Tarr, log_P)
+        vmrH2_profile = self._interp_2d_log_vmr(self._vmr_grids["H2"], Tarr, log_P)
+        vmrHe_profile = self._interp_2d_log_vmr(self._vmr_grids["He"], Tarr, log_P)
 
         # MMW profile
         mmw_profile = self._interp_2d(self._mmw_grid, Tarr, log_P)
@@ -991,7 +1162,13 @@ class FastChemEquilibriumCondensationChemistry(FastChemEquilibriumChemistry):
         input_data.pressure = P_flat.tolist()
         input_data.equilibrium_condensation = self.equilibrium_condensation
         input_data.rainout_condensation = self.rainout_condensation
-        fc.calcDensities(input_data, output_data)
+        fastchem_flag = fc.calcDensities(input_data, output_data)
+        self._validate_fastchem_output(
+            output_data,
+            T_flat,
+            P_flat,
+            fastchem_flag,
+        )
         return output_data
 
 
@@ -1045,7 +1222,9 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
             self.co_ratio_range[1],
             self.n_co_ratio,
         )
+        # Hybrid VMR grids are also stored as log10(VMR).
         self._hybrid_vmr_grids: dict[str, jnp.ndarray] | None = None
+        self._hybrid_mmw_grid: jnp.ndarray | None = None
         self._hybrid_species_built: list[str] | None = None
 
         self._free_solver = ConstantVMR(
@@ -1085,7 +1264,7 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
 
     def _hybrid_cache_key(self, pressure_bar: np.ndarray, species_names: list[str]) -> str:
         h = hashlib.sha256()
-        h.update("v3_bar_pressure".encode())
+        h.update(FASTCHEM_GRID_SCHEMA.encode())
         h.update(f"T:{self.n_temp},{self.t_min},{self.t_max}".encode())
         h.update(f"P:{pressure_bar.size},{pressure_bar.min():.6e},{pressure_bar.max():.6e}".encode())
         h.update(
@@ -1178,12 +1357,30 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
 
         if cache_file.exists():
             logger.info("Loading FastChem hybrid grid from cache: %s", cache_file)
-            data = np.load(cache_file, allow_pickle=True)
+            data = np.load(cache_file, allow_pickle=False)
+            if data["schema"].item() != FASTCHEM_GRID_SCHEMA:
+                raise RuntimeError(
+                    f"Unexpected FastChem hybrid cache schema in '{cache_file}'."
+                )
             self._hybrid_vmr_grids = {}
             for name in species_names:
-                key = f"vmr_{name}"
-                if key in data:
-                    self._hybrid_vmr_grids[name] = jnp.array(data[key])
+                key = f"log_vmr_{name}"
+                if key not in data:
+                    raise RuntimeError(
+                        f"FastChem hybrid cache '{cache_file}' is missing '{key}'."
+                    )
+                _validate_cached_log_vmr(data[key], key)
+                self._hybrid_vmr_grids[name] = jnp.array(data[key])
+            if "mmw_grid" not in data:
+                raise RuntimeError(
+                    f"FastChem hybrid cache '{cache_file}' is missing 'mmw_grid'."
+                )
+            mmw_grid = np.asarray(data["mmw_grid"], dtype=np.float64)
+            if np.any(~np.isfinite(mmw_grid)) or np.any(mmw_grid <= 0.0):
+                raise RuntimeError(
+                    f"FastChem hybrid cache '{cache_file}' has an invalid MMW grid."
+                )
+            self._hybrid_mmw_grid = jnp.array(mmw_grid)
             self._hybrid_species_built = list(species_names)
             return
 
@@ -1203,16 +1400,19 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         solar_abundances = np.array([fc.getElementAbundance(i) for i in range(n_elements)])
 
         fc_species_idx = self._resolve_fastchem_species_indices(fc, species_names)
-        if not fc_species_idx:
-            self._hybrid_vmr_grids = {}
-            self._hybrid_species_built = list(species_names)
-            return
+        missing_species = sorted(set(species_names) - set(fc_species_idx))
+        if missing_species:
+            raise RuntimeError(
+                "FastChem hybrid grid is missing required species mappings: "
+                + ", ".join(missing_species)
+            )
 
         grid_shape = (self.n_metallicity, self.n_co_ratio, self.n_temp, self.n_pressure)
         vmr_grids_np: dict[str, np.ndarray] = {
             name: np.zeros(grid_shape, dtype=np.float64)
             for name in fc_species_idx
         }
+        mmw_grid_np = np.zeros(grid_shape, dtype=np.float64)
 
         t_flat = np.repeat(self._T_grid, self.n_pressure)
         # pyFastChem expects pressure in bar here as well.
@@ -1232,28 +1432,33 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
 
                 output_data = self._run_fastchem(fc, t_flat, p_flat)
                 n_densities = np.array(output_data.number_densities)
-                total_n = np.clip(
-                    np.array(output_data.total_element_density),
-                    numerics_config.F64_FLOOR,
-                    None,
-                )
+                total_n = gas_particle_density(p_flat, t_flat)
+                mmw_grid_np[i_mh, i_co, :, :] = np.asarray(
+                    output_data.mean_molecular_weight,
+                    dtype=np.float64,
+                ).reshape(self.n_temp, self.n_pressure)
 
                 for name, sp_idx in fc_species_idx.items():
                     vmr = n_densities[:, sp_idx] / total_n
-                    vmr_grids_np[name][i_mh, i_co, :, :] = vmr.reshape(self.n_temp, self.n_pressure)
+                    vmr_grids_np[name][i_mh, i_co, :, :] = np.log10(
+                        np.maximum(vmr, numerics_config.TRACE_SPECIES_FLOOR)
+                    ).reshape(self.n_temp, self.n_pressure)
 
         self._hybrid_vmr_grids = {name: jnp.array(g) for name, g in vmr_grids_np.items()}
+        self._hybrid_mmw_grid = jnp.array(mmw_grid_np)
         self._hybrid_species_built = list(species_names)
 
         save_dict = {
+            "schema": np.asarray(FASTCHEM_GRID_SCHEMA),
             "log_metallicity_grid": np.asarray(self._log_metallicity_grid),
             "co_ratio_grid": np.asarray(self._co_ratio_grid),
             "T_grid": np.asarray(self._T_grid),
             "log_P_grid": np.asarray(self._log_P_grid),
+            "mmw_grid": mmw_grid_np,
         }
         for name, grid in vmr_grids_np.items():
-            save_dict[f"vmr_{name}"] = np.asarray(grid)
-        np.savez_compressed(cache_file, **save_dict)
+            save_dict[f"log_vmr_{name}"] = np.asarray(grid)
+        _save_npz_atomic(cache_file, save_dict)
         logger.info("FastChem hybrid grid saved to cache: %s", cache_file)
 
     def _interp_4d(
@@ -1305,6 +1510,25 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
                         idx_p = i_p + d_p
                         result = result + (w0 * w1 * w2 * w3) * grid[idx_mh, idx_co, idx_t, idx_p]
         return result
+
+    def _interp_4d_log_vmr(
+        self,
+        log_vmr_grid: jnp.ndarray,
+        log_metallicity: jnp.ndarray,
+        co_ratio: jnp.ndarray,
+        Tarr: jnp.ndarray,
+        log_P: jnp.ndarray,
+    ) -> jnp.ndarray:
+        return jnp.power(
+            10.0,
+            self._interp_4d(
+                log_vmr_grid,
+                log_metallicity,
+                co_ratio,
+                Tarr,
+                log_P,
+            ),
+        )
 
     def sample(
         self,
@@ -1382,7 +1606,7 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
             overrides = {}
             for species in needed:
                 if species in self._hybrid_vmr_grids:
-                    overrides[species] = self._interp_4d(
+                    overrides[species] = self._interp_4d_log_vmr(
                         self._hybrid_vmr_grids[species],
                         log_metallicity,
                         co_ratio,
@@ -1463,6 +1687,134 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
             vmrH2=vmrH2,
             vmrHe=vmrHe,
             mmw=mmw,
+            mmr_mols=mmr_mols,
+            mmr_atoms=mmr_atoms,
+            vmrH2_profile=vmrH2_profile,
+            vmrHe_profile=vmrHe_profile,
+            mmw_profile=mmw_profile,
+            continuum_vmr_profiles=continuum_profile_map,
+        )
+
+
+class FastChemMetallicityEquilibriumChemistry(FastChemHybridChemistry):
+    """FastChem equilibrium chemistry with free metallicity and fixed C/O.
+
+    Unlike :class:`FastChemHybridChemistry`, every requested line species is
+    taken from the FastChem grid.  No independent ``logVMR_*`` sites are
+    created, which keeps the equilibrium and free-abundance retrieval families
+    mutually exclusive.  For an Fe-only line list, ``log_metallicity`` is also
+    exposed as the deterministic ``Fe_H`` quantity requested by the run plan.
+    """
+
+    def __init__(
+        self,
+        *args,
+        fixed_co_ratio: float = SOLAR_ELEMENT_ABUNDANCES["C"]
+        / SOLAR_ELEMENT_ABUNDANCES["O"],
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if not np.isfinite(fixed_co_ratio) or fixed_co_ratio <= 0.0:
+            raise ValueError("fixed_co_ratio must be finite and positive.")
+        self.fixed_co_ratio = float(fixed_co_ratio)
+
+    def sample(
+        self,
+        mol_names: list[str],
+        mol_masses: list[float],
+        atom_names: list[str],
+        atom_masses: list[float],
+        art: object,
+        Tarr: jnp.ndarray | None = None,
+    ) -> CompositionState:
+        if Tarr is None:
+            T_mid = (self.t_min + self.t_max) / 2.0
+            Tarr = jnp.full(art.pressure.shape, T_mid)
+
+        log_metallicity = numpyro.sample(
+            "log_metallicity",
+            dist.Uniform(self.metallicity_range[0], self.metallicity_range[1]),
+        )
+        numpyro.deterministic("Fe_H", log_metallicity)
+        co_ratio = jnp.asarray(self.fixed_co_ratio)
+        numpyro.deterministic("C_O_ratio_fixed", co_ratio)
+
+        canonical_line_species = {
+            name: self._canonical_species_name(name)
+            for name in list(mol_names) + list(atom_names)
+        }
+        needed = list(
+            dict.fromkeys(
+                list(canonical_line_species.values())
+                + list(self.hidden_continuum_species())
+                + ["H2", "He"]
+            )
+        )
+        if (
+            self._hybrid_vmr_grids is None
+            or self._hybrid_mmw_grid is None
+            or any(name not in self._hybrid_vmr_grids for name in needed)
+        ):
+            self._build_hybrid_grid(np.asarray(art.pressure), needed)
+
+        log_P = jnp.log10(art.pressure)
+        profiles = {
+            species: self._interp_4d_log_vmr(
+                self._hybrid_vmr_grids[species],
+                log_metallicity,
+                co_ratio,
+                Tarr,
+                log_P,
+            )
+            for species in needed
+        }
+        mmw_profile = self._interp_4d(
+            self._hybrid_mmw_grid,
+            log_metallicity,
+            co_ratio,
+            Tarr,
+            log_P,
+        )
+
+        vmr_mols_profiles = [
+            profiles[canonical_line_species[name]] for name in mol_names
+        ]
+        vmr_atoms_profiles = [
+            profiles[canonical_line_species[name]] for name in atom_names
+        ]
+        vmrH2_profile = profiles["H2"]
+        vmrHe_profile = profiles["He"]
+        continuum_profile_map = {
+            species: profiles[species]
+            for species in self.hidden_continuum_species()
+        }
+
+        n_layers = art.pressure.size
+        if vmr_mols_profiles:
+            mmr_mols = jnp.array(
+                [
+                    vmr_prof * (mass / mmw_profile)
+                    for vmr_prof, mass in zip(vmr_mols_profiles, mol_masses)
+                ]
+            )
+        else:
+            mmr_mols = jnp.zeros((0, n_layers))
+        if vmr_atoms_profiles:
+            mmr_atoms = jnp.array(
+                [
+                    vmr_prof * (mass / mmw_profile)
+                    for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses)
+                ]
+            )
+        else:
+            mmr_atoms = jnp.zeros((0, n_layers))
+
+        return CompositionState(
+            vmr_mols=[jnp.mean(profile) for profile in vmr_mols_profiles],
+            vmr_atoms=[jnp.mean(profile) for profile in vmr_atoms_profiles],
+            vmrH2=jnp.mean(vmrH2_profile),
+            vmrHe=jnp.mean(vmrHe_profile),
+            mmw=jnp.mean(mmw_profile),
             mmr_mols=mmr_mols,
             mmr_atoms=mmr_atoms,
             vmrH2_profile=vmrH2_profile,

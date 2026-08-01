@@ -41,33 +41,150 @@ python -m dataio.collapse_emission_timeseries_to_1d \
 python -m atmo_retrieval \
   --planet KELT-20b --mode emission --data-format spectrum \
   --emission-selection pre_eclipse --wavelength-range full \
-  --epoch 20210501 20210518 20230430 20230615 20240516
+  --epoch 20210501 20210518 20230430 20230615 20240516 \
+  --pt-profile guillot
 
 # Run either prepared time-series retrieval.
-python -m atmo_retrieval --planet KELT-20b --mode transmission --epoch 20250601
+python -m atmo_retrieval \
+  --planet KELT-20b --mode transmission --epoch 20250601 \
+  --pt-profile isothermal
 ```
 
 The preparation step is unnecessary when the retrieval-ready time-series bundle
 already exists.
 
-Collapsed products require `collapse-source` cubes prepared with
-`--phase-bin all`. Their saved collapse operators carry the frozen SYSREM basis
-and apply it to each forward-model time series before exposure selection and
-1D coaddition.
+Prepared time-series and collapsed products replay temporal preprocessing on
+the complete source exposure sequence before selecting likelihood rows. The
+saved frozen operator applies the visibility mask, optional time-median
+subtraction, and SYSREM projection using the saved uncertainty of every
+exposure/wavelength pixel. Products containing the retired `V_chunk_diag`
+chunk approximation must be regenerated.
+
+Collapsed products additionally require `collapse-source` cubes prepared with
+`--phase-bin all`; their operator then performs planet-frame coaddition after
+the full-exposure preprocessing above.
 
 Mode-specific atmospheric defaults are explicit: transmission uses a
-`1e-8`-`1` bar grid with a Guillot P-T profile, while emission uses a
-`1e-4`-`1` bar grid with a p-spline P-T profile. Pass `--pt-profile` to override
-the mode default for a run.
+`1e-8`-`1` bar grid with an isothermal P-T profile, while emission uses a
+`1e-4`-`1` bar grid with a Guillot P-T profile. Pass `--pt-profile` to override
+the mode default for an individual run.
+
+Transmission radius convention is explicit: the sampled catalog-informed
+radius prior is adopted as `R_ref` at `P_ref = 1 bar`, which is also the
+transmission grid's lower boundary. It is passed to ExoJAX as `radius_btm`,
+and the corresponding gravity is computed at that same radius. This is a
+modeling convention, not a direct observational measurement of `R_1bar`; each
+run records the convention in `run_config.log`.
+
+High-resolution emission contrasts use a stationary PHOENIX denominator. The
+unbroadened stellar surface spectrum is auto-fetched on first use and cached by
+its exact PHOENIX parameters and model wavelength grid. Every emission run then
+rotationally broadens that cached spectrum with the active target's
+`v_sini_star` and `gamma1`/`gamma2`, convolves it with the same instrumental
+Gaussian profile as the planet, and samples it at zero velocity. The rotation
+operator automatically reserves 10% more velocity support than the configured
+stellar `v_sini_star` (KELT-20b therefore uses 129.14 km/s rather than the
+100 km/s floor).
 
 SVI is used as a warm start for NUTS/HMC. `--svi-only` outputs are approximate
 diagnostics, not production posterior samples.
+
+### Image-specified HRS retrieval runners
+
+The dedicated runners in `scripts/` encode the initial retrieval plan: a
+transmission species ladder, the Fe I/Na I/Ca I dayside model, and the joint
+terminator+dayside likelihood. Inspect the resolved parameters and prepared
+data before starting an inference run:
+
+```bash
+conda run -n retrieval python scripts/run_transmission_retrievals.py --list
+conda run -n retrieval python scripts/run_transmission_retrievals.py \
+  --case free_fe --epoch 20190504 --arm red --dry-run
+conda run -n retrieval python scripts/run_emission_retrievals.py \
+  --epoch 20210501 --arm red --dry-run
+conda run -n retrieval python scripts/run_joint_retrievals.py \
+  --transmission-epoch 20190504 --emission-epoch 20210501 \
+  --arm red --dry-run
+```
+
+Remove `--dry-run` to launch inference. Repeat an epoch flag to combine nights,
+use `--arm full` for separate red+blue likelihood components, and use `--quick`
+for a short smoke retrieval. The default shared-system policy uses an
+informative mass prior and fixes `Rp` and `Rstar`; pass `--radius-policy tight`
+to sample their catalog normal priors instead.
+
+Transmission free-chemistry cases use one constant VMR per listed atom and
+separate Fe I/Fe II velocity offsets. `equilibrium_fe` instead samples only
+`[M/H]` for the chemistry, fixes C/O to solar, and obtains Fe I/Fe II, H2, He,
+continuum abundances, and mean molecular weight from the FastChem grid. It does
+not create simultaneous free Fe VMR sites.
+
+Emission and joint retrievals require prepared time-series bundles because
+`Kp` is free. If a dry run reports missing files, prepare the emission epoch
+before launching it:
+
+```bash
+conda run -n retrieval python -m dataio.prepare_emission_retrieval_timeseries \
+  --planet KELT-20b --ephemeris Duck24 --epoch 20210501 --arm red --run-sysrem
+```
+
+Each inference output records the fully resolved scientific intent as JSON in
+`run_config.log`. Unless `--output` is supplied, these runs write beneath
+`output/intended_retrievals/<planet>/{transmission,emission,joint}/`.
 
 Low-resolution inputs are passed explicitly:
 - use `--joint-spectrum-tbl path/to/file.tbl` for multi-bin low-res spectra
 - use `--bandpass-tbl path/to/file.tbl` for single-band / sparse broadband constraints
 - `--joint-spectrum-tbl` paths can be full paths or relative to `input/lrs`, canonical form `transmission/kelt9b/file.tbl` or `emission/kelt20b/file.tbl`
 - `--bandpass-tbl` paths can be full paths or relative to `input/phot`, canonical form `transmission/kelt20b/file.tbl` or `emission/kelt9b/file.tbl`
+
+MAST low-resolution products can be inventoried and fetched reproducibly with
+`dataio.mast_spectra`. Query-only mode writes the observation, product, and
+selection manifests without downloading potentially large files:
+
+```bash
+conda run -n retrieval python -m dataio.mast_spectra \
+  --target KELT-20 --planet KELT-20b --mode emission --query-only
+
+# After reviewing input/lrs/emission/kelt20b/mast/manifest.json:
+conda run -n retrieval python -m dataio.mast_spectra \
+  --target KELT-20 --planet KELT-20b --mode emission --download
+
+# Fetch calibrated exposure/integration inputs for a light-curve reduction:
+conda run -n retrieval python -m dataio.mast_spectra \
+  --target KELT-20 --planet KELT-20b --mode transmission \
+  --product-profile reduction --query-only
+```
+
+Discovery unions a target-centered cone search with exact `target_name` queries
+from `reference/mast_target_aliases.json`, then deduplicates observations by
+MAST `obsid`. The registry covers every planet currently represented in the HRS
+transmission/emission directories; add one-off labels with repeatable
+`--archive-target-name` arguments. The manifest records every query that matched
+each observation and includes completeness counts grouped by proposal, target
+label, instrument/filter, and product classification. Proposal IDs are narrowing
+filters only: proposal-wide discovery without an object, exact target label, or
+observation ID is intentionally unsupported.
+
+`--product-profile direct` is the conservative default: extracted 1D spectra and
+candidate reduced depth tables. `--product-profile reduction` selects calibrated
+time-series inputs (`IMA`, `CALINTS`, `RATEINTS`) plus instrument `FLT` files;
+this correctly retains WFC3 `IMA` products even when MAST labels their
+`productType` as `AUXILIARY`. `--product-profile all` includes all supported,
+non-raw scientific products. Raw products, proprietary data, and count/byte
+limits remain separately controlled. Query-only mode prints the planned total
+in GiB, records it as `selected_bytes`, and applies `--max-total-gb` before any
+download begins (products with missing archive size metadata count as zero).
+Only products with explicit wavelength, transit/eclipse depth, and uncertainty
+columns are converted to retrieval-ready
+`.tbl` files under `normalized/`. Calibrated flux spectra and time-series
+exposures remain in the manifest as `reduction required`; they are never treated
+as atmospheric depth constraints automatically. Use `--help` for observation,
+instrument, product-subgroup, size-limit, and explicit column/unit overrides.
+For an already curated download list, pass exact `mast:` product identifiers
+with repeated `--data-uri` arguments or a one-URI-per-line `--uri-file`; this
+bypasses the positional archive search while retaining the same manifest,
+checksum, inspection, and normalization behavior.
 
 ## joint retrieval bandpass constraints
 
@@ -183,13 +300,17 @@ input/hrs/{mode}/{planet}/{epoch}/{arm}/
     data.npy
     sigma.npy
     phase.npy
-    U_sysrem.npz
+    bjd_tdb.npy
+    timeseries_operator.npz
+    U_sysrem.npz  # present only when SYSREM was run
   collapse_source/
     wavelength.npy
     data.npy
     sigma.npy
     phase.npy
-    U_sysrem.npz
+    bjd_tdb.npy
+    timeseries_operator.npz
+    U_sysrem.npz  # present only when SYSREM was run
   collapsed/full_transit/
     wavelength_transmission.npy
     spectrum_transmission.npy

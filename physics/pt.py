@@ -239,7 +239,4 @@ def numpyro_gp_temperature(
     # Sample T ~ N(mu, K)
     Tarr = numpyro.sample("Tarr", dist.MultivariateNormal(loc=mu, covariance_matrix=K))
 
-    # Optional hard bounds (keeps RT stable; remove if you want tails)
-    Tarr = jnp.clip(Tarr, T_low, T_high)
-
     return Tarr

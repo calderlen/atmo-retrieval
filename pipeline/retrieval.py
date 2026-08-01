@@ -30,7 +30,12 @@ from dataio.load import (
     parse_nasa_archive_tbl,
 )
 from dataio.collapse_transmission_timeseries_to_1d import get_sysrem_deep_mask
-from physics.chemistry import ConstantVMR, FastChemHybridChemistry, FreeVMR
+from physics.chemistry import (
+    ConstantVMR,
+    FastChemHybridChemistry,
+    FastChemMetallicityEquilibriumChemistry,
+    FreeVMR,
+)
 from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
 from opacities import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
 from physics.model import (
@@ -38,9 +43,11 @@ from physics.model import (
     ChunkedSysremInputs,
     CollapsedEmissionInputs,
     CollapsedTransmissionInputs,
+    FrozenTimeseriesInputs,
     SpectroscopicObservationInputs,
     apply_collapsed_emission_operator,
     apply_collapsed_transmission_operator,
+    apply_frozen_timeseries_operator,
     compute_model_timeseries,
     compute_atmospheric_state_from_posterior,
     apply_model_pipeline_corrections,
@@ -70,6 +77,26 @@ from plotting.plot import (
     plot_contribution_combined,
     save_retrieval_corner_plots,
 )
+
+
+DEFAULT_ROTATION_VSINI_MAX_KMS = 100.0
+STELLAR_ROTATION_VSINI_MARGIN = 1.10
+
+
+def _rotation_operator_vsini_max(
+    stellar_vsini: float | None,
+) -> float:
+    """Return rotation-kernel support for the planet and star."""
+    try:
+        stellar_vsini_value = float(stellar_vsini)
+    except (TypeError, ValueError):
+        return DEFAULT_ROTATION_VSINI_MAX_KMS
+    if not np.isfinite(stellar_vsini_value) or stellar_vsini_value <= 0.0:
+        return DEFAULT_ROTATION_VSINI_MAX_KMS
+    return max(
+        DEFAULT_ROTATION_VSINI_MAX_KMS,
+        STELLAR_ROTATION_VSINI_MARGIN * stellar_vsini_value,
+    )
 
 
 def _load_timeseries_metadata(data_dir: Path) -> dict[str, Any]:
@@ -178,7 +205,7 @@ def _load_collapsed_emission_operator(
         sysrem_required = {
             "sysrem_U",
             "sysrem_chunk_labels",
-            "sysrem_V_chunk_diag",
+            "sysrem_projection_sigma",
         }
         missing_sysrem = sorted(sysrem_required.difference(arrays))
         if missing_sysrem:
@@ -190,7 +217,7 @@ def _load_collapsed_emission_operator(
             {
                 "U_sysrem": arrays["sysrem_U"],
                 "chunk_labels": arrays["sysrem_chunk_labels"],
-                "V_chunk_diag": arrays["sysrem_V_chunk_diag"],
+                "projection_sigma": arrays["sysrem_projection_sigma"],
             },
             n_exp=np.asarray(arrays["source_phase"]).size,
         )
@@ -317,7 +344,7 @@ def _load_collapsed_transmission_operator(
         sysrem_required = {
             "sysrem_U",
             "sysrem_chunk_labels",
-            "sysrem_V_chunk_diag",
+            "sysrem_projection_sigma",
         }
         missing_sysrem = sorted(sysrem_required.difference(arrays))
         if missing_sysrem:
@@ -330,7 +357,7 @@ def _load_collapsed_transmission_operator(
                 {
                     "U_sysrem": arrays["sysrem_U"],
                     "chunk_labels": arrays["sysrem_chunk_labels"],
-                    "V_chunk_diag": arrays["sysrem_V_chunk_diag"],
+                    "projection_sigma": arrays["sysrem_projection_sigma"],
                 },
                 n_exp=np.asarray(arrays["source_phase"]).size,
             )
@@ -475,13 +502,6 @@ def load_pre_sysrem_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, n
     return np.load(data_path), np.load(sigma_path)
 
 
-def _normalize_phoenix_spectrum_path(path: str | Path) -> str:
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = Path.cwd() / candidate
-    return str(candidate.resolve())
-
-
 def _normalize_phoenix_cache_dir(path: str | Path | None) -> Path:
     candidate = config.PHOENIX_CACHE_DIR if path is None else Path(path).expanduser()
     if not candidate.is_absolute():
@@ -492,50 +512,7 @@ def _normalize_phoenix_cache_dir(path: str | Path | None) -> Path:
 
 
 @lru_cache(maxsize=None)
-def _read_phoenix_spectrum_ascii(path_str: str) -> tuple[np.ndarray, np.ndarray]:
-    path = Path(path_str)
-    if not path.exists():
-        raise FileNotFoundError(f"PHOENIX spectrum file not found: {path}")
-
-    try:
-        raw = np.loadtxt(path, dtype=float, comments="#")
-    except Exception as exc:
-        raise ValueError(f"Failed to read PHOENIX spectrum from {path}: {exc}") from exc
-
-    if raw.ndim == 1:
-        if raw.size == 0:
-            raise ValueError(f"PHOENIX spectrum file is empty: {path}")
-        if raw.size != 2:
-            raise ValueError(
-                f"PHOENIX spectrum file {path} must have exactly two columns "
-                "(wavelength_A, stellar_surface_flux)."
-            )
-        raw = raw[np.newaxis, :]
-
-    if raw.ndim != 2 or raw.shape[1] != 2:
-        raise ValueError(
-            f"PHOENIX spectrum file {path} must have exactly two columns "
-            f"(wavelength_A, stellar_surface_flux); got shape {raw.shape}."
-        )
-
-    wavelength_angstrom = np.asarray(raw[:, 0], dtype=float)
-    stellar_surface_flux = np.asarray(raw[:, 1], dtype=float)
-    if np.any(~np.isfinite(wavelength_angstrom)) or np.any(~np.isfinite(stellar_surface_flux)):
-        raise ValueError(f"PHOENIX spectrum file {path} contains non-finite values.")
-
-    order = np.argsort(wavelength_angstrom)
-    wavelength_angstrom = wavelength_angstrom[order]
-    stellar_surface_flux = stellar_surface_flux[order]
-    if np.any(np.diff(wavelength_angstrom) <= 0):
-        raise ValueError(f"PHOENIX spectrum file {path} must be strictly increasing in wavelength.")
-    if np.any(stellar_surface_flux <= 0):
-        raise ValueError(f"PHOENIX spectrum file {path} must have strictly positive stellar surface flux values.")
-
-    return wavelength_angstrom, stellar_surface_flux
-
-
-@lru_cache(maxsize=None)
-def _read_processed_phoenix_cache(path_str: str) -> tuple[np.ndarray, np.ndarray]:
+def _read_phoenix_surface_flux_cache(path_str: str) -> tuple[np.ndarray, np.ndarray]:
     path = Path(path_str)
     try:
         with np.load(path) as raw:
@@ -612,7 +589,7 @@ def _format_phoenix_cache_float(value: float) -> str:
     return f"{value:+.3f}".replace("+", "p").replace("-", "m").replace(".", "p")
 
 
-def _build_processed_phoenix_cache_path(
+def _build_phoenix_surface_flux_cache_path(
     *,
     cache_dir: Path,
     temperature: float,
@@ -620,13 +597,24 @@ def _build_processed_phoenix_cache_path(
     metallicity: float,
     target_wavelength_angstrom: np.ndarray,
 ) -> Path:
-    grid_hash = hashlib.sha1(np.asarray(target_wavelength_angstrom, dtype=np.float64).tobytes()).hexdigest()[:16]
+    cache_key = hashlib.sha1()
+    cache_key.update(b"phoenix-surface-flux-v1\0")
+    cache_key.update(
+        np.asarray(
+            [temperature, logg, metallicity],
+            dtype=np.float64,
+        ).tobytes()
+    )
+    cache_key.update(
+        np.asarray(target_wavelength_angstrom, dtype=np.float64).tobytes()
+    )
+    input_hash = cache_key.hexdigest()[:16]
     filename = (
         "phoenix_"
         f"T{_format_phoenix_cache_float(temperature)}_"
         f"logg{_format_phoenix_cache_float(logg)}_"
         f"feh{_format_phoenix_cache_float(metallicity)}_"
-        f"{grid_hash}.npz"
+        f"{input_hash}.npz"
     )
     return cache_dir / filename
 
@@ -666,7 +654,7 @@ def _load_chromatic_phoenix_surface_flux_on_grid(
         Rstar=Rstar,
     )
     cache_dir = _normalize_phoenix_cache_dir(phoenix_cache_dir)
-    cache_path = _build_processed_phoenix_cache_path(
+    cache_path = _build_phoenix_surface_flux_cache_path(
         cache_dir=cache_dir,
         temperature=temperature,
         logg=resolved_logg,
@@ -675,7 +663,9 @@ def _load_chromatic_phoenix_surface_flux_on_grid(
     )
 
     if cache_path.exists():
-        cached_wavelength_angstrom, cached_flux = _read_processed_phoenix_cache(str(cache_path))
+        cached_wavelength_angstrom, cached_flux = (
+            _read_phoenix_surface_flux_cache(str(cache_path))
+        )
         if cached_wavelength_angstrom.shape == target_wavelength_angstrom.shape and np.array_equal(
             cached_wavelength_angstrom,
             target_wavelength_angstrom,
@@ -686,9 +676,8 @@ def _load_chromatic_phoenix_surface_flux_on_grid(
         from chromatic import get_phoenix_photons
     except ImportError as exc:
         raise ImportError(
-            "chromatic-lightcurves is required to auto-fetch PHOENIX spectra when "
-            "phoenix_spectrum_path is not provided. Install chromatic-lightcurves or "
-            "provide a local two-column PHOENIX spectrum file."
+            "chromatic-lightcurves is required to auto-fetch and cache PHOENIX spectra. "
+            "Install chromatic-lightcurves before running an emission retrieval."
         ) from exc
 
     sort_idx = np.argsort(target_wavelength_angstrom)
@@ -724,13 +713,13 @@ def _load_chromatic_phoenix_surface_flux_on_grid(
         temperature=np.asarray(temperature, dtype=float),
         logg=np.asarray(resolved_logg, dtype=float),
         metallicity=np.asarray(resolved_metallicity, dtype=float),
+        cache_schema_version=np.asarray(1, dtype=int),
     )
     return stellar_surface_flux
 
 
 def _load_phoenix_surface_flux_on_grid(
     *,
-    phoenix_spectrum_path: str | Path | None,
     phoenix_cache_dir: str | Path | None,
     nu_grid: np.ndarray,
     mode: str,
@@ -743,47 +732,16 @@ def _load_phoenix_surface_flux_on_grid(
 ) -> np.ndarray | None:
     if _normalize_retrieval_mode(mode) != "emission":
         return None
-
-    if phoenix_spectrum_path is None:
-        return _load_chromatic_phoenix_surface_flux_on_grid(
-            nu_grid=nu_grid,
-            component_name=component_name,
-            Tstar=Tstar,
-            logg_star=logg_star,
-            metallicity=metallicity,
-            Mstar=Mstar,
-            Rstar=Rstar,
-            phoenix_cache_dir=phoenix_cache_dir,
-        )
-
-    normalized_path = _normalize_phoenix_spectrum_path(phoenix_spectrum_path)
-    wavelength_angstrom, stellar_surface_flux = _read_phoenix_spectrum_ascii(normalized_path)
-
-    target_wavelength_angstrom = 1.0e8 / np.asarray(nu_grid, dtype=float)
-    target_min = float(np.min(target_wavelength_angstrom))
-    target_max = float(np.max(target_wavelength_angstrom))
-    source_min = float(np.min(wavelength_angstrom))
-    source_max = float(np.max(wavelength_angstrom))
-    if target_min < source_min or target_max > source_max:
-        raise ValueError(
-            f"PHOENIX spectrum {normalized_path} does not cover the wavelength range "
-            f"required by emission component '{component_name}' "
-            f"({target_min:.3f}-{target_max:.3f} A requested, "
-            f"{source_min:.3f}-{source_max:.3f} A available)."
-        )
-
-    interpolated_flux = np.interp(
-        target_wavelength_angstrom,
-        wavelength_angstrom,
-        stellar_surface_flux,
+    return _load_chromatic_phoenix_surface_flux_on_grid(
+        nu_grid=nu_grid,
+        component_name=component_name,
+        Tstar=Tstar,
+        logg_star=logg_star,
+        metallicity=metallicity,
+        Mstar=Mstar,
+        Rstar=Rstar,
+        phoenix_cache_dir=phoenix_cache_dir,
     )
-    if np.any(~np.isfinite(interpolated_flux)):
-        raise ValueError(
-            f"Interpolated PHOENIX stellar surface flux for component '{component_name}' "
-            f"contains non-finite values."
-        )
-
-    return np.asarray(interpolated_flux, dtype=float)
 
 
 @dataclass(frozen=True)
@@ -792,11 +750,251 @@ class SysremInputBundle:
     V: np.ndarray | None = None
     chunk_indices: tuple[np.ndarray, ...] | None = None
     U_chunks: tuple[np.ndarray, ...] | None = None
-    V_chunks: tuple[np.ndarray, ...] | None = None
+    projection_sigma: np.ndarray | None = None
 
     @property
     def is_chunked(self) -> bool:
         return self.chunk_indices is not None
+
+
+@dataclass(frozen=True)
+class FrozenTimeseriesOperatorSpec:
+    source_wavelength: np.ndarray
+    source_phase: np.ndarray
+    source_bjd_tdb: np.ndarray
+    active_exposure_mask: np.ndarray
+    selected_exposure_indices: np.ndarray
+    subtract_time_median: bool
+    has_sysrem: bool
+
+
+def _load_frozen_timeseries_operator_spec(
+    data_dir: str | Path,
+    target_wavelength: np.ndarray,
+    selected_phase: np.ndarray,
+) -> FrozenTimeseriesOperatorSpec:
+    data_dir = Path(data_dir)
+    metadata = _load_timeseries_metadata(data_dir)
+    operator_name = metadata.get(
+        "timeseries_operator_file",
+        "timeseries_operator.npz",
+    )
+    operator_path = data_dir / str(operator_name)
+    if not operator_path.exists():
+        raise FileNotFoundError(
+            f"Prepared time series {data_dir} is missing {operator_path.name}. "
+            "Regenerate it so the forward model can replay preprocessing on "
+            "the complete source exposure sequence before row selection."
+        )
+
+    required = {
+        "schema_version",
+        "source_wavelength",
+        "source_phase",
+        "source_bjd_tdb",
+        "active_exposure_mask",
+        "selected_exposure_indices",
+        "subtract_time_median",
+        "has_sysrem",
+    }
+    with np.load(operator_path) as raw:
+        missing = sorted(required.difference(raw.files))
+        if missing:
+            raise ValueError(
+                f"{operator_path} is missing required arrays: "
+                f"{', '.join(missing)}. Regenerate the prepared time series."
+            )
+        schema_version = int(np.asarray(raw["schema_version"]).item())
+        source_wavelength = np.asarray(raw["source_wavelength"], dtype=float)
+        source_phase = _normalize_phase(
+            np.asarray(raw["source_phase"], dtype=float)
+        )
+        source_bjd_tdb = np.asarray(raw["source_bjd_tdb"], dtype=float)
+        active_mask = np.asarray(
+            raw["active_exposure_mask"],
+            dtype=float,
+        )
+        selected_indices = np.asarray(
+            raw["selected_exposure_indices"],
+            dtype=int,
+        )
+        subtract_time_median = bool(
+            np.asarray(raw["subtract_time_median"]).item()
+        )
+        has_sysrem = bool(np.asarray(raw["has_sysrem"]).item())
+
+    if schema_version != 1:
+        raise ValueError(
+            f"Unsupported frozen time-series operator schema {schema_version} "
+            f"in {operator_path}; expected schema 1."
+        )
+    target_wavelength = np.asarray(target_wavelength, dtype=float)
+    if source_wavelength.ndim != 1 or target_wavelength.ndim != 1:
+        raise ValueError(
+            f"{operator_path} source and prepared wavelength grids must be 1D."
+        )
+    if np.any(~np.isfinite(source_wavelength)) or np.any(
+        np.diff(source_wavelength) <= 0.0
+    ):
+        raise ValueError(
+            f"{operator_path} source_wavelength must be finite and strictly increasing."
+        )
+    if source_wavelength.shape != target_wavelength.shape or not np.allclose(
+        source_wavelength,
+        target_wavelength,
+        rtol=1.0e-12,
+        atol=1.0e-8,
+    ):
+        raise ValueError(
+            f"{operator_path} source_wavelength does not match wavelength.npy. "
+            "Regenerate the prepared bundle atomically."
+        )
+    if source_phase.ndim != 1 or active_mask.shape != source_phase.shape:
+        raise ValueError(
+            f"{operator_path} source_phase and active_exposure_mask must be "
+            "matching 1D arrays."
+        )
+    if np.any(~np.isfinite(source_phase)):
+        raise ValueError(f"{operator_path} source_phase must be finite.")
+    if source_bjd_tdb.shape != source_phase.shape or np.any(
+        ~np.isfinite(source_bjd_tdb)
+    ):
+        raise ValueError(
+            f"{operator_path} source_bjd_tdb must be finite and match source_phase."
+        )
+    if selected_indices.ndim != 1:
+        raise ValueError(
+            f"{operator_path} selected_exposure_indices must be 1D."
+        )
+    selected_phase = _normalize_phase(np.asarray(selected_phase, dtype=float))
+    if selected_indices.size != selected_phase.size:
+        raise ValueError(
+            f"{operator_path} selects {selected_indices.size} rows but phase.npy "
+            f"contains {selected_phase.size}."
+        )
+    if np.any(selected_indices < 0) or np.any(
+        selected_indices >= source_phase.size
+    ):
+        raise ValueError(
+            f"{operator_path} contains out-of-range selected exposure indices."
+        )
+    if np.unique(selected_indices).size != selected_indices.size or np.any(
+        np.diff(selected_indices) <= 0
+    ):
+        raise ValueError(
+            f"{operator_path} selected exposure indices must be unique and "
+            "strictly increasing."
+        )
+    if not np.allclose(
+        source_phase[selected_indices],
+        selected_phase,
+        rtol=0.0,
+        atol=1.0e-10,
+    ):
+        raise ValueError(
+            f"{operator_path} selected phases do not match phase.npy."
+        )
+    if np.any(~np.isfinite(active_mask)) or np.any(active_mask < 0.0) or np.any(
+        active_mask > 1.0
+    ):
+        raise ValueError(
+            f"{operator_path} active_exposure_mask must be finite and within [0, 1]."
+        )
+
+    selected_bjd_path = data_dir / "bjd_tdb.npy"
+    if not selected_bjd_path.exists():
+        raise FileNotFoundError(
+            f"Prepared time series {data_dir} is missing bjd_tdb.npy. "
+            "Regenerate it with the canonical timing contract."
+        )
+    selected_bjd_tdb = np.asarray(np.load(selected_bjd_path), dtype=float)
+    if selected_bjd_tdb.shape != selected_phase.shape or not np.allclose(
+        source_bjd_tdb[selected_indices],
+        selected_bjd_tdb,
+        rtol=0.0,
+        atol=1.0e-10,
+    ):
+        raise ValueError(
+            f"{operator_path} selected source times do not match bjd_tdb.npy."
+        )
+
+    metadata_run_sysrem = metadata.get("run_sysrem")
+    if metadata_run_sysrem is not None and bool(metadata_run_sysrem) != has_sysrem:
+        raise ValueError(
+            f"{operator_path} has_sysrem={has_sysrem} disagrees with "
+            f"timeseries_prep.json run_sysrem={metadata_run_sysrem}."
+        )
+    metadata_subtract_median = metadata.get("subtract_median")
+    if (
+        metadata_subtract_median is not None
+        and bool(metadata_subtract_median) != subtract_time_median
+    ):
+        raise ValueError(
+            f"{operator_path} subtract_time_median={subtract_time_median} "
+            "disagrees with timeseries_prep.json."
+        )
+    sysrem_path = data_dir / "U_sysrem.npz"
+    if has_sysrem != sysrem_path.exists():
+        raise ValueError(
+            f"{operator_path} has_sysrem={has_sysrem}, but "
+            f"U_sysrem.npz existence is {sysrem_path.exists()}."
+        )
+
+    metadata_n_source = metadata.get("n_source_exposures")
+    if metadata_n_source is not None and int(metadata_n_source) != source_phase.size:
+        raise ValueError(
+            f"{operator_path} contains {source_phase.size} source rows, but "
+            f"timeseries_prep.json records n_source_exposures={metadata_n_source}."
+        )
+    metadata_n_selected = metadata.get("n_exposures")
+    if metadata_n_selected is not None and int(metadata_n_selected) != selected_indices.size:
+        raise ValueError(
+            f"{operator_path} selects {selected_indices.size} rows, but "
+            f"timeseries_prep.json records n_exposures={metadata_n_selected}."
+        )
+    metadata_selected_indices = metadata.get("selected_exposure_indices")
+    if metadata_selected_indices is not None and not np.array_equal(
+        np.asarray(metadata_selected_indices, dtype=int),
+        selected_indices,
+    ):
+        raise ValueError(
+            f"{operator_path} selected_exposure_indices disagree with "
+            "timeseries_prep.json. Regenerate the prepared bundle atomically."
+        )
+
+    return FrozenTimeseriesOperatorSpec(
+        source_wavelength=source_wavelength,
+        source_phase=source_phase,
+        source_bjd_tdb=source_bjd_tdb,
+        active_exposure_mask=active_mask,
+        selected_exposure_indices=selected_indices,
+        subtract_time_median=subtract_time_median,
+        has_sysrem=has_sysrem,
+    )
+
+
+def _build_model_frozen_timeseries(
+    operator: FrozenTimeseriesOperatorSpec | None,
+    sysrem: SysremInputBundle | None,
+) -> FrozenTimeseriesInputs | None:
+    if operator is None:
+        return None
+    if operator.has_sysrem != (sysrem is not None):
+        raise ValueError(
+            "Frozen time-series operator and retrieval SYSREM settings disagree: "
+            f"operator has_sysrem={operator.has_sysrem}, "
+            f"retrieval supplied SYSREM={sysrem is not None}."
+        )
+    return FrozenTimeseriesInputs(
+        source_phase=jnp.asarray(operator.source_phase),
+        active_exposure_mask=jnp.asarray(operator.active_exposure_mask),
+        selected_exposure_indices=jnp.asarray(
+            operator.selected_exposure_indices,
+            dtype=jnp.int32,
+        ),
+        subtract_time_median=operator.subtract_time_median,
+        chunked_sysrem=_build_model_chunked_sysrem(sysrem),
+    )
 
 
 def _chunk_indices_from_labels(chunk_labels: np.ndarray) -> tuple[np.ndarray, ...]:
@@ -844,20 +1042,14 @@ def _load_sysrem_inputs(data_dir: str | Path) -> dict[str, np.ndarray]:
                 raw[name] = np.asarray(u_data[name])
         if "chunk_labels" in raw:
             return raw
-        if v_path is None:
-            raise FileNotFoundError(
-                f"Legacy SYSREM bundle {u_path.name} does not include chunk metadata and no "
-                f"V file was found in {data_dir}."
-            )
-        raw["V"] = np.load(v_path)
+        if v_path is not None:
+            raw["V"] = np.load(v_path)
         return raw
 
-    if v_path is None:
-        raise FileNotFoundError(f"No SYSREM weighting file found alongside {u_path.name} in {data_dir}.")
-    return {
-        "U": np.load(u_path),
-        "V": np.load(v_path),
-    }
+    raw = {"U": np.load(u_path)}
+    if v_path is not None:
+        raw["V"] = np.load(v_path)
+    return raw
 
 
 def _validate_sysrem_inputs(
@@ -878,49 +1070,69 @@ def _validate_sysrem_inputs(
         if U.shape[2] != n_chunks:
             raise ValueError(f"Chunk count mismatch: U has {U.shape[2]} chunks but chunk_labels encodes {n_chunks}.")
 
-        V_chunk_diag = raw.get("V_chunk_diag")
-        if V_chunk_diag is None:
-            raise ValueError("Chunked SYSREM bundle is missing V_chunk_diag.")
-        V_chunk_diag = np.asarray(V_chunk_diag, dtype=float)
-        if V_chunk_diag.ndim == 1:
-            V_chunk_diag = V_chunk_diag[np.newaxis, :]
-        expected_chunk_shape = (n_chunks, n_exp)
-        if V_chunk_diag.shape != expected_chunk_shape:
-            raise ValueError(f"V_chunk_diag shape mismatch: got {V_chunk_diag.shape}, expected {expected_chunk_shape}.")
+        projection_sigma = raw.get("projection_sigma")
+        if projection_sigma is None:
+            if raw.get("V_chunk_diag") is not None:
+                raise ValueError(
+                    "This SYSREM bundle uses the retired V_chunk_diag chunk "
+                    "approximation. Regenerate the prepared time series to save "
+                    "the required per-pixel projection_sigma matrix."
+                )
+            raise ValueError(
+                "Chunked SYSREM bundle is missing projection_sigma. Regenerate "
+                "the prepared time series with the current preparation code."
+            )
+        projection_sigma = np.asarray(projection_sigma, dtype=float)
+        expected_sigma_shape = (
+            n_exp,
+            np.asarray(raw["chunk_labels"]).size,
+        )
+        if projection_sigma.shape != expected_sigma_shape:
+            raise ValueError(
+                "projection_sigma shape mismatch: got "
+                f"{projection_sigma.shape}, expected {expected_sigma_shape}."
+            )
+        if np.any(~np.isfinite(projection_sigma)) or np.any(
+            projection_sigma <= 0.0
+        ):
+            raise ValueError(
+                "projection_sigma must contain only finite positive values."
+            )
 
         U_chunks: list[np.ndarray] = []
-        V_chunks: list[np.ndarray] = []
         for chunk in range(n_chunks):
             U_chunk = np.asarray(U[:, :, chunk], dtype=float)
             keep = np.any(np.isfinite(U_chunk), axis=0)
             U_chunk = U_chunk[:, keep]
             if U_chunk.ndim != 2 or U_chunk.shape[0] != n_exp:
                 raise ValueError(f"Chunk {chunk} has invalid U shape {U_chunk.shape} for n_exp={n_exp}.")
-
-            V_diag = np.asarray(V_chunk_diag[chunk], dtype=float)
-            if np.any(~np.isfinite(V_diag)) or np.any(V_diag <= 0):
-                raise ValueError(f"Chunk {chunk} has invalid V_chunk_diag values; all entries must be finite and > 0.")
+            if np.any(~np.isfinite(U_chunk)):
+                raise ValueError(
+                    f"Chunk {chunk} has non-finite values in active SYSREM basis columns."
+                )
 
             U_chunks.append(U_chunk)
-            V_chunks.append(np.diag(V_diag))
 
         return SysremInputBundle(
             chunk_indices=tuple(chunk_indices),
             U_chunks=tuple(U_chunks),
-            V_chunks=tuple(V_chunks),
+            projection_sigma=projection_sigma,
         )
 
     U = np.asarray(raw["U_sysrem"] if "U_sysrem" in raw else raw["U"])
-    V = np.asarray(raw["V"])
+    V_raw = raw.get("V")
+    V = None if V_raw is None else np.asarray(V_raw)
 
     if U.ndim == 3:
         raise ValueError(
             "3D SYSREM inputs now require an explicit chunked bundle with chunk_labels and "
-            "V_chunk_diag in U_sysrem.npz. Legacy 3D U arrays without chunk metadata are unsupported."
+            "projection_sigma in U_sysrem.npz. Legacy 3D U arrays without chunk metadata are unsupported."
         )
 
     if U.shape[0] != n_exp:
         raise ValueError(f"U exposure axis mismatch: U.shape[0]={U.shape[0]} but n_exp={n_exp}.")
+    if V is None:
+        return SysremInputBundle(U=U)
     if V.ndim == 1:
         if V.size != n_exp:
             raise ValueError(f"V exposure axis mismatch: V.size={V.size} but n_exp={n_exp}.")
@@ -942,7 +1154,12 @@ def _build_model_chunked_sysrem(
     return ChunkedSysremInputs(
         chunk_indices=tuple(jnp.asarray(indices, dtype=jnp.int32) for indices in sysrem.chunk_indices),
         U_chunks=tuple(jnp.asarray(U_chunk) for U_chunk in sysrem.U_chunks),
-        V_chunks=tuple(jnp.asarray(V_chunk) for V_chunk in sysrem.V_chunks),
+        sigma_chunks=tuple(
+            jnp.asarray(
+                sysrem.projection_sigma[:, np.asarray(indices, dtype=int)]
+            )
+            for indices in sysrem.chunk_indices
+        ),
     )
 
 
@@ -952,10 +1169,15 @@ def _describe_sysrem_inputs(sysrem: SysremInputBundle) -> str:
         basis_counts = [int(U_chunk.shape[1]) for U_chunk in sysrem.U_chunks]
         return (
             f"chunked SYSREM: {len(chunk_sizes)} chunks, "
-            f"chunk_sizes={chunk_sizes}, basis_counts={basis_counts}"
+            f"chunk_sizes={chunk_sizes}, basis_counts={basis_counts}, "
+            f"per_pixel_sigma_shape={sysrem.projection_sigma.shape}"
         )
 
-    return f"U shape={sysrem.U.shape}, V shape={sysrem.V.shape}"
+    v_description = "unused" if sysrem.V is None else str(sysrem.V.shape)
+    return (
+        f"U shape={sysrem.U.shape}, per-pixel sigma from observation, "
+        f"legacy V shape={v_description}"
+    )
 
 
 def _subset_sysrem_inputs(
@@ -970,12 +1192,16 @@ def _subset_sysrem_inputs(
         return SysremInputBundle(
             chunk_indices=tuple(np.asarray(chunk_indices, dtype=int) for chunk_indices in sysrem.chunk_indices),
             U_chunks=tuple(np.asarray(U_chunk)[indices] for U_chunk in sysrem.U_chunks),
-            V_chunks=tuple(np.asarray(V_chunk)[np.ix_(indices, indices)] for V_chunk in sysrem.V_chunks),
+            projection_sigma=np.asarray(sysrem.projection_sigma)[indices],
         )
 
     return SysremInputBundle(
         U=np.asarray(sysrem.U)[indices],
-        V=np.asarray(sysrem.V)[np.ix_(indices, indices)],
+        V=(
+            None
+            if sysrem.V is None
+            else np.asarray(sysrem.V)[np.ix_(indices, indices)]
+        ),
     )
 
 
@@ -1033,11 +1259,9 @@ def _subset_sysrem_wavelengths(
 
     new_chunk_indices: list[np.ndarray] = []
     new_u_chunks: list[np.ndarray] = []
-    new_v_chunks: list[np.ndarray] = []
-    for chunk_indices, U_chunk, V_chunk in zip(
+    for chunk_indices, U_chunk in zip(
         sysrem.chunk_indices or (),
         sysrem.U_chunks or (),
-        sysrem.V_chunks or (),
     ):
         remapped = old_to_new[np.asarray(chunk_indices, dtype=int)]
         remapped = remapped[remapped >= 0]
@@ -1045,7 +1269,6 @@ def _subset_sysrem_wavelengths(
             continue
         new_chunk_indices.append(np.sort(remapped).astype(int))
         new_u_chunks.append(np.asarray(U_chunk))
-        new_v_chunks.append(np.asarray(V_chunk))
 
     if not new_chunk_indices:
         raise ValueError("Spectral thinning removed all chunked SYSREM wavelength columns.")
@@ -1053,7 +1276,7 @@ def _subset_sysrem_wavelengths(
     return SysremInputBundle(
         chunk_indices=tuple(new_chunk_indices),
         U_chunks=tuple(new_u_chunks),
-        V_chunks=tuple(new_v_chunks),
+        projection_sigma=np.asarray(sysrem.projection_sigma)[:, selected],
     )
 
 
@@ -1073,7 +1296,7 @@ def _remap_sysrem_wavelength_sort(
             for chunk_indices in (sysrem.chunk_indices or ())
         ),
         U_chunks=tuple(np.asarray(U_chunk) for U_chunk in (sysrem.U_chunks or ())),
-        V_chunks=tuple(np.asarray(V_chunk) for V_chunk in (sysrem.V_chunks or ())),
+        projection_sigma=np.asarray(sysrem.projection_sigma)[:, sort_idx],
     )
 
 
@@ -1177,9 +1400,39 @@ def _build_composition_solver(
             )
         return solver
 
+    if model == "fastchem_equilibrium_metallicity_grid":
+        parameter_file = fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
+        if parameter_file is None:
+            raise ValueError(
+                "chemistry_model='fastchem_equilibrium_metallicity_grid' requires "
+                "a FastChem parameters.dat path. Pass fastchem_parameter_file or "
+                "set FASTCHEM_PARAMETER_FILE in config."
+            )
+        parameter_file = Path(parameter_file).expanduser()
+        if not parameter_file.exists():
+            raise FileNotFoundError(
+                "chemistry_model='fastchem_equilibrium_metallicity_grid' requires "
+                f"an existing FastChem parameter file, but '{parameter_file}' was not found."
+            )
+        return FastChemMetallicityEquilibriumChemistry(
+            fastchem_parameter_file=str(parameter_file),
+            continuum_species=tuple(config.FASTCHEM_HYBRID_CONTINUUM_SPECIES),
+            metallicity_range=tuple(config.FASTCHEM_HYBRID_METALLICITY_RANGE),
+            co_ratio_range=tuple(config.FASTCHEM_HYBRID_CO_RATIO_RANGE),
+            n_metallicity=int(config.FASTCHEM_HYBRID_N_METALLICITY),
+            n_co_ratio=int(config.FASTCHEM_HYBRID_N_CO_RATIO),
+            h2_he_ratio=float(config.H2_HE_RATIO),
+            n_temp=int(config.FASTCHEM_N_TEMP),
+            n_pressure=int(config.FASTCHEM_N_PRESSURE),
+            t_min=float(config.FASTCHEM_T_MIN),
+            t_max=float(config.FASTCHEM_T_MAX),
+            cache_dir=config.FASTCHEM_CACHE_DIR,
+        )
+
     raise ValueError(
         f"Unknown chemistry_model: {chemistry_model}. "
-        "Choose from {'constant', 'free', 'fastchem_hybrid_grid'}."
+        "Choose from {'constant', 'free', 'fastchem_hybrid_grid', "
+        "'fastchem_equilibrium_metallicity_grid'}."
     )
 
 
@@ -1329,13 +1582,16 @@ def _synthesize_timeseries_from_atmospheric_state(
     params = atmo_state["params"]
     observation_config = component.observation_config
 
-    Rp_rj = float(params.get("Rp", config.DEFAULT_POSTERIOR_RP))
+    # Existing posterior artifacts store this sampled site as ``Rp``.  Its
+    # explicit runtime meaning is the adopted transmission reference radius
+    # (and, for emission, the same planet radius used for projected area).
+    R_ref_rj = float(params.get("Rp", config.DEFAULT_POSTERIOR_RP))
     Mp_mj = float(params.get("Mp", config.DEFAULT_POSTERIOR_MP))
     Rstar_rs = float(params.get("Rstar", model_params["R_star"]))
 
-    Rp_cm = Rp_rj * RJ
+    radius_btm_cm = R_ref_rj * RJ
     Rstar_cm = Rstar_rs * Rs
-    g_ref = gravity_surface(Rp_rj, Mp_mj)
+    gravity_btm = gravity_surface(R_ref_rj, Mp_mj)
 
     dtau = jnp.asarray(atmo_state["dtau"])
     Tarr = jnp.asarray(atmo_state["Tarr"])
@@ -1344,6 +1600,7 @@ def _synthesize_timeseries_from_atmospheric_state(
     collapsed_transmission = (
         component.observation_inputs.collapsed_transmission
     )
+    frozen_timeseries = component.observation_inputs.frozen_timeseries
     collapsed_operator = (
         collapsed_emission
         if collapsed_emission is not None
@@ -1357,6 +1614,11 @@ def _synthesize_timeseries_from_atmospheric_state(
             collapsed_operator.velocity_offset_reference_kms
         )
         model_inst_nus = collapsed_operator.source_inst_nus
+    elif frozen_timeseries is not None:
+        phase = np.asarray(frozen_timeseries.source_phase)
+        Kp_kms = float(params.get("Kp", model_params["Kp"]))
+        v_sys_kms = float(params.get("v_sys", 0.0))
+        model_inst_nus = jnp.asarray(component.inst_nus)
     elif observation_config.radial_velocity_mode == "none":
         phase = np.zeros_like(phase)
         Kp_kms = 0.0
@@ -1373,9 +1635,9 @@ def _synthesize_timeseries_from_atmospheric_state(
         dtau=dtau,
         Tarr=Tarr,
         mmw_profile=mmw_profile,
-        Rp=Rp_cm,
+        radius_btm=radius_btm_cm,
         Rstar=Rstar_cm,
-        g_ref=g_ref,
+        gravity_btm=gravity_btm,
         phase=jnp.asarray(phase),
         Kp=Kp_kms,
         v_sys=v_sys_kms,
@@ -1398,14 +1660,25 @@ def _synthesize_timeseries_from_atmospheric_state(
             model_ts,
             collapsed_transmission,
         )
+    elif frozen_timeseries is not None:
+        model_ts = apply_frozen_timeseries_operator(
+            model_ts,
+            frozen_timeseries,
+        )
     model_ts = apply_model_pipeline_corrections(
         model_ts,
         subtract_weighted_global_mean=observation_config.subtract_weighted_global_mean,
-        apply_sysrem=observation_config.apply_sysrem,
+        apply_sysrem=(
+            observation_config.apply_sysrem and frozen_timeseries is None
+        ),
         sigma=jnp.asarray(component.sigma),
         U=None if component.sysrem is None or component.sysrem.U is None else jnp.asarray(component.sysrem.U),
         V=None if component.sysrem is None or component.sysrem.V is None else jnp.asarray(component.sysrem.V),
-        chunked_sysrem=_build_model_chunked_sysrem(component.sysrem),
+        chunked_sysrem=(
+            None
+            if frozen_timeseries is not None
+            else _build_model_chunked_sysrem(component.sysrem)
+        ),
     )
 
     return np.asarray(jax.device_get(model_ts))
@@ -1492,6 +1765,7 @@ def _build_spectroscopic_observation_inputs(
     sigma: np.ndarray,
     phase: np.ndarray,
     sysrem: SysremInputBundle | None,
+    frozen_timeseries: FrozenTimeseriesInputs | None = None,
     collapsed_emission: CollapsedEmissionInputs | None = None,
     collapsed_transmission: CollapsedTransmissionInputs | None = None,
 ) -> SpectroscopicObservationInputs:
@@ -1499,15 +1773,45 @@ def _build_spectroscopic_observation_inputs(
         data=jnp.asarray(data),
         sigma=jnp.asarray(sigma),
         phase=jnp.asarray(phase),
-        U=None if sysrem is None or sysrem.U is None else jnp.asarray(sysrem.U),
-        V=None if sysrem is None or sysrem.V is None else jnp.asarray(sysrem.V),
-        chunked_sysrem=_build_model_chunked_sysrem(sysrem),
+        U=(
+            None
+            if frozen_timeseries is not None
+            or sysrem is None
+            or sysrem.U is None
+            else jnp.asarray(sysrem.U)
+        ),
+        V=(
+            None
+            if frozen_timeseries is not None
+            or sysrem is None
+            or sysrem.V is None
+            else jnp.asarray(sysrem.V)
+        ),
+        chunked_sysrem=(
+            None
+            if frozen_timeseries is not None
+            else _build_model_chunked_sysrem(sysrem)
+        ),
+        frozen_timeseries=frozen_timeseries,
         collapsed_emission=collapsed_emission,
         collapsed_transmission=collapsed_transmission,
     )
 
 
 def _coerce_model_params(params: dict) -> dict[str, float | None]:
+    def _configured_error(parameter_name: str, default: float) -> float:
+        error_name = f"{parameter_name}_err"
+        error = params.get(error_name)
+        if error is None and hasattr(params[parameter_name], "std_dev"):
+            error = params[parameter_name].std_dev
+        if error is None:
+            return float(default)
+
+        error = float(error)
+        if not np.isfinite(error) or error <= 0.0:
+            return float(default)
+        return error
+
     Kp_low = params.get("Kp_low")
     Kp_high = params.get("Kp_high")
     Mp_upper_3sigma = params.get("M_p_upper_3sigma")
@@ -1528,9 +1832,9 @@ def _coerce_model_params(params: dict) -> dict[str, float | None]:
         "RV_abs": params.get("RV_abs", config.DEFAULT_RV_ABS),
         "RV_abs_err": params.get("RV_abs_err", config.DEFAULT_RV_ABS_ERR),
         "R_p": params["R_p"].nominal_value if hasattr(params["R_p"], "nominal_value") else params["R_p"],
-        "R_p_err": params["R_p"].std_dev if hasattr(params["R_p"], "std_dev") else config.DEFAULT_RP_ERR,
+        "R_p_err": _configured_error("R_p", config.DEFAULT_RP_ERR),
         "M_p": params["M_p"].nominal_value if hasattr(params["M_p"], "nominal_value") else params["M_p"],
-        "M_p_err": params["M_p"].std_dev if hasattr(params["M_p"], "std_dev") else config.DEFAULT_MP_ERR,
+        "M_p_err": _configured_error("M_p", config.DEFAULT_MP_ERR),
         "M_p_upper_3sigma": Mp_upper_3sigma,
         "M_star": (
             params["M_star"].nominal_value
@@ -1538,10 +1842,13 @@ def _coerce_model_params(params: dict) -> dict[str, float | None]:
             else params.get("M_star")
         ),
         "R_star": params["R_star"].nominal_value if hasattr(params["R_star"], "nominal_value") else params["R_star"],
-        "R_star_err": params["R_star"].std_dev if hasattr(params["R_star"], "std_dev") else config.DEFAULT_RSTAR_ERR,
+        "R_star_err": _configured_error("R_star", config.DEFAULT_RSTAR_ERR),
         "T_star": params.get("T_star", config.DEFAULT_TSTAR),
         "logg_star": params.get("logg_star"),
         "Fe_H": params.get("Fe_H"),
+        "v_sini_star": params.get("v_sini_star"),
+        "gamma1": params.get("gamma1"),
+        "gamma2": params.get("gamma2"),
         "T_eq": params.get("T_eq"),
         "Tirr_mean": params.get("Tirr_mean", params.get("T_eq")),
         "Tirr_std": params.get("Tirr_std"),
@@ -1568,10 +1875,27 @@ def _default_region_name_for_mode(mode: str) -> str:
         return "dayside"
 
 
-def _build_art_for_mode(mode: str) -> object:
+def _build_art_for_mode(
+    mode: str,
+    *,
+    reference_pressure_bar: float | None = None,
+) -> object:
     mode = _normalize_retrieval_mode(mode)
     pressure_top, pressure_btm = config_utils.get_pressure_bounds_for_mode(mode)
     if mode == "transmission":
+        if reference_pressure_bar is None:
+            reference_pressure_bar = config_utils.get_transmission_reference_pressure_bar()
+        if not np.isclose(
+            float(reference_pressure_bar),
+            pressure_btm,
+            rtol=1e-12,
+            atol=0.0,
+        ):
+            raise ValueError(
+                "Transmission reference pressure must equal the RT lower "
+                f"boundary: P_ref={float(reference_pressure_bar):g} bar, "
+                f"P_btm={pressure_btm:g} bar"
+            )
         art = ArtTransPure(
             pressure_top=pressure_top,
             pressure_btm=pressure_btm,
@@ -1621,6 +1945,8 @@ def _prepare_observed_spectrum_arrays(
 def _build_component_grid_and_ops(
     wav_obs: np.ndarray,
     instrument_resolution: float,
+    *,
+    stellar_vsini: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, object, object]:
     inst_nus = wav2nu(wav_obs, "AA")
     nu_grid, _wav_grid, _res_high = setup_wavenumber_grid(
@@ -1630,7 +1956,17 @@ def _build_component_grid_and_ops(
         unit="AA",
     )
     _preflight_grid_checks(inst_nus, nu_grid)
-    sop_rot, sop_inst, _ = setup_spectral_operators(nu_grid, instrument_resolution)
+    rotation_vsini_max = _rotation_operator_vsini_max(stellar_vsini)
+    sop_rot, sop_inst, _ = setup_spectral_operators(
+        nu_grid,
+        instrument_resolution,
+        vsini_max=rotation_vsini_max,
+    )
+    if rotation_vsini_max > DEFAULT_ROTATION_VSINI_MAX_KMS:
+        print(
+            "  Stellar rotation operator support: "
+            f"vsini_max={rotation_vsini_max:g} km/s"
+        )
     return inst_nus, nu_grid, sop_rot, sop_inst
 
 
@@ -1643,6 +1979,7 @@ def _build_in_memory_timeseries_component_spec(
     sigma: np.ndarray,
     phase: np.ndarray,
     sysrem: SysremInputBundle | None,
+    frozen_timeseries_operator: FrozenTimeseriesOperatorSpec | None,
     instrument_resolution: float,
     apply_sysrem: bool,
     radial_velocity_mode: str,
@@ -1663,6 +2000,7 @@ def _build_in_memory_timeseries_component_spec(
         "sigma": np.asarray(sigma),
         "phase": np.asarray(phase),
         "sysrem": sysrem,
+        "frozen_timeseries_operator": frozen_timeseries_operator,
         "pre_sysrem_data": None if pre_sysrem_data is None else np.asarray(pre_sysrem_data),
         "pre_sysrem_sigma": None if pre_sysrem_sigma is None else np.asarray(pre_sysrem_sigma),
         "instrument_resolution": float(instrument_resolution),
@@ -1679,11 +2017,21 @@ def _build_in_memory_timeseries_component_spec(
 
 def _load_opacity_bundle(
     nu_grid: np.ndarray,
+    *,
+    atomic_species: dict[str, dict] | None = None,
+    molpath_hitemp: dict[str, str | Path] | None = None,
+    molpath_exomol: dict[str, str | Path] | None = None,
 ) -> tuple[dict, dict, dict]:
+    if atomic_species is None:
+        atomic_species = config.ATOMIC_SPECIES
+    if molpath_hitemp is None:
+        molpath_hitemp = config.MOLPATH_HITEMP
+    if molpath_exomol is None:
+        molpath_exomol = config.MOLPATH_EXOMOL
     opa_cias = setup_cia_opacities(config.CIA_PATHS, nu_grid)
     opa_mols, _ = load_molecular_opacities(
-        config.MOLPATH_HITEMP,
-        config.MOLPATH_EXOMOL,
+        molpath_hitemp,
+        molpath_exomol,
         nu_grid,
         config.OPA_LOAD,
         config.DIFFMODE,
@@ -1692,7 +2040,7 @@ def _load_opacity_bundle(
         cutwing=config.PREMODIT_CUTWING,
     )
     opa_atoms, _ = load_atomic_opacities(
-        config.ATOMIC_SPECIES,
+        atomic_species,
         nu_grid,
         config.OPA_LOAD,
         config.DIFFMODE,
@@ -1712,6 +2060,7 @@ def _build_primary_spectroscopic_component(
     sigma: np.ndarray,
     phase: np.ndarray,
     sysrem: SysremInputBundle | None,
+    frozen_timeseries: FrozenTimeseriesInputs | None,
     instrument_resolution: float,
     nu_grid: np.ndarray,
     inst_nus: np.ndarray,
@@ -1726,7 +2075,9 @@ def _build_primary_spectroscopic_component(
     metallicity: float | None,
     Mstar: float | None,
     Rstar: float | None,
-    phoenix_spectrum_path: str | Path | None,
+    stellar_vsini: float | None,
+    stellar_limb_darkening_u1: float | None,
+    stellar_limb_darkening_u2: float | None,
     phoenix_cache_dir: str | Path | None,
     apply_sysrem: bool,
     radial_velocity_mode: str,
@@ -1739,7 +2090,6 @@ def _build_primary_spectroscopic_component(
 ) -> SpectroscopicComponentBundle:
     mode = _normalize_retrieval_mode(mode)
     stellar_surface_flux = _load_phoenix_surface_flux_on_grid(
-        phoenix_spectrum_path=phoenix_spectrum_path,
         phoenix_cache_dir=phoenix_cache_dir,
         nu_grid=nu_grid,
         mode=mode,
@@ -1764,6 +2114,9 @@ def _build_primary_spectroscopic_component(
         inst_nus=inst_nus,
         Tstar=Tstar,
         stellar_surface_flux=stellar_surface_flux,
+        stellar_vsini=stellar_vsini,
+        stellar_limb_darkening_u1=stellar_limb_darkening_u1,
+        stellar_limb_darkening_u2=stellar_limb_darkening_u2,
         radial_velocity_mode=radial_velocity_mode,
         subtract_weighted_global_mean=subtract_weighted_global_mean,
         apply_sysrem=apply_sysrem,
@@ -1774,6 +2127,7 @@ def _build_primary_spectroscopic_component(
         sigma=sigma,
         phase=phase,
         sysrem=sysrem,
+        frozen_timeseries=frozen_timeseries,
         collapsed_emission=collapsed_emission,
         collapsed_transmission=collapsed_transmission,
     )
@@ -2060,6 +2414,15 @@ def _build_atmosphere_regions(
             composition_solver=composition_solver,
             name=region_name,
             sample_prefix=spec.get("sample_prefix"),
+            velocity_offset_mode=str(
+                spec.get("velocity_offset_mode", "shared")
+            ),
+            velocity_offset_species=tuple(
+                spec.get("velocity_offset_species", ())
+            ),
+            velocity_offset_bounds_kms=tuple(
+                spec.get("velocity_offset_bounds_kms", (-20.0, 20.0))
+            ),
         )
         region_configs.append(region_config)
         region_lookup[region_name] = region_config
@@ -2076,7 +2439,9 @@ def _load_joint_spectroscopic_component(
     default_metallicity: float | None,
     default_mstar: float | None,
     default_rstar: float | None,
-    default_phoenix_spectrum_path: str | Path | None,
+    default_stellar_vsini: float | None,
+    default_stellar_limb_darkening_u1: float | None,
+    default_stellar_limb_darkening_u2: float | None,
     default_phoenix_cache_dir: str | Path | None,
     default_sigma_scale: float = 1.0,
     default_spectral_stride: int = 1,
@@ -2088,6 +2453,7 @@ def _load_joint_spectroscopic_component(
     data_format = str(spec.get("data_format", "spectrum")).lower().strip()
     instrument_resolution = float(spec.get("instrument_resolution", config_utils.get_resolution()))
     radial_velocity_mode = str(spec.get("radial_velocity_mode", "orbital" if data_format == "timeseries" else "none"))
+    apply_sysrem_explicit = "apply_sysrem" in spec
     apply_sysrem = bool(spec.get("apply_sysrem", data_format == "timeseries" and config.APPLY_SYSREM_DEFAULT))
     subtract_weighted_global_mean = bool(
         spec.get(
@@ -2102,7 +2468,21 @@ def _load_joint_spectroscopic_component(
     metallicity = spec.get("Fe_H", spec.get("phoenix_metallicity", default_metallicity))
     Mstar = spec.get("M_star", default_mstar)
     Rstar = spec.get("R_star", default_rstar)
-    phoenix_spectrum_path = spec.get("phoenix_spectrum_path", default_phoenix_spectrum_path)
+    stellar_vsini = spec.get("v_sini_star", default_stellar_vsini)
+    stellar_limb_darkening_u1 = spec.get(
+        "gamma1",
+        spec.get(
+            "stellar_limb_darkening_u1",
+            default_stellar_limb_darkening_u1,
+        ),
+    )
+    stellar_limb_darkening_u2 = spec.get(
+        "gamma2",
+        spec.get(
+            "stellar_limb_darkening_u2",
+            default_stellar_limb_darkening_u2,
+        ),
+    )
     phoenix_cache_dir = spec.get("phoenix_cache_dir", default_phoenix_cache_dir)
     sigma_scale = _validate_sigma_scale(spec.get("sigma_scale", default_sigma_scale))
     spectral_stride, spectral_offset = _validate_spectral_subset(
@@ -2113,6 +2493,15 @@ def _load_joint_spectroscopic_component(
     pre_sysrem_sigma = None
     collapsed_emission = spec.get("collapsed_emission")
     collapsed_transmission = spec.get("collapsed_transmission")
+    frozen_timeseries_operator = spec.get("frozen_timeseries_operator")
+    if frozen_timeseries_operator is not None and not isinstance(
+        frozen_timeseries_operator,
+        FrozenTimeseriesOperatorSpec,
+    ):
+        raise TypeError(
+            f"Unsupported frozen time-series operator for component '{name}': "
+            f"{type(frozen_timeseries_operator)!r}"
+        )
     component_data_dir: Path | None = None
 
     if "tbl_path" in spec:
@@ -2120,6 +2509,13 @@ def _load_joint_spectroscopic_component(
             spec["tbl_path"],
             mode=component_mode,
         )
+        # The spectroscopy forward model represents transmission as the
+        # negative perturbation of normalized stellar flux, whereas archive
+        # tables conventionally store a positive absolute transit depth.
+        # Convert only at this internal spectroscopic boundary; scalar
+        # bandpass constraints continue to use positive transit depths.
+        if component_mode == "transmission":
+            spectrum = -np.asarray(spectrum)
         data = spectrum[np.newaxis, :]
         sigma = uncertainty[np.newaxis, :]
         phase = np.zeros((1,), dtype=float)
@@ -2137,14 +2533,28 @@ def _load_joint_spectroscopic_component(
             if isinstance(sysrem_spec, SysremInputBundle):
                 sysrem = sysrem_spec
             elif isinstance(sysrem_spec, dict):
-                sysrem = _validate_sysrem_inputs(sysrem_spec, n_exp=(1 if data.ndim == 1 else data.shape[0]))
+                n_sysrem_exp = (
+                    frozen_timeseries_operator.source_phase.size
+                    if frozen_timeseries_operator is not None
+                    else (1 if data.ndim == 1 else data.shape[0])
+                )
+                sysrem = _validate_sysrem_inputs(
+                    sysrem_spec,
+                    n_exp=n_sysrem_exp,
+                )
             else:
                 raise TypeError(f"Unsupported sysrem spec type for component '{name}': {type(sysrem_spec)!r}")
         elif spec.get("U") is not None or spec.get("V") is not None:
-            if spec.get("U") is None or spec.get("V") is None:
-                raise ValueError(f"Joint spectroscopic component '{name}' must provide both U and V together.")
+            if spec.get("U") is None:
+                raise ValueError(
+                    f"Joint spectroscopic component '{name}' cannot provide V "
+                    "without U. Per-pixel projection weights come from sigma."
+                )
+            raw_sysrem = {"U": np.asarray(spec["U"])}
+            if spec.get("V") is not None:
+                raw_sysrem["V"] = np.asarray(spec["V"])
             sysrem = _validate_sysrem_inputs(
-                {"U": np.asarray(spec["U"]), "V": np.asarray(spec["V"])},
+                raw_sysrem,
                 n_exp=(1 if data.ndim == 1 else data.shape[0]),
             )
         else:
@@ -2154,6 +2564,24 @@ def _load_joint_spectroscopic_component(
         component_data_dir = data_dir
         if data_format == "timeseries":
             wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
+            frozen_timeseries_operator = (
+                _load_frozen_timeseries_operator_spec(
+                    data_dir,
+                    wav_obs,
+                    phase,
+                )
+            )
+            if (
+                apply_sysrem_explicit
+                and apply_sysrem != frozen_timeseries_operator.has_sysrem
+            ):
+                raise ValueError(
+                    f"Joint spectroscopic component '{name}' requests "
+                    f"apply_sysrem={apply_sysrem}, but its frozen operator "
+                    f"records has_sysrem={frozen_timeseries_operator.has_sysrem}. "
+                    "Use a bundle prepared with the requested preprocessing."
+                )
+            apply_sysrem = frozen_timeseries_operator.has_sysrem
             pre_sysrem_bundle = load_pre_sysrem_timeseries_data(data_dir)
             if pre_sysrem_bundle is not None:
                 pre_sysrem_data, pre_sysrem_sigma = pre_sysrem_bundle
@@ -2161,7 +2589,7 @@ def _load_joint_spectroscopic_component(
             if apply_sysrem:
                 sysrem = _validate_sysrem_inputs(
                     _load_sysrem_inputs(data_dir),
-                    n_exp=data.shape[0],
+                    n_exp=frozen_timeseries_operator.source_phase.size,
                 )
             else:
                 sysrem = None
@@ -2205,6 +2633,10 @@ def _load_joint_spectroscopic_component(
 
     wav_obs, data, sigma, inst_nus = _prepare_observed_spectrum_arrays(wav_obs, data, sigma)
     sysrem = _remap_sysrem_wavelength_sort(sysrem, sort_idx_for_prepare)
+    frozen_timeseries = _build_model_frozen_timeseries(
+        frozen_timeseries_operator,
+        sysrem,
+    )
     if (
         collapsed_emission is None
         and component_data_dir is not None
@@ -2259,10 +2691,15 @@ def _load_joint_spectroscopic_component(
     inst_nus_component, nu_grid, sop_rot, sop_inst = _build_component_grid_and_ops(
         wav_obs,
         instrument_resolution,
+        stellar_vsini=(stellar_vsini if component_mode == "emission" else None),
     )
-    opa_cias, opa_mols, opa_atoms = _load_opacity_bundle(nu_grid)
+    opa_cias, opa_mols, opa_atoms = _load_opacity_bundle(
+        nu_grid,
+        atomic_species=spec.get("atomic_species"),
+        molpath_hitemp=spec.get("molpath_hitemp"),
+        molpath_exomol=spec.get("molpath_exomol"),
+    )
     stellar_surface_flux = _load_phoenix_surface_flux_on_grid(
-        phoenix_spectrum_path=phoenix_spectrum_path,
         phoenix_cache_dir=phoenix_cache_dir,
         nu_grid=nu_grid,
         mode=component_mode,
@@ -2288,6 +2725,9 @@ def _load_joint_spectroscopic_component(
         inst_nus=inst_nus_component,
         Tstar=Tstar,
         stellar_surface_flux=stellar_surface_flux,
+        stellar_vsini=stellar_vsini,
+        stellar_limb_darkening_u1=stellar_limb_darkening_u1,
+        stellar_limb_darkening_u2=stellar_limb_darkening_u2,
         radial_velocity_mode=radial_velocity_mode,
         subtract_weighted_global_mean=subtract_weighted_global_mean,
         apply_sysrem=apply_sysrem,
@@ -2298,6 +2738,7 @@ def _load_joint_spectroscopic_component(
         sigma=sigma,
         phase=phase,
         sysrem=sysrem,
+        frozen_timeseries=frozen_timeseries,
         collapsed_emission=collapsed_emission,
         collapsed_transmission=collapsed_transmission,
     )
@@ -2333,7 +2774,6 @@ def _load_bandpass_constraint(
     default_mstar: float | None,
     default_rstar: float | None,
     default_semi_major_axis_au: float | None,
-    default_phoenix_spectrum_path: str | Path | None,
     default_phoenix_cache_dir: str | Path | None,
 ) -> BandpassConstraintBundle:
     component_mode = _normalize_retrieval_mode(spec.get("mode", default_mode))
@@ -2348,7 +2788,6 @@ def _load_bandpass_constraint(
     metallicity = spec.get("Fe_H", spec.get("phoenix_metallicity", default_metallicity))
     Mstar = spec.get("M_star", default_mstar)
     Rstar = spec.get("R_star", default_rstar)
-    phoenix_spectrum_path = spec.get("phoenix_spectrum_path", default_phoenix_spectrum_path)
     phoenix_cache_dir = spec.get("phoenix_cache_dir", default_phoenix_cache_dir)
     include_reflection = bool(spec.get("include_reflection", False))
     semi_major_axis_au = spec.get("semi_major_axis_au", default_semi_major_axis_au)
@@ -2392,7 +2831,6 @@ def _load_bandpass_constraint(
 
     opa_cias, opa_mols, opa_atoms = _load_opacity_bundle(nu_grid)
     stellar_surface_flux = _load_phoenix_surface_flux_on_grid(
-        phoenix_spectrum_path=phoenix_spectrum_path,
         phoenix_cache_dir=phoenix_cache_dir,
         nu_grid=nu_grid,
         mode=component_mode,
@@ -2532,7 +2970,6 @@ def run_retrieval(
     joint_spectra: list[dict[str, Any]] | None = None,
     bandpass_constraints: list[dict[str, Any]] | None = None,
     atmosphere_regions: list[dict[str, Any]] | None = None,
-    phoenix_spectrum_path: str | Path | None = None,
     phoenix_cache_dir: str | Path | None = None,
     save_mcmc_diagnostics: bool = True,
     sigma_scale: float = 1.0,
@@ -2541,9 +2978,20 @@ def run_retrieval(
     diagnostic_label: str | None = None,
     apply_sysrem_override: bool | None = None,
     emission_selection: str | None = None,
+    shared_prior_modes: dict[str, str] | None = None,
+    primary_atomic_species: dict[str, dict] | None = None,
+    primary_molpath_hitemp: dict[str, str | Path] | None = None,
+    primary_molpath_exomol: dict[str, str | Path] | None = None,
+    retrieval_intent: dict[str, Any] | None = None,
+    model_param_overrides: dict[str, float] | None = None,
 ) -> None:
     retrieval_start = perf_counter()
     mode = _normalize_retrieval_mode(mode)
+    reference_pressure_bar = (
+        config_utils.get_transmission_reference_pressure_bar()
+        if mode == "transmission"
+        else None
+    )
     if emission_selection is not None:
         emission_selection = str(emission_selection).strip().lower().replace("-", "_")
         if emission_selection in {"full", "full_transit"}:
@@ -2587,7 +3035,6 @@ def run_retrieval(
         seed=seed,
         chemistry_model=chemistry_model,
         epoch=epochs or None,
-        phoenix_spectrum_path=None if phoenix_spectrum_path is None else str(phoenix_spectrum_path),
         phoenix_cache_dir=None if phoenix_cache_dir is None else str(phoenix_cache_dir),
         save_mcmc_diagnostics=save_mcmc_diagnostics,
         sigma_scale=sigma_scale,
@@ -2596,10 +3043,15 @@ def run_retrieval(
         diagnostic_label=sanitized_label,
         apply_sysrem_override=apply_sysrem_override,
         emission_selection=emission_selection,
+        reference_pressure_bar=reference_pressure_bar,
+        retrieval_intent=retrieval_intent,
+        model_param_overrides=model_param_overrides,
     )
 
     # Get planet parameters
-    params = config_utils.get_params()
+    params = dict(config_utils.get_params())
+    if model_param_overrides:
+        params.update(model_param_overrides)
     print(f"\nTarget: {config.PLANET} ({config.EPHEMERIS})")
 
     apply_sysrem_default = config.APPLY_SYSREM_DEFAULT if apply_sysrem_override is None else apply_sysrem_override
@@ -2613,6 +3065,7 @@ def run_retrieval(
     )
 
     primary_sysrem: SysremInputBundle | None = sysrem_inputs
+    primary_frozen_timeseries_operator: FrozenTimeseriesOperatorSpec | None = None
     primary_pre_sysrem_data: np.ndarray | None = None
     primary_pre_sysrem_sigma: np.ndarray | None = None
     primary_collapsed_emission: CollapsedEmissionInputs | None = None
@@ -2665,7 +3118,6 @@ def run_retrieval(
             "mode": mode,
             "data_format": data_format,
             "data_dir": str(arm_dirs["blue"]),
-            "apply_sysrem": apply_sysrem,
             "radial_velocity_mode": "orbital" if data_format == "timeseries" else "none",
             "subtract_weighted_global_mean": bool(
                 data_format == "spectrum"
@@ -2678,7 +3130,12 @@ def run_retrieval(
                 )
             ),
             "instrument_resolution": config_utils.get_resolution(),
+            "atomic_species": primary_atomic_species,
+            "molpath_hitemp": primary_molpath_hitemp,
+            "molpath_exomol": primary_molpath_exomol,
         }
+        if apply_sysrem_override is not None and data_format == "timeseries":
+            blue_component_spec["apply_sysrem"] = bool(apply_sysrem_override)
         joint_spectra = list(joint_spectra or []) + [blue_component_spec]
 
     print("\n[1/7] Loading time-series data...")
@@ -2700,13 +3157,17 @@ def run_retrieval(
             print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
             if apply_sysrem:
                 if primary_sysrem is None:
-                    if U is None or V is None:
+                    if U is None:
                         raise ValueError(
-                            "apply_sysrem=True requires either sysrem_inputs or both U and V "
-                            "when providing wav_obs/data/sigma/phase directly."
+                            "apply_sysrem=True requires either sysrem_inputs or U "
+                            "when providing wav_obs/data/sigma/phase directly; "
+                            "per-pixel weights come from sigma."
                         )
+                    raw_sysrem = {"U": U}
+                    if V is not None:
+                        raw_sysrem["V"] = V
                     primary_sysrem = _validate_sysrem_inputs(
-                        {"U": U, "V": V},
+                        raw_sysrem,
                         n_exp=data.shape[0],
                     )
                 print(f"  Using provided SYSREM auxiliaries: {_describe_sysrem_inputs(primary_sysrem)}")
@@ -2770,6 +3231,25 @@ def run_retrieval(
 
             if data_format == "timeseries":
                 wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
+                primary_frozen_timeseries_operator = (
+                    _load_frozen_timeseries_operator_spec(
+                        resolved_data_dir,
+                        wav_obs,
+                        phase,
+                    )
+                )
+                if (
+                    apply_sysrem_override is not None
+                    and bool(apply_sysrem_override)
+                    != primary_frozen_timeseries_operator.has_sysrem
+                ):
+                    raise ValueError(
+                        f"The prepared bundle records has_sysrem="
+                        f"{primary_frozen_timeseries_operator.has_sysrem}, but "
+                        f"the run requests apply_sysrem={bool(apply_sysrem_override)}. "
+                        "Use a bundle prepared with the requested preprocessing."
+                    )
+                apply_sysrem = primary_frozen_timeseries_operator.has_sysrem
                 pre_sysrem_bundle = load_pre_sysrem_timeseries_data(resolved_data_dir)
                 if pre_sysrem_bundle is not None:
                     primary_pre_sysrem_data, primary_pre_sysrem_sigma = pre_sysrem_bundle
@@ -2779,7 +3259,9 @@ def run_retrieval(
                 if apply_sysrem:
                     primary_sysrem = _validate_sysrem_inputs(
                         _load_sysrem_inputs(resolved_data_dir),
-                        n_exp=data.shape[0],
+                        n_exp=(
+                            primary_frozen_timeseries_operator.source_phase.size
+                        ),
                     )
                     print(f"  Loaded SYSREM auxiliaries: {_describe_sysrem_inputs(primary_sysrem)}")
             elif data_format == "spectrum":
@@ -2854,6 +3336,11 @@ def run_retrieval(
                     primary_pre_sysrem_sigma = primary_pre_sysrem_sigma[sort_idx]
             primary_sysrem = _remap_sysrem_wavelength_sort(primary_sysrem, sort_idx)
 
+        primary_frozen_timeseries = _build_model_frozen_timeseries(
+            primary_frozen_timeseries_operator,
+            primary_sysrem,
+        )
+
         if mode == "emission" and emission_selection is not None:
             primary_collapsed_emission = _load_collapsed_emission_operator(
                 resolved_data_dir,
@@ -2909,13 +3396,28 @@ def run_retrieval(
             )
             _preflight_grid_checks(inst_nus, nu_grid)
 
-            sop_rot, sop_inst, _ = setup_spectral_operators(nu_grid, Rinst)
+            rotation_vsini_max = _rotation_operator_vsini_max(
+                params.get("v_sini_star") if mode == "emission" else None,
+            )
+            sop_rot, sop_inst, _ = setup_spectral_operators(
+                nu_grid,
+                Rinst,
+                vsini_max=rotation_vsini_max,
+            )
             print("  Spectral operators initialized")
+            if rotation_vsini_max > DEFAULT_ROTATION_VSINI_MAX_KMS:
+                print(
+                    "  Stellar rotation operator support: "
+                    f"vsini_max={rotation_vsini_max:g} km/s"
+                )
 
     # Setup primary atmospheric RT geometry
     print("\n[4/7] Initializing primary atmospheric RT...")
     with _StepTimer("Step 4/7"):
-        primary_art = _build_art_for_mode(mode)
+        primary_art = _build_art_for_mode(
+            mode,
+            reference_pressure_bar=reference_pressure_bar,
+        )
         pressure_top, pressure_btm = config_utils.get_pressure_bounds_for_mode(mode)
         print(f"  {config.NLAYER} atmospheric layers")
         print(f"  Pressure range: {pressure_top:.1e} - {pressure_btm:.1e} bar")
@@ -2937,9 +3439,24 @@ def run_retrieval(
             else:
                 print(f"  Loaded {n_cia} CIA sources")
 
+            resolved_primary_hitemp = (
+                config.MOLPATH_HITEMP
+                if primary_molpath_hitemp is None
+                else primary_molpath_hitemp
+            )
+            resolved_primary_exomol = (
+                config.MOLPATH_EXOMOL
+                if primary_molpath_exomol is None
+                else primary_molpath_exomol
+            )
+            resolved_primary_atoms = (
+                config.ATOMIC_SPECIES
+                if primary_atomic_species is None
+                else primary_atomic_species
+            )
             opa_mols, _molmass_arr = load_molecular_opacities(
-                config.MOLPATH_HITEMP,
-                config.MOLPATH_EXOMOL,
+                resolved_primary_hitemp,
+                resolved_primary_exomol,
                 nu_grid,
                 config.OPA_LOAD,
                 config.DIFFMODE,
@@ -2951,7 +3468,7 @@ def run_retrieval(
 
             # Load atomic opacities (optional, uses Kurucz with auto-download)
             opa_atoms, _atommass_arr = load_atomic_opacities(
-                config.ATOMIC_SPECIES,
+                resolved_primary_atoms,
                 nu_grid,
                 config.OPA_LOAD,
                 config.DIFFMODE,
@@ -2966,13 +3483,28 @@ def run_retrieval(
     print(f"  Chemistry model: {chemistry_model}")
     with _StepTimer("Step 6/7"):
         model_params = _coerce_model_params(params)
+        # Persist the resolved radius-pressure convention alongside the other
+        # runtime model parameters.  Catalog ``P0`` values remain metadata;
+        # transmission uses the explicit adopted reference pressure below.
+        model_params["reference_pressure_bar"] = reference_pressure_bar
         primary_region_name = _default_region_name_for_mode(mode)
         if mode == "emission":
-            if phoenix_spectrum_path is None:
-                print("  PHOENIX stellar spectrum: chromatic auto-fetch")
-                print(f"  Processed PHOENIX cache: {_normalize_phoenix_cache_dir(phoenix_cache_dir)}")
+            print("  PHOENIX stellar spectrum: auto-fetch/cache")
+            print(
+                "  PHOENIX surface-flux cache: "
+                f"{_normalize_phoenix_cache_dir(phoenix_cache_dir)}"
+            )
+            if model_params["v_sini_star"] is None or not np.isfinite(
+                float(model_params["v_sini_star"])
+            ):
+                print("  Stellar rotation: skipped (no finite v_sini_star)")
             else:
-                print(f"  PHOENIX stellar spectrum: {phoenix_spectrum_path}")
+                print(
+                    "  Stellar rotation: "
+                    f"v sin(i)={float(model_params['v_sini_star']):g} km/s"
+                )
+            print(f"  Stellar instrumental profile: Gaussian convolution at R={Rinst:g}")
+            print("  Stellar denominator velocity: 0 km/s (stellar-rest frame)")
 
         primary_is_timeseries = (
             np.asarray(phase).size > 1
@@ -2995,6 +3527,7 @@ def run_retrieval(
                 sigma=sigma,
                 phase=phase,
                 sysrem=primary_sysrem,
+                frozen_timeseries_operator=primary_frozen_timeseries_operator,
                 instrument_resolution=Rinst,
                 apply_sysrem=apply_sysrem,
                 radial_velocity_mode=primary_radial_velocity_mode,
@@ -3006,6 +3539,13 @@ def run_retrieval(
                 pre_sysrem_data=primary_pre_sysrem_data,
                 pre_sysrem_sigma=primary_pre_sysrem_sigma,
             )
+            primary_component_spec.update(
+                {
+                    "atomic_species": primary_atomic_species,
+                    "molpath_hitemp": primary_molpath_hitemp,
+                    "molpath_exomol": primary_molpath_exomol,
+                }
+            )
             primary_component = _load_joint_spectroscopic_component(
                 primary_component_spec,
                 default_mode=mode,
@@ -3014,7 +3554,9 @@ def run_retrieval(
                 default_metallicity=model_params["Fe_H"],
                 default_mstar=model_params["M_star"],
                 default_rstar=model_params["R_star"],
-                default_phoenix_spectrum_path=phoenix_spectrum_path,
+                default_stellar_vsini=model_params["v_sini_star"],
+                default_stellar_limb_darkening_u1=model_params["gamma1"],
+                default_stellar_limb_darkening_u2=model_params["gamma2"],
                 default_phoenix_cache_dir=phoenix_cache_dir,
                 default_sigma_scale=1.0,
                 default_spectral_stride=1,
@@ -3029,6 +3571,7 @@ def run_retrieval(
                 sigma=sigma,
                 phase=phase,
                 sysrem=primary_sysrem,
+                frozen_timeseries=primary_frozen_timeseries,
                 instrument_resolution=Rinst,
                 nu_grid=nu_grid,
                 inst_nus=inst_nus,
@@ -3043,7 +3586,9 @@ def run_retrieval(
                 metallicity=model_params["Fe_H"],
                 Mstar=model_params["M_star"],
                 Rstar=model_params["R_star"],
-                phoenix_spectrum_path=phoenix_spectrum_path,
+                stellar_vsini=model_params["v_sini_star"],
+                stellar_limb_darkening_u1=model_params["gamma1"],
+                stellar_limb_darkening_u2=model_params["gamma2"],
                 phoenix_cache_dir=phoenix_cache_dir,
                 apply_sysrem=apply_sysrem,
                 radial_velocity_mode=primary_radial_velocity_mode,
@@ -3068,7 +3613,9 @@ def run_retrieval(
                     default_metallicity=model_params["Fe_H"],
                     default_mstar=model_params["M_star"],
                     default_rstar=model_params["R_star"],
-                    default_phoenix_spectrum_path=phoenix_spectrum_path,
+                    default_stellar_vsini=model_params["v_sini_star"],
+                    default_stellar_limb_darkening_u1=model_params["gamma1"],
+                    default_stellar_limb_darkening_u2=model_params["gamma2"],
                     default_phoenix_cache_dir=phoenix_cache_dir,
                     default_sigma_scale=sigma_scale,
                     default_spectral_stride=spectral_stride,
@@ -3092,7 +3639,6 @@ def run_retrieval(
                     default_mstar=model_params["M_star"],
                     default_rstar=model_params["R_star"],
                     default_semi_major_axis_au=model_params["a"],
-                    default_phoenix_spectrum_path=phoenix_spectrum_path,
                     default_phoenix_cache_dir=phoenix_cache_dir,
                 )
                 if component.name in observations_payload:
@@ -3116,7 +3662,11 @@ def run_retrieval(
                 f"{', '.join(orbital_component_names)}."
             )
 
-        shared_system = build_shared_system_config(params=model_params)
+        shared_system = build_shared_system_config(
+            params=model_params,
+            reference_pressure_bar=reference_pressure_bar,
+            prior_modes=shared_prior_modes,
+        )
 
         atmosphere_region_configs, atmosphere_region_lookup = _build_atmosphere_regions(
             model_params=model_params,
@@ -3192,6 +3742,7 @@ def run_retrieval(
                 lr=config.SVI_LEARNING_RATE,
                 lr_decay_steps=config.SVI_LR_DECAY_STEPS,
                 lr_decay_rate=config.SVI_LR_DECAY_RATE,
+                prior_modes=shared_prior_modes,
             )
 
             if svi_only:

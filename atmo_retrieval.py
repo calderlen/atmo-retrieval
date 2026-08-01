@@ -894,7 +894,12 @@ def create_parser():
     model_group.add_argument(
         "--chemistry-model",
         type=str,
-        choices=["constant", "free", "fastchem_hybrid_grid"],
+        choices=[
+            "constant",
+            "free",
+            "fastchem_hybrid_grid",
+            "fastchem_equilibrium_metallicity_grid",
+        ],
         default=config.CHEMISTRY_MODEL_DEFAULT,
         help=(
             "Chemistry/composition model "
@@ -905,16 +910,9 @@ def create_parser():
         "--fastchem-parameter-file",
         type=str,
         default=None,
-        help="Path to FastChem parameters.dat (required for fastchem_hybrid_grid)",
-    )
-    model_group.add_argument(
-        "--phoenix-spectrum-path",
-        type=str,
-        default=None,
         help=(
-            "Optional local two-column ASCII PHOENIX stellar spectrum for emission mode "
-            "(wavelength_A, stellar_surface_flux). If omitted, emission mode can "
-            "auto-fetch PHOENIX spectra through chromatic-lightcurves."
+            "Path to FastChem parameters.dat (required for FastChem hybrid or "
+            "metallicity-equilibrium chemistry)"
         ),
     )
     model_group.add_argument(
@@ -1502,6 +1500,13 @@ def print_config_summary(config, args):
         skipped_epochs = [epoch for epoch in requested_epochs if epoch not in epochs]
         if skipped_epochs:
             print(f"Selection-skipped epochs: {', '.join(skipped_epochs)}")
+    if args.mode == "emission":
+        print(
+            "PHOENIX rotational broadening: "
+            f"apply v_sini_star={params.get('v_sini_star')} km/s"
+        )
+        print("PHOENIX instrumental broadening: apply retrieval instrument profile")
+        print("PHOENIX denominator RV: 0 km/s")
     if args.phase_bin:
         print(f"Phase bin: {args.phase_bin}")
     if args.all_phase_bins:
@@ -1656,7 +1661,6 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             seed=args.seed,
             joint_spectra=joint_spectra or None,
             bandpass_constraints=bandpass_constraints or None,
-            phoenix_spectrum_path=args.phoenix_spectrum_path,
             **diagnostic_run_kwargs,
         )
 
@@ -1674,7 +1678,6 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
             seed=args.seed,
             joint_spectra=joint_spectra or None,
             bandpass_constraints=bandpass_constraints or None,
-            phoenix_spectrum_path=args.phoenix_spectrum_path,
             **diagnostic_run_kwargs,
         )
 

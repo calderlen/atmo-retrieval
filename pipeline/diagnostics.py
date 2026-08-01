@@ -162,7 +162,6 @@ def build_diagnostic_context(
     spectral_stride: int = 1,
     spectral_offset: int = 0,
     fastchem_parameter_file: str | Path | None = None,
-    phoenix_spectrum_path: str | Path | None = None,
     phoenix_cache_dir: str | Path | None = None,
 ) -> DiagnosticContext:
     if data_format != "timeseries":
@@ -254,7 +253,9 @@ def build_diagnostic_context(
                 default_metallicity=model_params["Fe_H"],
                 default_mstar=model_params["M_star"],
                 default_rstar=model_params["R_star"],
-                default_phoenix_spectrum_path=phoenix_spectrum_path,
+                default_stellar_vsini=model_params["v_sini_star"],
+                default_stellar_limb_darkening_u1=model_params["gamma1"],
+                default_stellar_limb_darkening_u2=model_params["gamma2"],
                 default_phoenix_cache_dir=phoenix_cache_dir,
             )
             if component.name in spectroscopic_components:
@@ -1005,10 +1006,13 @@ def run_multiseed_svi(
     for seed in seeds:
         guide = build_guide(
             context.model_c,
-            context.model_params["M_p"],
-            context.model_params["M_p_err"],
-            context.model_params["R_star"],
-            context.model_params["R_star_err"],
+            Mp_mean=context.model_params["M_p"],
+            Mp_std=context.model_params["M_p_err"],
+            Mp_upper_3sigma=context.model_params.get("M_p_upper_3sigma"),
+            Rp_mean=context.model_params["R_p"],
+            Rp_std=context.model_params["R_p_err"],
+            Rstar_mean=context.model_params["R_star"],
+            Rstar_std=context.model_params["R_star_err"],
         )
         optimizer = build_svi_optimizer(
             lr,

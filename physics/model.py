@@ -19,6 +19,8 @@ PTProfileMode = Literal[
 ]
 AtmosphereRegionName = Literal["terminator", "dayside"]
 RVBehavior = Literal["orbital", "none"]
+VelocityOffsetMode = Literal["shared", "region", "species", "none"]
+SystemPriorMode = Literal["fixed", "normal", "upper_limit"]
 BandpassObservable = Literal["flux_ratio", "eclipse_depth", "radius_ratio", "transit_depth"]
 
 import config
@@ -48,7 +50,13 @@ from physics.pt import (
 )
 
 # chemistry models
-from physics.chemistry import CompositionSolver, ConstantVMR, FastChemHybridChemistry, FreeVMR
+from physics.chemistry import (
+    CompositionSolver,
+    ConstantVMR,
+    FastChemEquilibriumChemistry,
+    FastChemHybridChemistry,
+    FreeVMR,
+)
 CIA_COLLISION_PAIRS: tuple[tuple[str, str, str], ...] = (
     ("H2H2", "H2", "H2"),
     ("H2He", "H2", "He"),
@@ -105,12 +113,15 @@ def _run_rt_for_mode(
     dtau: jnp.ndarray,
     Tarr_rt: jnp.ndarray,
     mmw_rt: jnp.ndarray,
-    Rp: float | jnp.ndarray,
-    g_ref: float | jnp.ndarray,
+    radius_btm: float | jnp.ndarray,
+    gravity_btm: float | jnp.ndarray,
     nu_grid: jnp.ndarray,
 ) -> jnp.ndarray:
     if mode == "transmission":
-        return art.run(dtau, Tarr_rt, mmw_rt, Rp, g_ref)
+        # ExoJAX defines these inputs at the lower pressure boundary.  For
+        # transmission, radius_btm is explicitly the adopted R_ref at
+        # P_ref == the configured transmission pressure lower boundary.
+        return art.run(dtau, Tarr_rt, mmw_rt, radius_btm, gravity_btm)
     if mode == "emission":
         return art.run(dtau, Tarr_rt, nu_grid)
 
@@ -123,14 +134,18 @@ class SharedSystemConfig:
     Kp_bounds: tuple[float, float] | None
     v_sys_mean: float
     v_sys_std: float
-    Rp_mean: float
-    Rp_std: float
+    R_ref_mean: float
+    R_ref_std: float
     Mp_mean: float
     Mp_std: float
     Mp_upper_3sigma: float | None
     Rstar_mean: float
     Rstar_std: float
     period_day: float
+    reference_pressure_bar: float | None = None
+    Mp_prior_mode: SystemPriorMode = "upper_limit"
+    R_ref_prior_mode: SystemPriorMode = "normal"
+    Rstar_prior_mode: SystemPriorMode = "normal"
 
 # TODO: ensure these region-specific data-ignorant params in the dataclass shold be region-specific, or if some of these should be shared between atmopsheric regions
 # paramaters that are region-specific (so emission vs. transmission), but shared across all observation types in a joint retrieval.
@@ -152,6 +167,9 @@ class AtmosphereRegionConfig:
     atom_masses: jnp.ndarray
     Tirr_mean: float | None
     sample_prefix: str | None = None
+    velocity_offset_mode: VelocityOffsetMode = "shared"
+    velocity_offset_species: tuple[str, ...] = ()
+    velocity_offset_bounds_kms: tuple[float, float] = (-20.0, 20.0)
 
 # TODO: vice versa from above, ensure these observation-specific data-ignorant params in the dataclass should be observation-specific, or if some of these should be shared between observation types
 # parameters that are specific to an observation type (e.g. high-res spectroscopy vs. broadband photometry) for a given atmospheric region
@@ -173,6 +191,9 @@ class SpectroscopicObservationConfig:
     apply_sysrem: bool
     Tstar: float | None
     stellar_surface_flux: jnp.ndarray | None = None
+    stellar_vsini: float | None = None
+    stellar_limb_darkening_u1: float = 0.0
+    stellar_limb_darkening_u2: float = 0.0
     sample_prefix: str | None = None
 
 
@@ -217,8 +238,8 @@ class SharedSystemState(NamedTuple):
     v_sys: jnp.ndarray
     Mp: jnp.ndarray
     Rstar: jnp.ndarray
-    Rp: jnp.ndarray
-    g_ref: jnp.ndarray
+    R_ref: jnp.ndarray
+    g_btm: jnp.ndarray
 
 class AtmosphereState(NamedTuple):
     art: object
@@ -232,12 +253,26 @@ class AtmosphereState(NamedTuple):
     vmrH2_profile: jnp.ndarray
     vmrHe_profile: jnp.ndarray
     continuum_vmr_profiles: dict[str, jnp.ndarray]
+    velocity_offset_mode: VelocityOffsetMode
+    region_velocity_offset_kms: jnp.ndarray
+    species_velocity_offsets_kms: dict[str, jnp.ndarray]
+    is_valid: jnp.ndarray
 
 
 class ChunkedSysremInputs(NamedTuple):
     chunk_indices: tuple[jnp.ndarray, ...]
     U_chunks: tuple[jnp.ndarray, ...]
-    V_chunks: tuple[jnp.ndarray, ...]
+    sigma_chunks: tuple[jnp.ndarray, ...]
+
+
+class FrozenTimeseriesInputs(NamedTuple):
+    """Full-exposure operator for an ordinary phase-selected time series."""
+
+    source_phase: jnp.ndarray
+    active_exposure_mask: jnp.ndarray
+    selected_exposure_indices: jnp.ndarray
+    subtract_time_median: bool
+    chunked_sysrem: ChunkedSysremInputs | None = None
 
 
 class CollapsedEmissionInputs(NamedTuple):
@@ -286,6 +321,7 @@ class SpectroscopicObservationInputs(NamedTuple):
     U: jnp.ndarray | None = None
     V: jnp.ndarray | None = None
     chunked_sysrem: ChunkedSysremInputs | None = None
+    frozen_timeseries: FrozenTimeseriesInputs | None = None
     collapsed_emission: CollapsedEmissionInputs | None = None
     collapsed_transmission: CollapsedTransmissionInputs | None = None
 
@@ -307,6 +343,59 @@ def _sanitize_site_name(name: str) -> str:
     cleaned = "".join(ch if ch.isalnum() else "_" for ch in name)
     cleaned = cleaned.strip("_")
     return cleaned or "component"
+
+
+def _safe_temperature_profile(
+    temperature_raw: jnp.ndarray,
+    temperature_min: float,
+    temperature_max: float,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Return a safe evaluation copy and whether the raw profile is supported."""
+    temperature_raw = jnp.asarray(temperature_raw)
+    is_valid = jnp.all(jnp.isfinite(temperature_raw)) & jnp.all(
+        (temperature_raw >= temperature_min) & (temperature_raw <= temperature_max)
+    )
+    temperature_safe = jnp.nan_to_num(
+        jnp.clip(temperature_raw, temperature_min, temperature_max),
+        nan=temperature_min,
+        posinf=temperature_max,
+        neginf=temperature_min,
+    )
+    return temperature_safe, is_valid
+
+
+def _safe_mmw_profile(
+    mmw_raw: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Apply the current RT numerical support limits to one shared MMW copy."""
+    mmw_raw = jnp.asarray(mmw_raw)
+    is_valid = jnp.all(jnp.isfinite(mmw_raw)) & jnp.all(
+        (mmw_raw >= config.MMW_RT_MIN) & (mmw_raw <= config.MMW_RT_MAX)
+    )
+    # This replacement exists only so JAX can finish evaluating a proposal
+    # that receives zero probability. Every downstream calculation uses this
+    # same safe profile.
+    mmw_safe = jnp.nan_to_num(
+        jnp.clip(mmw_raw, config.MMW_RT_MIN, config.MMW_RT_MAX),
+        nan=config.MMW_RT_MIN,
+        posinf=config.MMW_RT_MAX,
+        neginf=config.MMW_RT_MIN,
+    )
+    return mmw_safe, is_valid
+
+
+def _safe_nonnegative_profile(
+    value: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    value = jnp.asarray(value)
+    is_valid = jnp.all(jnp.isfinite(value)) & jnp.all(value >= 0.0)
+    safe = jnp.nan_to_num(
+        jnp.maximum(value, 0.0),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    return safe, is_valid
 
 # given a retrieval mode, return the default atmospheric region name to use if not specified in the configs
 def _default_region_name_for_mode(mode: RetrievalMode) -> AtmosphereRegionName:
@@ -370,19 +459,69 @@ def sysrem_model_distortion(
     return M - M_fit
 
 
+def sysrem_model_distortion_per_pixel(
+    M: jnp.ndarray,
+    U: jnp.ndarray,
+    sigma: jnp.ndarray,
+) -> jnp.ndarray:
+    """Apply a frozen SYSREM basis with exposure-by-wavelength uncertainties.
+
+    Unlike the legacy projection above, each wavelength column gets its own
+    weighted least-squares solve. This preserves the pixel-level uncertainties
+    used by preparation instead of reducing a whole wavelength chunk to one
+    exposure weight.
+    """
+    M = jnp.asarray(M)
+    U = jnp.asarray(U)
+    sigma = jnp.asarray(sigma)
+    if U.shape[1] == 0:
+        return M
+    if sigma.shape != M.shape:
+        raise ValueError(
+            f"Per-pixel SYSREM sigma shape {sigma.shape} does not match model "
+            f"shape {M.shape}."
+        )
+
+    weights = 1.0 / jnp.clip(
+        sigma,
+        config.F32_FLOOR_RECIP,
+        None,
+    ) ** 2
+    if U.shape[1] == 1:
+        basis = U[:, 0][:, None]
+        denominator = jnp.sum(weights * basis**2, axis=0)
+        numerator = jnp.sum(weights * basis * M, axis=0)
+        coeffs = numerator / jnp.clip(
+            denominator,
+            config.F32_FLOOR_RECIP,
+            None,
+        )
+        return M - basis * coeffs[None, :]
+
+    gram = jnp.einsum("eb,ew,ec->wbc", U, weights, U)
+    rhs = jnp.einsum("eb,ew,ew->wb", U, weights, M)
+    coeffs = jnp.linalg.solve(gram, rhs[..., None])[..., 0]
+    fitted = jnp.einsum("eb,wb->ew", U, coeffs)
+    return M - fitted
+
+
 def sysrem_model_distortion_chunked(
     M: jnp.ndarray,
     chunked_sysrem: ChunkedSysremInputs,
 ) -> jnp.ndarray:
     corrected = M
-    for chunk_indices, U_chunk, V_chunk in zip(
+    for chunk_indices, U_chunk, sigma_chunk in zip(
         chunked_sysrem.chunk_indices,
         chunked_sysrem.U_chunks,
-        chunked_sysrem.V_chunks,
+        chunked_sysrem.sigma_chunks,
     ):
         if chunk_indices.shape[0] == 0 or U_chunk.shape[1] == 0:
             continue
-        corrected_chunk = sysrem_model_distortion(M[:, chunk_indices], U_chunk, V_chunk)
+        corrected_chunk = sysrem_model_distortion_per_pixel(
+            M[:, chunk_indices],
+            U_chunk,
+            sigma_chunk,
+        )
         corrected = corrected.at[:, chunk_indices].set(corrected_chunk)
     return corrected
 
@@ -412,6 +551,22 @@ def check_grid_resolution(
         print(f"[INFO] Grid check passed: {R_grid/R:.1f} pixels per FWHM (Target R={R}).")
 
 
+def _sanitize_opacity_term(
+    opacity: jnp.ndarray,
+    *,
+    negative_rtol: float = 0.0,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Return a safe nonnegative term and a scalar validity decision."""
+    opacity = jnp.asarray(opacity)
+    finite = jnp.isfinite(opacity)
+    finite_opacity = jnp.where(finite, opacity, 0.0)
+    positive_scale = jnp.max(jnp.where(finite_opacity > 0.0, finite_opacity, 0.0))
+    negative_tolerance = negative_rtol * positive_scale
+    is_valid = jnp.all(finite) & jnp.all(finite_opacity >= -negative_tolerance)
+    safe_opacity = jnp.maximum(finite_opacity, 0.0)
+    return safe_opacity, is_valid
+
+
 def _compute_cia_opacity_terms(
     art: object,
     opa_cias: dict[str, OpaCIA],
@@ -420,7 +575,7 @@ def _compute_cia_opacity_terms(
     vmrHe_profile: jnp.ndarray,
     mmw_profile: jnp.ndarray,
     g: jnp.ndarray,
-) -> dict[str, jnp.ndarray]:
+) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
     """Compute CIA optical-depth contributions keyed by CIA source name."""
     vmr_profiles = {
         "H2": vmrH2_profile,
@@ -428,11 +583,12 @@ def _compute_cia_opacity_terms(
     }
 
     cia_terms: dict[str, jnp.ndarray] = {}
+    cia_valid = jnp.asarray(True)
     for cia_key, species_x, species_y in CIA_COLLISION_PAIRS:
         cia = opa_cias.get(cia_key)
         if cia is None:
             continue
-        logacia_matrix = cia.logacia_matrix(Tarr)
+        logacia_matrix_raw = cia.logacia_matrix(Tarr)
         # exojax's CIA interpolation can emit NaNs when the runtime nu_grid
         # extends beyond the tabulated CIA wavenumber range. Treat CIA as zero
         # outside the database support instead of letting those NaNs poison dtau.
@@ -440,27 +596,25 @@ def _compute_cia_opacity_terms(
         cia_nu_min = jnp.min(cia_nu)
         cia_nu_max = jnp.max(cia_nu)
         supported_nu = (jnp.asarray(cia.nu_grid) >= cia_nu_min) & (
-            jnp.asarray(cia.nu_grid) < cia_nu_max
+            jnp.asarray(cia.nu_grid) <= cia_nu_max
         )
-        logacia_matrix = jnp.where(supported_nu[None, :], logacia_matrix, -jnp.inf)
-        logacia_matrix = jnp.nan_to_num(
-            logacia_matrix,
-            nan=-jnp.inf,
-            posinf=-jnp.inf,
-            neginf=-jnp.inf,
+        in_support_finite = jnp.all(
+            jnp.where(
+                supported_nu[None, :],
+                jnp.isfinite(logacia_matrix_raw),
+                True,
+            )
         )
-        vmr_x = jnp.nan_to_num(
-            jnp.clip(jnp.asarray(vmr_profiles[species_x]), 0.0, None),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
+        # Outside the CIA database support, zero opacity is intentional. An
+        # invalid value inside support is replaced only for safe evaluation
+        # and still marks the proposal invalid.
+        logacia_matrix = jnp.where(
+            supported_nu[None, :] & jnp.isfinite(logacia_matrix_raw),
+            logacia_matrix_raw,
+            -jnp.inf,
         )
-        vmr_y = jnp.nan_to_num(
-            jnp.clip(jnp.asarray(vmr_profiles[species_y]), 0.0, None),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
+        vmr_x, vmr_x_valid = _safe_nonnegative_profile(vmr_profiles[species_x])
+        vmr_y, vmr_y_valid = _safe_nonnegative_profile(vmr_profiles[species_y])
         dtau_cia = art.opacity_profile_cia(
             logacia_matrix,
             Tarr,
@@ -469,14 +623,13 @@ def _compute_cia_opacity_terms(
             mmw_profile[:, None],
             g,
         )
-        cia_terms[f"CIA_{cia_key}"] = jnp.nan_to_num(
-            dtau_cia,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
+        dtau_cia_safe, term_valid = _sanitize_opacity_term(dtau_cia)
+        cia_terms[f"CIA_{cia_key}"] = dtau_cia_safe
+        cia_valid = cia_valid & (
+            in_support_finite & vmr_x_valid & vmr_y_valid & term_valid
         )
 
-    return cia_terms
+    return cia_terms, cia_valid
 
 
 def _compute_xs_opacity_terms(
@@ -486,7 +639,7 @@ def _compute_xs_opacity_terms(
     mmr_profiles: dict[str, jnp.ndarray],
     species_masses: dict[str, jnp.ndarray],
     g: jnp.ndarray,
-) -> dict[str, jnp.ndarray]:
+) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
     """Compute line-opacity optical-depth contributions keyed by species.
 
     ``mmr_profiles`` contains mass mixing ratios, so ExoJAX requires the
@@ -495,19 +648,29 @@ def _compute_xs_opacity_terms(
     supplied profile is a volume mixing ratio.
     """
     xs_terms: dict[str, jnp.ndarray] = {}
+    xs_valid = jnp.asarray(True)
     for species, mmr_profile in mmr_profiles.items():
         opa = opa_by_species.get(species)
         if opa is None:
             continue
-        xsmatrix = opa.xsmatrix(Tarr, art.pressure)
-        xs_terms[species] = art.opacity_profile_xs(
-            xsmatrix,
-            mmr_profile,
+        xsmatrix_raw = opa.xsmatrix(Tarr, art.pressure)
+        xsmatrix_finite = jnp.all(jnp.isfinite(xsmatrix_raw))
+        xsmatrix_safe = jnp.where(jnp.isfinite(xsmatrix_raw), xsmatrix_raw, 0.0)
+        mmr_safe, mmr_valid = _safe_nonnegative_profile(mmr_profile)
+        dtau_raw = art.opacity_profile_xs(
+            xsmatrix_safe,
+            mmr_safe,
             species_masses[species],
             g,
         )
+        dtau_safe, term_valid = _sanitize_opacity_term(
+            dtau_raw,
+            negative_rtol=config.PREMODIT_NEGATIVE_ROUNDOFF_RTOL,
+        )
+        xs_terms[species] = dtau_safe
+        xs_valid = xs_valid & xsmatrix_finite & mmr_valid & term_valid
 
-    return xs_terms
+    return xs_terms, xs_valid
 
 
 def _compute_continuum_opacity_terms(
@@ -517,15 +680,14 @@ def _compute_continuum_opacity_terms(
     continuum_vmr_profiles: dict[str, jnp.ndarray],
     mmw_profile: jnp.ndarray,
     g: jnp.ndarray,
-) -> dict[str, jnp.ndarray]:
+) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
     """Compute hidden continuum opacity terms such as the H- continuum."""
-    if layer_optical_depth_Hminus is None:
-        return {}
-
     vmre = continuum_vmr_profiles.get("e-")
     vmrh = continuum_vmr_profiles.get("H")
     if vmre is None or vmrh is None:
-        return {}
+        return {}, jnp.asarray(True)
+    if layer_optical_depth_Hminus is None:
+        return {}, jnp.asarray(False)
 
     # exojax.layer_optical_depth_Hminus combines layer-only quantities with
     # a (n_layer, n_nu) continuum matrix using raw broadcasting. Provide
@@ -538,35 +700,15 @@ def _compute_continuum_opacity_terms(
     if gravity_column.ndim == 1:
         gravity_column = gravity_column[:, None]
 
-    # Guard against float32 overflow in the exojax H- formulation.
-    # bound_free_absorption contains exp(alpha / (lambda_0 * T)) which blows
-    # past float32's ~3.4e38 ceiling once T drops below ~130 K, a regime the
-    # AutoMultivariateNormal guide can transiently probe during SVI init even
-    # though Guillot priors forbid it physically. Similarly, a vanishing mmw
-    # would turn the 1/mmw factor into a float32 overflow. Finally, the
-    # exojax formula takes jnp.log10(absorption_coeff) where absorption_coeff
-    # is proportional to vmre * vmrh; at zero VMR the forward pass is safely
-    # masked but the backward pass goes through 1/0 and produces NaN
-    # gradients, which numpyro's find_valid_initial_params rejects. Floor
-    # vmre and vmrh to a tiny positive so log10 and its derivative stay
-    # finite.
-    T_safe = jnp.clip(Tarr, min=500.0)
-    mmw_column = jnp.maximum(mmw_column, 1e-2)
-    # The VMR floor must keep the product
-    #   (kappa_bf + kappa_ff) * electron_pressure * hydrogen_density
-    # safely inside float32's normal range (> ~1e-38) so that log10 never
-    # sees a zero. The individual factors can get as small as
-    # (kappa_bf + kappa_ff) ~ 1e-18 and electron_pressure * hydrogen_density
-    # ~ vmre * vmrh * narr^2 * kB * T ~ vmre * vmrh * 1e13 in the thin-upper
-    # layers. A symmetric 1e-15 floor keeps the product above ~1e-20, which
-    # is 18 orders of magnitude above float32's underflow threshold, while
-    # still being a negligibly small abundance.
-    vmre_safe = jnp.maximum(vmre, 1e-15)
-    vmrh_safe = jnp.maximum(vmrh, 1e-15)
+    vmre_safe, vmre_valid = _safe_nonnegative_profile(vmre)
+    vmrh_safe, vmrh_valid = _safe_nonnegative_profile(vmrh)
+    # Keep the small positive abundance floors required by ExoJAX's logarithms.
+    vmre_safe = jnp.maximum(vmre_safe, 1e-15)
+    vmrh_safe = jnp.maximum(vmrh_safe, 1e-15)
 
-    dtau_hminus = layer_optical_depth_Hminus(
+    dtau_hminus_raw = layer_optical_depth_Hminus(
         nu_grid,
-        T_safe,
+        Tarr,
         art.pressure,
         art.dParr,
         vmre_safe,
@@ -574,9 +716,9 @@ def _compute_continuum_opacity_terms(
         mmw_column,
         gravity_column,
     )
-    dtau_hminus = jnp.where(jnp.isfinite(dtau_hminus), dtau_hminus, 0.0)
+    dtau_hminus, term_valid = _sanitize_opacity_term(dtau_hminus_raw)
 
-    return {"CONT_Hminus": dtau_hminus}
+    return {"CONT_Hminus": dtau_hminus}, vmre_valid & vmrh_valid & term_valid
 
 
 def _compute_opacity_terms(
@@ -595,9 +737,9 @@ def _compute_opacity_terms(
     mmw_profile: jnp.ndarray,
     g: jnp.ndarray,
     continuum_vmr_profiles: dict[str, jnp.ndarray] | None = None,
-) -> dict[str, jnp.ndarray]:
+) -> tuple[dict[str, jnp.ndarray], jnp.ndarray]:
     """Compute all opacity terms using a single canonical implementation."""
-    opacity_terms = _compute_cia_opacity_terms(
+    opacity_terms, opacity_valid = _compute_cia_opacity_terms(
         art,
         opa_cias,
         Tarr,
@@ -606,8 +748,7 @@ def _compute_opacity_terms(
         mmw_profile,
         g,
     )
-    opacity_terms.update(
-        _compute_xs_opacity_terms(
+    mol_terms, mol_valid = _compute_xs_opacity_terms(
             art,
             opa_mols,
             Tarr,
@@ -615,9 +756,8 @@ def _compute_opacity_terms(
             mol_masses,
             g,
         )
-    )
-    opacity_terms.update(
-        _compute_xs_opacity_terms(
+    opacity_terms.update(mol_terms)
+    atom_terms, atom_valid = _compute_xs_opacity_terms(
             art,
             opa_atoms,
             Tarr,
@@ -625,9 +765,8 @@ def _compute_opacity_terms(
             atom_masses,
             g,
         )
-    )
-    opacity_terms.update(
-        _compute_continuum_opacity_terms(
+    opacity_terms.update(atom_terms)
+    continuum_terms, continuum_valid = _compute_continuum_opacity_terms(
             art,
             nu_grid=nu_grid,
             Tarr=Tarr,
@@ -635,8 +774,9 @@ def _compute_opacity_terms(
             mmw_profile=mmw_profile,
             g=g,
         )
-    )
-    return opacity_terms
+    opacity_terms.update(continuum_terms)
+    opacity_valid = opacity_valid & mol_valid & atom_valid & continuum_valid
+    return opacity_terms, opacity_valid
 
 
 def _sum_opacity_terms(
@@ -648,12 +788,7 @@ def _sum_opacity_terms(
     dtau = jnp.zeros((art.pressure.size, nu_grid.size))
     for term_name, dtau_term in opacity_terms.items():
         _debug_nonfinite_array(f"opacity_terms[{term_name}]", dtau_term)
-        # PreModit polynomial reconstruction of line strength can return slightly
-        # negative cross sections in f32 near the edges of its robust temperature
-        # range, especially for dense atomic spectra. A negative dtau contribution
-        # produces exp(-dtau) > 1 which then NaN-propagates through the Simpson
-        # integration in transmission RT. Clamp each term to >= 0 as a hard guard.
-        dtau = dtau + jnp.clip(dtau_term, 0.0, None)
+        dtau = dtau + dtau_term
         _debug_nonfinite_array(f"opacity_cumulative[{term_name}]", dtau)
     return dtau
 
@@ -674,8 +809,9 @@ def compute_opacity(
     mmw_profile: jnp.ndarray,
     g: jnp.ndarray,
     continuum_vmr_profiles: dict[str, jnp.ndarray] | None = None,
-) -> jnp.ndarray:
-    opacity_terms = _compute_opacity_terms(
+    return_validity: bool = False,
+) -> jnp.ndarray | tuple[jnp.ndarray, jnp.ndarray]:
+    opacity_terms, opacity_valid = _compute_opacity_terms(
         art,
         opa_mols,
         opa_atoms,
@@ -692,7 +828,10 @@ def compute_opacity(
         g,
         continuum_vmr_profiles,
     )
-    return _sum_opacity_terms(opacity_terms, art, nu_grid)
+    dtau = _sum_opacity_terms(opacity_terms, art, nu_grid)
+    if return_validity:
+        return dtau, opacity_valid
+    return dtau
 
 
 def compute_opacity_per_species(
@@ -712,7 +851,7 @@ def compute_opacity_per_species(
     nu_grid: jnp.ndarray,
     continuum_vmr_profiles: dict[str, jnp.ndarray] | None = None,
 ) -> dict[str, jnp.ndarray]:
-    return _compute_opacity_terms(
+    opacity_terms, _ = _compute_opacity_terms(
         art,
         opa_mols,
         opa_atoms,
@@ -729,6 +868,7 @@ def compute_opacity_per_species(
         g,
         continuum_vmr_profiles,
     )
+    return opacity_terms
 
 
 _MISSING = object()
@@ -831,7 +971,9 @@ def reconstruct_temperature_profile(
         )
         gamma = _posterior_site_value(posterior_params, "gamma", local_params=local_params)
 
-        Rp = _posterior_site_value(
+        # ``Rp`` is the legacy posterior site name; semantically it is the
+        # sampled reference radius used at the RT lower boundary.
+        R_ref = _posterior_site_value(
             posterior_params,
             "Rp",
             default=config.DEFAULT_POSTERIOR_RP,
@@ -841,11 +983,11 @@ def reconstruct_temperature_profile(
             "Mp",
             default=config.DEFAULT_POSTERIOR_MP,
         )
-        g_ref = gravity_surface(Rp, Mp)
+        g_btm = gravity_surface(R_ref, Mp)
 
         return guillot_profile(
             pressure_bar=art.pressure,
-            g_cgs=g_ref,
+            g_cgs=g_btm,
             Tirr=Tirr,
             Tint=Tint_fixed,
             kappa_ir_cgs=kappa_ir_cgs,
@@ -1053,7 +1195,7 @@ def reconstruct_fastchem_hybrid_profiles(
         for species in needed:
             if species not in composition_solver._hybrid_vmr_grids:
                 continue
-            vmr_profile = composition_solver._interp_4d(
+            vmr_profile = composition_solver._interp_4d_log_vmr(
                 composition_solver._hybrid_vmr_grids[species],
                 jnp.asarray(log_metallicity),
                 jnp.asarray(co_ratio),
@@ -1254,10 +1396,16 @@ def compute_atmospheric_state_from_posterior(
         Tint_fixed=region_config.Tint_fixed,
         sample_prefix=sample_prefix,
     )
-    # Mirror the clip applied at sampling time in _sample_atmosphere_state so
-    # posterior-reconstructed spectra use the same in-range Tarr that was fed
-    # to the likelihood during inference. See the note there for full context.
-    Tarr = jnp.clip(Tarr, region_config.T_low, region_config.T_high)
+    Tarr_np = np.asarray(Tarr, dtype=np.float64)
+    if (
+        np.any(~np.isfinite(Tarr_np))
+        or np.any(Tarr_np < region_config.T_low)
+        or np.any(Tarr_np > region_config.T_high)
+    ):
+        raise ValueError(
+            "Posterior temperature profile lies outside the supported range "
+            f"[{region_config.T_low}, {region_config.T_high}] K."
+        )
     composition_solver = region_config.composition_solver
     continuum_vmr_profiles: dict[str, jnp.ndarray] = {}
     if isinstance(composition_solver, ConstantVMR):
@@ -1348,15 +1496,43 @@ def compute_atmospheric_state_from_posterior(
         for atom, vmr_profile in vmr_atoms_profiles_dict.items():
             vmr_atoms[atom] = float(jnp.mean(vmr_profile))
 
+    mmw_np = np.asarray(mmw_profile, dtype=np.float64)
+    if (
+        np.any(~np.isfinite(mmw_np))
+        or np.any(mmw_np < config.MMW_RT_MIN)
+        or np.any(mmw_np > config.MMW_RT_MAX)
+    ):
+        raise ValueError(
+            "Posterior MMW profile lies outside the current RT numerical support "
+            f"[{config.MMW_RT_MIN}, {config.MMW_RT_MAX}]."
+        )
+
+    chemistry_profiles = {
+        **{f"MMR {name}": profile for name, profile in mmr_mols.items()},
+        **{f"MMR {name}": profile for name, profile in mmr_atoms.items()},
+        "VMR H2": vmrH2_profile,
+        "VMR He": vmrHe_profile,
+        **{
+            f"continuum VMR {name}": profile
+            for name, profile in continuum_vmr_profiles.items()
+        },
+    }
+    for label, profile in chemistry_profiles.items():
+        profile_np = np.asarray(profile, dtype=np.float64)
+        if np.any(~np.isfinite(profile_np)) or np.any(profile_np < 0.0):
+            raise ValueError(f"Posterior reconstruction produced an invalid {label} profile.")
 
     # Compute gravity profile
-    Rp = params.get("Rp", config.DEFAULT_POSTERIOR_RP) * RJ
+    # ``Rp`` remains the persisted posterior site for compatibility; its
+    # runtime meaning is the adopted reference radius at the RT lower
+    # boundary.
+    R_ref = params.get("Rp", config.DEFAULT_POSTERIOR_RP) * RJ
     Mp = params.get("Mp", config.DEFAULT_POSTERIOR_MP) * MJ
-    g_ref = gravity_surface(Rp / RJ, Mp / MJ)
-    g = art.gravity_profile(Tarr, mmw_profile, Rp, g_ref)
+    g_btm = gravity_surface(R_ref / RJ, Mp / MJ)
+    g = art.gravity_profile(Tarr, mmw_profile, R_ref, g_btm)
 
     # Compute total dtau (pass MMR profiles for molecules/atoms, VMR for CIA)
-    dtau = compute_opacity(
+    dtau, opacity_valid = compute_opacity(
         art=art,
         opa_mols=opa_mols,
         opa_atoms=opa_atoms,
@@ -1372,7 +1548,10 @@ def compute_atmospheric_state_from_posterior(
         mmw_profile=mmw_profile,
         g=g,
         continuum_vmr_profiles=continuum_vmr_profiles,
+        return_validity=True,
     )
+    if not bool(np.asarray(opacity_valid)):
+        raise ValueError("Posterior reconstruction produced an invalid opacity term.")
 
     # Compute per-species dtau
     dtau_per_species = compute_opacity_per_species(
@@ -1413,7 +1592,7 @@ def compute_atmospheric_state_from_posterior(
 
 def _sample_temperature_profile(
     region_config: AtmosphereRegionConfig,
-    g_ref: float | jnp.ndarray,
+    gravity_btm: float | jnp.ndarray,
 ) -> jnp.ndarray:
     art = region_config.art
     pt_profile = region_config.pt_profile
@@ -1435,7 +1614,7 @@ def _sample_temperature_profile(
 
         return guillot_profile(
             pressure_bar=art.pressure,
-            g_cgs=g_ref,
+            g_cgs=gravity_btm,
             Tirr=Tirr,
             Tint=region_config.Tint_fixed,
             kappa_ir_cgs=kappa_ir_cgs,
@@ -1484,9 +1663,9 @@ def compute_model_timeseries(
     dtau: jnp.ndarray,
     Tarr: jnp.ndarray,
     mmw_profile: jnp.ndarray,
-    Rp: float | jnp.ndarray,
+    radius_btm: float | jnp.ndarray,
     Rstar: float | jnp.ndarray,
-    g_ref: float | jnp.ndarray,
+    gravity_btm: float | jnp.ndarray,
     phase: jnp.ndarray,
     Kp: float | jnp.ndarray,
     v_sys: float | jnp.ndarray,
@@ -1499,55 +1678,31 @@ def compute_model_timeseries(
     Tstar: float | None = None,
     stellar_surface_flux: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-    Tarr_rt = jnp.nan_to_num(
-        jnp.clip(Tarr, min=100.0, max=8000.0),
-        nan=1500.0,
-        posinf=8000.0,
-        neginf=100.0,
-    )
-    # mmw floor of 1.0, not 0.1: exojax's normalized_layer_height recurrence
-    # computes a = 1 + (H_n / r_n) * log(k), where k = pressure_decrease_rate
-    # is the per-layer pressure ratio (~0.158 for P_TOP=1e-8, P_BTM=1, 10
-    # layers) and log(k) ~ -1.84. H_n is the pressure scale height normalized
-    # by radius_btm, and H_n ~ kB*T/(m_u*mmw*g*radius_btm). If mmw drops below
-    # ~0.2, H_n/r_n can exceed 1/|log(k)| ~ 0.54 at high T and low g, which
-    # flips a negative; once a < 0, layer heights flip sign, normalized radii
-    # go negative, and chord_geometric_matrix_lower evaluates safe_sqrt() on a
-    # negative argument -> NaN. Physical gas mmw cannot go below ~1 (pure H
-    # atmosphere); H2/He is ~2.3; clipping to [1.0, 50.0] keeps H_n/r_n below
-    # ~0.08 across the full [T_LOW, T_HIGH, g_ref] envelope so RT stays
-    # numerically well-posed even if FastChem returns a bad mmw at a grid
-    # corner. 50 as the upper bound generously covers heavy-metallicity
-    # atmospheres (pure H2O would be ~18, pure Fe ~56).
-    mmw_rt = jnp.nan_to_num(
-        jnp.clip(mmw_profile, min=1.0, max=50.0),
-        nan=2.3,
-        posinf=50.0,
-        neginf=1.0,
-    )
-    # Diagnostic probes BEFORE art.run to pinpoint which input carries a NaN
-    # on any remaining failure. Tarr_rt and mmw_rt are already nan_to_num'd so
-    # they should always print clean; dtau catches any NaN introduced between
-    # _sum_opacity_terms and here; Rp and g_ref are the scalar inputs.
+    # Temperature and MMW have already been validated and replaced with their
+    # single safe evaluation copies in _sample_atmosphere_state.
+    Tarr_rt = jnp.asarray(Tarr)
+    mmw_rt = jnp.asarray(mmw_profile)
+    # Diagnostic probes before art.run pinpoint any unexpected failure after
+    # the shared validation/safe-copy boundary.
     _debug_nonfinite_array("spectroscopy.rt_input.dtau", dtau)
     _debug_nonfinite_array("spectroscopy.rt_input.Tarr_rt", Tarr_rt)
     _debug_nonfinite_array("spectroscopy.rt_input.mmw_rt", mmw_rt)
-    _debug_nonfinite_scalar("spectroscopy.rt_input.Rp", Rp)
-    _debug_nonfinite_scalar("spectroscopy.rt_input.g_ref", g_ref)
+    _debug_nonfinite_scalar("spectroscopy.rt_input.radius_btm", radius_btm)
+    _debug_nonfinite_scalar("spectroscopy.rt_input.gravity_btm", gravity_btm)
     rt = _run_rt_for_mode(
         mode=mode,
         art=art,
         dtau=dtau,
         Tarr_rt=Tarr_rt,
         mmw_rt=mmw_rt,
-        Rp=Rp,
-        g_ref=g_ref,
+        radius_btm=radius_btm,
+        gravity_btm=gravity_btm,
         nu_grid=nu_grid,
     )
     _debug_nonfinite_array("spectroscopy.rt", rt)
 
     # Tidal locking: spin period = orbital period.
-    vsini = 2.0 * jnp.pi * Rp / (period_day * 86400.0) / 1.0e5
+    vsini = 2.0 * jnp.pi * radius_btm / (period_day * 86400.0) / 1.0e5
     rt = sop_rot.rigid_rotation(rt, vsini, 0.0, 0.0)
     rt = sop_inst.ipgauss(rt, beta_inst)
 
@@ -1556,11 +1711,11 @@ def compute_model_timeseries(
     _debug_nonfinite_array("spectroscopy.planet_ts", planet_ts)
 
     if mode == "transmission":
-        # ArtTransPure returns (R_lambda / Rp)**2. Convert that directly to
+        # ArtTransPure returns (R_lambda / radius_btm)**2. Convert that directly to
         # transit depth and then to the negative perturbation of normalized
         # stellar flux. The prepared transmission data are flux residuals, not
         # radius-ratio spectra.
-        transit_depth_ts = jnp.clip(planet_ts, 0.0, None) * (Rp / Rstar) ** 2
+        transit_depth_ts = jnp.clip(planet_ts, 0.0, None) * (radius_btm / Rstar) ** 2
         return -transit_depth_ts
 
     Fs = _resolve_emission_stellar_surface_flux(
@@ -1568,13 +1723,14 @@ def compute_model_timeseries(
         stellar_surface_flux=stellar_surface_flux,
         context="compute_model_timeseries",
     )
-    # The observations and PHOENIX spectrum are in the stellar-rest frame.
-    # Only the planet follows the orbital velocity.
+    # The component builder has already applied the star-specific rotation and
+    # instrumental profile to Fs. Keep that prepared denominator fixed in the
+    # stellar-rest frame; only the planet follows the orbital velocity.
     stellar_spectrum = sop_inst.sampling(Fs, 0.0, inst_nus)
     return (
         planet_ts
         / jnp.clip(stellar_spectrum[None, :], config.F32_FLOOR_RECIP, None)
-        * (Rp / Rstar) ** 2
+        * (radius_btm / Rstar) ** 2
     )
 
 
@@ -1652,6 +1808,42 @@ def apply_collapsed_transmission_operator(
     return spectrum_binned[operator.output_indices][None, :]
 
 
+def apply_frozen_timeseries_operator(
+    model_ts: jnp.ndarray,
+    operator: FrozenTimeseriesInputs,
+) -> jnp.ndarray:
+    """Replay full-exposure preprocessing before selecting likelihood rows."""
+    model_ts = jnp.asarray(model_ts)
+    if model_ts.ndim != 2:
+        raise ValueError(
+            "A frozen time-series operator requires a 2D model time series; "
+            f"got shape {model_ts.shape}."
+        )
+    if model_ts.shape[0] != operator.source_phase.size:
+        raise ValueError(
+            "Frozen time-series source exposure count does not match the model: "
+            f"{operator.source_phase.size} versus {model_ts.shape[0]}."
+        )
+
+    processed = model_ts * operator.active_exposure_mask[:, None]
+    median_subtracted = processed - jnp.median(
+        processed,
+        axis=0,
+        keepdims=True,
+    )
+    processed = jnp.where(
+        jnp.asarray(operator.subtract_time_median),
+        median_subtracted,
+        processed,
+    )
+    if operator.chunked_sysrem is not None:
+        processed = sysrem_model_distortion_chunked(
+            processed,
+            operator.chunked_sysrem,
+        )
+    return processed[operator.selected_exposure_indices]
+
+
 def apply_model_pipeline_corrections(
     model_ts: jnp.ndarray,
     *,
@@ -1693,9 +1885,16 @@ def apply_model_pipeline_corrections(
         if chunked_sysrem is not None:
             model_ts = sysrem_model_distortion_chunked(model_ts, chunked_sysrem)
         else:
-            if (U is None) or (V is None):
-                raise ValueError("apply_sysrem=True requires either chunked SYSREM inputs or both U and V.")
-            model_ts = sysrem_model_distortion(model_ts, U, V)
+            if U is None or sigma is None:
+                raise ValueError(
+                    "apply_sysrem=True requires either chunked SYSREM inputs "
+                    "or U plus per-pixel sigma."
+                )
+            model_ts = sysrem_model_distortion_per_pixel(
+                model_ts,
+                U,
+                sigma,
+            )
 
     return model_ts
 
@@ -1706,53 +1905,58 @@ def _normalize_chunked_sysrem_inputs(
     n_exp: int,
     n_wave: int,
 ) -> ChunkedSysremInputs:
-    chunk_indices_np = tuple(np.asarray(indices, dtype=int) for indices in chunked_sysrem.chunk_indices)
-    U_chunks_np = tuple(np.asarray(U_chunk) for U_chunk in chunked_sysrem.U_chunks)
-    V_chunks_np = tuple(np.asarray(V_chunk) for V_chunk in chunked_sysrem.V_chunks)
+    chunk_indices = tuple(
+        jnp.asarray(indices, dtype=jnp.int32)
+        for indices in chunked_sysrem.chunk_indices
+    )
+    U_chunks = tuple(jnp.asarray(U_chunk) for U_chunk in chunked_sysrem.U_chunks)
+    sigma_chunks = tuple(
+        jnp.asarray(sigma_chunk) for sigma_chunk in chunked_sysrem.sigma_chunks
+    )
 
-    if not (len(chunk_indices_np) == len(U_chunks_np) == len(V_chunks_np)):
-        raise ValueError("chunked_sysrem must provide the same number of chunk indices, U chunks, and V chunks.")
+    if not (len(chunk_indices) == len(U_chunks) == len(sigma_chunks)):
+        raise ValueError(
+            "chunked_sysrem must provide the same number of chunk indices, "
+            "U chunks, and per-pixel sigma chunks."
+        )
 
-    assigned = np.zeros((n_wave,), dtype=bool)
     normalized_indices: list[jnp.ndarray] = []
     normalized_u_chunks: list[jnp.ndarray] = []
-    normalized_v_chunks: list[jnp.ndarray] = []
+    normalized_sigma_chunks: list[jnp.ndarray] = []
+    assigned_column_count = 0
 
-    for chunk_number, (indices, U_chunk, V_chunk) in enumerate(zip(chunk_indices_np, U_chunks_np, V_chunks_np)):
+    for chunk_number, (indices, U_chunk, sigma_chunk) in enumerate(
+        zip(chunk_indices, U_chunks, sigma_chunks)
+    ):
         if indices.ndim != 1:
             raise ValueError(f"chunk_indices[{chunk_number}] must be 1D, got shape {indices.shape}.")
-        if np.any(indices < 0) or np.any(indices >= n_wave):
-            raise ValueError(f"chunk_indices[{chunk_number}] contains out-of-range wavelength columns.")
-        if np.unique(indices).size != indices.size:
-            raise ValueError(f"chunk_indices[{chunk_number}] contains duplicate wavelength columns.")
-        if np.any(assigned[indices]):
-            raise ValueError(f"chunk_indices[{chunk_number}] overlaps another SYSREM chunk.")
-        assigned[indices] = True
+        assigned_column_count += indices.shape[0]
 
         if U_chunk.ndim != 2 or U_chunk.shape[0] != n_exp:
             raise ValueError(
                 f"U_chunks[{chunk_number}] must have shape (n_exp, n_basis), "
                 f"got {U_chunk.shape} with n_exp={n_exp}."
             )
-        if V_chunk.ndim == 1:
-            if V_chunk.size != n_exp:
-                raise ValueError(f"V_chunks[{chunk_number}] length {V_chunk.size} does not match n_exp={n_exp}.")
-            V_chunk = np.diag(V_chunk)
-        elif V_chunk.ndim != 2 or V_chunk.shape != (n_exp, n_exp):
-            raise ValueError(f"V_chunks[{chunk_number}] must have shape {(n_exp, n_exp)}, got {V_chunk.shape}.")
+        expected_sigma_shape = (n_exp, indices.size)
+        if sigma_chunk.shape != expected_sigma_shape:
+            raise ValueError(
+                f"sigma_chunks[{chunk_number}] must have shape "
+                f"{expected_sigma_shape}, got {sigma_chunk.shape}."
+            )
+        normalized_indices.append(indices)
+        normalized_u_chunks.append(U_chunk)
+        normalized_sigma_chunks.append(sigma_chunk)
 
-        normalized_indices.append(jnp.asarray(indices, dtype=jnp.int32))
-        normalized_u_chunks.append(jnp.asarray(U_chunk))
-        normalized_v_chunks.append(jnp.asarray(V_chunk))
-
-    if not np.all(assigned):
-        missing = int(np.sum(~assigned))
-        raise ValueError(f"chunked_sysrem does not cover the full wavelength axis; {missing} columns are unassigned.")
+    if assigned_column_count != n_wave:
+        raise ValueError(
+            "chunked_sysrem chunk sizes do not cover the full wavelength axis; "
+            f"assigned {assigned_column_count} columns for n_wave={n_wave}."
+        )
 
     return ChunkedSysremInputs(
         chunk_indices=tuple(normalized_indices),
         U_chunks=tuple(normalized_u_chunks),
-        V_chunks=tuple(normalized_v_chunks),
+        sigma_chunks=tuple(normalized_sigma_chunks),
     )
 
 
@@ -1765,6 +1969,7 @@ def _normalize_spectroscopic_observation_inputs(
     U = None if inputs.U is None else jnp.asarray(inputs.U)
     V = None if inputs.V is None else jnp.asarray(inputs.V)
     chunked_sysrem = inputs.chunked_sysrem
+    frozen_timeseries = inputs.frozen_timeseries
     collapsed_emission = inputs.collapsed_emission
     collapsed_transmission = inputs.collapsed_transmission
 
@@ -1780,6 +1985,13 @@ def _normalize_spectroscopic_observation_inputs(
         raise ValueError(f"phase length {phase.shape[0]} does not match number of exposures {data.shape[0]}")
     if chunked_sysrem is not None and (U is not None or V is not None):
         raise ValueError("Provide either global U/V SYSREM inputs or chunked_sysrem, not both.")
+    if frozen_timeseries is not None and (
+        U is not None or V is not None or chunked_sysrem is not None
+    ):
+        raise ValueError(
+            "A frozen time-series operator owns its SYSREM projection; do not "
+            "also provide top-level U/V or chunked_sysrem inputs."
+        )
     if V is not None:
         expected_shape = (data.shape[0], data.shape[0])
         if V.shape != expected_shape:
@@ -1789,6 +2001,52 @@ def _normalize_spectroscopic_observation_inputs(
             chunked_sysrem,
             n_exp=data.shape[0],
             n_wave=data.shape[1],
+        )
+    if frozen_timeseries is not None:
+        source_phase = jnp.asarray(frozen_timeseries.source_phase)
+        active_mask = jnp.asarray(frozen_timeseries.active_exposure_mask)
+        selected_indices = jnp.asarray(
+            frozen_timeseries.selected_exposure_indices,
+            dtype=jnp.int32,
+        )
+        if source_phase.ndim != 1 or active_mask.shape != source_phase.shape:
+            raise ValueError(
+                "Frozen time-series source_phase and active_exposure_mask must "
+                "be matching 1D arrays."
+            )
+        if selected_indices.ndim != 1:
+            raise ValueError(
+                "Frozen time-series selected_exposure_indices must be 1D."
+            )
+        if selected_indices.size != data.shape[0]:
+            raise ValueError(
+                "Frozen time-series selected exposure count must match the "
+                f"observed data: {selected_indices.size} versus {data.shape[0]}."
+            )
+        frozen_timeseries = FrozenTimeseriesInputs(
+            source_phase=source_phase,
+            active_exposure_mask=active_mask,
+            selected_exposure_indices=selected_indices,
+            subtract_time_median=jnp.asarray(
+                frozen_timeseries.subtract_time_median,
+                dtype=bool,
+            ),
+            chunked_sysrem=(
+                None
+                if frozen_timeseries.chunked_sysrem is None
+                else _normalize_chunked_sysrem_inputs(
+                    frozen_timeseries.chunked_sysrem,
+                    n_exp=source_phase.size,
+                    n_wave=data.shape[1],
+                )
+            ),
+        )
+    if frozen_timeseries is not None and (
+        collapsed_emission is not None or collapsed_transmission is not None
+    ):
+        raise ValueError(
+            "A spectroscopic component cannot combine an ordinary frozen "
+            "time-series operator with a collapsed 1D operator."
         )
     if collapsed_emission is not None:
         source_wavelength = jnp.asarray(collapsed_emission.source_wavelength)
@@ -1979,6 +2237,7 @@ def _normalize_spectroscopic_observation_inputs(
         U=U,
         V=V,
         chunked_sysrem=chunked_sysrem,
+        frozen_timeseries=frozen_timeseries,
         collapsed_emission=collapsed_emission,
         collapsed_transmission=collapsed_transmission,
     )
@@ -1999,6 +2258,43 @@ def _sample_shared_system_state(
     sample_v_sys: bool,
 ) -> SharedSystemState:
     import math
+
+    def _sample_positive_parameter(
+        site_name: str,
+        *,
+        mean: float,
+        std: float,
+        low: float,
+        mode: SystemPriorMode,
+        upper: float | None = None,
+        upper_low: float | None = None,
+    ) -> jnp.ndarray:
+        if mode == "fixed":
+            if not math.isfinite(float(mean)) or float(mean) <= low:
+                raise ValueError(
+                    f"{site_name} fixed prior requires a finite value > {low}."
+                )
+            value = jnp.asarray(mean)
+            numpyro.deterministic(site_name, value)
+            return value
+        if mode == "upper_limit":
+            uniform_low = low if upper_low is None else float(upper_low)
+            if upper is None or not math.isfinite(float(upper)) or float(upper) <= uniform_low:
+                raise ValueError(
+                    f"{site_name} prior mode 'upper_limit' requires a finite upper bound > {uniform_low}."
+                )
+            return numpyro.sample(site_name, dist.Uniform(uniform_low, float(upper)))
+        if mode == "normal":
+            if not math.isfinite(float(mean)):
+                raise ValueError(f"{site_name} normal prior requires a finite mean.")
+            if not math.isfinite(float(std)) or float(std) <= 0.0:
+                raise ValueError(f"{site_name} normal prior requires a finite positive std.")
+            return numpyro.sample(
+                site_name,
+                dist.TruncatedNormal(float(mean), float(std), low=low),
+            )
+        raise ValueError(f"Unsupported {site_name} prior mode: {mode!r}")
+
     if not sample_Kp:
         Kp = jnp.asarray(shared_config.Kp_mean)
         numpyro.deterministic("Kp", Kp)
@@ -2020,24 +2316,44 @@ def _sample_shared_system_state(
     else:
         v_sys = jnp.asarray(0.0)
         numpyro.deterministic("v_sys", v_sys)
-    if shared_config.Mp_upper_3sigma is not None:
-        Mp = numpyro.sample("Mp", dist.Uniform(0.5, shared_config.Mp_upper_3sigma)) * MJ
-    else:
-        Mp = numpyro.sample("Mp", dist.TruncatedNormal(shared_config.Mp_mean, shared_config.Mp_std, low=0.0)) * MJ
-    Rstar = numpyro.sample(
+    Mp = _sample_positive_parameter(
+        "Mp",
+        mean=shared_config.Mp_mean,
+        std=shared_config.Mp_std,
+        low=0.0,
+        mode=shared_config.Mp_prior_mode,
+        upper=shared_config.Mp_upper_3sigma,
+        upper_low=0.5,
+    ) * MJ
+    Rstar = _sample_positive_parameter(
         "Rstar",
-        dist.TruncatedNormal(shared_config.Rstar_mean, shared_config.Rstar_std, low=0.0),
+        mean=shared_config.Rstar_mean,
+        std=shared_config.Rstar_std,
+        low=0.0,
+        mode=shared_config.Rstar_prior_mode,
     ) * Rs
-    Rp = numpyro.sample("Rp", dist.TruncatedNormal(shared_config.Rp_mean, shared_config.Rp_std, low=0.5)) * RJ
-    g_ref = gravity_surface(Rp / RJ, Mp / MJ)
+    # Keep the NumPyro site name ``Rp`` for compatibility with existing
+    # posterior files, while giving the runtime quantity its explicit
+    # reference-radius meaning.
+    R_ref = _sample_positive_parameter(
+        "Rp",
+        mean=shared_config.R_ref_mean,
+        std=shared_config.R_ref_std,
+        low=0.5,
+        mode=shared_config.R_ref_prior_mode,
+    ) * RJ
+    # P_ref is validated against the transmission RT lower boundary when the
+    # ArtTransPure object is built; this is therefore the gravity at the same
+    # reference/lower-boundary radius used by the forward model.
+    g_btm = gravity_surface(R_ref / RJ, Mp / MJ)
 
     return SharedSystemState(
         Kp=Kp,
         v_sys=v_sys,
         Mp=Mp,
         Rstar=Rstar,
-        Rp=Rp,
-        g_ref=g_ref,
+        R_ref=R_ref,
+        g_btm=g_btm,
     )
 
 
@@ -2047,26 +2363,13 @@ def _sample_atmosphere_state(
     *,
     scope_prefix: str | None = None,
 ) -> AtmosphereState:
-    # Clamp Tarr to [T_low, T_high] before it feeds any downstream consumer.
-    # Rationale: guillot_profile has no notion of the configured atmospheric T
-    # range - for Tirr near T_high and gamma at the upper prior edge, the
-    # top-of-atmosphere Guillot temperature T_top^4 = (3/4)*Tirr^4*(2/3 + gamma/sqrt(3))
-    # can exceed 10,000 K, which is far outside PreModit's robust range (~1451-5585 K
-    # for [1500, 5500]) and FastChem's tabulated grid. PreModit's f32 polynomial
-    # reconstruction of line strength overflows on out-of-range T, producing Inf
-    # then NaN cross sections; FastChem's grid interpolator likewise returns NaN
-    # mass fractions when T exceeds its tabulated extent. Both propagate through
-    # opacity_terms = xsmatrix * mmr to yield all-NaN optical depths and a NaN
-    # logL that numpyro.factor rejects during MCMC init. Clipping once here
-    # guarantees every downstream Tarr consumer (composition solver, xsmatrix,
-    # gravity_profile, H-minus continuum) sees an in-range temperature. The clip
-    # gradient is zero in saturated regions, which means Guillot parameters get
-    # no likelihood pull when the unclipped profile would be unphysical anyway;
-    # tightened priors (LOG_GAMMA_BOUNDS, LOG_KAPPA_IR_BOUNDS) keep that clipped
-    # tail to a minority of prior mass.
     if scope_prefix is None:
-        Tarr_raw = _sample_temperature_profile(region_config, shared_state.g_ref)
-        Tarr = jnp.clip(Tarr_raw, region_config.T_low, region_config.T_high)
+        Tarr_raw = _sample_temperature_profile(region_config, shared_state.g_btm)
+        Tarr, temperature_valid = _safe_temperature_profile(
+            Tarr_raw,
+            region_config.T_low,
+            region_config.T_high,
+        )
         comp = region_config.composition_solver.sample(
             region_config.mol_names,
             region_config.mol_masses,
@@ -2077,8 +2380,12 @@ def _sample_atmosphere_state(
         )
     else:
         with numpyro.handlers.scope(prefix=scope_prefix):
-            Tarr_raw = _sample_temperature_profile(region_config, shared_state.g_ref)
-            Tarr = jnp.clip(Tarr_raw, region_config.T_low, region_config.T_high)
+            Tarr_raw = _sample_temperature_profile(region_config, shared_state.g_btm)
+            Tarr, temperature_valid = _safe_temperature_profile(
+                Tarr_raw,
+                region_config.T_low,
+                region_config.T_high,
+            )
             comp = region_config.composition_solver.sample(
                 region_config.mol_names,
                 region_config.mol_masses,
@@ -2088,18 +2395,64 @@ def _sample_atmosphere_state(
                 Tarr=Tarr,
             )
 
+    def _sample_velocity_offsets() -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+        mode = region_config.velocity_offset_mode
+        bounds = region_config.velocity_offset_bounds_kms
+        if mode == "region":
+            return numpyro.sample("delta_v", dist.Uniform(*bounds)), {}
+        if mode == "species":
+            offsets = {
+                species: numpyro.sample(
+                    f"delta_v_{_sanitize_site_name(species)}",
+                    dist.Uniform(*bounds),
+                )
+                for species in region_config.velocity_offset_species
+            }
+            return jnp.asarray(0.0), offsets
+        if mode in {"shared", "none"}:
+            return jnp.asarray(0.0), {}
+        raise ValueError(
+            f"Unsupported velocity offset mode for region {region_config.name!r}: {mode!r}"
+        )
+
+    if scope_prefix is None:
+        region_velocity_offset_kms, species_velocity_offsets_kms = (
+            _sample_velocity_offsets()
+        )
+    else:
+        with numpyro.handlers.scope(prefix=scope_prefix):
+            region_velocity_offset_kms, species_velocity_offsets_kms = (
+                _sample_velocity_offsets()
+            )
+
+    mmw_profile, mmw_valid = _safe_mmw_profile(comp.mmw_profile)
+    chemistry_valid = jnp.asarray(True)
+    mmr_mols = {}
+    for i, mol in enumerate(region_config.mol_names):
+        profile, profile_valid = _safe_nonnegative_profile(comp.mmr_mols[i])
+        mmr_mols[mol] = profile
+        chemistry_valid = chemistry_valid & profile_valid
+    mmr_atoms = {}
+    for i, atom in enumerate(region_config.atom_names):
+        profile, profile_valid = _safe_nonnegative_profile(comp.mmr_atoms[i])
+        mmr_atoms[atom] = profile
+        chemistry_valid = chemistry_valid & profile_valid
+
+    vmrH2_profile, h2_valid = _safe_nonnegative_profile(comp.vmrH2_profile)
+    vmrHe_profile, he_valid = _safe_nonnegative_profile(comp.vmrHe_profile)
+    chemistry_valid = chemistry_valid & h2_valid & he_valid
+    continuum_vmr_profiles = {}
+    for species, raw_profile in comp.continuum_vmr_profiles.items():
+        profile, profile_valid = _safe_nonnegative_profile(raw_profile)
+        continuum_vmr_profiles[species] = profile
+        chemistry_valid = chemistry_valid & profile_valid
+
     g_profile = region_config.art.gravity_profile(
         Tarr,
-        comp.mmw_profile,
-        shared_state.Rp,
-        shared_state.g_ref,
+        mmw_profile,
+        shared_state.R_ref,
+        shared_state.g_btm,
     )
-    mmr_mols = {
-        mol: comp.mmr_mols[i] for i, mol in enumerate(region_config.mol_names)
-    }
-    mmr_atoms = {
-        atom: comp.mmr_atoms[i] for i, atom in enumerate(region_config.atom_names)
-    }
     mol_masses = {
         species: region_config.mol_masses[i]
         for i, species in enumerate(region_config.mol_names)
@@ -2113,22 +2466,26 @@ def _sample_atmosphere_state(
         art=region_config.art,
         Tarr=Tarr,
         g_profile=g_profile,
-        mmw_profile=comp.mmw_profile,
+        mmw_profile=mmw_profile,
         mmr_mols=mmr_mols,
         mmr_atoms=mmr_atoms,
         mol_masses=mol_masses,
         atom_masses=atom_masses,
-        vmrH2_profile=comp.vmrH2_profile,
-        vmrHe_profile=comp.vmrHe_profile,
-        continuum_vmr_profiles=comp.continuum_vmr_profiles,
+        vmrH2_profile=vmrH2_profile,
+        vmrHe_profile=vmrHe_profile,
+        continuum_vmr_profiles=continuum_vmr_profiles,
+        velocity_offset_mode=region_config.velocity_offset_mode,
+        region_velocity_offset_kms=region_velocity_offset_kms,
+        species_velocity_offsets_kms=species_velocity_offsets_kms,
+        is_valid=temperature_valid & chemistry_valid & mmw_valid,
     )
 
 
 def _compute_component_dtau(
     component_config: ObservationConfig,
     atmosphere_state: AtmosphereState,
-) -> jnp.ndarray:
-    return compute_opacity(
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    opacity_terms, opacity_valid = _compute_opacity_terms(
         art=atmosphere_state.art,
         opa_mols=component_config.opa_mols,
         opa_atoms=component_config.opa_atoms,
@@ -2145,6 +2502,31 @@ def _compute_component_dtau(
         g=atmosphere_state.g_profile,
         continuum_vmr_profiles=atmosphere_state.continuum_vmr_profiles,
     )
+    if atmosphere_state.species_velocity_offsets_kms:
+        if not isinstance(component_config, SpectroscopicObservationConfig):
+            raise ValueError(
+                "Species-specific velocity offsets are only supported for "
+                "spectroscopic observations."
+            )
+        for species, delta_v_kms in atmosphere_state.species_velocity_offsets_kms.items():
+            if species not in opacity_terms:
+                raise ValueError(
+                    f"Velocity-offset species {species!r} is not an active opacity "
+                    f"source for component {component_config.name!r}."
+                )
+            opacity_terms[species] = jax.vmap(
+                lambda layer_dtau: component_config.sop_inst.sampling(
+                    layer_dtau,
+                    delta_v_kms,
+                    component_config.nu_grid,
+                )
+            )(opacity_terms[species])
+    dtau = _sum_opacity_terms(
+        opacity_terms,
+        atmosphere_state.art,
+        component_config.nu_grid,
+    )
+    return dtau, atmosphere_state.is_valid & opacity_valid
 
 
 def _validate_unique_sample_prefixes(
@@ -2187,57 +2569,42 @@ def _compute_native_observable_spectrum(
     dtau: jnp.ndarray,
     Tarr: jnp.ndarray,
     mmw_profile: jnp.ndarray,
-    Rp: float | jnp.ndarray,
+    radius_btm: float | jnp.ndarray,
     Rstar: float | jnp.ndarray,
-    g_ref: float | jnp.ndarray,
+    gravity_btm: float | jnp.ndarray,
     nu_grid: jnp.ndarray,
     Tstar: float | None = None,
     stellar_surface_flux: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-    # Mirror the Tarr / mmw guards applied in compute_model_timeseries. See
-    # the comment on mmw_rt there for the derivation of the 1.0 floor; briefly,
-    # exojax's normalized_layer_height recurrence produces NaNs via a negative
-    # sqrt argument in chord_geometric_matrix_lower whenever mmw is small
-    # enough that the pressure scale height exceeds r_btm * |log(k)|^-1.
-    Tarr_rt = jnp.nan_to_num(
-        jnp.clip(Tarr, min=100.0, max=8000.0),
-        nan=1500.0,
-        posinf=8000.0,
-        neginf=100.0,
-    )
-    mmw_rt = jnp.nan_to_num(
-        jnp.clip(mmw_profile, min=1.0, max=50.0),
-        nan=2.3,
-        posinf=50.0,
-        neginf=1.0,
-    )
+    Tarr_rt = jnp.asarray(Tarr)
+    mmw_rt = jnp.asarray(mmw_profile)
     _debug_nonfinite_array("bandpass.rt_input.dtau", dtau)
     _debug_nonfinite_array("bandpass.rt_input.Tarr_rt", Tarr_rt)
     _debug_nonfinite_array("bandpass.rt_input.mmw_rt", mmw_rt)
-    _debug_nonfinite_scalar("bandpass.rt_input.Rp", Rp)
-    _debug_nonfinite_scalar("bandpass.rt_input.g_ref", g_ref)
+    _debug_nonfinite_scalar("bandpass.rt_input.radius_btm", radius_btm)
+    _debug_nonfinite_scalar("bandpass.rt_input.gravity_btm", gravity_btm)
     rt = _run_rt_for_mode(
         mode=mode,
         art=art,
         dtau=dtau,
         Tarr_rt=Tarr_rt,
         mmw_rt=mmw_rt,
-        Rp=Rp,
-        g_ref=g_ref,
+        radius_btm=radius_btm,
+        gravity_btm=gravity_btm,
         nu_grid=nu_grid,
     )
     _debug_nonfinite_array("bandpass.rt", rt)
 
     if mode == "transmission":
         # The native transmission observable is physically non-negative.
-        return jnp.sqrt(jnp.clip(rt, 0.0, None)) * (Rp / Rstar)
+        return jnp.sqrt(jnp.clip(rt, 0.0, None)) * (radius_btm / Rstar)
 
     Fs = _resolve_emission_stellar_surface_flux(
         nu_grid=nu_grid,
         stellar_surface_flux=stellar_surface_flux,
         context="_compute_native_observable_spectrum",
     )
-    return rt / jnp.clip(Fs, config.F32_FLOOR_RECIP, None) * (Rp / Rstar) ** 2
+    return rt / jnp.clip(Fs, config.F32_FLOOR_RECIP, None) * (radius_btm / Rstar) ** 2
 
 
 def _resolve_emission_stellar_surface_flux(
@@ -2249,7 +2616,7 @@ def _resolve_emission_stellar_surface_flux(
     if stellar_surface_flux is None:
         raise ValueError(
             f"{context} requires stellar_surface_flux for emission mode. "
-            "Provide phoenix_spectrum_path when building the observation config."
+            "Initialize the cached PHOENIX surface spectrum when building the observation config."
         )
 
     stellar_surface_flux = jnp.asarray(stellar_surface_flux)
@@ -2394,12 +2761,13 @@ def _evaluate_spectroscopic_component(
     shared_config: SharedSystemConfig,
     shared_state: SharedSystemState,
     atmosphere_state: AtmosphereState,
-) -> jnp.ndarray:
-    dtau = _compute_component_dtau(component_config, atmosphere_state)
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    dtau, model_valid = _compute_component_dtau(component_config, atmosphere_state)
     _debug_nonfinite_array(f"spectroscopy[{component_config.name}].dtau", dtau)
 
     collapsed_emission = observation_inputs.collapsed_emission
     collapsed_transmission = observation_inputs.collapsed_transmission
+    frozen_timeseries = observation_inputs.frozen_timeseries
     if collapsed_emission is not None and collapsed_transmission is not None:
         raise ValueError(
             "A spectroscopic component cannot use both collapsed emission "
@@ -2410,6 +2778,22 @@ def _evaluate_spectroscopic_component(
         if collapsed_emission is not None
         else collapsed_transmission
     )
+
+    def _resolved_velocity_offset(
+        base_offset: jnp.ndarray,
+        *,
+        use_shared: bool,
+    ) -> jnp.ndarray:
+        if atmosphere_state.velocity_offset_mode == "shared":
+            return shared_state.v_sys if use_shared else base_offset
+        if atmosphere_state.velocity_offset_mode == "region":
+            return base_offset + atmosphere_state.region_velocity_offset_kms
+        if atmosphere_state.velocity_offset_mode in {"species", "none"}:
+            return base_offset
+        raise ValueError(
+            f"Unsupported velocity offset mode: {atmosphere_state.velocity_offset_mode!r}"
+        )
+
     if collapsed_operator is not None:
         if component_config.mode != "emission":
             if collapsed_transmission is None:
@@ -2424,17 +2808,25 @@ def _evaluate_spectroscopic_component(
             )
         phase = collapsed_operator.source_phase
         Kp = collapsed_operator.kp_reference_kms
-        v_sys = collapsed_operator.velocity_offset_reference_kms
+        v_sys = _resolved_velocity_offset(
+            collapsed_operator.velocity_offset_reference_kms,
+            use_shared=False,
+        )
         model_inst_nus = collapsed_operator.source_inst_nus
+    elif frozen_timeseries is not None:
+        phase = frozen_timeseries.source_phase
+        Kp = shared_state.Kp
+        v_sys = _resolved_velocity_offset(jnp.asarray(0.0), use_shared=True)
+        model_inst_nus = component_config.inst_nus
     elif component_config.radial_velocity_mode == "none":
         phase = jnp.zeros_like(observation_inputs.phase)
         Kp = jnp.asarray(0.0)
-        v_sys = jnp.asarray(0.0)
+        v_sys = _resolved_velocity_offset(jnp.asarray(0.0), use_shared=False)
         model_inst_nus = component_config.inst_nus
     else:
         phase = observation_inputs.phase
         Kp = shared_state.Kp
-        v_sys = shared_state.v_sys
+        v_sys = _resolved_velocity_offset(jnp.asarray(0.0), use_shared=True)
         model_inst_nus = component_config.inst_nus
 
     model_ts = compute_model_timeseries(
@@ -2443,9 +2835,9 @@ def _evaluate_spectroscopic_component(
         dtau=dtau,
         Tarr=atmosphere_state.Tarr,
         mmw_profile=atmosphere_state.mmw_profile,
-        Rp=shared_state.Rp,
+        radius_btm=shared_state.R_ref,
         Rstar=shared_state.Rstar,
-        g_ref=shared_state.g_ref,
+        gravity_btm=shared_state.g_btm,
         phase=phase,
         Kp=Kp,
         v_sys=v_sys,
@@ -2469,10 +2861,17 @@ def _evaluate_spectroscopic_component(
             model_ts,
             collapsed_transmission,
         )
+    elif frozen_timeseries is not None:
+        model_ts = apply_frozen_timeseries_operator(
+            model_ts,
+            frozen_timeseries,
+        )
     model_ts = apply_model_pipeline_corrections(
         model_ts,
         subtract_weighted_global_mean=component_config.subtract_weighted_global_mean,
-        apply_sysrem=component_config.apply_sysrem,
+        apply_sysrem=(
+            component_config.apply_sysrem and frozen_timeseries is None
+        ),
         sigma=observation_inputs.sigma,
         U=observation_inputs.U,
         V=observation_inputs.V,
@@ -2486,7 +2885,7 @@ def _evaluate_spectroscopic_component(
         observation_inputs.sigma,
     )
     _debug_nonfinite_scalar(f"spectroscopy[{component_config.name}].logL", lnL)
-    return lnL
+    return lnL, model_valid
 
 
 def _evaluate_bandpass_component(
@@ -2494,18 +2893,18 @@ def _evaluate_bandpass_component(
     observation_inputs: BandpassObservationInputs,
     shared_state: SharedSystemState,
     atmosphere_state: AtmosphereState,
-) -> jnp.ndarray:
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     site_prefix = _bandpass_site_prefix(component_config)
-    dtau = _compute_component_dtau(component_config, atmosphere_state)
+    dtau, model_valid = _compute_component_dtau(component_config, atmosphere_state)
     spectrum = _compute_native_observable_spectrum(
         mode=component_config.mode,
         art=atmosphere_state.art,
         dtau=dtau,
         Tarr=atmosphere_state.Tarr,
         mmw_profile=atmosphere_state.mmw_profile,
-        Rp=shared_state.Rp,
+        radius_btm=shared_state.R_ref,
         Rstar=shared_state.Rstar,
-        g_ref=shared_state.g_ref,
+        gravity_btm=shared_state.g_btm,
         nu_grid=component_config.nu_grid,
         Tstar=component_config.Tstar,
         stellar_surface_flux=component_config.stellar_surface_flux,
@@ -2533,7 +2932,7 @@ def _evaluate_bandpass_component(
         if component_config.include_reflection:
             reflected_component = _compute_reflected_bandpass_component(
                 geometric_albedo,
-                shared_state.Rp,
+                shared_state.R_ref,
                 component_config.semi_major_axis_au,
             )
         numpyro.deterministic(f"{site_prefix}_reflected_component", reflected_component)
@@ -2549,10 +2948,13 @@ def _evaluate_bandpass_component(
         model_value=model_value,
         model_sigma=model_sigma,
     )
-    return _gaussian_log_likelihood(
-        observation_inputs.value,
-        effective_value,
-        observation_inputs.sigma,
+    return (
+        _gaussian_log_likelihood(
+            observation_inputs.value,
+            effective_value,
+            observation_inputs.sigma,
+        ),
+        model_valid,
     )
 
 
@@ -2561,15 +2963,28 @@ def joint_retrieval_model(
     observations: dict[str, ObservationInputs],
 ) -> None:
     multi_observation = len(model_config.observations) > 1
-    sample_v_sys = any(
+    orbital_region_names = {
+        component.region_name
+        for component in model_config.observations
+        if isinstance(component, SpectroscopicObservationConfig)
+        and component.radial_velocity_mode == "orbital"
+    }
+    sample_Kp = bool(orbital_region_names)
+    sample_shared_v_sys = any(
+        region.name in orbital_region_names
+        and region.velocity_offset_mode == "shared"
+        for region in model_config.atmosphere_regions
+    )
+    if any(
         isinstance(component, SpectroscopicObservationConfig)
         and component.radial_velocity_mode == "orbital"
         for component in model_config.observations
-    )
+    ) != sample_Kp:
+        raise RuntimeError("Internal orbital-component activation mismatch.")
     shared_state = _sample_shared_system_state(
         model_config.shared_system,
-        sample_Kp=sample_v_sys,
-        sample_v_sys=sample_v_sys,
+        sample_Kp=sample_Kp,
+        sample_v_sys=sample_shared_v_sys,
     )
     region_states = {}
     for region_config in model_config.atmosphere_regions:
@@ -2580,6 +2995,7 @@ def joint_retrieval_model(
         )
 
     total_lnL = 0.0
+    model_valid = jnp.asarray(True)
     for component_config in model_config.observations:
         if component_config.name not in observations:
             raise KeyError(f"Missing observation inputs for component '{component_config.name}'")
@@ -2592,7 +3008,7 @@ def joint_retrieval_model(
         component_input = observations[component_config.name]
         if isinstance(component_config, SpectroscopicObservationConfig):
             component_inputs = _normalize_spectroscopic_observation_inputs(component_input)
-            component_lnL = _evaluate_spectroscopic_component(
+            component_lnL, component_valid = _evaluate_spectroscopic_component(
                 component_config,
                 component_inputs,
                 model_config.shared_system,
@@ -2601,7 +3017,7 @@ def joint_retrieval_model(
             )
         elif isinstance(component_config, BandpassObservationConfig):
             component_inputs = _normalize_bandpass_observation_inputs(component_input)
-            component_lnL = _evaluate_bandpass_component(
+            component_lnL, component_valid = _evaluate_bandpass_component(
                 component_config,
                 component_inputs,
                 shared_state,
@@ -2609,6 +3025,7 @@ def joint_retrieval_model(
             )
 
         total_lnL = total_lnL + component_lnL
+        model_valid = model_valid & component_valid
 
         if multi_observation:
             numpyro.deterministic(
@@ -2616,10 +3033,11 @@ def joint_retrieval_model(
                 component_lnL,
             )
 
+    numpyro.factor("model_valid", jnp.where(model_valid, 0.0, -jnp.inf))
     numpyro.factor("logL", total_lnL)
     numpyro.deterministic("Kp_kms", shared_state.Kp)
     numpyro.deterministic("v_sys_kms", shared_state.v_sys)
-    numpyro.deterministic("vsini_kms", 2.0 * jnp.pi * shared_state.Rp / (model_config.shared_system.period_day * 86400.0) / 1.0e5,
+    numpyro.deterministic("vsini_kms", 2.0 * jnp.pi * shared_state.R_ref / (model_config.shared_system.period_day * 86400.0) / 1.0e5,
     )
 
 
@@ -2642,13 +3060,50 @@ def create_joint_retrieval_model(
 def build_shared_system_config(
     *,
     params: dict,
+    reference_pressure_bar: float | None = None,
+    prior_modes: dict[str, SystemPriorMode] | None = None,
 ) -> SharedSystemConfig:
+    prior_modes = dict(prior_modes or {})
+    allowed_prior_keys = {"Mp", "Rp", "Rstar"}
+    unknown_prior_keys = sorted(set(prior_modes).difference(allowed_prior_keys))
+    if unknown_prior_keys:
+        raise ValueError(
+            "Unknown shared-system prior mode keys: " + ", ".join(unknown_prior_keys)
+        )
+    valid_prior_modes = {"fixed", "normal", "upper_limit"}
+    for parameter, mode in prior_modes.items():
+        if mode not in valid_prior_modes:
+            raise ValueError(
+                f"Unsupported prior mode for {parameter}: {mode!r}. "
+                f"Choose from {sorted(valid_prior_modes)}."
+            )
     Kp_low = params.get("Kp_low")
     Kp_high = params.get("Kp_high")
     Kp_bounds = None
     Mp_upper_3sigma = params.get("M_p_upper_3sigma")
-    if (Kp_low is not None) and (Kp_high is not None):
-        Kp_bounds = (Kp_low, Kp_high)
+    if (
+        Kp_low is not None
+        and Kp_high is not None
+        and np.isfinite(float(Kp_low))
+        and np.isfinite(float(Kp_high))
+        and float(Kp_low) < float(Kp_high)
+    ):
+        Kp_bounds = (float(Kp_low), float(Kp_high))
+
+    if reference_pressure_bar is not None:
+        reference_pressure_bar = float(reference_pressure_bar)
+        if not np.isfinite(reference_pressure_bar) or reference_pressure_bar <= 0.0:
+            raise ValueError("reference_pressure_bar must be a finite positive pressure")
+        if not np.isclose(
+            reference_pressure_bar,
+            config.TRANSMISSION_PRESSURE_BTM,
+            rtol=1e-12,
+            atol=0.0,
+        ):
+            raise ValueError(
+                "reference_pressure_bar must equal the configured transmission "
+                f"lower boundary ({config.TRANSMISSION_PRESSURE_BTM:g} bar)"
+            )
 
     return SharedSystemConfig(
         Kp_mean=params["Kp"],
@@ -2656,14 +3111,21 @@ def build_shared_system_config(
         Kp_bounds=Kp_bounds,
         v_sys_mean=0.0,
         v_sys_std=10.0,
-        Rp_mean=params["R_p"],
-        Rp_std=params["R_p_err"],
+        R_ref_mean=params["R_p"],
+        R_ref_std=params["R_p_err"],
         Mp_mean=params["M_p"],
         Mp_std=params["M_p_err"],
         Mp_upper_3sigma=Mp_upper_3sigma,
         Rstar_mean=params["R_star"],
         Rstar_std=params["R_star_err"],
         period_day=params["period"],
+        reference_pressure_bar=reference_pressure_bar,
+        Mp_prior_mode=prior_modes.get(
+            "Mp",
+            "upper_limit" if Mp_upper_3sigma is not None else "normal",
+        ),
+        R_ref_prior_mode=prior_modes.get("Rp", "normal"),
+        Rstar_prior_mode=prior_modes.get("Rstar", "normal"),
     )
 
 
@@ -2702,6 +3164,9 @@ def build_atmosphere_region_config(
     composition_solver: CompositionSolver,
     name: str | None = None,
     sample_prefix: str | None = None,
+    velocity_offset_mode: VelocityOffsetMode = "shared",
+    velocity_offset_species: tuple[str, ...] = (),
+    velocity_offset_bounds_kms: tuple[float, float] = (-20.0, 20.0),
 ) -> AtmosphereRegionConfig:
     if T_low is None:
         T_low = config.T_LOW
@@ -2714,6 +3179,18 @@ def build_atmosphere_region_config(
     if gamma_bounds is None:
         gamma_bounds = tuple(float(10.0**bound) for bound in config.LOG_GAMMA_BOUNDS)
 
+    if isinstance(
+        composition_solver,
+        (FastChemEquilibriumChemistry, FastChemHybridChemistry),
+    ) and (
+        composition_solver.t_min > T_low or composition_solver.t_max < T_high
+    ):
+        raise ValueError(
+            "FastChem temperature grid must contain the full atmospheric range: "
+            f"grid=[{composition_solver.t_min}, {composition_solver.t_max}] K, "
+            f"atmosphere=[{T_low}, {T_high}] K. Rebuild with a wider grid."
+        )
+
     if Tirr_mean is not None and (Tirr_mean != Tirr_mean):
         Tirr_mean = None
 
@@ -2722,6 +3199,39 @@ def build_atmosphere_region_config(
         atom_names,
     )
     region_name = name or _default_region_name_for_mode(mode)
+    if velocity_offset_mode not in {"shared", "region", "species", "none"}:
+        raise ValueError(
+            f"Unsupported velocity_offset_mode for {region_name!r}: "
+            f"{velocity_offset_mode!r}."
+        )
+    velocity_offset_species = tuple(velocity_offset_species)
+    active_species = set(mol_names).union(atom_names)
+    missing_velocity_species = sorted(
+        set(velocity_offset_species).difference(active_species)
+    )
+    if missing_velocity_species:
+        raise ValueError(
+            f"Region {region_name!r} requested velocity offsets for inactive species: "
+            + ", ".join(missing_velocity_species)
+        )
+    if velocity_offset_mode == "species" and not velocity_offset_species:
+        raise ValueError(
+            f"Region {region_name!r} uses species velocity offsets but lists no species."
+        )
+    if velocity_offset_mode != "species" and velocity_offset_species:
+        raise ValueError(
+            f"Region {region_name!r} lists velocity-offset species but mode is "
+            f"{velocity_offset_mode!r}."
+        )
+    velocity_offset_bounds_kms = tuple(float(v) for v in velocity_offset_bounds_kms)
+    if (
+        len(velocity_offset_bounds_kms) != 2
+        or not np.all(np.isfinite(velocity_offset_bounds_kms))
+        or velocity_offset_bounds_kms[0] >= velocity_offset_bounds_kms[1]
+    ):
+        raise ValueError(
+            "velocity_offset_bounds_kms must be a finite increasing (low, high) pair."
+        )
 
     return AtmosphereRegionConfig(
         name=region_name,
@@ -2740,6 +3250,9 @@ def build_atmosphere_region_config(
         atom_masses=atom_masses,
         Tirr_mean=Tirr_mean,
         sample_prefix=sample_prefix,
+        velocity_offset_mode=velocity_offset_mode,
+        velocity_offset_species=velocity_offset_species,
+        velocity_offset_bounds_kms=velocity_offset_bounds_kms,
     )
 
 
@@ -2758,6 +3271,9 @@ def build_spectroscopic_observation_config(
     inst_nus: jnp.ndarray,
     Tstar: float | None = None,
     stellar_surface_flux: jnp.ndarray | np.ndarray | None = None,
+    stellar_vsini: float | None = None,
+    stellar_limb_darkening_u1: float | None = None,
+    stellar_limb_darkening_u2: float | None = None,
     radial_velocity_mode: RVBehavior = "orbital",
     subtract_weighted_global_mean: bool = False,
     apply_sysrem: bool | None = None,
@@ -2779,10 +3295,62 @@ def build_spectroscopic_observation_config(
     if mode == "emission" and stellar_surface_flux_arr is None:
         raise ValueError(
             "Emission spectroscopic observations require stellar_surface_flux. "
-            "Provide phoenix_spectrum_path when building the observation config."
+            "Initialize the cached PHOENIX surface spectrum before building the observation config."
+        )
+
+    if stellar_vsini is not None:
+        stellar_vsini = float(stellar_vsini)
+        if not np.isfinite(stellar_vsini):
+            stellar_vsini = None
+        elif stellar_vsini < 0.0:
+            raise ValueError("stellar_vsini must be non-negative when provided.")
+
+    def _finite_limb_darkening(value: float | None) -> float:
+        if value is None:
+            return 0.0
+        value = float(value)
+        return value if np.isfinite(value) else 0.0
+
+    stellar_limb_darkening_u1 = _finite_limb_darkening(
+        stellar_limb_darkening_u1
+    )
+    stellar_limb_darkening_u2 = _finite_limb_darkening(
+        stellar_limb_darkening_u2
+    )
+    if mode == "emission" and stellar_vsini is None:
+        warnings.warn(
+            "Emission stellar denominator has no finite stellar_vsini; "
+            "skipping stellar rotational broadening.",
+            UserWarning,
+        )
+    if (
+        mode == "emission"
+        and stellar_vsini is not None
+        and hasattr(sop_rot, "vrmax")
+        and stellar_vsini > float(sop_rot.vrmax)
+    ):
+        raise ValueError(
+            f"stellar_vsini={stellar_vsini:g} km/s exceeds the rotation "
+            f"operator limit of {float(sop_rot.vrmax):g} km/s. Build the "
+            "operator with a larger vsini_max."
         )
     check_grid_resolution(nu_grid, instrument_resolution)
     beta_inst = 1.0 / (instrument_resolution * 2.3548200450309493)
+    if mode == "emission":
+        # These quantities are fixed for an observation component, so prepare
+        # the stellar denominator once rather than repeating its convolutions
+        # at every likelihood evaluation.
+        if stellar_vsini is not None and stellar_vsini > 0.0:
+            stellar_surface_flux_arr = sop_rot.rigid_rotation(
+                stellar_surface_flux_arr,
+                stellar_vsini,
+                stellar_limb_darkening_u1,
+                stellar_limb_darkening_u2,
+            )
+        stellar_surface_flux_arr = sop_inst.ipgauss(
+            stellar_surface_flux_arr,
+            beta_inst,
+        )
 
     return SpectroscopicObservationConfig(
         name=name,
@@ -2801,6 +3369,9 @@ def build_spectroscopic_observation_config(
         apply_sysrem=apply_sysrem,
         Tstar=Tstar,
         stellar_surface_flux=stellar_surface_flux_arr,
+        stellar_vsini=stellar_vsini,
+        stellar_limb_darkening_u1=stellar_limb_darkening_u1,
+        stellar_limb_darkening_u2=stellar_limb_darkening_u2,
         sample_prefix=sample_prefix,
     )
 
@@ -2855,7 +3426,7 @@ def build_bandpass_observation_config(
     if mode == "emission" and stellar_surface_flux_arr is None:
         raise ValueError(
             "Emission bandpass observations require stellar_surface_flux. "
-            "Provide phoenix_spectrum_path when building the observation config."
+            "Initialize the cached PHOENIX surface spectrum before building the observation config."
         )
     if wavelength_m.shape != response.shape:
         raise ValueError(f"wavelength_m shape {wavelength_m.shape} does not match response shape {response.shape}")

@@ -15,6 +15,57 @@ from numpyro.infer.autoguide import AutoMultivariateNormal, AutoGuideList
 from numpyro.infer.initialization import init_to_value, init_to_median
 
 
+class _IndependentPriorGuide:
+    """Keep selected shared-system guide sites equal to their model priors."""
+
+    def __init__(
+        self,
+        distributions: dict[str, dist.Distribution],
+        centers: dict[str, float],
+    ) -> None:
+        self.distributions = dict(distributions)
+        self.centers = dict(centers)
+
+    def __call__(self, *args, **kwargs) -> dict[str, jnp.ndarray]:
+        del args, kwargs
+        return {
+            name: numpyro.sample(name, distribution)
+            for name, distribution in self.distributions.items()
+        }
+
+    def sample_posterior(
+        self,
+        rng_key: jax.Array,
+        params: dict,
+        *,
+        sample_shape: tuple[int, ...] = (),
+    ) -> dict[str, jnp.ndarray]:
+        del params
+        if not self.distributions:
+            return {}
+        keys = jax.random.split(rng_key, len(self.distributions))
+        return {
+            name: distribution.sample(key, sample_shape=sample_shape)
+            for (name, distribution), key in zip(self.distributions.items(), keys)
+        }
+
+    def median(self, params: dict) -> dict[str, jnp.ndarray]:
+        del params
+        return {name: jnp.asarray(value) for name, value in self.centers.items()}
+
+    def quantiles(
+        self,
+        params: dict,
+        quantiles: list[float] | jnp.ndarray,
+    ) -> dict[str, jnp.ndarray]:
+        del params
+        q = jnp.asarray(quantiles)
+        return {
+            name: distribution.icdf(q)
+            for name, distribution in self.distributions.items()
+        }
+
+
 def create_prior_guide(
     Mp_mean: float,
     Mp_std: float,
@@ -23,18 +74,33 @@ def create_prior_guide(
     Rp_std: float,
     Rstar_mean: float,
     Rstar_std: float,
-) -> Callable:
-    def prior_guide(*args, **kwargs) -> dict:
-        del args, kwargs
-        if Mp_upper_3sigma is not None:
-            Mp = numpyro.sample("Mp", dist.Uniform(0.5, Mp_upper_3sigma))
+    prior_modes: dict[str, str] | None = None,
+) -> _IndependentPriorGuide:
+    prior_modes = dict(prior_modes or {})
+    distributions: dict[str, dist.Distribution] = {}
+    centers: dict[str, float] = {}
+    if prior_modes.get("Mp") != "fixed":
+        if prior_modes.get("Mp") == "upper_limit" or (
+            "Mp" not in prior_modes and Mp_upper_3sigma is not None
+        ):
+            if Mp_upper_3sigma is None or Mp_upper_3sigma <= 0.5:
+                raise ValueError("Mp upper-limit guide requires Mp_upper_3sigma > 0.5.")
+            distributions["Mp"] = dist.Uniform(0.5, Mp_upper_3sigma)
+            centers["Mp"] = Mp_upper_3sigma / 3.0
         else:
-            Mp = numpyro.sample("Mp", dist.TruncatedNormal(Mp_mean, Mp_std, low=0.0))
-        Rp = numpyro.sample("Rp", dist.TruncatedNormal(Rp_mean, Rp_std, low=0.5))
-        Rstar = numpyro.sample("Rstar", dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0))
-        return {"Mp": Mp, "Rp": Rp, "Rstar": Rstar}
-
-    return prior_guide
+            distributions["Mp"] = dist.TruncatedNormal(Mp_mean, Mp_std, low=0.0)
+            centers["Mp"] = Mp_mean
+    if prior_modes.get("Rp", "normal") != "fixed":
+        distributions["Rp"] = dist.TruncatedNormal(Rp_mean, Rp_std, low=0.5)
+        centers["Rp"] = Rp_mean
+    if prior_modes.get("Rstar", "normal") != "fixed":
+        distributions["Rstar"] = dist.TruncatedNormal(
+            Rstar_mean,
+            Rstar_std,
+            low=0.0,
+        )
+        centers["Rstar"] = Rstar_mean
+    return _IndependentPriorGuide(distributions, centers)
 
 
 def build_guide(
@@ -46,7 +112,9 @@ def build_guide(
     Rp_std: float,
     Rstar_mean: float,
     Rstar_std: float,
+    prior_modes: dict[str, str] | None = None,
 ) -> AutoGuideList:
+    prior_modes = dict(prior_modes or {})
     guide = AutoGuideList(model_c)
     prior_guide = create_prior_guide(
         Mp_mean,
@@ -56,6 +124,7 @@ def build_guide(
         Rp_std,
         Rstar_mean,
         Rstar_std,
+        prior_modes,
     )
     guide.append(prior_guide)
 
@@ -64,9 +133,23 @@ def build_guide(
             return True
         if site.get("is_observed", False):
             return True
-        return site["name"] in {"Mp", "Rstar", "Rp"}
+        return (
+            site["name"] in {"Mp", "Rstar", "Rp"}
+            and prior_modes.get(
+                site["name"],
+                "upper_limit"
+                if site["name"] == "Mp" and Mp_upper_3sigma is not None
+                else "normal",
+            )
+            != "fixed"
+        )
 
-    model_hidden = handlers.block(model_c, hide_fn=_hide_from_autoguide)
+    # Blocking also hides sample messages from the outer seed handler. Seed the
+    # partial model explicitly so AutoMultivariateNormal can build its prototype.
+    model_hidden = handlers.block(
+        handlers.seed(model_c, rng_seed=0),
+        hide_fn=_hide_from_autoguide,
+    )
     guide.append(AutoMultivariateNormal(model_hidden, init_loc_fn=init_to_median))
 
     return guide
@@ -228,7 +311,9 @@ def run_svi(
     lr: float = 0.005,
     lr_decay_steps: int | None = None,
     lr_decay_rate: float | None = None,
+    prior_modes: dict[str, str] | None = None,
 ) -> tuple[dict, jnp.ndarray, Callable, dict, AutoGuideList]:
+    prior_modes = dict(prior_modes or {})
     guide = build_guide(
         model_c,
         Mp_mean,
@@ -238,6 +323,7 @@ def run_svi(
         Rp_std,
         Rstar_mean,
         Rstar_std,
+        prior_modes,
     )
     optimizer = build_svi_optimizer(lr, decay_steps=lr_decay_steps, decay_rate=lr_decay_rate)
     svi = SVI(model_c, guide, optimizer, loss=Trace_ELBO())
@@ -250,7 +336,18 @@ def run_svi(
 
     svi_median = guide[-1].median(params)
     Mp_init = Mp_upper_3sigma / 3.0 if Mp_upper_3sigma is not None else Mp_mean
-    svi_median.update({"Mp": Mp_init, "Rp": Rp_mean, "Rstar": Rstar_mean})
+    prior_init = {"Mp": Mp_init, "Rp": Rp_mean, "Rstar": Rstar_mean}
+    svi_median.update(
+        {
+            name: value
+            for name, value in prior_init.items()
+            if prior_modes.get(
+                name,
+                "upper_limit" if name == "Mp" and Mp_upper_3sigma is not None else "normal",
+            )
+            != "fixed"
+        }
+    )
     init_strategy = init_to_value(values=svi_median)
 
     save_svi_outputs(params, losses, svi_median, output_dir)
