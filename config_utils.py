@@ -9,7 +9,66 @@ import platform
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
 import config
+
+
+_AU_KM = 149_597_870.7
+_DAY_SECONDS = 86_400.0
+_JUPITER_MASS_IN_SOLAR_MASSES = 0.0009545942339693249
+
+TIMING_PARAMETER_FIELDS = (
+    "period",
+    "period_err",
+    "epoch",
+    "epoch_err",
+    "epoch_scale",
+    "epoch_reference",
+    "timing_model",
+    "dperiod_depoch",
+    "transit_midpoints_bjd_tdb",
+    "duration",
+    "duration_err",
+    "timing_source",
+    "RA",
+    "Dec",
+)
+
+SHADOW_PARAMETER_FIELDS = (
+    "v_sini_star",
+    "v_sini_star_err",
+    "lambda_angle",
+    "lambda_angle_err",
+    "gamma1",
+    "gamma2",
+    "b",
+    "rp_rs",
+    "a_rs",
+    "inclination",
+    "inclination_err",
+    "a",
+    "a_err",
+    "M_star",
+    "M_star_err",
+    "M_p",
+    "M_p_err",
+    "eccentricity",
+    "eccentricity_err",
+    "eccentricity_reported",
+    "eccentricity_model",
+    "eccentricity_adoption_reason",
+    "omega",
+    "omega_err",
+    "Kp",
+    "Kp_err",
+    "Kp_source",
+    "Kp_is_derived",
+    "Kp_derivation",
+    "geometry_source",
+    "rotation_source",
+    "limb_darkening_source",
+)
 
 
 _REMOVED_RUNTIME_CONFIG_NAMES = frozenset(
@@ -21,11 +80,172 @@ _REMOVED_RUNTIME_CONFIG_NAMES = frozenset(
 )
 
 
+def _finite_float(value) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def derive_planet_kp(planet_params: dict) -> dict:
+    """Derive the planet barycentric RV semiamplitude from orbital parameters.
+
+    The adopted convention is
+
+    ``Kp = 2*pi*a_p*sin(i) / (P*sqrt(1-e**2))``,
+
+    where ``a_p = a*M_star/(M_star + M_p)``. Configuration units are AU,
+    days, degrees, solar masses, and Jupiter masses; the result is km/s.
+    No edge-on, circular, or negligible-planet-mass fallback is used.
+    """
+
+    required = {
+        name: _finite_float(planet_params.get(name))
+        for name in (
+            "a",
+            "period",
+            "inclination",
+            "eccentricity",
+            "M_star",
+            "M_p",
+        )
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(
+            "Cannot derive Kp without finite " + ", ".join(missing) + "."
+        )
+
+    semi_major_axis_au = float(required["a"])
+    period_day = float(required["period"])
+    inclination_deg = float(required["inclination"])
+    eccentricity = float(required["eccentricity"])
+    stellar_mass_msun = float(required["M_star"])
+    planet_mass_mjup = float(required["M_p"])
+    if semi_major_axis_au <= 0.0 or period_day <= 0.0 or stellar_mass_msun <= 0.0:
+        raise ValueError("Kp derivation requires positive a, period, and M_star.")
+    if planet_mass_mjup < 0.0:
+        raise ValueError("Kp derivation requires non-negative M_p.")
+    if not 0.0 <= eccentricity < 1.0:
+        raise ValueError("Kp derivation requires 0 <= eccentricity < 1.")
+    sine_inclination = math.sin(math.radians(inclination_deg))
+    if sine_inclination <= 0.0:
+        raise ValueError("Kp derivation requires 0 < inclination < 180 degrees.")
+
+    planet_mass_msun = planet_mass_mjup * _JUPITER_MASS_IN_SOLAR_MASSES
+    planet_semimajor_axis_au = (
+        semi_major_axis_au
+        * stellar_mass_msun
+        / (stellar_mass_msun + planet_mass_msun)
+    )
+    kp_kms = (
+        2.0
+        * math.pi
+        * planet_semimajor_axis_au
+        * _AU_KM
+        * sine_inclination
+        / (
+            period_day
+            * _DAY_SECONDS
+            * math.sqrt(1.0 - eccentricity**2)
+        )
+    )
+    return {
+        "Kp": float(kp_kms),
+        "Kp_err": float("nan"),
+        "Kp_source": "derived_from_orbit",
+        "Kp_is_derived": True,
+        "Kp_derivation": {
+            "formula": "2*pi*a_planet*sin(inclination)/(period*sqrt(1-eccentricity^2))",
+            "a_planet_definition": "a*M_star/(M_star+M_p)",
+            "input_units": {
+                "a": "AU",
+                "period": "day",
+                "inclination": "degree",
+                "M_star": "solar_mass",
+                "M_p": "jupiter_mass",
+            },
+            "uncertainty": "not_propagated_without_coherent_posterior_samples",
+            "inputs": {
+                name: float(value) for name, value in required.items()
+            },
+        },
+    }
+
+
+def _with_resolved_kp(params: dict, *, source: str) -> dict:
+    result = dict(params)
+    if _finite_float(result.get("Kp")) is not None:
+        result.setdefault("Kp_is_derived", False)
+        result.setdefault("Kp_source", f"configured:{source}")
+        return result
+    try:
+        result.update(derive_planet_kp(result))
+    except ValueError:
+        result.setdefault("Kp_is_derived", False)
+        result.setdefault("Kp_source", "unresolved")
+    return result
+
+
 def get_params(planet: str | None = None, ephemeris: str | None = None) -> dict:
-    """Get planet parameters for the specified planet and ephemeris."""
+    """Get a copied parameter block with derivable quantities resolved."""
     planet = planet or config.PLANET
     ephemeris = ephemeris or config.EPHEMERIS
-    return config.PLANETS[planet][ephemeris]
+    return _with_resolved_kp(config.PLANETS[planet][ephemeris], source=ephemeris)
+
+
+def resolve_parameters(
+    *,
+    planet: str,
+    source: str,
+    fields: tuple[str, ...] | list[str] | None = None,
+) -> dict:
+    """Resolve one explicit parameter source, optionally restricted to fields."""
+
+    params = get_params(planet, source)
+    if fields is None:
+        return params
+    return {name: params.get(name) for name in fields}
+
+
+def resolve_parameter_domains(
+    *,
+    planet: str,
+    timing_source: str,
+    shadow_source: str = "Recommended",
+) -> dict:
+    """Combine timing and Doppler-shadow domains without monolithic routing.
+
+    Timing quantities remain tied to ``timing_source``. Stellar profile,
+    transit geometry, obliquity, eccentric geometry, and Kp are taken from the
+    independently selected ``shadow_source``. A missing shadow-source Kp is
+    re-derived after merging so the selected timing period is honored.
+    """
+
+    timing = get_params(planet, timing_source)
+    shadow = get_params(planet, shadow_source)
+    result = dict(timing)
+    for name in SHADOW_PARAMETER_FIELDS:
+        if name in shadow:
+            result[name] = shadow[name]
+
+    if bool(shadow.get("Kp_is_derived", False)):
+        result["Kp"] = float("nan")
+        result["Kp_err"] = float("nan")
+        result.pop("Kp_derivation", None)
+        result = _with_resolved_kp(
+            result,
+            source=f"timing={timing_source};shadow={shadow_source}",
+        )
+
+    result["parameter_resolution"] = {
+        "timing_source": timing_source,
+        "shadow_source": shadow_source,
+        "timing_fields": list(TIMING_PARAMETER_FIELDS),
+        "shadow_fields": list(SHADOW_PARAMETER_FIELDS),
+    }
+    return result
 
 
 def list_planets() -> list[str]:
@@ -37,6 +257,75 @@ def list_ephemerides(planet: str | None = None) -> list[str]:
     """List available ephemerides for a planet."""
     planet = planet or config.PLANET
     return list(config.PLANETS[planet].keys())
+
+
+def resolve_transit_midpoint(
+    bjd_tdb: np.ndarray,
+    planet_params: dict,
+    *,
+    reference_epoch_bjd_tdb: float,
+    observation_epoch: str | None = None,
+) -> float:
+    """Resolve the transit midpoint nearest an observing sequence.
+
+    Supported timing models are ``linear``, ``quadratic``, and ``ttv_table``.
+    A missing ``timing_model`` retains the historical linear behavior.  TTV
+    tables fail closed when no midpoint is configured for the requested raw
+    observing epoch.
+    """
+
+    times = np.asarray(bjd_tdb, dtype=float)
+    if times.size == 0 or not np.all(np.isfinite(times)):
+        raise ValueError("BJD_TDB observation times must be finite and non-empty.")
+
+    period = float(planet_params["period"])
+    if not np.isfinite(period) or period <= 0.0:
+        raise ValueError("The orbital period must be finite and positive.")
+    reference = float(reference_epoch_bjd_tdb)
+    if not np.isfinite(reference):
+        raise ValueError("The reference ephemeris epoch must be finite.")
+
+    model = str(planet_params.get("timing_model", "linear")).strip().lower()
+    observation_midpoint = 0.5 * (float(np.min(times)) + float(np.max(times)))
+
+    if model == "ttv_table":
+        table = planet_params.get("transit_midpoints_bjd_tdb")
+        if not isinstance(table, dict):
+            raise ValueError(
+                "timing_model='ttv_table' requires transit_midpoints_bjd_tdb."
+            )
+        key = None if observation_epoch is None else str(observation_epoch)
+        if key is None or key not in table:
+            raise ValueError(
+                "No TTV midpoint is configured for observation epoch "
+                f"{observation_epoch!r}."
+            )
+        midpoint = float(table[key])
+        if not np.isfinite(midpoint):
+            raise ValueError(
+                f"The TTV midpoint configured for {key!r} must be finite."
+            )
+        return midpoint
+
+    epoch_number = round((observation_midpoint - reference) / period)
+    if model == "linear":
+        return float(reference + epoch_number * period)
+
+    if model == "quadratic":
+        dperiod_depoch = float(planet_params.get("dperiod_depoch", np.nan))
+        if not np.isfinite(dperiod_depoch):
+            raise ValueError(
+                "timing_model='quadratic' requires finite dperiod_depoch."
+            )
+        return float(
+            reference
+            + epoch_number * period
+            + 0.5 * dperiod_depoch * epoch_number**2
+        )
+
+    raise ValueError(
+        f"Unsupported timing_model={model!r}; expected linear, quadratic, or ttv_table."
+    )
 
 
 def _pepsi_data_patterns(
@@ -57,7 +346,8 @@ def _pepsi_data_patterns(
     if year >= 2024:
         pepsi_coadd_exts.insert(0, "bwl")
     pepsi_coadd_extraction_modes = ("dxt", "sxt")
-    pepsi_sxs_exts = ["i"]
+    pepsi_slice_extraction_modes = ("dxs", "sxs")
+    pepsi_slice_exts = ["i"]
 
     patterns = []
     base_path = str(data_dir)
@@ -67,17 +357,29 @@ def _pepsi_data_patterns(
             for ext in pepsi_coadd_exts:
                 patterns.append(f"{base_path}/molecfit_weak/SCIENCE_TELLURIC_CORR_{file_prefix}*.{mode}.{ext}.fits")
                 patterns.append(f"{base_path}/**/SCIENCE_TELLURIC_CORR_{file_prefix}*.{mode}.{ext}.fits")
-        for ext in pepsi_sxs_exts:
-            patterns.append(f"{base_path}/molecfit_weak/SCIENCE_TELLURIC_CORR_{file_prefix}*.sxs.{ext}.fits")
-            patterns.append(f"{base_path}/**/SCIENCE_TELLURIC_CORR_{file_prefix}*.sxs.{ext}.fits")
+        for extraction_mode in pepsi_slice_extraction_modes:
+            for ext in pepsi_slice_exts:
+                patterns.append(
+                    f"{base_path}/molecfit_weak/SCIENCE_TELLURIC_CORR_"
+                    f"{file_prefix}*.{extraction_mode}.{ext}.fits"
+                )
+                patterns.append(
+                    f"{base_path}/**/SCIENCE_TELLURIC_CORR_"
+                    f"{file_prefix}*.{extraction_mode}.{ext}.fits"
+                )
     else:
         for mode in pepsi_coadd_extraction_modes:
             for ext in pepsi_coadd_exts:
                 patterns.append(f"{base_path}/{file_prefix}*.{mode}.{ext}")
                 patterns.append(f"{base_path}/**/{file_prefix}*.{mode}.{ext}")
-        for ext in pepsi_sxs_exts:
-            patterns.append(f"{base_path}/{file_prefix}*.sxs.{ext}")
-            patterns.append(f"{base_path}/**/{file_prefix}*.sxs.{ext}")
+        for extraction_mode in pepsi_slice_extraction_modes:
+            for ext in pepsi_slice_exts:
+                patterns.append(
+                    f"{base_path}/{file_prefix}*.{extraction_mode}.{ext}"
+                )
+                patterns.append(
+                    f"{base_path}/**/{file_prefix}*.{extraction_mode}.{ext}"
+                )
 
     return patterns
 
@@ -177,6 +479,21 @@ def resolve_pt_profile_for_mode(mode: str | None = None, pt_profile: str | None 
     return get_pt_profile_default_for_mode(mode)
 
 
+def resolve_pt_profile_for_region(
+    mode: str,
+    *,
+    primary_pt_profile: str,
+    is_primary: bool,
+    pt_profile: str | None = None,
+) -> str:
+    """Resolve a region override, the primary selection, or the region-mode default."""
+    if pt_profile is not None:
+        return pt_profile
+    if is_primary:
+        return primary_pt_profile
+    return get_pt_profile_default_for_mode(mode)
+
+
 def get_wavelength_range(
     observatory: str | None = None,
     instrument: str | None = None,
@@ -249,6 +566,42 @@ def _normalize_retrieval_mode(mode: str | None) -> str:
     if resolved not in {"transmission", "emission"}:
         raise ValueError(f"Unsupported retrieval mode: {mode!r}")
     return resolved
+
+
+def get_hrs_observation_arms(
+    planet: str,
+    epoch: str,
+    *,
+    mode: str | None = None,
+) -> tuple[str, ...]:
+    """Return the explicitly active PEPSI arms for one observation."""
+
+    resolved_mode = _normalize_retrieval_mode(mode)
+    requested_key = (resolved_mode, _planet_slug(planet), str(epoch))
+    matches = [
+        tuple(arms)
+        for (configured_mode, configured_planet, configured_epoch), arms
+        in config.HRS_OBSERVATION_ARMS.items()
+        if (
+            configured_mode.strip().lower(),
+            _planet_slug(configured_planet),
+            str(configured_epoch),
+        )
+        == requested_key
+    ]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Duplicate HRS observation-arm configuration for {requested_key}."
+        )
+    arms = matches[0] if matches else tuple(config.FULL_ARM_MEMBERS)
+    if not arms or len(set(arms)) != len(arms):
+        raise ValueError(f"Invalid HRS observation arms for {requested_key}: {arms!r}.")
+    invalid = set(arms).difference(config.FULL_ARM_MEMBERS)
+    if invalid:
+        raise ValueError(
+            f"Invalid HRS observation arms for {requested_key}: {sorted(invalid)}."
+        )
+    return arms
 
 
 def get_raw_hrs_dir(
