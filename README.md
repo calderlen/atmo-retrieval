@@ -10,6 +10,105 @@ pip install jax numpyro exojax astropy matplotlib corner
 
 ## Command-line workflows
 
+Repeatable diagnostics and acquisition run without Jupyter:
+
+```bash
+# Prepared HRS products, including both timeseries and collapse-source bundles.
+conda run -n retrieval python scripts/render_hrs_product_diagnostics.py \
+  --planet KELT-20b --mode transmission --product both
+
+# Cross-product spectral-processing diagnostics.
+conda run -n retrieval python scripts/render_spectral_processing_diagnostics.py \
+  --planet KELT-20b --mode transmission
+
+# Discover or run raw-exposure edge-trim calibrations. These commands write
+# diagnostic proposals only; they never regenerate prepared arrays.
+conda run -n retrieval python scripts/run_edge_trim_calibrations.py --list
+conda run -n retrieval python scripts/run_edge_trim_calibrations.py \
+  --planet KELT-20b --mode transmission
+
+# TESS transit fit and retrieval-ready bandpass table.
+conda run -n retrieval python scripts/run_tess_transit.py --planet KELT-20b
+
+# Download the exact checked-in HST selection.
+conda run -n retrieval python scripts/download_mast_products.py \
+  --output-dir output/mast/hst-selection
+
+# Reconstruct figures from a completed retrieval.
+conda run -n retrieval python scripts/render_retrieval_diagnostics.py \
+  --run-dir output/kelt20b/Duck24/transmission/2026-04-02_03-53-01
+```
+
+TESS fitting is intentionally separate from retrieval. Pass the generated
+`tess_bandpass.tbl` to `atmo_retrieval.py` with `--bandpass-tbl`.
+
+Edge-trim calibration tests 0--20 nm on a 0.1 nm grid, refines acceptance and
+rejection transitions at 0.02 nm, and reruns SYSREM for as many as 256
+least-trim finalist pairs. Results are timestamped beneath
+`diagnostics/edge_trim_calibration/`. Only `accepted_post_sysrem` rows are
+acceptance-grade, and every manifest records
+`canonical_generation_authorized=false` and `prepared_arrays_written=false`.
+Use `--dry-run` with any `--planet`, `--mode`, `--epoch`, or `--arm` filters to
+inspect the exact datasets before starting the long calculation.
+
+Generate the frozen intrinsic PySME spectrum, then measure the stellar velocity
+zero point before preparing KELT-20 spectra. Template provenance is documented
+in `reference/stellar_lsd_templates/README.md`.
+
+```bash
+conda run -n retrieval python scripts/generate_pysme_stellar_template.py \
+  --planet KELT-20b \
+  --linelist input/vald/CalderLenhart.021791 \
+  --output reference/stellar_lsd_templates/kelt20b_pysme_lte_vacuum.npz
+```
+
+```bash
+conda run -n retrieval python scripts/measure_stellar_velocity_lsd.py \
+  --planet KELT-20b --ephemeris Duck24 --mode both \
+  --template reference/stellar_lsd_templates/kelt20b_pysme_lte_vacuum.npz \
+  --edge-trim-calibration-root diagnostics/edge_trim_calibration
+```
+
+The LSD rotational-profile fit uses only the quadratic law
+`I(mu) = 1 - gamma1*(1-mu) - gamma2*(1-mu)^2`. Both coefficients are required;
+there is no single-coefficient linear fallback.
+
+Systemic-velocity measurements use the blue arm only. Red-arm spectra are not
+loaded, combined, or used as a fallback when a blue-arm measurement fails.
+
+This reconstructs a barycentric vacuum wavelength grid from each PEPSI FITS
+header, measures one LSD RV per blue-arm exposure, and fits
+`gamma + K_star sin(2 pi phase)` across epochs. Transmission spectra
+between first and fourth contact are excluded by default because their line
+profiles contain the Rossiter-McLaughlin distortion. Pass
+`--include-in-transit` only for a deliberate diagnostic.
+
+The command always writes diagnostics and a `stellar_velocity_lsd.json` beside
+each processed epoch. A result is accepted for automatic stellar-rest use when
+the blue-arm profile checks pass. Its final `systemic_velocity_err_kms` is the
+fitted statistical uncertainty by default.
+No error floor is imposed. An optional floor can be requested explicitly with
+`--systematic-error-floor-kms`. A QC failure returns exit status 2 and remains
+diagnostic-only. Preparation ignores an unaccepted result, leaves wavelengths
+barycentric, and records the decision in `timeseries_prep.json`.
+
+To reproduce the three-dataset sampling described by Petz et al. (2023):
+
+```bash
+conda run -n retrieval python scripts/measure_stellar_velocity_lsd.py \
+  --planet KELT-20b --ephemeris Duck24 --mode both \
+  --epoch 20190504 --epoch 20210501 --epoch 20210518 \
+  --template reference/stellar_lsd_templates/kelt20b_pysme_lte_vacuum.npz \
+  --edge-trim-calibration-root diagnostics/edge_trim_calibration \
+  --output-dir diagnostics/stellar_velocity/kelt20b/pysme_petz2023
+```
+
+The estimator deconvolves a full disk-integrated PySME spectrum generated from
+the raw VALD atomic data. Agreement with the Petz et al. published
+`-22.78 +/- 0.11 km/s` PEPSI-frame value is a validation target, not an offset
+to insert. Any discrepancy remains visible in the fitted jitter and residual
+diagnostics rather than being shifted to the published answer.
+
 ```bash
 # Prepare raw exposure folders for a transmission retrieval.
 python -m dataio.prepare_retrieval_timeseries \
@@ -26,6 +125,12 @@ python -m dataio.prepare_retrieval_timeseries \
 python -m dataio.prepare_emission_retrieval_timeseries \
   --planet KELT-20b --epoch 20250601 --arm full \
   --product-kind collapse-source --phase-bin all --run-sysrem
+
+# Fit the mandatory shared-basis LSD shadow once per arm and project it onto
+# both exact prepared source grids. This always enables the retrieval model.
+python -m spectroscopy.doppler_shadow \
+  --planet KELT-20b --ephemeris Duck24 --shadow-source Recommended \
+  --epoch 20250601 --arm both
 
 # Build the nightly 1D transmission spectrum.
 python -m dataio.collapse_transmission_timeseries_to_1d \
@@ -68,6 +173,9 @@ Mode-specific atmospheric defaults are explicit: transmission uses a
 `1e-8`-`1` bar grid with an isothermal P-T profile, while emission uses a
 `1e-4`-`1` bar grid with a Guillot P-T profile. Pass `--pt-profile` to override
 the mode default for an individual run.
+In a mixed-mode joint retrieval, the primary region keeps that run-level
+selection, while each auxiliary region uses its own mode default unless its
+region specification provides an explicit `pt_profile`.
 
 Transmission radius convention is explicit: the sampled catalog-informed
 radius prior is adopted as `R_ref` at `P_ref = 1 bar`, which is also the
@@ -270,6 +378,7 @@ modules:
 │   ├── load.py
 │   ├── collapse_emission_timeseries_to_1d.py
 │   ├── collapse_transmission_timeseries_to_1d.py
+│   ├── lsd_doppler_shadow.py
 │   ├── prepare_emission_retrieval_timeseries.py
 │   ├── prepare_retrieval_timeseries.py
 │   └── tellurics.py
