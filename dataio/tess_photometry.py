@@ -1,7 +1,6 @@
-"""End-to-end TESS transit fitting helpers for retrieval bandpass constraints.
+"""End-to-end TESS transit fitting services for retrieval constraints.
 
-This module packages the workflow that previously lived only in the
-`*-tess-mlexo.ipynb` notebooks:
+The headless workflow is:
 
 1. fetch or accept raw TESS light curves
 2. build a joint multi-sector transit dataset
@@ -15,7 +14,7 @@ this module is the missing bridge from raw photometry to that scalar input.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import importlib
 import json
 import os
@@ -69,6 +68,7 @@ class TessTransitFitConfig:
     emcee_production_steps: int = 300
     emcee_thin: int = 5
     emcee_init_scale: float = 1.0e-3
+    random_seed: int = 123
     emcee_use_pool: bool = False
     emcee_n_processes: int = field(default_factory=lambda: max(1, min(4, (os.cpu_count() or 1) - 1)))
     emcee_start_method: str = "fork"
@@ -858,6 +858,7 @@ def fit_tess_transit_with_mlexo(
         result.x,
         bounds,
         n_walkers,
+        seed=config.random_seed,
         init_scale=config.emcee_init_scale,
     )
 
@@ -1103,3 +1104,66 @@ def serialize_tess_fit_summary(result: TessTransitFitResult) -> dict[str, Any]:
         },
     }
     return json.loads(json.dumps(summary))
+
+
+def save_tess_fit_artifacts(
+    result: TessTransitFitResult,
+    output_dir: str | Path,
+) -> dict[str, Path]:
+    """Persist one completed fit as reusable numerical and retrieval products."""
+
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=False)
+    config_path = directory / "run_config.json"
+    summary_path = directory / "fit_summary.json"
+    posterior_path = directory / "posterior_samples.npz"
+    model_path = directory / "model_products.npz"
+    table_path = directory / "tess_bandpass.tbl"
+
+    config_payload = asdict(result.config)
+    config_payload = json.loads(json.dumps(config_payload, default=str))
+    config_path.write_text(
+        json.dumps(config_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    summary_path.write_text(
+        json.dumps(serialize_tess_fit_summary(result), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    np.savez_compressed(
+        posterior_path,
+        theta=np.asarray(result.best_fit["posterior_theta"]),
+        log_probability=np.asarray(result.best_fit["posterior_log_prob"]),
+    )
+    dataset_arrays = {
+        f"dataset_{name}": np.asarray(result.dataset[name])
+        for name in ("time", "flux", "flux_err", "sector_idx", "sector_counts")
+    }
+    model_arrays = {
+        name: np.asarray(result.best_fit[name])
+        for name in (
+            "transit_model",
+            "gp_trend",
+            "mean_model",
+            "detrended_flux",
+            "residual_flux",
+            "phase_days",
+            "phase_grid",
+            "phase_model_grid",
+        )
+    }
+    np.savez_compressed(model_path, **dataset_arrays, **model_arrays)
+    write_tess_bandpass_tbl(
+        table_path,
+        constraint=result.bandpass_constraint,
+        planet_name=result.config.planet_name or result.config.target,
+        reference=result.config.reference,
+        note=result.config.note,
+    )
+    return {
+        "config": config_path,
+        "summary": summary_path,
+        "posterior": posterior_path,
+        "models": model_path,
+        "bandpass": table_path,
+    }
