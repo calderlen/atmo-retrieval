@@ -1,10 +1,9 @@
-"""Shared utilities for the image-specified retrieval runner scripts."""
+"""Retrieval-plan cases, preflight checks, and runner utilities."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -12,8 +11,6 @@ from typing import Iterable
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 import config
 import config_utils

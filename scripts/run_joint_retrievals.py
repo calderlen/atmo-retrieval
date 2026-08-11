@@ -4,9 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import asdict
+from pathlib import Path
 
-from retrieval_plan_common import (
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from pipeline.retrieval_plan import (
     RetrievalCase,
     add_common_arguments,
     atmosphere_region_spec,
