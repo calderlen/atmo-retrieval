@@ -16,13 +16,23 @@ configure_matplotlib()
 import matplotlib.pyplot as plt
 import numpy as np
 from numpyro.infer import SVI, Trace_ELBO
+from scipy.ndimage import gaussian_filter
 
 import config
 import config_utils
 from physics.chemistry import ConstantVMR, FastChemHybridChemistry, FreeVMR
-from physics.model import compute_atmospheric_state_from_posterior
+from physics.model import (
+    compute_atmospheric_state_from_posterior,
+    planet_rv_kms,
+    reconstruct_temperature_profile,
+)
 from pipeline import retrieval as _retrieval
 from pipeline.inference import build_guide, build_svi_optimizer
+from plotting.wavelength import pcolormesh_wavelength_segments
+from spectroscopy.spectral_diagnostics import (
+    coadd_in_planet_rest_frame,
+    nan_box_smooth,
+)
 
 
 _FULL_ATOMIC_SPECIES = deepcopy(config.ATOMIC_SPECIES)
@@ -528,6 +538,359 @@ def build_diag_config_from_run_dir(
     return config_payload
 
 
+def linear_edges_from_centers(centers: np.ndarray) -> np.ndarray:
+    """Return cell edges for a one-dimensional linear center grid."""
+
+    values = np.asarray(centers, dtype=float)
+    if values.ndim != 1 or values.size < 2:
+        raise ValueError("centers must be a one-dimensional array with at least two values.")
+    edges = np.empty(values.size + 1, dtype=float)
+    edges[1:-1] = 0.5 * (values[:-1] + values[1:])
+    edges[0] = values[0] - 0.5 * (values[1] - values[0])
+    edges[-1] = values[-1] + 0.5 * (values[-1] - values[-2])
+    return edges
+
+
+def log_edges_from_centers(centers: np.ndarray) -> np.ndarray:
+    """Return cell edges for a positive one-dimensional logarithmic grid."""
+
+    values = np.asarray(centers, dtype=float)
+    if np.any(values <= 0.0):
+        raise ValueError("logarithmic centers must be positive.")
+    return np.power(10.0, linear_edges_from_centers(np.log10(values)))
+
+
+def normalized_contribution_function(dtau: np.ndarray) -> np.ndarray:
+    """Compute the normalized vertical contribution from layer optical depths."""
+
+    optical_depth = np.asarray(dtau, dtype=float)
+    if optical_depth.ndim != 2:
+        raise ValueError("dtau must have shape (layer, wavelength).")
+    contribution = optical_depth * np.exp(-np.cumsum(optical_depth, axis=0))
+    total = np.sum(contribution, axis=0, keepdims=True)
+    return np.divide(
+        contribution,
+        total,
+        out=np.zeros_like(contribution),
+        where=total > 0.0,
+    )
+
+
+def posterior_summary_rows(posterior: dict[str, np.ndarray]) -> list[dict[str, Any]]:
+    """Summarize every sampled numeric posterior value for a CSV table."""
+
+    rows: list[dict[str, Any]] = []
+    for name, values in sorted(posterior.items()):
+        array = np.asarray(values)
+        if array.ndim < 1 or not np.issubdtype(array.dtype, np.number):
+            continue
+        finite = np.asarray(array, dtype=float)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            continue
+        rows.append(
+            {
+                "parameter": name,
+                "shape": "x".join(str(size) for size in array.shape),
+                "mean": float(np.mean(finite)),
+                "median": float(np.median(finite)),
+                "std": float(np.std(finite)),
+                "p05": float(np.percentile(finite, 5.0)),
+                "p95": float(np.percentile(finite, 95.0)),
+            }
+        )
+    return rows
+
+
+def default_corner_variables(
+    posterior: dict[str, np.ndarray],
+    *,
+    maximum: int = 16,
+) -> list[str]:
+    """Select compact numeric posterior variables for a default corner plot."""
+
+    priority = (
+        "Kp", "v_sys", "dRV", "dRV_0", "dRV_slope",
+        "Rp", "Mp", "Rstar",
+        "T0", "T_bottom", "T_top", "Tirr", "log10_kappa_ir_cgs", "log10_gamma",
+        "kappa_ir_cgs", "gamma", "T_deep", "log_P_trans", "delta_P",
+        "log_metallicity", "C_O_ratio",
+    )
+    ready: dict[str, np.ndarray] = {}
+    for name, values in posterior.items():
+        array = np.asarray(values)
+        if array.ndim == 0 or array.shape[0] < 2:
+            continue
+        if not np.issubdtype(array.dtype, np.number):
+            continue
+        components = 1 if array.ndim == 1 else int(np.prod(array.shape[1:]))
+        if components <= 6:
+            ready[name] = array
+    selected: list[str] = []
+    for wanted in priority:
+        for name in sorted(ready):
+            if name.split("/")[-1] == wanted and name not in selected:
+                selected.append(name)
+    for name in sorted(ready):
+        if name.split("/")[-1].startswith("logVMR_") and name not in selected:
+            selected.append(name)
+    for name in sorted(ready):
+        if name not in selected and not name.split("/")[-1].endswith("_kms"):
+            selected.append(name)
+    return selected[: int(maximum)]
+
+
+def plot_posterior_traces(
+    posterior: dict[str, np.ndarray],
+    *,
+    variables: Iterable[str] | None = None,
+    maximum: int = 6,
+) -> plt.Figure | None:
+    """Plot trace and histogram panels for scalar posterior variables."""
+
+    requested = list(variables) if variables is not None else default_corner_variables(
+        posterior,
+        maximum=maximum,
+    )
+    selected = [
+        name
+        for name in requested
+        if name in posterior and np.asarray(posterior[name]).ndim == 1
+    ][: int(maximum)]
+    if not selected:
+        return None
+    figure, axes = plt.subplots(len(selected), 2, figsize=(12, 2.6 * len(selected)), squeeze=False)
+    for row, name in enumerate(selected):
+        values = np.asarray(posterior[name], dtype=float)
+        axes[row, 0].plot(values, lw=0.8)
+        axes[row, 0].set(title=f"{name} trace", xlabel="sample", ylabel=name)
+        axes[row, 1].hist(values[np.isfinite(values)], bins=40)
+        axes[row, 1].set(title=f"{name} histogram", xlabel=name, ylabel="count")
+    figure.tight_layout()
+    return figure
+
+
+def load_saved_run_diagnostics(
+    run_dir: str | Path,
+    *,
+    epoch: str | None = None,
+    component_name: str | None = None,
+    apply_sysrem: bool | None = None,
+) -> dict[str, Any]:
+    """Reconstruct the model products needed for saved-run diagnostic figures."""
+
+    directory = Path(run_dir)
+    with np.load(directory / "posterior_sample.npz") as posterior_file:
+        posterior = {name: np.asarray(posterior_file[name]) for name in posterior_file.files}
+    diagnostic_config = build_diag_config_from_run_dir(directory, epoch=epoch)
+    if apply_sysrem is not None:
+        diagnostic_config["apply_sysrem"] = bool(apply_sysrem)
+    context = build_diagnostic_context(**diagnostic_config)
+    selected_name = component_name or context.spectroscopic_component_names[0]
+    component = _get_spectroscopic_component(context, selected_name)
+    atmo_state = compute_atmospheric_state_from_posterior(
+        posterior_samples=posterior,
+        region_config=context.shared_region_config,
+        opa_mols=component.opa_mols,
+        opa_atoms=component.opa_atoms,
+        opa_cias=component.opa_cias,
+        nu_grid=component.nu_grid,
+        use_median=True,
+        sample_prefix=context.shared_region_sample_prefix,
+    )
+    model_timeseries, _ = _retrieval._compute_model_timeseries_for_plot(
+        posterior_samples=posterior,
+        model_params=context.model_params,
+        region_config=context.shared_region_config,
+        component=component,
+        region_sample_prefix=context.shared_region_sample_prefix,
+        atmo_state=atmo_state,
+    )
+    if model_timeseries is None:
+        raise RuntimeError("Could not reconstruct the saved-run model timeseries.")
+    observed_mean, observed_error = _retrieval._summarize_observed_spectrum(
+        component.data,
+        component.sigma,
+    )
+    return {
+        "run_dir": directory,
+        "diagnostic_config": diagnostic_config,
+        "context": context,
+        "component_name": selected_name,
+        "component": component,
+        "posterior": posterior,
+        "atmospheric_state": atmo_state,
+        "model_timeseries": np.asarray(model_timeseries),
+        "observed_mean": np.asarray(observed_mean),
+        "observed_error": np.asarray(observed_error),
+    }
+
+
+def plot_temperature_profiles(
+    posterior: dict[str, np.ndarray],
+    region_config: object,
+    *,
+    sample_prefix: str | None,
+    draw_count: int = 100,
+    seed: int = 0,
+) -> plt.Figure:
+    """Plot posterior temperature profiles and their median reconstruction."""
+
+    sample_sizes = [
+        np.asarray(value).shape[0]
+        for value in posterior.values()
+        if np.asarray(value).ndim > 0
+    ]
+    if not sample_sizes:
+        raise ValueError("Posterior contains no sampled arrays.")
+    count = min(int(draw_count), min(sample_sizes))
+    indices = np.random.default_rng(seed).choice(min(sample_sizes), count, replace=False)
+    figure, axis = plt.subplots(figsize=(6, 7))
+    for index in indices:
+        sample = {
+            key: value if np.asarray(value).ndim == 0 else np.asarray(value)[index]
+            for key, value in posterior.items()
+        }
+        temperature = reconstruct_temperature_profile(
+            sample,
+            region_config.art,
+            pt_profile=region_config.pt_profile,
+            Tint_fixed=region_config.Tint_fixed,
+            sample_prefix=sample_prefix,
+        )
+        axis.plot(np.asarray(temperature), region_config.art.pressure, color="purple", alpha=0.08)
+    median = {
+        key: value if np.asarray(value).ndim == 0 else np.median(np.asarray(value), axis=0)
+        for key, value in posterior.items()
+    }
+    median_temperature = reconstruct_temperature_profile(
+        median,
+        region_config.art,
+        pt_profile=region_config.pt_profile,
+        Tint_fixed=region_config.Tint_fixed,
+        sample_prefix=sample_prefix,
+    )
+    axis.plot(np.asarray(median_temperature), region_config.art.pressure, color="black", lw=2)
+    axis.set(xlabel="T (K)", ylabel="P (bar)", yscale="log", title="Temperature-Pressure Profile")
+    axis.invert_yaxis()
+    axis.grid(alpha=0.3)
+    figure.tight_layout()
+    return figure
+
+
+def plot_contribution_functions(
+    nu_grid: np.ndarray,
+    pressure: np.ndarray,
+    dtau: np.ndarray,
+    *,
+    dtau_per_species: dict[str, np.ndarray] | None = None,
+    smooth_sigma: tuple[float, float] = (0.8, 10.0),
+    clip_percentiles: tuple[float, float] = (5.0, 99.5),
+) -> plt.Figure:
+    """Plot total and optional per-species contribution functions."""
+
+    wavelength = 1.0e8 / np.asarray(nu_grid, dtype=float)
+    total_dtau = np.asarray(dtau, dtype=float)
+    species_dtau = {
+        str(name): np.asarray(values, dtype=float)
+        for name, values in (dtau_per_species or {}).items()
+    }
+    if wavelength[0] > wavelength[-1]:
+        wavelength = wavelength[::-1]
+        total_dtau = total_dtau[:, ::-1]
+        species_dtau = {name: values[:, ::-1] for name, values in species_dtau.items()}
+    panels = [("Total", total_dtau), *species_dtau.items()]
+    ncols = 2
+    nrows = int(math.ceil(len(panels) / ncols))
+    figure, axes = plt.subplots(nrows, ncols, figsize=(14, 4.5 * nrows), squeeze=False)
+    wavelength_edges = linear_edges_from_centers(wavelength)
+    pressure_edges = log_edges_from_centers(np.asarray(pressure, dtype=float))
+    for axis, (label, layer_dtau) in zip(axes.flat, panels):
+        contribution = gaussian_filter(
+            normalized_contribution_function(layer_dtau),
+            sigma=smooth_sigma,
+        )
+        lower, upper = np.nanpercentile(contribution, clip_percentiles)
+        plotted = np.clip(contribution, lower, upper)
+        image = axis.pcolormesh(
+            wavelength_edges,
+            pressure_edges,
+            plotted,
+            shading="flat",
+            cmap="bone_r",
+        )
+        axis.set(xlabel="Wavelength (Angstroms)", ylabel="Pressure (bar)", yscale="log", title=label)
+        axis.invert_yaxis()
+        figure.colorbar(image, ax=axis, pad=0.01, label="Contribution")
+    for axis in axes.flat[len(panels):]:
+        axis.set_visible(False)
+    figure.suptitle("Contribution Functions")
+    figure.tight_layout()
+    return figure
+
+
+def planet_rest_frame_products(
+    wavelength: np.ndarray,
+    data: np.ndarray,
+    sigma: np.ndarray,
+    model: np.ndarray,
+    phase: np.ndarray,
+    posterior: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    """Shift observed and model timeseries using posterior-median orbital velocities."""
+
+    if "Kp" not in posterior:
+        raise KeyError("Posterior does not contain Kp.")
+    if "v_sys" in posterior:
+        v_sys = float(np.median(posterior["v_sys"]))
+    elif "Vsys_kms" in posterior:
+        v_sys = float(np.median(posterior["Vsys_kms"]))
+    else:
+        raise KeyError("Posterior does not contain v_sys or Vsys_kms.")
+    kp = float(np.median(posterior["Kp"]))
+    velocity = np.asarray(planet_rv_kms(np.asarray(phase), kp, v_sys))
+    observed = coadd_in_planet_rest_frame(wavelength, data, sigma, velocity)
+    modeled = coadd_in_planet_rest_frame(
+        wavelength,
+        model,
+        sigma,
+        velocity,
+        rest_wavelength=observed["wavelength"],
+    )
+    return {"Kp": kp, "v_sys": v_sys, "velocity": velocity, "observed": observed, "model": modeled}
+
+
+def plot_planet_rest_frame_coadd(
+    products: dict[str, Any],
+    *,
+    smooth_width: int = 11,
+) -> plt.Figure:
+    """Plot observed, modeled, and residual planet-rest-frame coadds."""
+
+    observed = products["observed"]
+    modeled = products["model"]
+    wavelength_nm = np.asarray(observed["wavelength"]) / 10.0
+    observed_coadd = np.asarray(observed["coadd"])
+    modeled_coadd = np.asarray(modeled["coadd"])
+    residual = observed_coadd - modeled_coadd
+    figure, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True, height_ratios=[2, 1])
+    axes[0].plot(wavelength_nm, observed_coadd, color="black", lw=0.6, alpha=0.4, label="Observed")
+    axes[0].plot(wavelength_nm, nan_box_smooth(observed_coadd, smooth_width), color="black", lw=1.5, label="Observed smoothed")
+    axes[0].plot(wavelength_nm, modeled_coadd, color="tab:red", lw=0.8, alpha=0.5, label="Model")
+    axes[0].plot(wavelength_nm, nan_box_smooth(modeled_coadd, smooth_width), color="tab:red", lw=1.8, label="Model smoothed")
+    axes[0].set(ylabel="Processed residual / model units", title="Planet-Rest-Frame Coadded Spectrum")
+    axes[0].legend()
+    axes[1].plot(wavelength_nm, residual, color="0.3", lw=0.5, alpha=0.4, label="Observed - model")
+    axes[1].plot(wavelength_nm, nan_box_smooth(residual, smooth_width), color="tab:blue", lw=1.5, label="Residual smoothed")
+    axes[1].set(xlabel="Wavelength (nm)", ylabel="Residual")
+    axes[1].legend()
+    for axis in axes:
+        axis.axhline(0.0, color="0.5", ls="--", lw=1)
+        axis.grid(alpha=0.25)
+    figure.tight_layout()
+    return figure
+
+
 def default_kp_vsys_grids(
     context: DiagnosticContext,
     *,
@@ -844,25 +1207,21 @@ def plot_processed_timeseries_comparison(
                 all_axes[row, col].sharey(all_axes[row, 0])
 
     wav_strided = wavelength[::wavelength_stride]
-    extent = [
-        float(wav_strided[0]),
-        float(wav_strided[-1]),
-        float(phase.min()),
-        float(phase.max()),
-    ]
+    phase_edges = np.linspace(float(phase.min()), float(phase.max()), phase.size + 1)
 
     for ax, arr, label in zip(all_axes[0], arrays, labels):
         arr_vmin = float(np.nanpercentile(arr, 2.0))
         arr_vmax = float(np.nanpercentile(arr, 98.0))
-        im = ax.imshow(
+        meshes = pcolormesh_wavelength_segments(
+            ax,
+            wav_strided,
             arr[:, ::wavelength_stride],
-            origin="lower",
-            aspect="auto",
-            extent=extent,
+            y_edges=phase_edges,
             vmin=arr_vmin,
             vmax=arr_vmax,
             cmap="RdBu_r",
         )
+        im = meshes[0]
         ax.set_title(label)
         ax.set_xlabel("Wavelength [A]")
         fig.colorbar(im, ax=ax, label="Processed flux", shrink=0.85)
@@ -888,15 +1247,16 @@ def plot_processed_timeseries_comparison(
         # First column of row 2: model difference
         diff = m1 - m2
         diff_vlim = float(np.nanpercentile(np.abs(diff), 98.0))
-        im_diff = all_axes[1, 0].imshow(
+        meshes = pcolormesh_wavelength_segments(
+            all_axes[1, 0],
+            wav_strided,
             diff[:, ::wavelength_stride],
-            origin="lower",
-            aspect="auto",
-            extent=extent,
+            y_edges=phase_edges,
             vmin=-diff_vlim,
             vmax=diff_vlim,
             cmap="RdBu_r",
         )
+        im_diff = meshes[0]
         all_axes[1, 0].set_title(f"{model_labels[0]} − {model_labels[1]}")
         all_axes[1, 0].set_xlabel("Wavelength [A]")
         all_axes[1, 0].set_ylabel("Orbital phase")
@@ -907,15 +1267,16 @@ def plot_processed_timeseries_comparison(
             col = idx + 1
             if col >= ncols:
                 break
-            im_r = all_axes[1, col].imshow(
+            meshes = pcolormesh_wavelength_segments(
+                all_axes[1, col],
+                wav_strided,
                 rarr[:, ::wavelength_stride],
-                origin="lower",
-                aspect="auto",
-                extent=extent,
+                y_edges=phase_edges,
                 vmin=-resid_vlim,
                 vmax=resid_vlim,
                 cmap="RdBu_r",
             )
+            im_r = meshes[0]
             all_axes[1, col].set_title(rlabel)
             all_axes[1, col].set_xlabel("Wavelength [A]")
             fig.colorbar(im_r, ax=all_axes[1, col], label="Residual flux", shrink=0.85)

@@ -1,6 +1,11 @@
 import os
 import numpy as np
-from plotting.style import configure_matplotlib
+from plotting.style import configure_matplotlib, save_figure_pdf
+from plotting.wavelength import (
+    fill_between_wavelength_segments,
+    plot_wavelength_segments,
+    wavelength_segment_slices,
+)
 
 configure_matplotlib()
 
@@ -68,7 +73,7 @@ def plot_svi_loss(loss_values: np.ndarray, save_path: str) -> None:
     ax.set_title("SVI loss")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(save_path, dpi=200)
+    save_path = save_figure_pdf(fig, save_path, dpi=200)
     plt.close(fig)
     print(f"SVI loss plot saved to {save_path}")
 
@@ -102,8 +107,29 @@ def _bin_observed_spectrum(
     values = values[sort_idx]
     errors = errors[sort_idx]
 
-    n_bins = min(max_bins, wavelength.size)
-    index_bins = np.array_split(np.arange(wavelength.size), n_bins)
+    segments = wavelength_segment_slices(wavelength)
+    n_bins = max(len(segments), min(max_bins, wavelength.size))
+    bins_per_segment = np.ones(len(segments), dtype=int)
+    remaining_bins = n_bins - len(segments)
+    if remaining_bins:
+        segment_sizes = np.asarray(
+            [segment.stop - segment.start for segment in segments],
+            dtype=float,
+        )
+        shares = remaining_bins * segment_sizes / np.sum(segment_sizes)
+        additions = np.floor(shares).astype(int)
+        bins_per_segment += additions
+        remainder = remaining_bins - int(np.sum(additions))
+        if remainder:
+            priority = np.argsort(-(shares - additions))
+            bins_per_segment[priority[:remainder]] += 1
+
+    index_bins = []
+    for segment, segment_bins in zip(segments, bins_per_segment):
+        segment_indices = np.arange(segment.start, segment.stop)
+        index_bins.extend(
+            np.array_split(segment_indices, min(int(segment_bins), segment_indices.size))
+        )
 
     binned_wavelength = []
     binned_values = []
@@ -149,8 +175,14 @@ def plot_transmission_spectrum(
     rp_pre_sysrem_err: np.ndarray | None = None,
 ) -> None:
     rp_hmc_np = np.asarray(rp_hmc)
-    mean = rp_hmc_np.mean(axis=0)
-    std = rp_hmc_np.std(axis=0)
+    if rp_hmc_np.ndim == 1:
+        rp_hmc_np = rp_hmc_np[None, :]
+    if rp_hmc_np.ndim != 2:
+        raise ValueError(
+            "rp_hmc must contain posterior predictive spectra with shape "
+            f"(draw, wavelength); got {rp_hmc_np.shape}."
+        )
+    q16, median, q84 = np.nanpercentile(rp_hmc_np, [16.0, 50.0, 84.0], axis=0)
     rp_svi_np = None if rp_svi is None else np.asarray(rp_svi)
 
     wavelength_np = np.asarray(wavelength_nm, dtype=float)
@@ -158,8 +190,9 @@ def plot_transmission_spectrum(
     wavelength_sorted = wavelength_np[sort_idx]
     obs_sorted = np.asarray(rp_obs, dtype=float)[sort_idx]
     err_sorted = np.asarray(rp_err, dtype=float)[sort_idx]
-    mean_sorted = np.asarray(mean, dtype=float)[sort_idx]
-    std_sorted = np.asarray(std, dtype=float)[sort_idx]
+    median_sorted = np.asarray(median, dtype=float)[sort_idx]
+    q16_sorted = np.asarray(q16, dtype=float)[sort_idx]
+    q84_sorted = np.asarray(q84, dtype=float)[sort_idx]
     svi_sorted = None if rp_svi_np is None else rp_svi_np[sort_idx]
 
     bin_wavelength, bin_obs, bin_err = _bin_observed_spectrum(
@@ -168,9 +201,13 @@ def plot_transmission_spectrum(
         err_sorted,
     )
     if bin_wavelength.size:
-        model_valid = np.isfinite(wavelength_sorted) & np.isfinite(mean_sorted)
+        model_valid = np.isfinite(wavelength_sorted) & np.isfinite(median_sorted)
         if np.count_nonzero(model_valid) >= 2:
-            bin_model = np.interp(bin_wavelength, wavelength_sorted[model_valid], mean_sorted[model_valid])
+            bin_model = np.interp(
+                bin_wavelength,
+                wavelength_sorted[model_valid],
+                median_sorted[model_valid],
+            )
         else:
             bin_model = np.full_like(bin_obs, np.nan)
         bin_residual = bin_obs - bin_model
@@ -255,25 +292,33 @@ def plot_transmission_spectrum(
             label="Binned processed residuals",
             zorder=4,
         )
-    ax.fill_between(
+    if rp_hmc_np.shape[0] >= 4:
+        fill_between_wavelength_segments(
+            ax,
+            wavelength_sorted,
+            q16_sorted,
+            q84_sorted,
+            color="C0",
+            alpha=0.25,
+            label="68% posterior predictive interval",
+            zorder=2,
+        )
+    plot_wavelength_segments(
+        ax,
         wavelength_sorted,
-        mean_sorted - std_sorted,
-        mean_sorted + std_sorted,
-        color="C0",
-        alpha=0.25,
-        label="Posterior model scatter",
-        zorder=2,
-    )
-    ax.plot(
-        wavelength_sorted,
-        mean_sorted,
+        median_sorted,
         color="C0",
         lw=1.7,
-        label="Processed model mean",
+        label=(
+            "Posterior predictive median"
+            if rp_hmc_np.shape[0] >= 4
+            else "Posterior-median processed model"
+        ),
         zorder=5,
     )
     if svi_sorted is not None:
-        ax.plot(
+        plot_wavelength_segments(
+            ax,
             wavelength_sorted,
             svi_sorted,
             color="C3",
@@ -304,7 +349,7 @@ def plot_transmission_spectrum(
     ax_resid.set_ylabel("Data - model", fontsize=11)
     ax_resid.grid(True, alpha=0.3)
     fig.subplots_adjust(hspace=0.32 if has_pre_sysrem else 0.22)
-    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    save_path = save_figure_pdf(fig, save_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Transmission spectrum plot saved to {save_path}")
 
@@ -314,29 +359,64 @@ def plot_emission_spectrum(
     fp_obs: np.ndarray,
     fp_err: np.ndarray,
     fp_hmc: np.ndarray,
-    fp_svi: np.ndarray,
+    fp_svi: np.ndarray | None,
     save_path: str,
 ) -> None:
     fp_hmc_np = np.asarray(fp_hmc)
-    mean = fp_hmc_np.mean(axis=0)
-    std = fp_hmc_np.std(axis=0)
-    fp_svi_np = np.asarray(fp_svi)
+    if fp_hmc_np.ndim == 1:
+        fp_hmc_np = fp_hmc_np[None, :]
+    if fp_hmc_np.ndim != 2:
+        raise ValueError(
+            "fp_hmc must contain posterior predictive spectra with shape "
+            f"(draw, wavelength); got {fp_hmc_np.shape}."
+        )
+    q16, median, q84 = np.nanpercentile(fp_hmc_np, [16.0, 50.0, 84.0], axis=0)
+    fp_svi_np = None if fp_svi is None else np.asarray(fp_svi)
 
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.errorbar(
         wavelength_nm, fp_obs, yerr=fp_err,
         fmt=".", ms=2, color="k", ecolor="0.3", elinewidth=0.5, alpha=0.6, label="Observed",
     )
-    ax.fill_between(wavelength_nm, mean - std, mean + std, color="C1", alpha=0.25, label="HMC ±1σ")
-    ax.plot(wavelength_nm, mean, color="C1", lw=1.5, label="HMC mean")
-    ax.plot(wavelength_nm, fp_svi_np, color="C3", lw=1.5, ls="--", label="SVI median")
+    if fp_hmc_np.shape[0] >= 4:
+        fill_between_wavelength_segments(
+            ax,
+            wavelength_nm,
+            q16,
+            q84,
+            color="C1",
+            alpha=0.25,
+            label="68% posterior predictive interval",
+        )
+    plot_wavelength_segments(
+        ax,
+        wavelength_nm,
+        median,
+        color="C1",
+        lw=1.5,
+        label=(
+            "Posterior predictive median"
+            if fp_hmc_np.shape[0] >= 4
+            else "Posterior-median processed model"
+        ),
+    )
+    if fp_svi_np is not None:
+        plot_wavelength_segments(
+            ax,
+            wavelength_nm,
+            fp_svi_np,
+            color="C3",
+            lw=1.5,
+            ls="--",
+            label="SVI median (initialization diagnostic)",
+        )
     ax.set_xlabel("Wavelength [nm]", fontsize=12)
     ax.set_ylabel(r"$F_p/F_\star$", fontsize=12)
     ax.set_title("Emission Spectrum", fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(save_path, dpi=200)
+    save_path = save_figure_pdf(fig, save_path, dpi=200)
     plt.close(fig)
     print(f"Emission spectrum plot saved to {save_path}")
 
@@ -398,7 +478,7 @@ def plot_temperature_profile(
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(save_path, dpi=200)
+    save_path = save_figure_pdf(fig, save_path, dpi=200)
     plt.close(fig)
     print(f"T-P profile plot saved to {save_path}")
 
@@ -555,7 +635,7 @@ def plot_corner(
         print("No corner figure was generated; skipping save.")
         return
 
-    fig.savefig(save_path, dpi=200)
+    save_path = save_figure_pdf(fig, save_path, dpi=200)
     plt.close(fig)
     print(f"Corner plot saved to {save_path}")
 
@@ -595,10 +675,10 @@ def save_retrieval_corner_plots(
             plot_corner(
                 svi_samples=svi_corner_samples,
                 variables=svi_vars,
-                save_path=os.path.join(output_dir, "corner_plot_svi.png"),
+                save_path=os.path.join(output_dir, "corner_plot_svi.pdf"),
             )
         else:
-            print("No SVI variables available for corner_plot_svi.png; skipping.")
+            print("No SVI variables available for corner_plot_svi.pdf; skipping.")
 
     if hmc_corner_samples is not None:
         hmc_vars = []
@@ -609,10 +689,10 @@ def save_retrieval_corner_plots(
             plot_corner(
                 hmc_samples=hmc_corner_samples,
                 variables=hmc_vars,
-                save_path=os.path.join(output_dir, "corner_plot_hmc.png"),
+                save_path=os.path.join(output_dir, "corner_plot_hmc.pdf"),
             )
         else:
-            print("No HMC variables available for corner_plot_hmc.png; skipping.")
+            print("No HMC variables available for corner_plot_hmc.pdf; skipping.")
 
     if hmc_corner_samples is not None and svi_corner_samples is not None:
         overlay_vars = []
@@ -624,10 +704,10 @@ def save_retrieval_corner_plots(
                 hmc_samples=hmc_corner_samples,
                 svi_samples=svi_corner_samples,
                 variables=overlay_vars,
-                save_path=os.path.join(output_dir, "corner_plot_overlay.png"),
+                save_path=os.path.join(output_dir, "corner_plot_overlay.pdf"),
             )
         else:
-            print("No overlapping HMC/SVI variables for corner_plot_overlay.png; skipping.")
+            print("No overlapping HMC/SVI variables for corner_plot_overlay.pdf; skipping.")
 
 
 def create_transmission_plots(
@@ -645,15 +725,15 @@ def create_transmission_plots(
 ) -> None:
     print("Generating diagnostic plots...")
 
-    plot_svi_loss(losses, os.path.join(output_dir, "svi_loss.png"))
+    plot_svi_loss(losses, os.path.join(output_dir, "svi_loss.pdf"))
 
     plot_transmission_spectrum(
         wav_obs, rp_mean, rp_std, predictions["rp"], svi_mu,
-        os.path.join(output_dir, "transmission_spectrum.png")
+        os.path.join(output_dir, "transmission_spectrum.pdf")
     )
 
     plot_temperature_profile(
-        posterior_sample, art, os.path.join(output_dir, "temperature_profile.png")
+        posterior_sample, art, os.path.join(output_dir, "temperature_profile.pdf")
     )
 
     save_retrieval_corner_plots(
@@ -736,7 +816,7 @@ def plot_phase_trace(
     fig.tight_layout()
     
     if save_path:
-        fig.savefig(save_path, dpi=200)
+        save_path = save_figure_pdf(fig, save_path, dpi=200)
         plt.close(fig)
         print(f"Phase trace plot saved to {save_path}")
     else:
@@ -781,7 +861,7 @@ def plot_phase_comparison(
         fig.legend(handles, labels_legend, loc='upper right', fontsize=12)
         
         if save_path:
-            fig.savefig(save_path, dpi=200)
+            save_path = save_figure_pdf(fig, save_path, dpi=200)
             plt.close(fig)
             print(f"Phase comparison corner plot saved to {save_path}")
         else:
@@ -826,7 +906,7 @@ def plot_aliasing_matrix(
     fig.tight_layout()
     
     if save_path:
-        fig.savefig(save_path, dpi=200)
+        save_path = save_figure_pdf(fig, save_path, dpi=200)
         plt.close(fig)
         print(f"Aliasing matrix plot saved to {save_path}")
     else:
@@ -859,7 +939,7 @@ def plot_ccf_pair(
     fig.tight_layout()
     
     if save_path:
-        fig.savefig(save_path, dpi=200)
+        save_path = save_figure_pdf(fig, save_path, dpi=200)
         plt.close(fig)
         print(f"CCF pair plot saved to {save_path}")
     else:
@@ -1013,7 +1093,7 @@ def plot_contribution_function(
     fig.tight_layout()
     
     if save_path:
-        fig.savefig(save_path, dpi=200)
+        save_path = save_figure_pdf(fig, save_path, dpi=200)
         plt.close(fig)
         print(f"Contribution function plot saved to {save_path}")
     else:
@@ -1126,7 +1206,7 @@ def plot_contribution_per_species(
     fig.tight_layout()
     
     if save_path:
-        fig.savefig(save_path, dpi=200, bbox_inches='tight')
+        save_path = save_figure_pdf(fig, save_path, dpi=200, bbox_inches='tight')
         plt.close(fig)
         print(f"Per-species contribution plot saved to {save_path}")
     else:
@@ -1231,7 +1311,7 @@ def plot_contribution_combined(
     fig.tight_layout()
     
     if save_path:
-        fig.savefig(save_path, dpi=200, bbox_inches='tight')
+        save_path = save_figure_pdf(fig, save_path, dpi=200, bbox_inches='tight')
         plt.close(fig)
         print(f"Combined contribution plot saved to {save_path}")
     else:
