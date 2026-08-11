@@ -12,7 +12,7 @@ the time-series retrieval path:
 - ``bjd_tdb.npy`` (1D canonical barycentric mid-exposure times)
 
 Optional auxiliary products are also written when available, including
-``jd.npy`` (raw UTC ``JD-OBS``), ``snr.npy``, ``exptime.npy``, ``airmass.npy``,
+``jd.npy`` (UTC exposure midpoint), ``snr.npy``, ``exptime.npy``, ``airmass.npy``,
 and the frozen full-exposure SYSREM operator with per-pixel uncertainties.
 """
 
@@ -28,7 +28,7 @@ import numpy as np
 import config
 import config_utils
 from config import EPHEMERIS, FULL_ARM_MEMBERS
-from config_utils import get_params
+from config_utils import get_params, resolve_transit_midpoint
 from dataio.collapse_emission_timeseries_to_1d import (
     describe_emission_selection,
     emission_selection_mask,
@@ -38,11 +38,17 @@ from dataio.collapse_transmission_timeseries_to_1d import (
     get_bjd_tdb,
     get_ephemeris_epoch_bjd_tdb,
     get_orbital_phase,
-    get_pepsi_data,
     get_sysrem_deep_mask,
     get_sysrem_chunk_indices,
     get_sysrem_ignore_mask,
 )
+from dataio.edge_trim_manifest import load_accepted_edge_trim_widths
+from dataio.hrs_preparation import (
+    load_hrs_arm,
+    output_dir_for,
+    requested_stellar_velocity_correction,
+)
+from dataio.wavelength_frame_contract import build_wavelength_frame_contract
 
 
 EMISSION_PHASE_BINS = {
@@ -55,123 +61,13 @@ EMISSION_PHASE_BINS = {
 }
 
 
-def _output_dir_for(
-    planet: str,
-    epoch: str,
-    arm: str,
-    product_kind: str,
-) -> Path:
-    if product_kind == "collapse-source":
-        return config_utils.get_collapse_source_dir(
-            planet=planet,
-            epoch=epoch,
-            arm=arm,
-            mode="emission",
-        )
-    return config_utils.get_timeseries_data_dir(
-        planet=planet,
-        epoch=epoch,
-        arm=arm,
-        mode="emission",
-    )
-
-
-def _raw_input_dir_for(planet: str, epoch: str) -> Path:
-    return config_utils.get_raw_hrs_dir(planet=planet, epoch=epoch, mode="emission")
-
-
-def _planet_config(planet: str, ephemeris: str) -> dict[str, Any]:
-    return get_params(planet, ephemeris)
-
-
-def _unwrap_result(result: Any) -> tuple[tuple[np.ndarray, ...], dict[str, Any]]:
-    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
-        return result[0], result[1]
-    return result, {}
-
-
-def _load_single_arm(
-    arm: str,
-    epoch: str,
-    planet: str,
-    *,
-    prefer_molecfit: bool,
-    regrid: bool,
-    subtract_median: bool,
-    run_sysrem: bool,
-) -> tuple[tuple[np.ndarray, ...], dict[str, Any]]:
-    result = get_pepsi_data(
-        arm=arm,
-        observation_epoch=epoch,
-        planet_name=planet,
-        do_molecfit=prefer_molecfit,
-        data_dir=_raw_input_dir_for(planet, epoch),
-        regrid=regrid,
-        subtract_median=subtract_median,
-        run_sysrem=run_sysrem,
-        data_mode="emission",
-    )
-    if result is None and prefer_molecfit:
-        print(f"  No molecfit files for {arm}; retrying with raw files.")
-        result = get_pepsi_data(
-            arm=arm,
-            observation_epoch=epoch,
-            planet_name=planet,
-            do_molecfit=False,
-            data_dir=_raw_input_dir_for(planet, epoch),
-            regrid=regrid,
-            subtract_median=subtract_median,
-            run_sysrem=run_sysrem,
-            data_mode="emission",
-        )
-    if result is None:
-        raise FileNotFoundError(
-            f"Could not load {arm}-arm PEPSI emission data for {planet} {epoch} from "
-            f"{_raw_input_dir_for(planet, epoch)}."
-        )
-    return _unwrap_result(result)
-
-
-def _load_data(
-    *,
-    arm: str,
-    epoch: str,
-    planet: str,
-    molecfit: bool,
-    regrid: bool,
-    subtract_median: bool,
-    run_sysrem: bool,
-) -> tuple[tuple[np.ndarray, ...], dict[str, Any]]:
-    if arm == "full":
-        raise ValueError(
-            "_load_data() is per-arm; 'full' must be expanded into its "
-            "constituent arms by the caller."
-        )
-
-    prefer_molecfit = molecfit
-    if arm == "blue":
-        prefer_molecfit = False
-
-    return _load_single_arm(
-        arm,
-        epoch,
-        planet,
-        prefer_molecfit=prefer_molecfit,
-        regrid=regrid,
-        subtract_median=subtract_median,
-        run_sysrem=run_sysrem,
-    )
-
-
 def _sanitize_columns(
     wavelength: np.ndarray,
     data: np.ndarray,
     sigma: np.ndarray,
     *,
     arm: str | None = None,
-    planet: str | None = None,
-    mode: str | None = None,
-    epoch: str | None = None,
+    edge_trim_widths_A: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     wavelength = np.asarray(wavelength, dtype=float)
     data = np.asarray(data, dtype=float)
@@ -197,9 +93,7 @@ def _sanitize_columns(
         valid &= ~get_sysrem_ignore_mask(
             wavelength,
             arm,
-            planet=planet,
-            mode=mode,
-            epoch=epoch,
+            explicit_edge_trim_widths_A=edge_trim_widths_A,
         )
 
     if not np.any(valid):
@@ -225,16 +119,6 @@ def _circular_phase_distance(phase: np.ndarray, center: float) -> np.ndarray:
     phase_01 = _phase_mod_1(phase)
     delta = np.abs(phase_01 - float(center))
     return np.minimum(delta, 1.0 - delta)
-
-
-def _nearest_reference_epoch(
-    bjd_tdb: np.ndarray,
-    reference_epoch_bjd_tdb: float,
-    period: float,
-) -> float:
-    obs_mid = 0.5 * (float(np.min(bjd_tdb)) + float(np.max(bjd_tdb)))
-    n_orbits = round((obs_mid - reference_epoch_bjd_tdb) / period)
-    return float(reference_epoch_bjd_tdb + n_orbits * period)
 
 
 def _is_valid_numeric(value: Any) -> bool:
@@ -273,7 +157,7 @@ def _phase_bin_definition(phase_bin: str, planet_params: dict[str, Any]) -> str:
     raise ValueError(f"Unknown emission phase bin: {phase_bin}")
 
 
-def _phase_selection_mask(
+def emission_phase_selection_mask(
     phase: np.ndarray,
     *,
     phase_bin: str,
@@ -363,6 +247,11 @@ def _save_metadata(
     arm_edge_trim: dict[str, float | int],
     spectral_column_masking: dict[str, Any],
     product_kind: str,
+    stellar_velocity: dict[str, Any],
+    wavelength_frame_contract: dict[str, Any],
+    input_exposure_files: list[str],
+    excluded_exposure_files: list[str],
+    science_exposure_selection: dict[str, Any],
 ) -> None:
     phase_01 = _phase_mod_1(phase)
     model_preprocessing_steps = ["active_exposure_mask"]
@@ -386,6 +275,9 @@ def _save_metadata(
         "eclipse_center_phase": 0.5,
         "n_exposures": int(phase.size),
         "n_source_exposures": int(source_phase.size),
+        "input_exposure_files": list(input_exposure_files),
+        "excluded_exposure_files": list(excluded_exposure_files),
+        "science_exposure_selection": science_exposure_selection,
         "selected_exposure_indices": np.asarray(
             selected_exposure_indices,
             dtype=int,
@@ -406,6 +298,10 @@ def _save_metadata(
         "run_sysrem": bool(run_sysrem),
         "arm_edge_trim": arm_edge_trim,
         "spectral_column_masking": spectral_column_masking,
+        "stellar_velocity": stellar_velocity,
+        "wavelength_medium": wavelength_frame_contract["wavelength_medium"],
+        "wavelength_frame": wavelength_frame_contract["wavelength_frame"],
+        "wavelength_frame_contract": wavelength_frame_contract,
     }
     if _is_valid_numeric(planet_params.get("duration")) and _is_valid_numeric(planet_params.get("period")):
         metadata["eclipse_half_width_phase"] = _eclipse_half_width_phase(planet_params)
@@ -506,6 +402,23 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run chunk-aware SYSREM and export retrieval SYSREM auxiliaries",
     )
+    parser.add_argument(
+        "--edge-trim-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Apply this dataset's exact widths from an accepted adaptive schema-v3 "
+            "calibration manifest"
+        ),
+    )
+    parser.add_argument(
+        "--apply-stellar-rest",
+        action="store_true",
+        help=(
+            "Apply an accepted stellar_velocity_lsd.json correction. By default, "
+            "products remain in the barycentric frame."
+        ),
+    )
     return parser
 
 
@@ -531,7 +444,7 @@ def main() -> int:
             "--output-dir, or drop --output-dir to use the default per-arm paths."
         )
 
-    planet_cfg = _planet_config(args.planet, args.ephemeris)
+    planet_cfg = get_params(args.planet, args.ephemeris)
     period = planet_cfg.get("period")
     ra = planet_cfg.get("RA")
     dec = planet_cfg.get("Dec")
@@ -571,13 +484,14 @@ def main() -> int:
         if args.output_dir:
             output_dir = Path(args.output_dir)
         else:
-            output_dir = _output_dir_for(
-                args.planet,
-                args.epoch,
-                arm,
-                args.product_kind,
+            output_dir = output_dir_for(
+                mode="emission",
+                planet=args.planet,
+                epoch=args.epoch,
+                arm=arm,
+                product_kind=args.product_kind,
             )
-        _process_arm(
+        prepare_arm(
             arm=arm,
             args=args,
             planet_cfg=planet_cfg,
@@ -591,7 +505,7 @@ def main() -> int:
     return 0
 
 
-def _process_arm(
+def prepare_arm(
     *,
     arm: str,
     args: argparse.Namespace,
@@ -602,8 +516,31 @@ def _process_arm(
     dec: str,
     output_dir: Path,
 ) -> None:
+    """Prepare and persist one emission arm using resolved CLI arguments."""
+
     print(f"\nLoading PEPSI {arm} emission data for {args.planet} ({args.epoch})...")
-    result, extras = _load_data(
+    edge_trim_widths_A = None
+    edge_trim_source = None
+    if args.edge_trim_manifest is not None:
+        selected_manifest, edge_trim_widths_A = load_accepted_edge_trim_widths(
+            args.edge_trim_manifest,
+            planet=args.planet,
+            mode="emission",
+            epoch=args.epoch,
+            arm=arm,
+        )
+        edge_trim_source = str(selected_manifest)
+    stellar_rest_velocity_kms, stellar_velocity = (
+        requested_stellar_velocity_correction(
+            enabled=args.apply_stellar_rest,
+            mode="emission",
+            planet=args.planet,
+            epoch=args.epoch,
+            arm=arm,
+        )
+    )
+    result, extras = load_hrs_arm(
+        mode="emission",
         arm=arm,
         epoch=args.epoch,
         planet=args.planet,
@@ -611,6 +548,8 @@ def _process_arm(
         regrid=args.regrid,
         subtract_median=args.subtract_median,
         run_sysrem=args.run_sysrem,
+        stellar_rest_velocity_kms=stellar_rest_velocity_kms,
+        edge_trim_widths_A=edge_trim_widths_A,
     )
 
     wave, data, sigma, jd, snr, exptime, airmass, n_spectra, npix = result
@@ -626,6 +565,7 @@ def _process_arm(
         ra,
         dec,
         header_bjd_tdb=extras.get("header_bjd_tdb"),
+        input_time_keyword=str(extras.get("input_time_keyword", "JD-OBS")),
         return_diagnostics=True,
     )
     time_metadata.update(
@@ -636,16 +576,30 @@ def _process_arm(
             "ephemeris_epoch_scale": str(planet_cfg["epoch_scale"]).lower(),
             "ephemeris_epoch_reference": planet_cfg["epoch_reference"],
             "ephemeris_epoch_bjd_tdb": reference_epoch_bjd_tdb,
+            "input_time_provenance": dict(
+                extras.get("input_time_provenance", {})
+            ),
         }
     )
-    t0 = _nearest_reference_epoch(bjd_tdb, reference_epoch_bjd_tdb, period)
+    t0 = resolve_transit_midpoint(
+        bjd_tdb,
+        planet_cfg,
+        reference_epoch_bjd_tdb=reference_epoch_bjd_tdb,
+        observation_epoch=args.epoch,
+    )
+    time_metadata.update(
+        {
+            "timing_model": str(planet_cfg.get("timing_model", "linear")),
+            "resolved_mid_transit_bjd_tdb": t0,
+        }
+    )
     phase = np.asarray(get_orbital_phase(bjd_tdb, t0, period), dtype=float)
     source_phase = np.asarray(phase, dtype=float).copy()
     source_bjd_tdb = np.asarray(bjd_tdb, dtype=float).copy()
     source_data = np.asarray(data, dtype=float).copy()
     source_sigma = np.asarray(sigma, dtype=float).copy()
     active_exposure_mask = np.ones_like(source_phase, dtype=float)
-    selection = _phase_selection_mask(
+    selection = emission_phase_selection_mask(
         phase,
         phase_bin=args.phase_bin,
         planet_params=planet_cfg,
@@ -670,9 +624,7 @@ def _process_arm(
     sysrem_ignore_mask = get_sysrem_ignore_mask(
         wave_1d,
         arm,
-        planet=args.planet,
-        mode="emission",
-        epoch=args.epoch,
+        explicit_edge_trim_widths_A=edge_trim_widths_A,
     )
     deep_telluric_mask = get_sysrem_deep_mask(wave_1d, arm)
     edge_trim_info = arm_edge_trim_metadata(
@@ -681,15 +633,15 @@ def _process_arm(
         planet=args.planet,
         mode="emission",
         epoch=args.epoch,
+        explicit_widths_A=edge_trim_widths_A,
+        source=edge_trim_source,
     )
     wave_1d, _source_data_masked, source_sigma, column_indices = _sanitize_columns(
         wave_1d,
         source_data,
         source_sigma,
         arm=arm,
-        planet=args.planet,
-        mode="emission",
-        epoch=args.epoch,
+        edge_trim_widths_A=edge_trim_widths_A,
     )
     data = data[:, column_indices]
     sigma = sigma[:, column_indices]
@@ -763,6 +715,11 @@ def _process_arm(
         # exported non-SYSREM cube.
         (output_dir / "U_sysrem.npz").unlink(missing_ok=True)
 
+    wavelength_frame_contract = build_wavelength_frame_contract(
+        extras,
+        n_source_exposures=source_phase.size,
+        stellar_velocity=stellar_velocity,
+    )
     _save_metadata(
         output_dir,
         planet=args.planet,
@@ -784,6 +741,13 @@ def _process_arm(
         arm_edge_trim=edge_trim_info,
         spectral_column_masking=spectral_column_masking,
         product_kind=args.product_kind,
+        stellar_velocity=stellar_velocity,
+        wavelength_frame_contract=wavelength_frame_contract,
+        input_exposure_files=list(extras.get("input_exposure_files", ())),
+        excluded_exposure_files=list(extras.get("excluded_exposure_files", ())),
+        science_exposure_selection=dict(
+            extras.get("science_exposure_selection_metadata", {})
+        ),
     )
 
     phase_01 = _phase_mod_1(phase)
@@ -802,7 +766,10 @@ def _process_arm(
         "  timeseries_operator.npz: "
         f"{source_phase.size} source rows -> {phase.size} likelihood rows"
     )
-    print("  jd.npy: raw UTC JD-OBS; bjd_tdb.npy: canonical BJD_TDB")
+    print(
+        "  jd.npy: UTC midpoint from "
+        f"{time_metadata['input_keyword']}; bjd_tdb.npy: canonical BJD_TDB"
+    )
     print(
         f"  Phase range: {float(np.min(phase)):.5f} to {float(np.max(phase)):.5f}; "
         f"phase(mod1): {float(np.min(phase_01)):.5f} to {float(np.max(phase_01)):.5f}; "

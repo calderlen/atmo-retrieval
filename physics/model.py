@@ -273,6 +273,7 @@ class FrozenTimeseriesInputs(NamedTuple):
     selected_exposure_indices: jnp.ndarray
     subtract_time_median: bool
     chunked_sysrem: ChunkedSysremInputs | None = None
+    fixed_source_model: jnp.ndarray | None = None
 
 
 class CollapsedEmissionInputs(NamedTuple):
@@ -300,6 +301,7 @@ class CollapsedTransmissionInputs(NamedTuple):
     source_wavelength: jnp.ndarray
     source_inst_nus: jnp.ndarray
     source_phase: jnp.ndarray
+    fixed_source_model: jnp.ndarray
     active_exposure_mask: jnp.ndarray
     selected_exposure_indices: jnp.ndarray
     shift_left_indices: jnp.ndarray
@@ -1766,10 +1768,14 @@ def apply_collapsed_emission_operator(
     right = selected[exposure_indices, operator.shift_left_indices + 1]
     shifted = left + operator.shift_fractions * (right - left)
     spectrum_unbinned = jnp.sum(operator.coadd_weights * shifted, axis=0)
-    retained = operator.bin_indices.shape[0]
+    if operator.bin_indices.shape[0] != spectrum_unbinned.shape[0]:
+        raise ValueError(
+            "A collapsed-emission operator must assign every shifted "
+            "wavelength to one output bin."
+        )
     spectrum_binned = jnp.zeros_like(operator.output_wavelength).at[
         operator.bin_indices
-    ].add(operator.bin_weights * spectrum_unbinned[:retained])
+    ].add(operator.bin_weights * spectrum_unbinned)
     return spectrum_binned[operator.output_indices][None, :]
 
 
@@ -1785,7 +1791,15 @@ def apply_collapsed_transmission_operator(
             f"series; got shape {model_ts.shape}."
         )
 
+    fixed_source_model = jnp.asarray(operator.fixed_source_model)
     model_wavelength_order = model_ts[:, ::-1]
+    if fixed_source_model.shape != model_wavelength_order.shape:
+        raise ValueError(
+            "Collapsed transmission fixed LSD shadow shape does not match the "
+            f"planet model: {fixed_source_model.shape} versus "
+            f"{model_wavelength_order.shape}."
+        )
+    model_wavelength_order = model_wavelength_order + fixed_source_model
     residual_ts = (
         model_wavelength_order
         * operator.active_exposure_mask[:, None]
@@ -1801,10 +1815,14 @@ def apply_collapsed_transmission_operator(
     right = selected[exposure_indices, operator.shift_left_indices + 1]
     shifted = left + operator.shift_fractions * (right - left)
     spectrum_unbinned = jnp.sum(operator.coadd_weights * shifted, axis=0)
-    retained = operator.bin_indices.shape[0]
+    if operator.bin_indices.shape[0] != spectrum_unbinned.shape[0]:
+        raise ValueError(
+            "A collapsed-transmission operator must assign every shifted "
+            "wavelength to one output bin."
+        )
     spectrum_binned = jnp.zeros_like(operator.output_wavelength).at[
         operator.bin_indices
-    ].add(operator.bin_weights * spectrum_unbinned[:retained])
+    ].add(operator.bin_weights * spectrum_unbinned)
     return spectrum_binned[operator.output_indices][None, :]
 
 
@@ -1824,6 +1842,15 @@ def apply_frozen_timeseries_operator(
             "Frozen time-series source exposure count does not match the model: "
             f"{operator.source_phase.size} versus {model_ts.shape[0]}."
         )
+
+    if operator.fixed_source_model is not None:
+        fixed_source_model = jnp.asarray(operator.fixed_source_model)
+        if fixed_source_model.shape != model_ts.shape:
+            raise ValueError(
+                "Fixed Doppler-shadow source model shape does not match the "
+                f"planet model: {fixed_source_model.shape} versus {model_ts.shape}."
+            )
+        model_ts = model_ts + fixed_source_model
 
     processed = model_ts * operator.active_exposure_mask[:, None]
     median_subtracted = processed - jnp.median(
@@ -2005,6 +2032,11 @@ def _normalize_spectroscopic_observation_inputs(
     if frozen_timeseries is not None:
         source_phase = jnp.asarray(frozen_timeseries.source_phase)
         active_mask = jnp.asarray(frozen_timeseries.active_exposure_mask)
+        fixed_source_model = (
+            None
+            if frozen_timeseries.fixed_source_model is None
+            else jnp.asarray(frozen_timeseries.fixed_source_model)
+        )
         selected_indices = jnp.asarray(
             frozen_timeseries.selected_exposure_indices,
             dtype=jnp.int32,
@@ -2023,6 +2055,15 @@ def _normalize_spectroscopic_observation_inputs(
                 "Frozen time-series selected exposure count must match the "
                 f"observed data: {selected_indices.size} versus {data.shape[0]}."
             )
+        if fixed_source_model is not None and fixed_source_model.shape != (
+            source_phase.size,
+            data.shape[1],
+        ):
+            raise ValueError(
+                "Fixed Doppler-shadow source model must have source exposure x "
+                f"wavelength shape {(source_phase.size, data.shape[1])}; got "
+                f"{fixed_source_model.shape}."
+            )
         frozen_timeseries = FrozenTimeseriesInputs(
             source_phase=source_phase,
             active_exposure_mask=active_mask,
@@ -2040,6 +2081,7 @@ def _normalize_spectroscopic_observation_inputs(
                     n_wave=data.shape[1],
                 )
             ),
+            fixed_source_model=fixed_source_model,
         )
     if frozen_timeseries is not None and (
         collapsed_emission is not None or collapsed_transmission is not None
@@ -2140,6 +2182,9 @@ def _normalize_spectroscopic_observation_inputs(
             collapsed_transmission.source_inst_nus
         )
         source_phase = jnp.asarray(collapsed_transmission.source_phase)
+        fixed_source_model = jnp.asarray(
+            collapsed_transmission.fixed_source_model
+        )
         active_mask = jnp.asarray(
             collapsed_transmission.active_exposure_mask
         )
@@ -2179,6 +2224,16 @@ def _normalize_spectroscopic_observation_inputs(
                 "Collapsed transmission source_phase and "
                 "active_exposure_mask must be matching 1D arrays."
             )
+        if fixed_source_model.shape != (
+            source_phase.size,
+            source_wavelength.size,
+        ):
+            raise ValueError(
+                "Collapsed transmission fixed_source_model must have source "
+                "exposure x wavelength shape "
+                f"{(source_phase.size, source_wavelength.size)}; got "
+                f"{fixed_source_model.shape}."
+            )
         if shift_left_indices.shape != coadd_weights.shape:
             raise ValueError(
                 "Collapsed transmission shift indices and coadd weights "
@@ -2204,6 +2259,7 @@ def _normalize_spectroscopic_observation_inputs(
             source_wavelength=source_wavelength,
             source_inst_nus=source_inst_nus,
             source_phase=source_phase,
+            fixed_source_model=fixed_source_model,
             active_exposure_mask=active_mask,
             selected_exposure_indices=selected_indices,
             shift_left_indices=shift_left_indices,

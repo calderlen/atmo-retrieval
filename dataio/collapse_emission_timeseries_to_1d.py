@@ -18,10 +18,15 @@ import numpy as np
 
 import config
 import config_utils
+from dataio.orbital_velocity import planet_radial_velocity_kms
 from config import FULL_ARM_MEMBERS
 
 
 SPEED_OF_LIGHT_KMS = 299792.458
+EMISSION_COLLAPSE_SCHEMA_VERSION = 4
+COLLAPSE_COVERAGE_POLICY = (
+    "all_selected_exposures_in_bounds_and_within_native_segment"
+)
 
 EMISSION_COLLAPSE_SELECTIONS = (
     "full_emission",
@@ -210,6 +215,8 @@ def collapse_selected_emission_exposures(
     phase: np.ndarray,
     *,
     kp_kms: float,
+    eccentricity: float = 0.0,
+    omega_deg: float | None = None,
     bin_size: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Shift selected residual spectra to the planet frame and coadd them."""
@@ -225,29 +232,80 @@ def collapse_selected_emission_exposures(
         sigma,
         phase,
         kp_kms=kp_kms,
+        eccentricity=eccentricity,
+        omega_deg=omega_deg,
         bin_size=bin_size,
     )
+    return apply_emission_collapse_operator(data, operator)
+
+
+def apply_emission_collapse_operator(
+    data: np.ndarray,
+    operator: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply one validated planet-frame shift/coadd/bin operator to data."""
+    data = np.asarray(data, dtype=float)
+    if data.ndim != 2:
+        raise ValueError(f"data must be 2D; got shape {data.shape}.")
+    if not np.all(np.isfinite(data)):
+        raise ValueError("data must contain only finite values.")
+
+    left_indices = np.asarray(operator["shift_left_indices"], dtype=np.int32)
+    fractions = np.asarray(operator["shift_fractions"], dtype=float)
+    coadd_weights = np.asarray(operator["coadd_weights"], dtype=float)
+    bin_indices = np.asarray(operator["bin_indices"], dtype=np.int32)
+    bin_weights = np.asarray(operator["bin_weights"], dtype=float)
+    output_wavelength = np.asarray(operator["output_wavelength"], dtype=float)
+    output_uncertainty = np.asarray(operator["output_uncertainty"], dtype=float)
+
+    if left_indices.shape != fractions.shape or left_indices.shape != coadd_weights.shape:
+        raise ValueError(
+            "shift_left_indices, shift_fractions, and coadd_weights must have "
+            f"the same shape; got {left_indices.shape}, {fractions.shape}, and "
+            f"{coadd_weights.shape}."
+        )
+    if left_indices.shape[0] != data.shape[0]:
+        raise ValueError(
+            "Collapse operator exposure count does not match data: "
+            f"{left_indices.shape[0]} versus {data.shape[0]}."
+        )
+    if np.any(left_indices < 0) or np.any(left_indices + 1 >= data.shape[1]):
+        raise ValueError("Collapse operator contains out-of-range source indices.")
+    if np.any(~np.isfinite(fractions)) or np.any(
+        (fractions < 0.0) | (fractions > 1.0)
+    ):
+        raise ValueError("Collapse operator fractions must be finite and within [0, 1].")
+    if np.any(~np.isfinite(coadd_weights)) or np.any(coadd_weights < 0.0):
+        raise ValueError("Collapse operator coadd weights must be finite and nonnegative.")
+    if not np.allclose(
+        np.sum(coadd_weights, axis=0),
+        1.0,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    ):
+        raise ValueError("Collapse operator coadd weights must sum to one.")
+    if bin_indices.ndim != 1 or bin_weights.shape != bin_indices.shape:
+        raise ValueError("bin_indices and bin_weights must be matching 1D arrays.")
+    if bin_indices.size != left_indices.shape[1]:
+        raise ValueError(
+            "Every shifted wavelength must have one bin assignment; got "
+            f"{left_indices.shape[1]} shifted wavelengths and "
+            f"{bin_indices.size} bin assignments."
+        )
+    if np.any(bin_indices < 0) or np.any(bin_indices >= output_wavelength.size):
+        raise ValueError("Collapse operator contains out-of-range bin indices.")
+
     exposure_indices = np.arange(data.shape[0])[:, None]
-    left_indices = operator["shift_left_indices"]
-    fractions = operator["shift_fractions"]
     left_data = data[exposure_indices, left_indices]
     right_data = data[exposure_indices, left_indices + 1]
     shifted_data = left_data + fractions * (right_data - left_data)
-    spectrum_unbinned = np.sum(
-        operator["coadd_weights"] * shifted_data,
-        axis=0,
-    )
-    retained = operator["bin_indices"].size
+    spectrum_unbinned = np.sum(coadd_weights * shifted_data, axis=0)
     spectrum_binned = np.bincount(
-        operator["bin_indices"],
-        weights=operator["bin_weights"] * spectrum_unbinned[:retained],
-        minlength=operator["output_wavelength"].size,
+        bin_indices,
+        weights=bin_weights * spectrum_unbinned,
+        minlength=output_wavelength.size,
     )
-    return (
-        operator["output_wavelength"],
-        spectrum_binned,
-        operator["output_uncertainty"],
-    )
+    return output_wavelength, spectrum_binned, output_uncertainty
 
 
 def build_emission_collapse_operator(
@@ -256,51 +314,175 @@ def build_emission_collapse_operator(
     phase: np.ndarray,
     *,
     kp_kms: float,
+    velocity_offset_kms: float = 0.0,
+    eccentricity: float = 0.0,
+    omega_deg: float | None = None,
     bin_size: int = 1,
+    max_native_gap_factor: float = config.DEFAULT_REGRID_MAX_NATIVE_GAP_FACTOR,
 ) -> dict[str, np.ndarray]:
-    """Build the fixed shift, coadd, and binning operator for one selection."""
+    """Build a coverage-safe shift, coadd, and binning operator."""
     wavelength = np.asarray(wavelength, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
     phase = np.asarray(phase, dtype=float)
 
-    velocities = float(kp_kms) * np.sin(2.0 * np.pi * phase)
+    if wavelength.ndim != 1 or wavelength.size < 2:
+        raise ValueError("wavelength must be a 1D array with at least two pixels.")
+    if np.any(~np.isfinite(wavelength)) or np.any(np.diff(wavelength) <= 0.0):
+        raise ValueError("wavelength must be finite and strictly increasing.")
+    if sigma.ndim != 2 or sigma.shape != (phase.size, wavelength.size):
+        raise ValueError(
+            "sigma must have shape (phase.size, wavelength.size); got "
+            f"{sigma.shape}, expected {(phase.size, wavelength.size)}."
+        )
+    if phase.size == 0 or np.any(~np.isfinite(phase)):
+        raise ValueError("phase must contain at least one finite exposure phase.")
+    if np.any(~np.isfinite(sigma)) or np.any(sigma <= 0.0):
+        raise ValueError("sigma must contain only finite positive values.")
+    if not np.isfinite(kp_kms):
+        raise ValueError("kp_kms must be finite.")
+    if not np.isfinite(velocity_offset_kms):
+        raise ValueError("velocity_offset_kms must be finite.")
+    if int(bin_size) != bin_size or int(bin_size) < 1:
+        raise ValueError("bin_size must be a positive integer.")
+    bin_size = int(bin_size)
+    if not np.isfinite(max_native_gap_factor) or max_native_gap_factor <= 0.0:
+        raise ValueError("max_native_gap_factor must be finite and positive.")
+
+    spacing = np.diff(wavelength)
+    typical_spacing = float(np.median(spacing))
+    maximum_gap = float(max_native_gap_factor) * typical_spacing
+
+    velocities = planet_radial_velocity_kms(
+        phase,
+        kp_kms=float(kp_kms),
+        eccentricity=float(eccentricity),
+        omega_deg=omega_deg,
+    )
+    velocities = velocities + float(velocity_offset_kms)
     beta = velocities / SPEED_OF_LIGHT_KMS
+    if np.any(np.abs(beta) >= 1.0):
+        raise ValueError("Planet-frame velocity must remain below the speed of light.")
     doppler_factor = np.sqrt((1.0 + beta) / (1.0 - beta))
     shift_query_full = doppler_factor[:, None] * wavelength[None, :]
-    covered_wavelength = wavelength
-    shift_query_wavelength = shift_query_full
-    shift_right_indices = np.searchsorted(
+    boundary_tolerance = (
+        8.0
+        * np.finfo(float).eps
+        * max(1.0, float(np.max(np.abs(wavelength))))
+    )
+    within_bounds = (
+        (shift_query_full >= wavelength[0] - boundary_tolerance)
+        & (shift_query_full <= wavelength[-1] + boundary_tolerance)
+    )
+
+    shift_right_indices_full = np.searchsorted(
         wavelength,
-        shift_query_wavelength,
+        shift_query_full,
         side="left",
     )
-    shift_right_indices = np.clip(
-        shift_right_indices,
+    shift_right_indices_full = np.clip(
+        shift_right_indices_full,
         1,
         wavelength.size - 1,
     )
-    shift_left_indices = shift_right_indices - 1
-    left_wavelength = wavelength[shift_left_indices]
-    right_wavelength = wavelength[shift_right_indices]
-    shift_fractions = (
-        (shift_query_wavelength - left_wavelength)
-        / (right_wavelength - left_wavelength)
+    shift_left_indices_full = shift_right_indices_full - 1
+    left_wavelength_full = wavelength[shift_left_indices_full]
+    right_wavelength_full = wavelength[shift_right_indices_full]
+    bracket_width_full = right_wavelength_full - left_wavelength_full
+
+    # With side="left", an exact sample at the first pixel after a gap is
+    # initially paired with the final pixel before that gap. Move it to the
+    # first valid bracket within its own native segment.
+    exact_right = np.isclose(
+        shift_query_full,
+        right_wavelength_full,
+        rtol=0.0,
+        atol=boundary_tolerance,
     )
+    right_has_native_neighbor = shift_right_indices_full < wavelength.size - 1
+    next_indices = np.minimum(shift_right_indices_full + 1, wavelength.size - 1)
+    next_width = wavelength[next_indices] - right_wavelength_full
+    move_exact_segment_start = (
+        (bracket_width_full > maximum_gap)
+        & exact_right
+        & right_has_native_neighbor
+        & (next_width <= maximum_gap)
+    )
+    shift_left_indices_full = np.where(
+        move_exact_segment_start,
+        shift_right_indices_full,
+        shift_left_indices_full,
+    )
+    shift_right_indices_full = np.where(
+        move_exact_segment_start,
+        next_indices,
+        shift_right_indices_full,
+    )
+    left_wavelength_full = wavelength[shift_left_indices_full]
+    right_wavelength_full = wavelength[shift_right_indices_full]
+    bracket_width_full = right_wavelength_full - left_wavelength_full
+    shift_fractions_full = (
+        (shift_query_full - left_wavelength_full)
+        / bracket_width_full
+    )
+
+    gap_safe = bracket_width_full <= maximum_gap
+    fraction_tolerance = 64.0 * np.finfo(float).eps
+    fraction_safe = (
+        np.isfinite(shift_fractions_full)
+        & (shift_fractions_full >= -fraction_tolerance)
+        & (shift_fractions_full <= 1.0 + fraction_tolerance)
+    )
+    valid_shift = within_bounds & gap_safe & fraction_safe
+    common_coverage = np.all(valid_shift, axis=0)
+    if not np.any(common_coverage):
+        raise ValueError(
+            "No wavelengths retain in-bounds, gap-safe coverage from every "
+            "selected exposure after the planet-frame shift."
+        )
+
+    covered_source_indices = np.flatnonzero(common_coverage).astype(np.int32)
+    covered_wavelength = wavelength[common_coverage]
+    shift_left_indices = shift_left_indices_full[:, common_coverage]
+    shift_fractions = np.clip(
+        shift_fractions_full[:, common_coverage],
+        0.0,
+        1.0,
+    )
+
     exposure_indices = np.arange(sigma.shape[0])[:, None]
     left_sigma = sigma[exposure_indices, shift_left_indices]
-    right_sigma = sigma[exposure_indices, shift_right_indices]
+    right_sigma = sigma[exposure_indices, shift_left_indices + 1]
     shifted_sigma = left_sigma + shift_fractions * (right_sigma - left_sigma)
+    if np.any(~np.isfinite(shifted_sigma)) or np.any(shifted_sigma <= 0.0):
+        raise ValueError(
+            "Planet-frame interpolation produced non-finite or nonpositive "
+            "uncertainties."
+        )
     inverse_variance = 1.0 / shifted_sigma**2
     weight_sum = np.sum(inverse_variance, axis=0)
+    if np.any(~np.isfinite(weight_sum)) or np.any(weight_sum <= 0.0):
+        raise ValueError("Planet-frame coadd has invalid inverse-variance sums.")
     coadd_weights = inverse_variance / weight_sum[None, :]
     uncertainty_unbinned = np.sqrt(1.0 / weight_sum)
 
-    n_bins = covered_wavelength.size // bin_size
-    retained = n_bins * bin_size
-    bin_indices = np.repeat(np.arange(n_bins, dtype=np.int32), bin_size)
-    wavelength_retained = covered_wavelength[:retained]
-    uncertainty_retained = uncertainty_unbinned[:retained]
-    bin_inverse_variance = 1.0 / uncertainty_retained**2
+    # Restart bin numbering whenever coverage removes a source pixel or the
+    # retained wavelengths cross a native/masked gap. Thus a non-default bin
+    # size can never combine disconnected wavelength segments.
+    segment_breaks = np.flatnonzero(
+        (np.diff(covered_source_indices) != 1)
+        | (np.diff(covered_wavelength) > maximum_gap)
+    ) + 1
+    segment_starts = np.r_[0, segment_breaks]
+    segment_stops = np.r_[segment_breaks, covered_wavelength.size]
+    bin_indices = np.empty(covered_wavelength.size, dtype=np.int32)
+    next_bin = 0
+    for start, stop in zip(segment_starts, segment_stops):
+        local_bins = np.arange(stop - start, dtype=np.int32) // bin_size
+        bin_indices[start:stop] = next_bin + local_bins
+        next_bin += int(local_bins[-1]) + 1
+
+    n_bins = next_bin
+    bin_inverse_variance = 1.0 / uncertainty_unbinned**2
     bin_weight_sum = np.bincount(
         bin_indices,
         weights=bin_inverse_variance,
@@ -309,12 +491,22 @@ def build_emission_collapse_operator(
     bin_weights = bin_inverse_variance / bin_weight_sum[bin_indices]
     output_wavelength = np.bincount(
         bin_indices,
-        weights=bin_weights * wavelength_retained,
+        weights=bin_weights * covered_wavelength,
         minlength=n_bins,
     )
     output_uncertainty = np.sqrt(1.0 / bin_weight_sum)
 
+    all_exposures_in_bounds = np.all(within_bounds, axis=0)
+    all_exposures_gap_safe = np.all(gap_safe, axis=0)
+
     return {
+        "planet_velocity_kms": np.asarray(velocities, dtype=float),
+        "velocity_offset_kms": np.asarray(velocity_offset_kms, dtype=float),
+        "eccentricity": np.asarray(eccentricity, dtype=float),
+        "omega_planet_deg": np.asarray(
+            np.nan if omega_deg is None else omega_deg,
+            dtype=float,
+        ),
         "shift_left_indices": shift_left_indices.astype(np.int32),
         "shift_fractions": shift_fractions,
         "coadd_weights": coadd_weights,
@@ -322,6 +514,27 @@ def build_emission_collapse_operator(
         "bin_weights": bin_weights,
         "output_wavelength": output_wavelength,
         "output_uncertainty": output_uncertainty,
+        "covered_source_indices": covered_source_indices,
+        "n_source_wavelengths": np.asarray(wavelength.size, dtype=np.int32),
+        "n_covered_wavelengths": np.asarray(
+            covered_wavelength.size,
+            dtype=np.int32,
+        ),
+        "n_dropped_out_of_bounds": np.asarray(
+            np.count_nonzero(~all_exposures_in_bounds),
+            dtype=np.int32,
+        ),
+        "n_dropped_gap_crossing": np.asarray(
+            np.count_nonzero(
+                all_exposures_in_bounds & ~all_exposures_gap_safe
+            ),
+            dtype=np.int32,
+        ),
+        "max_native_gap_factor": np.asarray(
+            max_native_gap_factor,
+            dtype=float,
+        ),
+        "max_native_gap_angstrom": np.asarray(maximum_gap, dtype=float),
     }
 
 
@@ -375,28 +588,41 @@ def collapse_epoch_arm(
     *,
     planet: str,
     ephemeris: str,
+    shadow_source: str = "Recommended",
     epoch: str,
     arm: str,
     selection: str,
     kp_kms: float,
     bin_size: int,
     min_exposures: int,
+    source_dir: Path | None = None,
+    output_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Build one phase-selected, one-night, one-arm emission spectrum."""
     canonical = canonicalize_emission_selection(selection)
-    params = config_utils.get_params(planet, ephemeris)
-    data_dir = config_utils.get_collapse_source_dir(
+    params = config_utils.resolve_parameter_domains(
         planet=planet,
-        epoch=epoch,
-        arm=arm,
-        mode="emission",
+        timing_source=ephemeris,
+        shadow_source=shadow_source,
     )
-    output_dir = collapsed_emission_dir(
-        planet=planet,
-        epoch=epoch,
-        arm=arm,
-        selection=canonical,
-    )
+    if source_dir is None:
+        data_dir = config_utils.get_collapse_source_dir(
+            planet=planet,
+            epoch=epoch,
+            arm=arm,
+            mode="emission",
+        )
+    else:
+        data_dir = Path(source_dir)
+    if output_dir is None:
+        output_dir = collapsed_emission_dir(
+            planet=planet,
+            epoch=epoch,
+            arm=arm,
+            selection=canonical,
+        )
+    else:
+        output_dir = Path(output_dir)
     wavelength, data, sigma, phase, source_metadata = _load_prepared_timeseries(data_dir)
     frozen_sysrem = load_frozen_sysrem_arrays(data_dir)
     if source_metadata.get("run_sysrem") is True and frozen_sysrem is None:
@@ -409,7 +635,7 @@ def collapse_epoch_arm(
     ingress, egress = emission_eclipse_boundaries(params)
 
     metadata: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": EMISSION_COLLAPSE_SCHEMA_VERSION,
         "product_kind": "collapsed_emission_spectrum",
         "observable_kind": "continuum_removed_emission_line_contrast",
         "model_preprocessing": (
@@ -420,6 +646,8 @@ def collapse_epoch_arm(
         "status": "ready",
         "planet": planet,
         "ephemeris": ephemeris,
+        "shadow_source": shadow_source,
+        "parameter_resolution": params.get("parameter_resolution"),
         "epoch": epoch,
         "arm": arm,
         "selection": canonical,
@@ -427,11 +655,28 @@ def collapse_epoch_arm(
         "eclipse_ingress_phase": ingress,
         "eclipse_egress_phase": egress,
         "kp_reference_kms": float(kp_kms),
+        "planet_velocity_model": (
+            "keplerian_transit_centered"
+            if float(params.get("eccentricity", 0.0)) != 0.0
+            else "circular_sinusoid"
+        ),
+        "eccentricity": float(params.get("eccentricity", 0.0)),
+        "omega_planet_deg": (
+            None
+            if params.get("omega") is None
+            else float(params.get("omega"))
+        ),
         "velocity_offset_reference_kms": 0.0,
         "source_data_dir": str(data_dir),
         "source_phase_bin": source_metadata.get("phase_bin"),
         "source_subtract_median": source_metadata.get("subtract_median"),
         "source_run_sysrem": source_metadata.get("run_sysrem"),
+        "wavelength_medium": source_metadata.get("wavelength_medium"),
+        "wavelength_frame": source_metadata.get("wavelength_frame"),
+        "wavelength_frame_contract": source_metadata.get(
+            "wavelength_frame_contract"
+        ),
+        "arm_edge_trim": source_metadata.get("arm_edge_trim"),
         "n_source_exposures": int(phase.size),
         "n_selected_exposures": int(selected_indices.size),
         "selected_exposure_indices": selected_indices.tolist(),
@@ -462,15 +707,13 @@ def collapse_epoch_arm(
         selected_sigma,
         selected_phase,
         kp_kms=kp_kms,
+        eccentricity=float(params.get("eccentricity", 0.0)),
+        omega_deg=params.get("omega"),
         bin_size=bin_size,
     )
-    wavelength_1d, spectrum_1d, uncertainty_1d = collapse_selected_emission_exposures(
-        wavelength,
+    wavelength_1d, spectrum_1d, uncertainty_1d = apply_emission_collapse_operator(
         data[selected_indices],
-        selected_sigma,
-        selected_phase,
-        kp_kms=kp_kms,
-        bin_size=bin_size,
+        collapse_operator,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     np.save(output_dir / _PRODUCT_FILENAMES[0], wavelength_1d)
@@ -478,7 +721,10 @@ def collapse_epoch_arm(
     np.save(output_dir / _PRODUCT_FILENAMES[2], uncertainty_1d)
     np.savez_compressed(
         output_dir / _PRODUCT_FILENAMES[3],
-        schema_version=np.asarray(3, dtype=np.int32),
+        schema_version=np.asarray(
+            EMISSION_COLLAPSE_SCHEMA_VERSION,
+            dtype=np.int32,
+        ),
         source_wavelength=np.asarray(wavelength, dtype=float),
         source_phase=np.asarray(phase, dtype=float),
         selected_exposure_indices=np.asarray(selected_indices, dtype=np.int32),
@@ -488,7 +734,24 @@ def collapse_epoch_arm(
         bin_indices=collapse_operator["bin_indices"],
         bin_weights=collapse_operator["bin_weights"],
         output_wavelength=collapse_operator["output_wavelength"],
+        covered_source_indices=collapse_operator["covered_source_indices"],
+        n_source_wavelengths=collapse_operator["n_source_wavelengths"],
+        n_covered_wavelengths=collapse_operator["n_covered_wavelengths"],
+        n_dropped_out_of_bounds=collapse_operator[
+            "n_dropped_out_of_bounds"
+        ],
+        n_dropped_gap_crossing=collapse_operator[
+            "n_dropped_gap_crossing"
+        ],
+        max_native_gap_factor=collapse_operator["max_native_gap_factor"],
+        max_native_gap_angstrom=collapse_operator[
+            "max_native_gap_angstrom"
+        ],
+        coverage_policy=np.asarray(COLLAPSE_COVERAGE_POLICY),
         kp_reference_kms=np.asarray(kp_kms, dtype=float),
+        planet_velocity_kms=collapse_operator["planet_velocity_kms"],
+        eccentricity=collapse_operator["eccentricity"],
+        omega_planet_deg=collapse_operator["omega_planet_deg"],
         velocity_offset_reference_kms=np.asarray(0.0, dtype=float),
         has_sysrem=np.asarray(frozen_sysrem is not None, dtype=bool),
         **({} if frozen_sysrem is None else frozen_sysrem),
@@ -498,6 +761,37 @@ def collapse_epoch_arm(
             "collapse_operator_file": _PRODUCT_FILENAMES[3],
             "phase_min": float(np.min(phase_01[selected_indices])),
             "phase_max": float(np.max(phase_01[selected_indices])),
+            "wavelength_coverage_policy": COLLAPSE_COVERAGE_POLICY,
+            "n_source_wavelengths": int(wavelength.size),
+            "n_covered_unbinned_wavelengths": int(
+                collapse_operator["n_covered_wavelengths"]
+            ),
+            "n_dropped_wavelengths": int(
+                wavelength.size
+                - int(collapse_operator["n_covered_wavelengths"])
+            ),
+            "n_dropped_out_of_bounds": int(
+                collapse_operator["n_dropped_out_of_bounds"]
+            ),
+            "n_dropped_gap_crossing": int(
+                collapse_operator["n_dropped_gap_crossing"]
+            ),
+            "retained_unbinned_wavelength_fraction": float(
+                int(collapse_operator["n_covered_wavelengths"])
+                / wavelength.size
+            ),
+            "max_native_gap_factor": float(
+                collapse_operator["max_native_gap_factor"]
+            ),
+            "max_native_gap_angstrom": float(
+                collapse_operator["max_native_gap_angstrom"]
+            ),
+            "shift_fraction_min": float(
+                np.min(collapse_operator["shift_fractions"])
+            ),
+            "shift_fraction_max": float(
+                np.max(collapse_operator["shift_fractions"])
+            ),
             "wavelength_min_angstrom": float(np.min(wavelength_1d)),
             "wavelength_max_angstrom": float(np.max(wavelength_1d)),
             "n_output_wavelengths": int(wavelength_1d.size),
@@ -528,6 +822,11 @@ def create_parser() -> argparse.ArgumentParser:
         "--ephemeris",
         default=config.EPHEMERIS,
         help=f"Ephemeris configuration (default: {config.EPHEMERIS})",
+    )
+    parser.add_argument(
+        "--shadow-source",
+        default="Recommended",
+        help="Independent orbital-geometry source (default: Recommended)",
     )
     parser.add_argument(
         "--epoch",
@@ -575,7 +874,11 @@ def create_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = create_parser().parse_args()
     epochs = tuple(str(epoch).strip() for epoch in args.epoch if str(epoch).strip())
-    params = config_utils.get_params(args.planet, args.ephemeris)
+    params = config_utils.resolve_parameter_domains(
+        planet=args.planet,
+        timing_source=args.ephemeris,
+        shadow_source=args.shadow_source,
+    )
     kp_kms = params.get("Kp") if args.kp_kms is None else args.kp_kms
 
     selections = _unique_canonical_selections(args.selection)
@@ -589,6 +892,7 @@ def main() -> int:
                 result = collapse_epoch_arm(
                     planet=args.planet,
                     ephemeris=args.ephemeris,
+                    shadow_source=args.shadow_source,
                     epoch=str(epoch),
                     arm=arm,
                     selection=selection,

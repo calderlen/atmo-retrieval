@@ -12,7 +12,7 @@ time-series retrieval path:
 - ``bjd_tdb.npy`` (1D canonical barycentric mid-exposure times)
 
 Optional auxiliary products are also written when available, including
-``jd.npy`` (raw UTC ``JD-OBS``), ``snr.npy``, ``exptime.npy``, ``airmass.npy``,
+``jd.npy`` (UTC exposure midpoint), ``snr.npy``, ``exptime.npy``, ``airmass.npy``,
 and the frozen full-exposure SYSREM operator with per-pixel uncertainties. When SYSREM is
 enabled, ``pre_sysrem_data.npy`` and ``pre_sysrem_sigma.npy`` preserve the
 selected spectra just before SYSREM for diagnostics.
@@ -30,8 +30,9 @@ import numpy as np
 import config
 import config_utils
 from config import EPHEMERIS, FULL_ARM_MEMBERS, PHASE_BINS
-from config_utils import get_params
+from config_utils import get_params, resolve_transit_midpoint
 from dataio.collapse_transmission_timeseries_to_1d import (
+    active_transit_mask,
     arm_edge_trim_metadata,
     build_out_of_transit_residuals,
     compute_contact_phases,
@@ -39,134 +40,24 @@ from dataio.collapse_transmission_timeseries_to_1d import (
     get_bjd_tdb,
     get_ephemeris_epoch_bjd_tdb,
     get_orbital_phase,
-    get_pepsi_data,
     get_phase_bin_mask,
     get_sysrem_deep_mask,
     get_sysrem_chunk_indices,
     get_sysrem_ignore_mask,
 )
-from dataio.horus import remove_doppler_shadow
+from dataio.edge_trim_manifest import load_accepted_edge_trim_widths
+from dataio.hrs_preparation import (
+    load_hrs_arm,
+    output_dir_for,
+    requested_stellar_velocity_correction,
+)
+from dataio.wavelength_frame_contract import (
+    build_wavelength_frame_contract,
+    subset_loader_frame_extras,
+)
 
 
-def _output_dir_for(
-    planet: str,
-    epoch: str,
-    arm: str,
-    product_kind: str,
-) -> Path:
-    if product_kind == "collapse-source":
-        return config_utils.get_collapse_source_dir(
-            planet=planet,
-            epoch=epoch,
-            arm=arm,
-            mode="transmission",
-        )
-    return config_utils.get_timeseries_data_dir(
-        planet=planet,
-        epoch=epoch,
-        arm=arm,
-        mode="transmission",
-    )
-
-
-def _raw_input_dir_for(planet: str, epoch: str) -> Path:
-    return config_utils.get_raw_hrs_dir(planet=planet, epoch=epoch, mode="transmission")
-
-
-def _nearest_transit_midpoint(
-    bjd_tdb: np.ndarray,
-    reference_epoch_bjd_tdb: float,
-    period: float,
-) -> float:
-    obs_mid = 0.5 * (float(np.min(bjd_tdb)) + float(np.max(bjd_tdb)))
-    n_orbits = round((obs_mid - reference_epoch_bjd_tdb) / period)
-    return float(reference_epoch_bjd_tdb + n_orbits * period)
-
-
-def _planet_config(planet: str, ephemeris: str) -> dict[str, Any]:
-    return get_params(planet, ephemeris)
-
-
-def _unwrap_result(result: Any) -> tuple[tuple[np.ndarray, ...], dict[str, Any]]:
-    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
-        return result[0], result[1]
-    return result, {}
-
-
-def _load_single_arm(
-    arm: str,
-    epoch: str,
-    planet: str,
-    *,
-    prefer_molecfit: bool,
-    regrid: bool,
-    subtract_median: bool,
-    run_sysrem: bool,
-) -> tuple[tuple[np.ndarray, ...], dict[str, Any]]:
-    result = get_pepsi_data(
-        arm=arm,
-        observation_epoch=epoch,
-        planet_name=planet,
-        do_molecfit=prefer_molecfit,
-        data_dir=_raw_input_dir_for(planet, epoch),
-        regrid=regrid,
-        subtract_median=subtract_median,
-        run_sysrem=run_sysrem,
-        data_mode="transmission",
-    )
-    if result is None and prefer_molecfit:
-        print(f"  No molecfit files for {arm}; retrying with raw files.")
-        result = get_pepsi_data(
-            arm=arm,
-            observation_epoch=epoch,
-            planet_name=planet,
-            do_molecfit=False,
-            data_dir=_raw_input_dir_for(planet, epoch),
-            regrid=regrid,
-            subtract_median=subtract_median,
-            run_sysrem=run_sysrem,
-            data_mode="transmission",
-        )
-    if result is None:
-        raise FileNotFoundError(
-            f"Could not load {arm}-arm PEPSI data for {planet} {epoch} from "
-            f"{_raw_input_dir_for(planet, epoch)}."
-        )
-    return _unwrap_result(result)
-
-
-def _load_data(
-    *,
-    arm: str,
-    epoch: str,
-    planet: str,
-    molecfit: bool,
-    regrid: bool,
-    subtract_median: bool,
-    run_sysrem: bool,
-) -> tuple[tuple[np.ndarray, ...], dict[str, Any]]:
-    if arm == "full":
-        raise ValueError(
-            "_load_data() is per-arm; 'full' must be expanded into its "
-            "constituent arms by the caller."
-        )
-
-    prefer_molecfit = molecfit
-    if arm == "blue":
-        prefer_molecfit = False
-
-    return _load_single_arm(
-        arm,
-        epoch,
-        planet,
-        prefer_molecfit=prefer_molecfit,
-        regrid=regrid,
-        subtract_median=subtract_median,
-        run_sysrem=run_sysrem,
-    )
-
-
-def _phase_selection_mask(
+def transmission_phase_selection_mask(
     phase: np.ndarray,
     *,
     phase_bin: str,
@@ -177,40 +68,13 @@ def _phase_selection_mask(
     return get_phase_bin_mask(phase, phase_bin, planet_params)
 
 
-def _sanitize_columns(
-    wavelength: np.ndarray,
-    data: np.ndarray,
-    sigma: np.ndarray,
-    *,
-    arm: str | None = None,
-    planet: str | None = None,
-    mode: str | None = None,
-    epoch: str | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    column_indices = _valid_sorted_column_indices(
-        wavelength,
-        data,
-        sigma,
-        arm=arm,
-        planet=planet,
-        mode=mode,
-        epoch=epoch,
-    )
-    wavelength = np.asarray(wavelength, dtype=float)
-    data = np.asarray(data, dtype=float)
-    sigma = np.asarray(sigma, dtype=float)
-    return wavelength[column_indices], data[:, column_indices], sigma[:, column_indices]
-
-
 def _valid_sorted_column_indices(
     wavelength: np.ndarray,
     data: np.ndarray,
     sigma: np.ndarray,
     *,
     arm: str | None = None,
-    planet: str | None = None,
-    mode: str | None = None,
-    epoch: str | None = None,
+    edge_trim_widths_A: tuple[float, float] | None = None,
 ) -> np.ndarray:
     wavelength = np.asarray(wavelength, dtype=float)
     data = np.asarray(data, dtype=float)
@@ -236,9 +100,7 @@ def _valid_sorted_column_indices(
         valid &= ~get_sysrem_ignore_mask(
             wavelength,
             arm,
-            planet=planet,
-            mode=mode,
-            epoch=epoch,
+            explicit_edge_trim_widths_A=edge_trim_widths_A,
         )
 
     if not np.any(valid):
@@ -247,113 +109,6 @@ def _valid_sorted_column_indices(
     valid_indices = np.flatnonzero(valid)
     sort_idx = np.argsort(wavelength[valid_indices])
     return valid_indices[sort_idx]
-
-
-def _shadow_status(
-    *,
-    applied: bool,
-    skip_reason: str | None = None,
-    scaling: float | None = None,
-) -> dict[str, Any]:
-    return {
-        "applied": bool(applied),
-        "skip_reason": skip_reason,
-        "scaling": scaling,
-    }
-
-
-def _is_missing_numeric(value: Any) -> bool:
-    if value is None:
-        return True
-    try:
-        return not bool(np.isfinite(float(value)))
-    except (TypeError, ValueError):
-        return True
-
-
-def _build_shadow_inputs(
-    planet_cfg: dict[str, Any],
-    phase: np.ndarray,
-) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    phase = np.asarray(phase, dtype=float)
-    if phase.ndim != 1 or phase.size == 0 or not np.all(np.isfinite(phase)):
-        reason = "invalid_phase_array"
-        print(f"Warning: skipping Doppler shadow removal ({reason}).")
-        return None, _shadow_status(applied=False, skip_reason=reason)
-
-    planet_field_names = ("rp_rs", "b", "lambda_angle", "a_rs", "period")
-    stellar_field_map = {
-        "vsini": "v_sini_star",
-        "gamma1": "gamma1",
-        "gamma2": "gamma2",
-    }
-
-    missing: list[str] = []
-    planet_params: dict[str, float] = {}
-    for field_name in planet_field_names:
-        value = planet_cfg.get(field_name)
-        if _is_missing_numeric(value):
-            missing.append(field_name)
-        else:
-            planet_params[field_name] = float(value)
-
-    stellar_params: dict[str, float] = {}
-    for out_name, cfg_name in stellar_field_map.items():
-        value = planet_cfg.get(cfg_name)
-        if _is_missing_numeric(value):
-            missing.append(cfg_name)
-        else:
-            stellar_params[out_name] = float(value)
-
-    if missing:
-        reason = f"missing_or_invalid_shadow_params: {', '.join(missing)}"
-        print(f"Warning: skipping Doppler shadow removal ({reason}).")
-        return None, _shadow_status(applied=False, skip_reason=reason)
-
-    return {
-        "phase": phase,
-        "planet_params": planet_params,
-        "stellar_params": stellar_params,
-    }, _shadow_status(applied=False)
-
-
-def _apply_default_doppler_shadow(
-    data: np.ndarray,
-    wavelength: np.ndarray,
-    phase: np.ndarray,
-    *,
-    planet_cfg: dict[str, Any],
-    subtract_median: bool,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    data = np.asarray(data, dtype=float)
-    wavelength = np.asarray(wavelength, dtype=float)
-    phase = np.asarray(phase, dtype=float)
-
-    if not subtract_median:
-        reason = "subtract_median_disabled"
-        print("Warning: skipping Doppler shadow removal because --no-subtract-median was used.")
-        return data, _shadow_status(applied=False, skip_reason=reason)
-
-    shadow_inputs, status = _build_shadow_inputs(planet_cfg, phase)
-    if shadow_inputs is None:
-        return data, status
-
-    print("Applying Doppler shadow removal to retrieval-prep cube...")
-    corrected_data, _shadow_model, fit_info = remove_doppler_shadow(
-        data,
-        wavelength,
-        shadow_inputs["phase"],
-        shadow_inputs["planet_params"],
-        shadow_inputs["stellar_params"],
-    )
-    scaling = fit_info.get("scaling")
-    scaling_value = None if _is_missing_numeric(scaling) else float(scaling)
-    if scaling_value is not None:
-        print(f"  Doppler shadow scaling: {scaling_value:.6g}")
-    return np.asarray(corrected_data, dtype=float), _shadow_status(
-        applied=True,
-        scaling=scaling_value,
-    )
 
 
 def _chunk_labels_from_indices(
@@ -412,6 +167,7 @@ def _save_metadata(
     phase: np.ndarray,
     source_phase: np.ndarray,
     selected_exposure_indices: np.ndarray,
+    active_transit_interval: str,
     jd: np.ndarray,
     bjd_tdb: np.ndarray,
     time_metadata: dict[str, Any],
@@ -419,16 +175,23 @@ def _save_metadata(
     subtract_median: bool,
     run_sysrem: bool,
     regrid: bool,
-    doppler_shadow_status: dict[str, Any],
     arm_edge_trim: dict[str, float | int],
     spectral_column_masking: dict[str, Any],
     product_kind: str,
     out_of_transit_master_division: bool,
+    stellar_velocity: dict[str, Any],
+    wavelength_frame_contract: dict[str, Any],
+    input_exposure_files: list[str],
+    excluded_exposure_files: list[str],
+    science_exposure_selection: dict[str, Any],
 ) -> None:
-    contacts_serialized: dict[str, float] = {}
+    contacts_serialized: dict[str, float | None] = {}
     for k, v in contacts.items():
-        contacts_serialized[k] = float(v)
-    model_preprocessing_steps = ["active_exposure_mask"]
+        contacts_serialized[k] = float(v) if np.isfinite(v) else None
+    model_preprocessing_steps = [
+        "fixed_shared_basis_lsd_shadow",
+        "active_exposure_mask",
+    ]
     if subtract_median:
         model_preprocessing_steps.append("time_median_subtraction")
     if run_sysrem:
@@ -445,10 +208,14 @@ def _save_metadata(
         "t0_bjd_tdb": float(t0),
         "n_exposures": int(phase.size),
         "n_source_exposures": int(source_phase.size),
+        "input_exposure_files": list(input_exposure_files),
+        "excluded_exposure_files": list(excluded_exposure_files),
+        "science_exposure_selection": science_exposure_selection,
         "selected_exposure_indices": np.asarray(
             selected_exposure_indices,
             dtype=int,
         ).tolist(),
+        "active_transit_interval": str(active_transit_interval),
         "timeseries_operator_file": "timeseries_operator.npz",
         "model_preprocessing": "_then_".join(model_preprocessing_steps),
         "phase_min": float(np.min(phase)),
@@ -465,11 +232,18 @@ def _save_metadata(
         "out_of_transit_master_division": bool(
             out_of_transit_master_division
         ),
-        "doppler_shadow_applied": bool(doppler_shadow_status.get("applied", False)),
-        "doppler_shadow_skip_reason": doppler_shadow_status.get("skip_reason"),
-        "doppler_shadow_scaling": doppler_shadow_status.get("scaling"),
+        "fixed_doppler_shadow": {
+            "schema_version": 1,
+            "enabled": False,
+            "required": True,
+            "status": "pending_shared_basis_lsd_fit",
+        },
         "arm_edge_trim": arm_edge_trim,
         "spectral_column_masking": spectral_column_masking,
+        "stellar_velocity": stellar_velocity,
+        "wavelength_medium": wavelength_frame_contract["wavelength_medium"],
+        "wavelength_frame": wavelength_frame_contract["wavelength_frame"],
+        "wavelength_frame_contract": wavelength_frame_contract,
     }
     (output_dir / "timeseries_prep.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",
@@ -568,16 +342,35 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run chunk-aware SYSREM and export retrieval SYSREM auxiliaries",
     )
+    parser.add_argument(
+        "--edge-trim-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Apply this dataset's exact widths from an accepted adaptive schema-v3 "
+            "calibration manifest"
+        ),
+    )
+    parser.add_argument(
+        "--apply-stellar-rest",
+        action="store_true",
+        help=(
+            "Apply an accepted stellar_velocity_lsd.json correction. By default, "
+            "products remain in the barycentric frame."
+        ),
+    )
     return parser
 
 
-def _process_arm(
+def prepare_arm(
     *,
     arm: str,
     args: argparse.Namespace,
     planet_cfg: dict[str, Any],
     output_dir: Path,
 ) -> None:
+    """Prepare and persist one transmission arm using resolved CLI arguments."""
+
     period = planet_cfg["period"]
     ra = planet_cfg["RA"]
     dec = planet_cfg["Dec"]
@@ -589,8 +382,29 @@ def _process_arm(
     )
 
     print(f"\nLoading PEPSI {arm} data for {args.planet} ({args.epoch})...")
+    edge_trim_widths_A = None
+    edge_trim_source = None
+    if args.edge_trim_manifest is not None:
+        selected_manifest, edge_trim_widths_A = load_accepted_edge_trim_widths(
+            args.edge_trim_manifest,
+            planet=args.planet,
+            mode="transmission",
+            epoch=args.epoch,
+            arm=arm,
+        )
+        edge_trim_source = str(selected_manifest)
+    stellar_rest_velocity_kms, stellar_velocity = (
+        requested_stellar_velocity_correction(
+            enabled=args.apply_stellar_rest,
+            mode="transmission",
+            planet=args.planet,
+            epoch=args.epoch,
+            arm=arm,
+        )
+    )
     collapse_source = args.product_kind == "collapse-source"
-    result, extras = _load_data(
+    result, extras = load_hrs_arm(
+        mode="transmission",
         arm=arm,
         epoch=args.epoch,
         planet=args.planet,
@@ -598,6 +412,8 @@ def _process_arm(
         regrid=args.regrid,
         subtract_median=False if collapse_source else args.subtract_median,
         run_sysrem=False if collapse_source else args.run_sysrem,
+        stellar_rest_velocity_kms=stellar_rest_velocity_kms,
+        edge_trim_widths_A=edge_trim_widths_A,
     )
 
     wave, data, sigma, jd, snr, exptime, airmass, n_spectra, npix = result
@@ -608,6 +424,7 @@ def _process_arm(
         ra,
         dec,
         header_bjd_tdb=extras.get("header_bjd_tdb"),
+        input_time_keyword=str(extras.get("input_time_keyword", "JD-OBS")),
         return_diagnostics=True,
     )
     time_metadata.update(
@@ -618,24 +435,35 @@ def _process_arm(
             "ephemeris_epoch_scale": str(planet_cfg["epoch_scale"]).lower(),
             "ephemeris_epoch_reference": planet_cfg["epoch_reference"],
             "ephemeris_epoch_bjd_tdb": reference_epoch_bjd_tdb,
+            "input_time_provenance": dict(
+                extras.get("input_time_provenance", {})
+            ),
         }
     )
-    t0 = _nearest_transit_midpoint(bjd_tdb, reference_epoch_bjd_tdb, period)
+    t0 = resolve_transit_midpoint(
+        bjd_tdb,
+        planet_cfg,
+        reference_epoch_bjd_tdb=reference_epoch_bjd_tdb,
+        observation_epoch=args.epoch,
+    )
+    time_metadata.update(
+        {
+            "timing_model": str(planet_cfg.get("timing_model", "linear")),
+            "resolved_mid_transit_bjd_tdb": t0,
+        }
+    )
     phase = np.asarray(get_orbital_phase(bjd_tdb, t0, period), dtype=float)
     wave_1d_full = np.asarray(wave[0] if np.asarray(wave).ndim == 2 else wave, dtype=float)
     data = np.asarray(data, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
     if collapse_source:
         contacts = compute_contact_phases(planet_cfg)
+        active_transit = active_transit_mask(phase, planet_cfg)
         out_transit = (
             (phase < contacts["T1"])
             | (phase > contacts["T4"])
         )
-        full_transit = (
-            (phase >= contacts["T2"])
-            & (phase <= contacts["T3"])
-        )
-        source_rows = out_transit | full_transit
+        source_rows = out_transit | active_transit
         phase = phase[source_rows]
         jd = np.asarray(jd)[source_rows]
         bjd_tdb = np.asarray(bjd_tdb)[source_rows]
@@ -650,10 +478,11 @@ def _process_arm(
             sigma,
             out_transit,
         )
-        extras = {
+        extras = subset_loader_frame_extras(extras, source_rows)
+        extras.update({
             "pre_sysrem_flux": np.asarray(data, dtype=float).copy(),
             "pre_sysrem_error": np.asarray(sigma, dtype=float).copy(),
-        }
+        })
         if args.run_sysrem:
             sysrem_result = do_sysrem(
                 wave_1d_full,
@@ -667,6 +496,7 @@ def _process_arm(
                 planet_name=args.planet,
                 data_mode="transmission",
                 observation_epoch=args.epoch,
+                edge_trim_widths_A=edge_trim_widths_A,
             )
             data, sigma, U_sysrem, no_tellurics, diagnostics = sysrem_result
             extras.update(
@@ -676,31 +506,21 @@ def _process_arm(
                     **diagnostics,
                 }
             )
-        doppler_shadow_status = {
-            "applied": False,
-            "skip_reason": "disabled_for_collapsed_1d_source",
-            "scaling": None,
-        }
-    else:
-        data, doppler_shadow_status = _apply_default_doppler_shadow(
-            data,
-            wave_1d_full,
-            phase,
-            planet_cfg=planet_cfg,
-            subtract_median=args.subtract_median,
-        )
     source_phase = np.asarray(phase, dtype=float).copy()
     source_bjd_tdb = np.asarray(bjd_tdb, dtype=float).copy()
     source_data = np.asarray(data, dtype=float).copy()
     source_sigma = np.asarray(sigma, dtype=float).copy()
     contacts = compute_contact_phases(planet_cfg)
+    grazing_transit = bool(planet_cfg.get("grazing_transit", False))
     if collapse_source:
         # The dedicated collapse source intentionally omits ingress and
-        # egress, so its active model rows are the retained T23 rows.
-        active_exposure_mask = (
-            (source_phase >= contacts["T2"])
-            & (source_phase <= contacts["T3"])
+        # egress for ordinary transits. Grazing systems have no T23 interval,
+        # so their active model rows retain the observed T14 interval instead.
+        active_exposure_mask = active_transit_mask(
+            source_phase,
+            planet_cfg,
         ).astype(float)
+        active_transit_interval = "T14_grazing" if grazing_transit else "T23"
     else:
         # Ordinary preparation derives its temporal median and SYSREM basis
         # from the complete exposure sequence. Preserve the pre-existing T14
@@ -710,7 +530,8 @@ def _process_arm(
             (source_phase >= contacts["T1"])
             & (source_phase <= contacts["T4"])
         ).astype(float)
-    selection = _phase_selection_mask(
+        active_transit_interval = "T14_grazing" if grazing_transit else "T14"
+    selection = transmission_phase_selection_mask(
         phase,
         phase_bin=args.phase_bin,
         planet_params=planet_cfg,
@@ -740,9 +561,7 @@ def _process_arm(
     sysrem_ignore_mask = get_sysrem_ignore_mask(
         wave_1d,
         arm,
-        planet=args.planet,
-        mode="transmission",
-        epoch=args.epoch,
+        explicit_edge_trim_widths_A=edge_trim_widths_A,
     )
     deep_telluric_mask = get_sysrem_deep_mask(wave_1d, arm)
     edge_trim_info = arm_edge_trim_metadata(
@@ -751,15 +570,15 @@ def _process_arm(
         planet=args.planet,
         mode="transmission",
         epoch=args.epoch,
+        explicit_widths_A=edge_trim_widths_A,
+        source=edge_trim_source,
     )
     column_indices = _valid_sorted_column_indices(
         wave_1d,
         source_data,
         source_sigma,
         arm=arm,
-        planet=args.planet,
-        mode="transmission",
-        epoch=args.epoch,
+        edge_trim_widths_A=edge_trim_widths_A,
     )
     wave_1d = np.asarray(wave_1d, dtype=float)[column_indices]
     data = data[:, column_indices]
@@ -782,6 +601,10 @@ def _process_arm(
         pre_sysrem_sigma = pre_sysrem_sigma[:, column_indices]
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    # A newly prepared wavelength/exposure grid invalidates any previously
+    # projected fixed shadow cube.  The LSD fitter recreates it and updates the
+    # metadata only after exact alignment checks.
+    (output_dir / "shadow_source_model.npy").unlink(missing_ok=True)
 
     np.save(output_dir / "wavelength.npy", wave_1d)
     np.save(output_dir / "data.npy", data)
@@ -799,6 +622,7 @@ def _process_arm(
         source_phase=source_phase,
         source_bjd_tdb=source_bjd_tdb,
         active_exposure_mask=active_exposure_mask,
+        active_transit_interval=np.asarray(active_transit_interval),
         selected_exposure_indices=selected_exposure_indices,
         subtract_time_median=np.asarray(
             False if collapse_source else args.subtract_median,
@@ -850,6 +674,11 @@ def _process_arm(
             (output_dir / filename).unlink(missing_ok=True)
 
     contacts = compute_contact_phases(planet_cfg)
+    wavelength_frame_contract = build_wavelength_frame_contract(
+        extras,
+        n_source_exposures=source_phase.size,
+        stellar_velocity=stellar_velocity,
+    )
     _save_metadata(
         output_dir,
         planet=args.planet,
@@ -861,6 +690,7 @@ def _process_arm(
         phase=phase,
         source_phase=source_phase,
         selected_exposure_indices=selected_exposure_indices,
+        active_transit_interval=active_transit_interval,
         jd=jd,
         bjd_tdb=bjd_tdb,
         time_metadata=time_metadata,
@@ -868,11 +698,17 @@ def _process_arm(
         subtract_median=False if collapse_source else args.subtract_median,
         run_sysrem=args.run_sysrem,
         regrid=args.regrid,
-        doppler_shadow_status=doppler_shadow_status,
         arm_edge_trim=edge_trim_info,
         spectral_column_masking=spectral_column_masking,
         product_kind=args.product_kind,
         out_of_transit_master_division=collapse_source,
+        stellar_velocity=stellar_velocity,
+        wavelength_frame_contract=wavelength_frame_contract,
+        input_exposure_files=list(extras.get("input_exposure_files", ())),
+        excluded_exposure_files=list(extras.get("excluded_exposure_files", ())),
+        science_exposure_selection=dict(
+            extras.get("science_exposure_selection_metadata", {})
+        ),
     )
 
     product_label = (
@@ -890,7 +726,10 @@ def _process_arm(
         "  timeseries_operator.npz: "
         f"{source_phase.size} source rows -> {phase.size} likelihood rows"
     )
-    print("  jd.npy: raw UTC JD-OBS; bjd_tdb.npy: canonical BJD_TDB")
+    print(
+        "  jd.npy: UTC midpoint from "
+        f"{time_metadata['input_keyword']}; bjd_tdb.npy: canonical BJD_TDB"
+    )
     print(
         f"  Phase range: {float(np.min(phase)):.5f} to {float(np.max(phase)):.5f}; "
         f"wavelength range: {float(np.min(wave_1d)):.1f} to {float(np.max(wave_1d)):.1f} A"
@@ -940,9 +779,12 @@ def main() -> int:
     else:
         arms_to_run = (args.arm,)
 
-    planet_cfg = _planet_config(args.planet, args.ephemeris)
+    planet_cfg = get_params(args.planet, args.ephemeris)
     missing = []
-    for name in ("period", "duration", "RA", "Dec", "epoch", "tau"):
+    required_parameters = ["period", "duration", "RA", "Dec", "epoch"]
+    if not bool(planet_cfg.get("grazing_transit", False)):
+        required_parameters.append("tau")
+    for name in required_parameters:
         value = planet_cfg.get(name)
         if value is None or value != value:
             missing.append(name)
@@ -955,13 +797,14 @@ def main() -> int:
         if args.output_dir:
             output_dir = Path(args.output_dir)
         else:
-            output_dir = _output_dir_for(
-                args.planet,
-                args.epoch,
-                arm,
-                args.product_kind,
+            output_dir = output_dir_for(
+                mode="transmission",
+                planet=args.planet,
+                epoch=args.epoch,
+                arm=arm,
+                product_kind=args.product_kind,
             )
-        _process_arm(
+        prepare_arm(
             arm=arm,
             args=args,
             planet_cfg=planet_cfg,

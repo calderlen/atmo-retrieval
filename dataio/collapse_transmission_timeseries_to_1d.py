@@ -6,10 +6,12 @@ here. The command-line entry point consumes a dedicated full-exposure
 """
 
 import argparse
+import hashlib
 import json
 import os
+import re
+from datetime import datetime
 import numpy as np
-from glob import glob
 from pathlib import Path
 from astropy.io import fits
 from astropy.time import Time
@@ -32,17 +34,67 @@ from config_utils import (
     get_fits_columns,
     get_resolution,
 )
-from dataio.horus import remove_doppler_shadow as _remove_shadow
+from dataio.lsd_doppler_shadow import (
+    FIXED_LSD_SHADOW_METHOD,
+    FIXED_LSD_SHADOW_SCHEMA_VERSION,
+)
+from dataio.exposure_selection import (
+    ScienceExposureSelection,
+    apply_paired_snr_quality_rule,
+    select_science_exposures,
+)
+from dataio.orbital_velocity import planet_radial_velocity_kms
 
 
 PEPSI_INPUT_TIME_SCALE = "utc"
 PEPSI_BJD_TDB_VALIDATION_TOLERANCE_SECONDS = 0.1
+TRANSMISSION_COLLAPSE_SCHEMA_VERSION = 4
+
+
+def _calendar_mid_exposure_jd_utc(header, exptime_seconds: float) -> float | None:
+    """Reconstruct a UTC midpoint from PEPSI calendar start-time headers."""
+
+    date_obs = str(header.get("DATE-OBS", "")).strip()
+    ut_obs = str(header.get("UT-OBS", "")).strip()
+    if not date_obs or not ut_obs:
+        return None
+    if not np.isfinite(exptime_seconds) or exptime_seconds <= 0.0:
+        return None
+
+    value = f"{date_obs} {ut_obs}"
+    formats = (
+        "%d/%m/%Y %H:%M:%S.%f",
+        "%d/%m/%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+    )
+    for date_format in formats:
+        try:
+            start_utc = datetime.strptime(value, date_format)
+        except ValueError:
+            continue
+        return float(
+            Time(start_utc, scale=PEPSI_INPUT_TIME_SCALE).jd
+            + 0.5 * exptime_seconds / 86400.0
+        )
+    return None
 
 
 def compute_contact_phases(params: dict) -> dict[str, float]:
     period = params["period"]
     duration = params["duration"]
     half_dur_phase = (duration / period) / 2
+
+    if bool(params.get("grazing_transit", False)):
+        # A grazing event has a valid T14 interval but no T2/T3 contacts.
+        # Keep those contacts explicitly undefined rather than inventing a
+        # zero-width T23 interval.
+        return {
+            "T1": -half_dur_phase,
+            "T2": np.nan,
+            "T3": np.nan,
+            "T4": half_dur_phase,
+        }
 
     tau = params["tau"]
     tau_phase = tau / period
@@ -52,6 +104,16 @@ def compute_contact_phases(params: dict) -> dict[str, float]:
         "T3": half_dur_phase - tau_phase,
         "T4": half_dur_phase,
     }
+
+
+def active_transit_mask(phase: np.ndarray, params: dict) -> np.ndarray:
+    """Return the exposures used by the transmission collapse workflow."""
+
+    phase = np.asarray(phase, dtype=float)
+    contacts = compute_contact_phases(params)
+    if bool(params.get("grazing_transit", False)):
+        return (phase >= contacts["T1"]) & (phase <= contacts["T4"])
+    return (phase >= contacts["T2"]) & (phase <= contacts["T3"])
 
 
 def get_phase_boundaries(params: dict) -> dict[str, tuple[float, float]]:
@@ -306,93 +368,33 @@ def get_telluric_edge_mask(
     return edge_mask
 
 
-def _trim_lookup_key(value: str | None) -> str | None:
-    if value is None:
-        return None
-    return "".join(ch for ch in str(value).lower() if ch.isalnum())
-
-
-def _lookup_trim_mapping(mapping: dict, key: str | None):
-    if key is None or not isinstance(mapping, dict):
-        return None
-    if key in mapping:
-        return mapping[key]
-    normalized = _trim_lookup_key(key)
-    for candidate, value in mapping.items():
-        if _trim_lookup_key(candidate) == normalized:
-            return value
-    return None
-
-
-def _get_epoch_arm_edge_trim_widths(
-    arm: str,
-    *,
-    planet: str | None = None,
-    mode: str | None = None,
-    epoch: str | None = None,
-):
-    table = getattr(config, "DEFAULT_EPOCH_ARM_EDGE_TRIM_A", {})
-    if not isinstance(table, dict) or epoch is None:
-        return None
-
-    candidates = []
-    planet_table = _lookup_trim_mapping(table, planet)
-    if isinstance(planet_table, dict):
-        mode_table = _lookup_trim_mapping(planet_table, mode)
-        if isinstance(mode_table, dict):
-            candidates.append(_lookup_trim_mapping(mode_table, epoch))
-        candidates.append(_lookup_trim_mapping(planet_table, epoch))
-    mode_table = _lookup_trim_mapping(table, mode)
-    if isinstance(mode_table, dict):
-        candidates.append(_lookup_trim_mapping(mode_table, epoch))
-    candidates.append(_lookup_trim_mapping(table, epoch))
-
-    for epoch_table in candidates:
-        if not isinstance(epoch_table, dict):
-            continue
-        raw_widths = _lookup_trim_mapping(epoch_table, arm)
-        if raw_widths is not None:
-            return raw_widths
-    return None
-
-
-def _coerce_edge_trim_widths(raw_widths) -> tuple[float, float]:
-    if isinstance(raw_widths, dict):
-        left = raw_widths.get("left", 0.0)
-        right = raw_widths.get("right", 0.0)
-    else:
-        left, right = raw_widths
-    return max(float(left), 0.0), max(float(right), 0.0)
-
-
-def get_arm_edge_trim_widths(
-    arm: str,
-    *,
-    planet: str | None = None,
-    mode: str | None = None,
-    epoch: str | None = None,
+def _validated_edge_trim_widths(
+    explicit_widths_A: tuple[float, float],
 ) -> tuple[float, float]:
-    """Return configured left/right arm-edge trim widths in Angstroms."""
-    raw_widths = _get_epoch_arm_edge_trim_widths(
-        arm,
-        planet=planet,
-        mode=mode,
-        epoch=epoch,
-    )
-    if raw_widths is None:
-        raw_widths = getattr(config, "DEFAULT_ARM_EDGE_TRIM_A", {}).get(arm, (0.0, 0.0))
-    return _coerce_edge_trim_widths(raw_widths)
+    """Validate the exact left/right widths supplied by a manifest consumer."""
+
+    if len(explicit_widths_A) != 2:
+        raise ValueError("Explicit edge-trim widths must contain left and right values.")
+    left_width, right_width = (float(value) for value in explicit_widths_A)
+    if (
+        not np.isfinite(left_width)
+        or not np.isfinite(right_width)
+        or left_width < 0.0
+        or right_width < 0.0
+    ):
+        raise ValueError(
+            "Explicit edge-trim widths must be finite, non-negative Angstrom values."
+        )
+    return left_width, right_width
 
 
 def get_arm_edge_trim_mask(
     wave: np.ndarray,
     arm: str,
     *,
-    planet: str | None = None,
-    mode: str | None = None,
-    epoch: str | None = None,
+    explicit_widths_A: tuple[float, float] | None = None,
 ) -> np.ndarray:
-    """Return configured unstable arm-edge columns to drop or ignore."""
+    """Return columns selected by exact, explicitly supplied trim widths."""
     if arm == "full":
         raise ValueError(
             "arm='full' is not supported by get_arm_edge_trim_mask. "
@@ -402,15 +404,10 @@ def get_arm_edge_trim_mask(
 
     finite = np.isfinite(wave)
     edge_mask = np.zeros(wave.shape[0], dtype=bool)
-    if not np.any(finite):
+    if not np.any(finite) or explicit_widths_A is None:
         return edge_mask
 
-    left_width, right_width = get_arm_edge_trim_widths(
-        arm,
-        planet=planet,
-        mode=mode,
-        epoch=epoch,
-    )
+    left_width, right_width = _validated_edge_trim_widths(explicit_widths_A)
     if left_width <= 0.0 and right_width <= 0.0:
         return edge_mask
 
@@ -430,16 +427,18 @@ def arm_edge_trim_metadata(
     planet: str | None = None,
     mode: str | None = None,
     epoch: str | None = None,
+    explicit_widths_A: tuple[float, float] | None = None,
+    source: str | None = None,
 ) -> dict[str, float | int | str]:
     """Describe the configured arm-edge trim for a wavelength grid."""
     wave = np.asarray(wave, dtype=float)
     finite = np.isfinite(wave)
-    left_width, right_width = get_arm_edge_trim_widths(
-        arm,
-        planet=planet,
-        mode=mode,
-        epoch=epoch,
+    widths = (
+        None
+        if explicit_widths_A is None
+        else _validated_edge_trim_widths(explicit_widths_A)
     )
+    left_width, right_width = (0.0, 0.0) if widths is None else widths
     if not np.any(finite):
         return {
             "left_trim_A": left_width,
@@ -452,6 +451,7 @@ def arm_edge_trim_metadata(
             "keep_min_A": float("nan"),
             "keep_max_A": float("nan"),
             "n_trimmed_columns": 0,
+            "source": source or "none",
         }
 
     lo = float(np.nanmin(wave[finite]))
@@ -459,9 +459,7 @@ def arm_edge_trim_metadata(
     trim_mask = get_arm_edge_trim_mask(
         wave,
         arm,
-        planet=planet,
-        mode=mode,
-        epoch=epoch,
+        explicit_widths_A=explicit_widths_A,
     )
     return {
         "left_trim_A": left_width,
@@ -474,6 +472,7 @@ def arm_edge_trim_metadata(
         "keep_min_A": lo + left_width,
         "keep_max_A": hi - right_width,
         "n_trimmed_columns": int(np.count_nonzero(trim_mask)),
+        "source": source or "none",
     }
 
 
@@ -481,9 +480,7 @@ def get_sysrem_ignore_mask(
     wave: np.ndarray,
     arm: str,
     *,
-    planet: str | None = None,
-    mode: str | None = None,
-    epoch: str | None = None,
+    explicit_edge_trim_widths_A: tuple[float, float] | None = None,
 ) -> np.ndarray:
     """Return data-quality columns to ignore in SYSREM output."""
     return (
@@ -492,9 +489,7 @@ def get_sysrem_ignore_mask(
         | get_arm_edge_trim_mask(
             wave,
             arm,
-            planet=planet,
-            mode=mode,
-            epoch=epoch,
+            explicit_widths_A=explicit_edge_trim_widths_A,
         )
     )
 
@@ -534,6 +529,7 @@ def do_sysrem(
     planet_name: str | None = None,
     data_mode: str | None = None,
     observation_epoch: str | None = None,
+    edge_trim_widths_A: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, ...]:
     """Run SYSREM with separate treatment for telluric and non-telluric regions.
 
@@ -570,9 +566,7 @@ def do_sysrem(
     ignore_mask = get_arm_edge_trim_mask(
         wave,
         arm,
-        planet=planet_name,
-        mode=data_mode,
-        epoch=observation_epoch,
+        explicit_widths_A=edge_trim_widths_A,
     )
     if do_molecfit:
         ignore_mask |= get_sysrem_deep_mask(wave, arm) | get_telluric_edge_mask(wave, arm)
@@ -964,8 +958,15 @@ _PLANET_MOLECFIT_VELOCITY_OFFSET_MPS = {
 _MOLECFIT_CORRECTED_PREFIX = "SCIENCE_TELLURIC_CORR_"
 _MOLECFIT_FITS_SUFFIX = ".fits"
 _MAX_PIXEL_SPACING_RATIO_DEVIATION = 1.0e-3
+_PEPSI_VELOCITY_SUM_TOLERANCE_MPS = 100.0
 _SPEED_OF_LIGHT_MPS = 299792458.0
 _SPEED_OF_LIGHT_KMS = _SPEED_OF_LIGHT_MPS / 1000.0
+_SUPPORTED_WAVELENGTH_FRAMES = frozenset({"native", "barycentric"})
+_REMOVED_VELOCITY_HISTORY_RE = re.compile(
+    r"Radial\s+velocity\s+([A-Z0-9_+\-]+)\s*=\s*"
+    r"([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+\-]?\d+)?)\s*m/s\s+is\s+removed",
+    re.IGNORECASE,
+)
 
 
 def _wavelength_angstrom(data, column_config: dict) -> np.ndarray:
@@ -1061,6 +1062,179 @@ def _history_mentions(header, key: str) -> bool:
     return any(key in str(entry) for entry in history)
 
 
+def _velocity_history_entries(header) -> tuple[str, ...]:
+    """Return normalized PEPSI HISTORY entries describing removed velocities."""
+    history = header.get("HISTORY", ())
+    if isinstance(history, str):
+        history = (history,)
+    return tuple(
+        str(entry).strip()
+        for entry in history
+        if _REMOVED_VELOCITY_HISTORY_RE.search(str(entry))
+    )
+
+
+def parse_pepsi_velocity_frame(header) -> dict[str, object]:
+    """Decompose the velocity terms already removed from a PEPSI wavelength grid.
+
+    The returned observer and stellar components describe the transformation
+    recorded by the PEPSI FITS HISTORY cards.  They are deliberately separate:
+    a barycentric wavelength retains the stellar velocity while removing the
+    observatory/solar-system-barycenter velocity.
+    """
+    entries = _velocity_history_entries(header)
+    if not entries:
+        raise ValueError(
+            "PEPSI FITS header does not document a removed velocity term in HISTORY."
+        )
+
+    removed: list[tuple[str, float]] = []
+    for entry in entries:
+        match = _REMOVED_VELOCITY_HISTORY_RE.search(entry)
+        if match is None:
+            continue
+        removed.append((match.group(1).upper(), float(match.group(2))))
+    labels = {label for label, _value in removed}
+
+    observer_header = _finite_header_velocity_mps(header, "SSBVEL")
+    observer_header_key = "SSBVEL"
+    if observer_header is None:
+        observer_header = _finite_header_velocity_mps(header, "OBSVEL")
+        observer_header_key = "OBSVEL"
+    stellar_header = _finite_header_velocity_mps(header, "RADVEL")
+
+    def history_value(*requested_labels: str) -> float | None:
+        requested = set(requested_labels)
+        values = [value for label, value in removed if label in requested]
+        if not values:
+            return None
+        return float(np.sum(values))
+
+    observer_removed = 0.0
+    stellar_removed = 0.0
+    observer_documented = False
+    stellar_documented = False
+
+    standalone_observer = history_value("SSBVEL", "OBSVEL")
+    if standalone_observer is not None:
+        observer_removed = standalone_observer
+        observer_documented = True
+
+    standalone_stellar = history_value("RADVEL")
+    if standalone_stellar is not None:
+        stellar_removed = standalone_stellar
+        stellar_documented = True
+
+    combined_observer_stellar = history_value("OBSVEL+RADVEL")
+    if combined_observer_stellar is not None:
+        if observer_header is None and stellar_header is None:
+            raise ValueError(
+                "OBSVEL+RADVEL was removed, but neither component is available "
+                "in the PEPSI FITS header."
+            )
+        if observer_header is None:
+            observer_header = combined_observer_stellar - float(stellar_header)
+            observer_header_key = "OBSVEL(derived)"
+        if stellar_header is None:
+            stellar_header = combined_observer_stellar - float(observer_header)
+        observer_removed = float(observer_header)
+        stellar_removed = float(stellar_header)
+        observer_documented = True
+        stellar_documented = True
+        reconstructed = observer_removed + stellar_removed
+        if not np.isclose(
+            reconstructed,
+            combined_observer_stellar,
+            rtol=0.0,
+            atol=_PEPSI_VELOCITY_SUM_TOLERANCE_MPS,
+        ):
+            raise ValueError(
+                "PEPSI OBSVEL+RADVEL HISTORY value is inconsistent with its "
+                f"components: {combined_observer_stellar:.3f} != "
+                f"{reconstructed:.3f} m/s."
+            )
+
+    combined_sst = history_value("SSTVEL")
+    if combined_sst is not None:
+        if observer_header is None and stellar_header is None:
+            raise ValueError(
+                "SSTVEL was removed, but neither SSBVEL/OBSVEL nor RADVEL is "
+                "available in the PEPSI FITS header."
+            )
+        if observer_header is None:
+            observer_header = combined_sst - float(stellar_header)
+            observer_header_key = "observer_velocity(derived)"
+        if stellar_header is None:
+            stellar_header = combined_sst - float(observer_header)
+        observer_removed = float(observer_header)
+        stellar_removed = float(stellar_header)
+        observer_documented = True
+        stellar_documented = True
+        reconstructed = observer_removed + stellar_removed
+        if not np.isclose(
+            reconstructed,
+            combined_sst,
+            rtol=0.0,
+            atol=_PEPSI_VELOCITY_SUM_TOLERANCE_MPS,
+        ):
+            raise ValueError(
+                "PEPSI SSTVEL HISTORY value is inconsistent with its components: "
+                f"{combined_sst:.3f} != {reconstructed:.3f} m/s."
+            )
+
+    if not observer_documented:
+        raise ValueError(
+            "PEPSI FITS HISTORY does not document removal of OBSVEL, SSBVEL, "
+            "OBSVEL+RADVEL, or SSTVEL; a barycentric grid cannot be reconstructed."
+        )
+
+    instrument_removed = history_value("CCFOFF") or 0.0
+    recognized = {
+        "OBSVEL",
+        "SSBVEL",
+        "RADVEL",
+        "OBSVEL+RADVEL",
+        "SSTVEL",
+        "CCFOFF",
+    }
+    unknown = sorted(labels - recognized)
+    if unknown:
+        raise ValueError(
+            "Unsupported PEPSI removed-velocity HISTORY term(s): "
+            + ", ".join(unknown)
+        )
+
+    return {
+        "observer_velocity_removed_mps": float(observer_removed),
+        "observer_velocity_header_key": observer_header_key,
+        "stellar_velocity_removed_mps": float(stellar_removed),
+        "stellar_velocity_was_removed": bool(stellar_documented),
+        "instrument_velocity_removed_mps": float(instrument_removed),
+        "total_velocity_removed_mps": float(sum(value for _label, value in removed)),
+        "velocity_history_recipe": tuple(label for label, _value in removed),
+        "velocity_history_entries": entries,
+    }
+
+
+def _doppler_factor_velocity_mps(velocity_mps: float) -> float:
+    """Return the relativistic wavelength factor for a velocity in m/s."""
+    beta = float(velocity_mps) / _SPEED_OF_LIGHT_MPS
+    if not np.isfinite(beta) or abs(beta) >= 1.0:
+        raise ValueError("Velocity must be finite and smaller than the speed of light.")
+    return float(np.sqrt((1.0 + beta) / (1.0 - beta)))
+
+
+def _raw_pipeline_wavelength_to_barycentric(
+    wavelength_vacuum: np.ndarray,
+    frame_info: dict[str, object],
+) -> np.ndarray:
+    """Restore only the stellar term removed from a raw PEPSI wavelength grid."""
+    stellar_removed_mps = float(frame_info["stellar_velocity_removed_mps"])
+    return np.asarray(wavelength_vacuum, dtype=float) * _doppler_factor_velocity_mps(
+        stellar_removed_mps
+    )
+
+
 def _molecfit_velocity_correction_mps(
     header,
     *,
@@ -1109,6 +1283,18 @@ def _shift_wavelength_velocity_mps(
     """Apply the repository's wavelength Doppler convention."""
     beta = float(correction_velocity_mps) / _SPEED_OF_LIGHT_MPS
     return np.asarray(wavelength, dtype=float) / (1.0 - beta)
+
+
+def _shift_wavelength_to_stellar_rest(
+    wavelength: np.ndarray,
+    residual_velocity_kms: float,
+) -> np.ndarray:
+    """Remove a measured residual RV using positive velocity for recession."""
+    beta = float(residual_velocity_kms) / _SPEED_OF_LIGHT_KMS
+    if not np.isfinite(beta) or abs(beta) >= 1.0:
+        raise ValueError("stellar_rest_velocity_kms must be finite and smaller than c.")
+    doppler_factor = np.sqrt((1.0 + beta) / (1.0 - beta))
+    return np.asarray(wavelength, dtype=float) / doppler_factor
 
 
 def _validate_one_to_one_wavelength_ordering(
@@ -1269,6 +1455,140 @@ def _canonical_molecfit_wavelength(
     return canonical_wave, raw_path, correction_mps, correction_keys
 
 
+def _barycentric_molecfit_wavelength(
+    *,
+    molecfit_path: str | os.PathLike[str],
+    molecfit_data,
+    molecfit_header,
+    observation_epoch: str,
+    data_dir: str | os.PathLike[str],
+    raw_column_config: dict,
+    molecfit_column_config: dict,
+    jd_header_key: str,
+) -> tuple[np.ndarray, Path | None, dict[str, object]]:
+    """Return a barycentric vacuum grid for a Molecfit-corrected exposure.
+
+    Molecfit flux values retain the input pixel ordering.  When possible, the
+    paired raw PEPSI wavelength vector is therefore authoritative.  Legacy
+    Molecfit-only products are reconstructed from their header velocity
+    provenance without applying target-specific empirical offsets.
+    """
+    raw_path = _resolve_molecfit_raw_product(molecfit_path, data_dir)
+    molecfit_wave = _wavelength_angstrom(molecfit_data, molecfit_column_config)
+
+    if raw_path is not None:
+        with fits.open(raw_path) as raw_hdu:
+            raw_data = raw_hdu[1].data
+            raw_header = raw_hdu[0].header.copy()
+            raw_air_wave = _wavelength_angstrom(raw_data, raw_column_config)
+
+        if raw_air_wave.size != len(molecfit_data):
+            raise ValueError(
+                f"Raw product '{raw_path.name}' and Molecfit output "
+                f"'{Path(molecfit_path).name}' have different pixel counts: "
+                f"{raw_air_wave.size} != {len(molecfit_data)}."
+            )
+        if jd_header_key in raw_header and jd_header_key in molecfit_header:
+            raw_jd = float(raw_header[jd_header_key])
+            molecfit_jd = float(molecfit_header[jd_header_key])
+            if not np.isclose(raw_jd, molecfit_jd, rtol=0.0, atol=1.0e-5):
+                raise ValueError(
+                    f"Raw product '{raw_path.name}' and Molecfit output "
+                    f"'{Path(molecfit_path).name}' have inconsistent {jd_header_key}: "
+                    f"{raw_jd} != {molecfit_jd}."
+                )
+
+        raw_vacuum_wave = _air_wavelength_to_vacuum(raw_air_wave)
+        _validate_one_to_one_wavelength_ordering(
+            raw_vacuum_wave,
+            molecfit_wave,
+            reference_label=f"vacuum-converted raw grid '{raw_path.name}'",
+            candidate_label=f"Molecfit output grid '{Path(molecfit_path).name}'",
+        )
+        frame_info = parse_pepsi_velocity_frame(raw_header)
+        frame_info = {
+            **frame_info,
+            "synthetic_molecfit_shift_undone_mps": 0.0,
+            "wavelength_frame_source": "paired_raw_product",
+        }
+        return (
+            _raw_pipeline_wavelength_to_barycentric(raw_vacuum_wave, frame_info),
+            raw_path,
+            frame_info,
+        )
+
+    frame_info = parse_pepsi_velocity_frame(molecfit_header)
+    synthetic_shift_mps = float(_INTRODUCED_SHIFTS_MPS.get(observation_epoch, 0.0))
+    barycentric_wave = np.asarray(molecfit_wave, dtype=float)
+    # Undo only mechanical product-generation shifts.  The target-specific
+    # legacy and planet offsets are intentionally excluded from an absolute
+    # stellar-velocity measurement.
+    barycentric_wave /= _doppler_factor_velocity_mps(synthetic_shift_mps)
+    barycentric_wave /= _doppler_factor_velocity_mps(
+        float(frame_info["observer_velocity_removed_mps"])
+    )
+    barycentric_wave /= _doppler_factor_velocity_mps(
+        float(frame_info["instrument_velocity_removed_mps"])
+    )
+    frame_info = {
+        **frame_info,
+        "synthetic_molecfit_shift_undone_mps": synthetic_shift_mps,
+        "wavelength_frame_source": "molecfit_header_reconstruction",
+    }
+    return barycentric_wave, None, frame_info
+
+
+def _paired_snr_filtered_selection(
+    selection: ScienceExposureSelection,
+    *,
+    arm: str,
+    observation_epoch: str,
+    planet_name: str,
+    data_mode: str,
+    data_dir: str | os.PathLike[str],
+) -> ScienceExposureSelection:
+    """Return this arm's selection after the shared paired-S/N hard cut."""
+
+    if arm not in {"blue", "red"}:
+        return selection
+    companion_arm = "red" if arm == "blue" else "blue"
+    companion_selection = None
+    companion_product_choices = (True, False) if companion_arm == "red" else (False,)
+    for companion_molecfit in companion_product_choices:
+        companion_patterns = get_data_patterns(
+            observation_epoch,
+            planet_name,
+            mode=companion_arm,
+            do_molecfit=companion_molecfit,
+            data_dir=data_dir,
+        )
+        candidate = select_science_exposures(
+            companion_patterns,
+            planet_name=planet_name,
+            data_mode=data_mode,
+            observation_epoch=observation_epoch,
+            arm=companion_arm,
+            do_molecfit=companion_molecfit,
+        )
+        if candidate.discovered_files:
+            companion_selection = candidate
+            break
+    if companion_selection is None:
+        return selection
+
+    if arm == "blue":
+        blue_selection, _ = apply_paired_snr_quality_rule(
+            selection,
+            companion_selection,
+        )
+        return blue_selection
+    _, red_selection = apply_paired_snr_quality_rule(
+        companion_selection,
+        selection,
+    )
+    return red_selection
+
+
 def get_pepsi_data(
     arm: str,
     observation_epoch: str,
@@ -1278,11 +1598,12 @@ def get_pepsi_data(
     regrid: bool = False,
     subtract_median: bool = False,
     run_sysrem: bool = False,
-    remove_doppler_shadow: bool = False,
-    shadow_params: dict | None = None,
     *,
+    wavelength_frame: str = "native",
+    stellar_rest_velocity_kms: float | None = None,
     sysrem_stop_tol: float = config.DEFAULT_SYSREM_STOP_TOL,
     data_mode: str = "transmission",
+    edge_trim_widths_A: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, ...] | tuple[tuple[np.ndarray, ...], dict] | None:
     """Load and preprocess spectroscopic data from configured instrument.
 
@@ -1290,17 +1611,21 @@ def get_pepsi_data(
         arm: Spectrograph arm ('red' or 'blue')
         observation_epoch: Observation date (YYYYMMDD)
         planet_name: Planet name
-        do_molecfit: Use Molecfit-corrected flux/error and automatically apply
-            the original PEPSI Molecfit velocity-offset recipe
+        do_molecfit: Use Molecfit-corrected flux/error. ``native`` retains the
+            historical Molecfit velocity-offset recipe; ``barycentric`` uses
+            the paired raw grid or the documented header-only reconstruction.
         data_dir: Epoch-specific raw exposure directory
         regrid: Regrid all spectra to common wavelength grid
         subtract_median: Subtract median spectrum (stellar line removal)
         run_sysrem: Run SYSREM systematics removal
-        remove_doppler_shadow: Remove Doppler shadow (RM effect)
-        shadow_params: Dict with 'phase', 'planet_params', 'stellar_params' for shadow removal
+        wavelength_frame: Return the historical loader grid (``native``) or
+            reconstruct a vacuum barycentric grid (``barycentric``)
         sysrem_stop_tol: Minimum sigma-improvement required to keep a SYSREM component
-        data_mode: Data family ('transmission' or 'emission') for context-specific
-            edge-trim lookup
+        data_mode: Data family ('transmission' or 'emission') for preprocessing context
+        stellar_rest_velocity_kms: Measured residual stellar velocity to remove
+            from every wavelength array before regridding or SYSREM
+        edge_trim_widths_A: Explicit accepted left/right arm-edge trims in
+            Angstroms. No trim is discovered implicitly.
 
     Returns:
         ``(result, extras)``, where ``result`` is the tuple
@@ -1315,6 +1640,12 @@ def get_pepsi_data(
             epoch=observation_epoch,
             mode=data_mode,
         )
+    wavelength_frame = str(wavelength_frame).strip().lower()
+    if wavelength_frame not in _SUPPORTED_WAVELENGTH_FRAMES:
+        raise ValueError(
+            f"Unsupported wavelength_frame={wavelength_frame!r}; expected one of "
+            f"{sorted(_SUPPORTED_WAVELENGTH_FRAMES)}."
+        )
 
     # Get config for this instrument
     header_keys = get_header_keys()
@@ -1326,33 +1657,73 @@ def get_pepsi_data(
         observation_epoch, planet_name, mode=arm, do_molecfit=do_molecfit, data_dir=data_dir
     )
 
-    spectra_files = []
-    matched_pattern = None
-    for pattern in patterns:
-        spectra_files = sorted(glob(pattern, recursive=True))
-        if do_molecfit:
-            current_files = [
-                path
-                for path in spectra_files
-                if not any(part.endswith("_old") for part in Path(path).parts)
-            ]
-            if current_files:
-                spectra_files = current_files
-        if spectra_files:
-            matched_pattern = pattern
-            break
-
-    if not spectra_files:
+    exposure_selection = select_science_exposures(
+        patterns,
+        planet_name=planet_name,
+        data_mode=data_mode,
+        observation_epoch=observation_epoch,
+        arm=arm,
+        do_molecfit=do_molecfit,
+    )
+    exposure_selection = _paired_snr_filtered_selection(
+        exposure_selection,
+        arm=arm,
+        observation_epoch=observation_epoch,
+        planet_name=planet_name,
+        data_mode=data_mode,
+        data_dir=data_dir,
+    )
+    matched_pattern = exposure_selection.matched_pattern
+    if not exposure_selection.discovered_files:
         print(f'No files found for {observation_epoch}_{planet_name} ({arm}) in {data_dir}')
         return None
 
+    spectra_files = [str(path) for path in exposure_selection.usable_files]
+    configured_excluded_files = [
+        path.name for path in exposure_selection.configured_excluded_files
+    ]
+    if configured_excluded_files:
+        print(
+            "Excluded known-bad exposure(s) before preprocessing: "
+            + ", ".join(configured_excluded_files)
+        )
+    snr_quality_excluded_files = [
+        path.name for path in exposure_selection.snr_quality_excluded_files
+    ]
+    if snr_quality_excluded_files:
+        print(
+            "Excluded paired q_snr < "
+            f"{config.HRS_PAIRED_SNR_Q_THRESHOLD:g} exposure(s) before preprocessing: "
+            + ", ".join(snr_quality_excluded_files)
+        )
+    for check in exposure_selection.fits_object_checks:
+        if check.accepted:
+            continue
+        print(
+            "Excluded FITS OBJECT mismatch/unverifiable exposure before "
+            f"preprocessing: {check.path.name} "
+            f"(OBJECT={check.observed_name!r}; reason={check.rejection_reason})."
+        )
+    excluded_exposure_files = [
+        path.name for path in exposure_selection.excluded_files
+    ]
+    if not spectra_files:
+        print(
+            f"No usable files remain for {observation_epoch}_{planet_name} "
+            f"({arm}) after exposure-level QC exclusions."
+        )
+        return None
+
     n_spectra = len(spectra_files)
+    input_exposure_files = [Path(path).name for path in spectra_files]
     # Surface which PEPSI product family fed this run so provenance is never
     # ambiguous:
     #   .dxt.*  dual-beam coadd (preferred)
     #   .sxt.*  single-beam coadd (used when dual-beam product unavailable)
     #   .sxs.*  per-readout sub-exposure (last-resort fallback)
-    if matched_pattern and ".sxs." in matched_pattern:
+    if matched_pattern and ".dxs." in matched_pattern:
+        product_grade = "per-readout, dual-beam (.dxs)"
+    elif matched_pattern and ".sxs." in matched_pattern:
         product_grade = "sub-exposure (.sxs)"
     elif matched_pattern and ".sxt." in matched_pattern:
         product_grade = "coadded, single-beam (.sxt)"
@@ -1362,9 +1733,18 @@ def get_pepsi_data(
 
     i = 0
     jd, snr_spectra, exptime = np.zeros(n_spectra), np.zeros(n_spectra), np.zeros(n_spectra)
+    calendar_midpoint_jd_utc = np.full(n_spectra, np.nan, dtype=float)
     header_bjd_tdb = np.full(n_spectra, np.nan, dtype=float)
     wavelength_velocity_correction_mps = np.zeros(n_spectra, dtype=float)
     wavelength_velocity_components: list[tuple[str, ...]] = [()] * n_spectra
+    observer_velocity_removed_mps = np.full(n_spectra, np.nan, dtype=float)
+    stellar_velocity_removed_mps = np.full(n_spectra, np.nan, dtype=float)
+    instrument_velocity_removed_mps = np.full(n_spectra, np.nan, dtype=float)
+    synthetic_molecfit_shift_undone_mps = np.zeros(n_spectra, dtype=float)
+    velocity_history_recipe: list[tuple[str, ...]] = [()] * n_spectra
+    velocity_history_entries: list[tuple[str, ...]] = [()] * n_spectra
+    velocity_frame_parse_error: list[str | None] = [None] * n_spectra
+    wavelength_frame_source: list[str] = ["native"] * n_spectra
     airmass = np.zeros(n_spectra)
 
     for spectrum in spectra_files:
@@ -1375,38 +1755,116 @@ def get_pepsi_data(
         # Get column names from instrument config
         flux_tag, error_tag = col_cfg["flux"], col_cfg["error"]
         loaded_wave = _wavelength_angstrom(data, col_cfg)
+        frame_info: dict[str, object] | None = None
         if do_molecfit:
-            loaded_wave, raw_path, rest_correction_mps, rest_correction_keys = (
-                _canonical_molecfit_wavelength(
+            if wavelength_frame == "barycentric":
+                loaded_wave, raw_path, frame_info = _barycentric_molecfit_wavelength(
                     molecfit_path=spectrum,
                     molecfit_data=data,
                     molecfit_header=header,
                     observation_epoch=observation_epoch,
-                    planet_name=planet_name,
-                    arm=arm,
                     data_dir=data_dir,
                     raw_column_config=raw_col_cfg,
                     molecfit_column_config=col_cfg,
                     jd_header_key=header_keys["jd"],
                 )
-            )
-            wavelength_velocity_correction_mps[i] = rest_correction_mps
-            wavelength_velocity_components[i] = rest_correction_keys
-            if i == 0:
-                keys = ", ".join(rest_correction_keys) or "no nonzero terms"
-                validation = (
-                    f" Raw product '{raw_path.name}' validates the pixel mapping."
-                    if raw_path is not None
-                    else " Original raw product unavailable; using FITS-header reconstruction."
+                if i == 0:
+                    print(
+                        "Barycentric Molecfit wavelength reconstruction: "
+                        f"{frame_info['wavelength_frame_source']} "
+                        f"(observer={float(frame_info['observer_velocity_removed_mps']) / 1000.0:+.6f}, "
+                        f"stellar={float(frame_info['stellar_velocity_removed_mps']) / 1000.0:+.6f} km/s)."
+                    )
+            else:
+                loaded_wave, raw_path, rest_correction_mps, rest_correction_keys = (
+                    _canonical_molecfit_wavelength(
+                        molecfit_path=spectrum,
+                        molecfit_data=data,
+                        molecfit_header=header,
+                        observation_epoch=observation_epoch,
+                        planet_name=planet_name,
+                        arm=arm,
+                        data_dir=data_dir,
+                        raw_column_config=raw_col_cfg,
+                        molecfit_column_config=col_cfg,
+                        jd_header_key=header_keys["jd"],
+                    )
                 )
-                print(
-                    "Molecfit velocity restoration: original PEPSI recipe using "
-                    f"{keys} "
-                    f"(correction={rest_correction_mps:.3f} m/s)."
-                    f"{validation}"
-                )
+                wavelength_velocity_correction_mps[i] = rest_correction_mps
+                wavelength_velocity_components[i] = rest_correction_keys
+                if i == 0:
+                    keys = ", ".join(rest_correction_keys) or "no nonzero terms"
+                    validation = (
+                        f" Raw product '{raw_path.name}' validates the pixel mapping."
+                        if raw_path is not None
+                        else " Original raw product unavailable; using FITS-header reconstruction."
+                    )
+                    print(
+                        "Molecfit velocity restoration: original PEPSI recipe using "
+                        f"{keys} "
+                        f"(correction={rest_correction_mps:.3f} m/s)."
+                        f"{validation}"
+                    )
         else:
             loaded_wave = _air_wavelength_to_vacuum(loaded_wave)
+            try:
+                frame_info = parse_pepsi_velocity_frame(header)
+            except ValueError as exc:
+                if wavelength_frame == "barycentric":
+                    raise ValueError(f"{Path(spectrum).name}: {exc}") from exc
+                velocity_frame_parse_error[i] = str(exc)
+            if wavelength_frame == "barycentric" and frame_info is not None:
+                loaded_wave = _raw_pipeline_wavelength_to_barycentric(
+                    loaded_wave,
+                    frame_info,
+                )
+                frame_info = {
+                    **frame_info,
+                    "synthetic_molecfit_shift_undone_mps": 0.0,
+                    "wavelength_frame_source": "raw_pipeline_history",
+                }
+                if i == 0:
+                    print(
+                        "Barycentric raw wavelength reconstruction: FITS HISTORY "
+                        f"(observer={float(frame_info['observer_velocity_removed_mps']) / 1000.0:+.6f}, "
+                        f"stellar={float(frame_info['stellar_velocity_removed_mps']) / 1000.0:+.6f} km/s)."
+                    )
+
+        if frame_info is None and velocity_frame_parse_error[i] is None:
+            try:
+                frame_info = parse_pepsi_velocity_frame(header)
+            except ValueError as exc:
+                velocity_frame_parse_error[i] = str(exc)
+        if frame_info is not None:
+            observer_velocity_removed_mps[i] = float(
+                frame_info["observer_velocity_removed_mps"]
+            )
+            stellar_velocity_removed_mps[i] = float(
+                frame_info["stellar_velocity_removed_mps"]
+            )
+            instrument_velocity_removed_mps[i] = float(
+                frame_info["instrument_velocity_removed_mps"]
+            )
+            synthetic_molecfit_shift_undone_mps[i] = float(
+                frame_info.get("synthetic_molecfit_shift_undone_mps", 0.0)
+            )
+            velocity_history_recipe[i] = tuple(
+                str(item) for item in frame_info["velocity_history_recipe"]
+            )
+            velocity_history_entries[i] = tuple(
+                str(item) for item in frame_info["velocity_history_entries"]
+            )
+            wavelength_frame_source[i] = str(
+                frame_info.get(
+                    "wavelength_frame_source",
+                    "native_molecfit" if do_molecfit else "native_raw_pipeline",
+                )
+            )
+        if stellar_rest_velocity_kms is not None:
+            loaded_wave = _shift_wavelength_to_stellar_rest(
+                loaded_wave,
+                stellar_rest_velocity_kms,
+            )
 
         if i == 0:
             npix = loaded_wave.size
@@ -1429,20 +1887,6 @@ def get_pepsi_data(
         if col_cfg.get("error") == "Var":
             errorin[i, :] = np.sqrt(errorin[i, :])
 
-        input_time_key = header_keys["jd"]
-        declared_time_scale = str(
-            header.get(header_keys.get("timesys", "TIMESYS"), "")
-        ).strip().lower()
-        if declared_time_scale and declared_time_scale not in {"ut", "utc"}:
-            raise ValueError(
-                f"PEPSI {input_time_key} is configured as UTC, but "
-                f"'{Path(spectrum).name}' declares TIMESYS={declared_time_scale!r}."
-            )
-        jd[i] = float(header[input_time_key])  # UTC mid-exposure by PEPSI contract
-        header_bjd_tdb[i] = float(
-            header.get(header_keys.get("bjd_tdb", "JD-TDB"), np.nan)
-        )
-
         snr_key = header_keys["snr"]
         snr_spectra[i] = header.get(snr_key, np.nan)
 
@@ -1458,10 +1902,73 @@ def get_pepsi_data(
         else:
             exptime[i] = float(exptime_val)
 
+        input_time_key = header_keys["jd"]
+        declared_time_scale = str(
+            header.get(header_keys.get("timesys", "TIMESYS"), "")
+        ).strip().lower()
+        if declared_time_scale and declared_time_scale not in {"ut", "utc"}:
+            raise ValueError(
+                f"PEPSI {input_time_key} is configured as UTC, but "
+                f"'{Path(spectrum).name}' declares TIMESYS={declared_time_scale!r}."
+            )
+        jd[i] = float(header[input_time_key])  # UTC mid-exposure by PEPSI contract
+        calendar_midpoint = _calendar_mid_exposure_jd_utc(header, exptime[i])
+        if calendar_midpoint is not None:
+            calendar_midpoint_jd_utc[i] = calendar_midpoint
+        header_bjd_tdb[i] = float(
+            header.get(header_keys.get("bjd_tdb", "JD-TDB"), np.nan)
+        )
+
         airmass_key = header_keys["airmass"]
         airmass[i] = header[airmass_key]
 
         i += 1
+
+    input_time_provenance: dict[str, object] = {
+        "source": input_time_key,
+        "reconstructed": False,
+        "reason": None,
+        "original_keyword": input_time_key,
+        "scale": PEPSI_INPUT_TIME_SCALE,
+        "reference": "topocenter",
+        "exposure_reference": "midpoint",
+    }
+    if n_spectra > 1 and float(np.ptp(jd)) == 0.0:
+        constant_header_jd = float(jd[0])
+        complete_calendar_times = bool(
+            np.all(np.isfinite(calendar_midpoint_jd_utc))
+        )
+        varying_calendar_times = bool(
+            complete_calendar_times
+            and float(np.ptp(calendar_midpoint_jd_utc)) > 0.0
+        )
+        if not varying_calendar_times:
+            missing_count = int(
+                np.count_nonzero(~np.isfinite(calendar_midpoint_jd_utc))
+            )
+            raise ValueError(
+                f"All {n_spectra} exposures have identical {input_time_key}="
+                f"{jd[0]:.9f}, and a varying UTC midpoint cannot be reconstructed "
+                "from DATE-OBS + UT-OBS + EXPTIME/2 "
+                f"({missing_count} incomplete or unparseable calendar timestamps)."
+            )
+        jd = calendar_midpoint_jd_utc.copy()
+        reconstructed_source = "DATE-OBS+UT-OBS+EXPTIME/2"
+        input_time_provenance.update(
+            {
+                "source": reconstructed_source,
+                "reconstructed": True,
+                "reason": f"constant_{input_time_key}_across_multiple_exposures",
+                "date_keyword": "DATE-OBS",
+                "time_keyword": "UT-OBS",
+                "exposure_keyword": header_keys["exptime"],
+            }
+        )
+        print(
+            f"Warning: all {n_spectra} exposures share {input_time_key}="
+            f"{constant_header_jd:.9f}; using UTC midpoints reconstructed "
+            f"from {reconstructed_source}."
+        )
 
     n_missing_snr = int(np.count_nonzero(~np.isfinite(snr_spectra)))
     if n_missing_snr:
@@ -1501,6 +2008,19 @@ def get_pepsi_data(
     wavelength_velocity_components = [
         wavelength_velocity_components[index] for index in obs_order
     ]
+    observer_velocity_removed_mps = observer_velocity_removed_mps[obs_order]
+    stellar_velocity_removed_mps = stellar_velocity_removed_mps[obs_order]
+    instrument_velocity_removed_mps = instrument_velocity_removed_mps[obs_order]
+    synthetic_molecfit_shift_undone_mps = (
+        synthetic_molecfit_shift_undone_mps[obs_order]
+    )
+    velocity_history_recipe = [velocity_history_recipe[index] for index in obs_order]
+    velocity_history_entries = [velocity_history_entries[index] for index in obs_order]
+    velocity_frame_parse_error = [
+        velocity_frame_parse_error[index] for index in obs_order
+    ]
+    wavelength_frame_source = [wavelength_frame_source[index] for index in obs_order]
+    input_exposure_files = [input_exposure_files[index] for index in obs_order]
     snr_spectra = snr_spectra[obs_order]
     exptime = exptime[obs_order]
     airmass = airmass[obs_order]
@@ -1543,35 +2063,46 @@ def get_pepsi_data(
             planet_name=planet_name,
             data_mode=data_mode,
             observation_epoch=observation_epoch,
+            edge_trim_widths_A=edge_trim_widths_A,
         )
         fluxin, errorin, U_sysrem, no_tellurics, sysrem_diagnostics = sysrem_result
         n_systematics_used = [int(np.sum(np.isfinite(U_sysrem[0, :, i]))) for i in range(U_sysrem.shape[2])]
 
-    # Step 5: Doppler shadow removal
-    shadow_model = None
-    shadow_fit_info = None
-    if remove_doppler_shadow and shadow_params is not None:
-        print("Removing Doppler shadow (Rossiter-McLaughlin effect)...")
-        wave_1d = wave[0, :] if wave.ndim == 2 else wave
-        fluxin, shadow_model, shadow_fit_info = _remove_shadow(
-            fluxin, wave_1d,
-            shadow_params['phase'],
-            shadow_params['planet_params'],
-            shadow_params['stellar_params'],
-        )
-
     result = (wave, fluxin, errorin, jd, snr_spectra, exptime, airmass, n_spectra, npix)
 
+    final_wavelength_frame = (
+        'stellar_rest' if stellar_rest_velocity_kms is not None else wavelength_frame
+    )
     extras = {
         'header_bjd_tdb': header_bjd_tdb,
-        'input_time_keyword': header_keys['jd'],
+        'input_time_keyword': input_time_provenance['source'],
+        'input_time_provenance': input_time_provenance,
         'input_time_scale': PEPSI_INPUT_TIME_SCALE,
         'input_time_reference': 'topocenter',
         'input_exposure_reference': 'midpoint',
+        'input_exposure_files': input_exposure_files,
+        'excluded_exposure_files': excluded_exposure_files,
+        'science_exposure_selection': exposure_selection,
+        'science_exposure_selection_metadata': exposure_selection.metadata(),
         'header_bjd_tdb_keyword': header_keys.get('bjd_tdb', 'JD-TDB'),
         'wavelength_medium': 'vacuum',
+        'wavelength_frame': final_wavelength_frame,
+        'wavelength_intermediate_frame': wavelength_frame,
+        'wavelength_frame_source': wavelength_frame_source,
+        'observer_velocity_removed_kms': observer_velocity_removed_mps / 1000.0,
+        'stellar_velocity_removed_kms': stellar_velocity_removed_mps / 1000.0,
+        'instrument_velocity_removed_kms': instrument_velocity_removed_mps / 1000.0,
+        'synthetic_molecfit_shift_undone_kms': (
+            synthetic_molecfit_shift_undone_mps / 1000.0
+        ),
+        'velocity_history_recipe': velocity_history_recipe,
+        'velocity_history_entries': velocity_history_entries,
+        'velocity_frame_parse_error': velocity_frame_parse_error,
+        'stellar_rest_velocity_kms': stellar_rest_velocity_kms,
         'wavelength_velocity_recipe': (
-            'original_pepsi_molecfit' if do_molecfit else 'none'
+            'barycentric_from_pepsi_history'
+            if wavelength_frame == 'barycentric'
+            else ('original_pepsi_molecfit' if do_molecfit else 'none')
         ),
         'wavelength_velocity_correction_mps': wavelength_velocity_correction_mps,
         'wavelength_velocity_components': wavelength_velocity_components,
@@ -1581,8 +2112,6 @@ def get_pepsi_data(
         'U_sysrem': U_sysrem,
         'no_tellurics': no_tellurics,
         'n_systematics_used': n_systematics_used,
-        'shadow_model': shadow_model,
-        'shadow_fit_info': shadow_fit_info,
     }
     if sysrem_diagnostics is not None:
         extras.update(sysrem_diagnostics)
@@ -1595,14 +2124,17 @@ def get_bjd_tdb(
     Dec: str,
     *,
     header_bjd_tdb: np.ndarray | None = None,
+    input_time_keyword: str = "JD-OBS",
     validation_tolerance_seconds: float = PEPSI_BJD_TDB_VALIDATION_TOLERANCE_SECONDS,
     return_diagnostics: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, float | int | str | None]]:
     """Convert topocentric UTC Julian dates to barycentric BJD_TDB.
 
-    PEPSI ``JD-OBS`` values are UTC mid-exposure times. When a product also
-    supplies ``JD-TDB``, it is treated as an independent validation value, not
-    as an alternate input path.
+    PEPSI ``JD-OBS`` values normally provide UTC mid-exposure times. The loader
+    may instead pass strictly reconstructed calendar midpoints when ``JD-OBS``
+    is constant across multiple exposures. When a product also supplies
+    ``JD-TDB``, it is treated as an independent validation value, not as an
+    alternate input path.
     """
     jd_utc = np.asarray(jd_utc, dtype=float)
     if not np.all(np.isfinite(jd_utc)):
@@ -1622,7 +2154,7 @@ def get_bjd_tdb(
     bjd_tdb = np.asarray((observed_times.tdb + ltt_bary).jd, dtype=float)
 
     diagnostics: dict[str, float | int | str | None] = {
-        "input_keyword": "JD-OBS",
+        "input_keyword": str(input_time_keyword),
         "input_scale": PEPSI_INPUT_TIME_SCALE,
         "input_reference": "topocenter",
         "input_exposure_reference": "midpoint",
@@ -1638,7 +2170,7 @@ def get_bjd_tdb(
         header_bjd_tdb = np.asarray(header_bjd_tdb, dtype=float)
         if header_bjd_tdb.shape != bjd_tdb.shape:
             raise ValueError(
-                "Header JD-TDB shape does not match JD-OBS shape: "
+                "Header JD-TDB shape does not match the input UTC time shape: "
                 f"{header_bjd_tdb.shape} != {bjd_tdb.shape}."
             )
         validated = np.isfinite(header_bjd_tdb)
@@ -1762,8 +2294,8 @@ def calculate_transmission_spectrum(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Extract a planet-rest-frame differential transmission spectrum.
 
-    The returned spectrum is the inverse-variance coadd of full-transit (T23)
-    fractional flux residuals,
+    The returned spectrum is the inverse-variance coadd of active-transit
+    fractional flux residuals (T23 normally, T14 for a grazing transit),
 
         flux / median(flux_out_of_transit) - 1,
 
@@ -1795,10 +2327,15 @@ def calculate_transmission_spectrum(
     )
 
     contacts = compute_contact_phases(transit_params)
-    t23 = (orbital_phase >= contacts["T2"]) & (orbital_phase <= contacts["T3"])
+    active_transit = active_transit_mask(orbital_phase, transit_params)
+    active_interval = (
+        "T14_grazing"
+        if bool(transit_params.get("grazing_transit", False))
+        else "T23"
+    )
     out_transit = (orbital_phase < contacts["T1"]) | (orbital_phase > contacts["T4"])
 
-    print(f"Full-transit (T23): {np.sum(t23)} exposures")
+    print(f"Active transit ({active_interval}): {np.sum(active_transit)} exposures")
     print(f"Out-of-transit: {np.sum(out_transit)} exposures")
     print(f"Orbital phase range: {orbital_phase.min():.4f} to {orbital_phase.max():.4f}")
 
@@ -1808,13 +2345,18 @@ def calculate_transmission_spectrum(
         out_transit,
     )
 
-    t23_phase = orbital_phase[t23]
-    planet_velocity = Kp_kms * np.sin(2.0 * np.pi * t23_phase)
-    t23_residual = residual[t23]
-    t23_error = residual_error[t23]
+    active_phase = orbital_phase[active_transit]
+    planet_velocity = planet_radial_velocity_kms(
+        active_phase,
+        kp_kms=float(Kp_kms),
+        eccentricity=float(transit_params.get("eccentricity", 0.0)),
+        omega_deg=transit_params.get("omega"),
+    )
+    active_residual = residual[active_transit]
+    active_error = residual_error[active_transit]
 
-    shifted_residual = np.full_like(t23_residual, np.nan)
-    shifted_error = np.full_like(t23_error, np.inf)
+    shifted_residual = np.full_like(active_residual, np.nan)
+    shifted_error = np.full_like(active_error, np.inf)
     for i, velocity_kms in enumerate(planet_velocity):
         beta = velocity_kms / _SPEED_OF_LIGHT_KMS
         doppler_factor = np.sqrt((1.0 + beta) / (1.0 - beta))
@@ -1822,14 +2364,14 @@ def calculate_transmission_spectrum(
         shifted_residual[i] = np.interp(
             observed_wavelength,
             wave_grid,
-            t23_residual[i],
+            active_residual[i],
             left=np.nan,
             right=np.nan,
         )
         shifted_error[i] = np.interp(
             observed_wavelength,
             wave_grid,
-            t23_error[i],
+            active_error[i],
             left=np.inf,
             right=np.inf,
         )
@@ -1842,7 +2384,7 @@ def calculate_transmission_spectrum(
     full_coverage = np.all(valid_shifted, axis=0)
     if not np.any(full_coverage):
         raise ValueError(
-            "No wavelength columns retain coverage from every T23 exposure "
+            f"No wavelength columns retain coverage from every {active_interval} exposure "
             "after shifting into the planet rest frame."
         )
 
@@ -1854,7 +2396,14 @@ def calculate_transmission_spectrum(
     spectrum = np.sum(weights * shifted_residual, axis=0) / weight_sum
     spectrum_error = np.sqrt(1.0 / weight_sum)
 
-    return wave_grid, spectrum, spectrum_error, orbital_phase, t23, out_transit
+    return (
+        wave_grid,
+        spectrum,
+        spectrum_error,
+        orbital_phase,
+        active_transit,
+        out_transit,
+    )
 
 
 def bin_spectrum(
@@ -1959,43 +2508,122 @@ def _load_transmission_collapse_source(
     return wavelength, data, sigma, phase, metadata
 
 
+def _load_required_lsd_shadow_source_model(
+    data_dir: Path,
+    *,
+    metadata: dict,
+    wavelength: np.ndarray,
+    phase: np.ndarray,
+) -> tuple[np.ndarray, dict]:
+    """Load the mandatory shared-basis LSD model for a collapse source."""
+
+    shadow = metadata.get("fixed_doppler_shadow")
+    if not isinstance(shadow, dict) or not bool(shadow.get("enabled", False)):
+        raise ValueError(
+            f"{data_dir} has no enabled shared-basis LSD Doppler shadow. Run "
+            "python -m spectroscopy.doppler_shadow after preparing both source products."
+        )
+    if int(shadow.get("schema_version", -1)) != FIXED_LSD_SHADOW_SCHEMA_VERSION:
+        raise ValueError(
+            f"{data_dir} has unsupported fixed LSD shadow schema "
+            f"{shadow.get('schema_version')!r}; expected "
+            f"{FIXED_LSD_SHADOW_SCHEMA_VERSION}."
+        )
+    if str(shadow.get("method")) != FIXED_LSD_SHADOW_METHOD:
+        raise ValueError(
+            f"{data_dir} does not use the required {FIXED_LSD_SHADOW_METHOD} method."
+        )
+    model_name = str(shadow.get("source_model_file", ""))
+    model_path = (data_dir / model_name).resolve()
+    if not model_name or model_path.parent != data_dir.resolve():
+        raise ValueError("The fixed LSD source model must live in its source directory.")
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Required fixed LSD source model is missing: {model_path}")
+    actual_sha256 = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    if actual_sha256 != str(shadow.get("source_model_sha256", "")):
+        raise ValueError(f"Fixed LSD source-model hash mismatch for {model_path}.")
+    model = np.asarray(np.load(model_path), dtype=float)
+    expected_shape = (phase.size, wavelength.size)
+    if model.shape != expected_shape or np.any(~np.isfinite(model)):
+        raise ValueError(
+            f"{model_path} must be finite with shape {expected_shape}; got {model.shape}."
+        )
+    required_provenance = (
+        "artifact_file",
+        "artifact_sha256",
+        "artifact_metadata_file",
+        "template_sha256",
+    )
+    missing = [name for name in required_provenance if not shadow.get(name)]
+    if missing:
+        raise ValueError(
+            f"{data_dir} fixed LSD provenance is missing: {', '.join(missing)}."
+        )
+    return model, dict(shadow)
+
+
 def collapse_transmission_epoch_arm(
     *,
     planet: str,
     ephemeris: str,
+    shadow_source: str = "Recommended",
     epoch: str,
     arm: str,
     kp_kms: float,
     bin_size: int = 1,
+    source_dir: Path | None = None,
+    output_dir: Path | None = None,
 ) -> dict:
-    """Build one SYSREM-aware, full-transit 1D spectrum."""
+    """Build one SYSREM-aware, active-transit 1D spectrum."""
     from dataio.collapse_emission_timeseries_to_1d import (
+        COLLAPSE_COVERAGE_POLICY,
+        apply_emission_collapse_operator,
         build_emission_collapse_operator,
-        collapse_selected_emission_exposures,
         load_frozen_sysrem_arrays,
     )
 
-    params = config_utils.get_params(planet, ephemeris)
-    source_dir = config_utils.get_collapse_source_dir(
+    params = config_utils.resolve_parameter_domains(
         planet=planet,
-        epoch=epoch,
-        arm=arm,
-        mode="transmission",
+        timing_source=ephemeris,
+        shadow_source=shadow_source,
     )
-    output_dir = collapsed_transmission_dir(
-        planet=planet,
-        epoch=epoch,
-        arm=arm,
-    )
+    if source_dir is None:
+        source_dir = config_utils.get_collapse_source_dir(
+            planet=planet,
+            epoch=epoch,
+            arm=arm,
+            mode="transmission",
+        )
+    else:
+        source_dir = Path(source_dir)
+    if output_dir is None:
+        output_dir = collapsed_transmission_dir(
+            planet=planet,
+            epoch=epoch,
+            arm=arm,
+        )
+    else:
+        output_dir = Path(output_dir)
     wavelength, data, sigma, phase, source_metadata = (
         _load_transmission_collapse_source(source_dir)
     )
-    contacts = compute_contact_phases(params)
-    t23 = (
-        (phase >= contacts["T2"])
-        & (phase <= contacts["T3"])
+    fixed_source_model, fixed_shadow_metadata = (
+        _load_required_lsd_shadow_source_model(
+            source_dir,
+            metadata=source_metadata,
+            wavelength=wavelength,
+            phase=phase,
+        )
     )
-    selected_indices = np.flatnonzero(t23)
+    active_transit = active_transit_mask(phase, params)
+    active_interval = (
+        "T14_grazing" if bool(params.get("grazing_transit", False)) else "T23"
+    )
+    selected_indices = np.flatnonzero(active_transit)
+    if selected_indices.size == 0:
+        raise ValueError(
+            f"No exposures fall inside the active {active_interval} interval."
+        )
 
     selected_phase = phase[selected_indices]
     selected_sigma = sigma[selected_indices]
@@ -2004,16 +2632,14 @@ def collapse_transmission_epoch_arm(
         selected_sigma,
         selected_phase,
         kp_kms=kp_kms,
+        eccentricity=float(params.get("eccentricity", 0.0)),
+        omega_deg=params.get("omega"),
         bin_size=bin_size,
     )
     wavelength_1d, spectrum_1d, uncertainty_1d = (
-        collapse_selected_emission_exposures(
-            wavelength,
+        apply_emission_collapse_operator(
             data[selected_indices],
-            selected_sigma,
-            selected_phase,
-            kp_kms=kp_kms,
-            bin_size=bin_size,
+            fixed,
         )
     )
     frozen_sysrem = load_frozen_sysrem_arrays(source_dir)
@@ -2032,10 +2658,15 @@ def collapse_transmission_epoch_arm(
     operator_name = "transmission_collapse_operator.npz"
     np.savez_compressed(
         output_dir / operator_name,
-        schema_version=np.asarray(2, dtype=np.int32),
+        schema_version=np.asarray(
+            TRANSMISSION_COLLAPSE_SCHEMA_VERSION,
+            dtype=np.int32,
+        ),
         source_wavelength=wavelength,
         source_phase=phase,
-        active_exposure_mask=t23.astype(float),
+        fixed_source_model=fixed_source_model,
+        active_exposure_mask=active_transit.astype(float),
+        active_transit_interval=np.asarray(active_interval),
         selected_exposure_indices=selected_indices.astype(np.int32),
         shift_left_indices=fixed["shift_left_indices"],
         shift_fractions=fixed["shift_fractions"],
@@ -2043,33 +2674,90 @@ def collapse_transmission_epoch_arm(
         bin_indices=fixed["bin_indices"],
         bin_weights=fixed["bin_weights"],
         output_wavelength=fixed["output_wavelength"],
+        covered_source_indices=fixed["covered_source_indices"],
+        n_source_wavelengths=fixed["n_source_wavelengths"],
+        n_covered_wavelengths=fixed["n_covered_wavelengths"],
+        n_dropped_out_of_bounds=fixed["n_dropped_out_of_bounds"],
+        n_dropped_gap_crossing=fixed["n_dropped_gap_crossing"],
+        max_native_gap_factor=fixed["max_native_gap_factor"],
+        max_native_gap_angstrom=fixed["max_native_gap_angstrom"],
+        coverage_policy=np.asarray(COLLAPSE_COVERAGE_POLICY),
         kp_reference_kms=np.asarray(kp_kms, dtype=float),
+        planet_velocity_kms=fixed["planet_velocity_kms"],
+        eccentricity=np.asarray(params.get("eccentricity", 0.0), dtype=float),
+        omega_planet_deg=np.asarray(params.get("omega", np.nan), dtype=float),
         velocity_offset_reference_kms=np.asarray(0.0, dtype=float),
         has_sysrem=np.asarray(frozen_sysrem is not None, dtype=bool),
         **({} if frozen_sysrem is None else frozen_sysrem),
     )
     metadata = {
-        "schema_version": 2,
+        "schema_version": TRANSMISSION_COLLAPSE_SCHEMA_VERSION,
         "product_kind": "collapsed_transmission_spectrum",
         "observable_kind": "continuum_removed_negative_transmission_flux",
         "model_preprocessing": (
-            "t23_visibility_then_frozen_per_pixel_sysrem_then_planet_frame_"
+            "fixed_shared_basis_lsd_shadow_then_"
+            f"{active_interval.lower()}_visibility_then_frozen_per_pixel_sysrem_"
+            "then_planet_frame_"
             "inverse_variance_coadd_then_subtract_inverse_variance_"
             "weighted_constant"
         ),
+        "active_transit_interval": active_interval,
         "planet": planet,
         "ephemeris": ephemeris,
+        "shadow_source": shadow_source,
+        "parameter_resolution": params.get("parameter_resolution"),
         "epoch": epoch,
         "arm": arm,
         "kp_reference_kms": float(kp_kms),
+        "planet_velocity_model": (
+            "keplerian_transit_centered"
+            if float(params.get("eccentricity", 0.0)) != 0.0
+            else "circular_sinusoid"
+        ),
+        "eccentricity": float(params.get("eccentricity", 0.0)),
+        "omega_planet_deg": (
+            None
+            if params.get("omega") is None
+            else float(params.get("omega"))
+        ),
         "velocity_offset_reference_kms": 0.0,
         "source_data_dir": str(source_dir),
         "source_run_sysrem": source_metadata.get("run_sysrem"),
+        "fixed_doppler_shadow": fixed_shadow_metadata,
+        "wavelength_medium": source_metadata.get("wavelength_medium"),
+        "wavelength_frame": source_metadata.get("wavelength_frame"),
+        "wavelength_frame_contract": source_metadata.get(
+            "wavelength_frame_contract"
+        ),
+        "arm_edge_trim": source_metadata.get("arm_edge_trim"),
         "n_source_exposures": int(phase.size),
         "n_selected_exposures": int(selected_indices.size),
         "selected_exposure_indices": selected_indices.tolist(),
         "bin_size": int(bin_size),
         "collapse_operator_file": operator_name,
+        "wavelength_coverage_policy": COLLAPSE_COVERAGE_POLICY,
+        "n_source_wavelengths": int(wavelength.size),
+        "n_covered_unbinned_wavelengths": int(
+            fixed["n_covered_wavelengths"]
+        ),
+        "n_dropped_wavelengths": int(
+            wavelength.size - int(fixed["n_covered_wavelengths"])
+        ),
+        "n_dropped_out_of_bounds": int(
+            fixed["n_dropped_out_of_bounds"]
+        ),
+        "n_dropped_gap_crossing": int(
+            fixed["n_dropped_gap_crossing"]
+        ),
+        "retained_unbinned_wavelength_fraction": float(
+            int(fixed["n_covered_wavelengths"]) / wavelength.size
+        ),
+        "max_native_gap_factor": float(fixed["max_native_gap_factor"]),
+        "max_native_gap_angstrom": float(
+            fixed["max_native_gap_angstrom"]
+        ),
+        "shift_fraction_min": float(np.min(fixed["shift_fractions"])),
+        "shift_fraction_max": float(np.max(fixed["shift_fractions"])),
         "n_output_wavelengths": int(wavelength_1d.size),
     }
     (output_dir / "collapse_metadata.json").write_text(
@@ -2083,11 +2771,12 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Collapse dedicated transmission source cubes into SYSREM-aware "
-            "full-transit 1D spectra."
+            "active-transit 1D spectra."
         )
     )
     parser.add_argument("--planet", required=True)
     parser.add_argument("--ephemeris", default=EPHEMERIS)
+    parser.add_argument("--shadow-source", default="Recommended")
     parser.add_argument("--epoch", nargs="+", required=True)
     parser.add_argument(
         "--arm",
@@ -2101,7 +2790,11 @@ def create_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = create_parser().parse_args()
-    params = config_utils.get_params(args.planet, args.ephemeris)
+    params = config_utils.resolve_parameter_domains(
+        planet=args.planet,
+        timing_source=args.ephemeris,
+        shadow_source=args.shadow_source,
+    )
     kp_kms = params.get("Kp") if args.kp_kms is None else args.kp_kms
     arms = config.FULL_ARM_MEMBERS if args.arm == "full" else (args.arm,)
     for epoch in args.epoch:
@@ -2109,13 +2802,14 @@ def main() -> int:
             result = collapse_transmission_epoch_arm(
                 planet=args.planet,
                 ephemeris=args.ephemeris,
+                shadow_source=args.shadow_source,
                 epoch=str(epoch),
                 arm=arm,
                 kp_kms=float(kp_kms),
                 bin_size=int(args.bin_size),
             )
             print(
-                f"READY {epoch}/{arm}/full_transit: "
+                f"READY {epoch}/{arm}/{result['active_transit_interval']}: "
                 f"{result['n_selected_exposures']} exposures, "
                 f"{result['n_output_wavelengths']} wavelengths"
             )
