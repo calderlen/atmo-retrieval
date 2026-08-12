@@ -71,7 +71,6 @@ from dataio.exposure_selection import (
     ScienceExposureSelection,
     select_science_exposures,
 )
-from dataio.hrs_preparation import resolve_stellar_velocity_correction
 from dataio.prepare_retrieval_timeseries import transmission_phase_selection_mask
 
 
@@ -121,7 +120,6 @@ class CalibrationSettings:
     maximum_finalists: int = 256
     run_sysrem_finalists: bool = True
     use_molecfit_for_red: bool = True
-    apply_stellar_velocity_correction: bool = True
 
     def validated(self) -> "CalibrationSettings":
         grid_controls = (
@@ -331,24 +329,6 @@ def _raw_inventory(files: Sequence[Path]) -> dict[str, Any]:
     }
 
 
-def _stellar_velocity(
-    *,
-    planet: str,
-    epoch: str,
-    arm: str,
-    mode: str,
-    enabled: bool,
-) -> tuple[float | None, dict[str, Any]]:
-    if not enabled:
-        return None, {"applied": False, "reason": "disabled_in_notebook"}
-    return resolve_stellar_velocity_correction(
-        mode=mode,
-        planet=planet,
-        epoch=epoch,
-        arm=arm,
-    )
-
-
 def load_raw_epoch_arm(
     *,
     planet: str,
@@ -377,13 +357,12 @@ def load_raw_epoch_arm(
     from dataio.collapse_transmission_timeseries_to_1d import get_pepsi_data
 
     prefer_molecfit = bool(settings.use_molecfit_for_red and arm == "red")
-    velocity_kms, velocity_metadata = _stellar_velocity(
-        planet=display_planet,
-        epoch=epoch,
-        arm=arm,
-        mode=mode,
-        enabled=settings.apply_stellar_velocity_correction,
-    )
+    velocity_metadata = {
+        "applied": False,
+        "reason": "edge_trim_calibration_in_barycentric_frame",
+        "wavelength_frame": "barycentric",
+        "wavelength_medium": "vacuum",
+    }
     result = get_pepsi_data(
         arm=arm,
         observation_epoch=epoch,
@@ -393,7 +372,7 @@ def load_raw_epoch_arm(
         regrid=True,
         subtract_median=False,
         run_sysrem=False,
-        stellar_rest_velocity_kms=velocity_kms,
+        stellar_rest_velocity_kms=None,
         data_mode=mode,
     )
     used_molecfit = prefer_molecfit
@@ -1986,7 +1965,7 @@ def run_edge_trim_calibration(
     )
     overall_status = accepted_status if all_accepted else "failed_or_incomplete"
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "proposed_dataset_specific_edge_trim_calibration",
         "generated_utc": generated.isoformat(),
         "planet": display_planet,
@@ -1996,6 +1975,8 @@ def run_edge_trim_calibration(
         "epochs": list(resolved_epochs),
         "arms": list(resolved_arms),
         "products_required": list(PRODUCTS),
+        "calibration_wavelength_frame": "barycentric",
+        "calibration_wavelength_medium": "vacuum",
         "overall_status": overall_status,
         "canonical_generation_authorized": False,
         "prepared_arrays_written": False,

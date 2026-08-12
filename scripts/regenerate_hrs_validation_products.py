@@ -1,11 +1,10 @@
 #!/usr/bin/env python
 """Regenerate the configured HRS product inventory into an isolated tree.
 
-The canonical ``input/hrs/<mode>/<planet>/.../timeseries_prep.json`` files are
-used only to define the currently supported planet/ephemeris/epoch/arm
-inventory. Every spectrum is rebuilt from the corresponding raw FITS folder.
-Every dataset requires its newest adaptive schema-v3 calibration manifest to be
-accepted post-SYSREM. No canonical prepared or collapsed arrays are modified.
+The raw ``input/hrs/<mode>/raw/<planet>/<epoch>`` folders define the inventory.
+Every spectrum is rebuilt from the corresponding raw FITS folder. Every dataset
+requires its newest adaptive schema-v4 calibration manifest to be accepted
+post-SYSREM. No canonical prepared or collapsed arrays are modified.
 """
 
 from __future__ import annotations
@@ -36,7 +35,7 @@ from dataio.edge_trim_manifest import (
     load_accepted_edge_trim_manifest,
     normalize_dataset_key,
 )
-from dataio.exposure_selection import select_science_exposures
+from dataio.hrs_diagnostic_products import discover_raw_calibration_inventory
 from dataio.prepare_emission_retrieval_timeseries import (
     prepare_arm as prepare_emission_arm,
 )
@@ -79,30 +78,19 @@ def discover_supported_inventory(
     modes: tuple[str, ...],
     planets: set[str],
 ) -> list[dict[str, str]]:
-    """Discover the active prepared inventory without reading its arrays."""
+    """Discover every configured raw epoch/arm without reading prepared arrays."""
 
     records: dict[tuple[str, str, str, str], dict[str, str]] = {}
-    for mode in modes:
-        pattern = f"{mode}/*/*/*/timeseries/timeseries_prep.json"
-        for metadata_path in sorted(CANONICAL_HRS_ROOT.glob(pattern)):
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            planet = str(metadata.get("planet", "")).strip()
-            if not planet:
-                raise ValueError(f"{metadata_path} does not identify its planet.")
-            if planets and normalize_dataset_key(planet) not in planets:
-                continue
-            ephemeris = str(metadata.get("ephemeris", "")).strip()
-            epoch = str(metadata.get("epoch", "")).strip()
-            arm = str(metadata.get("arm", "")).strip().lower()
-            if not ephemeris or not epoch or arm not in {"blue", "red"}:
-                raise ValueError(f"{metadata_path} has an incomplete dataset identity.")
-            active_arms = config_utils.get_hrs_observation_arms(
-                planet,
-                epoch,
-                mode=mode,
-            )
-            if arm not in active_arms:
-                continue
+    raw_inventory = discover_raw_calibration_inventory(CANONICAL_HRS_ROOT)
+    for (mode, raw_slug), entry in raw_inventory.items():
+        if mode not in modes:
+            continue
+        planet = str(entry["planet_display"])
+        planet_slug = normalize_dataset_key(planet)
+        if planets and planet_slug not in planets:
+            continue
+        ephemeris = str(entry["ephemeris"])
+        for epoch, arm in entry["datasets"]:
             raw_dir = config_utils.get_raw_hrs_dir(
                 planet=planet,
                 epoch=epoch,
@@ -112,100 +100,26 @@ def discover_supported_inventory(
                 raise FileNotFoundError(
                     f"Inventory entry {mode}/{planet}/{epoch}/{arm} has no raw directory: {raw_dir}"
                 )
-            key = (mode, normalize_dataset_key(planet), epoch, arm)
+            metadata_candidates = (
+                CANONICAL_HRS_ROOT / mode / raw_slug / epoch / arm / "timeseries_prep.json",
+                CANONICAL_HRS_ROOT / mode / raw_slug / epoch / arm / "timeseries" / "timeseries_prep.json",
+            )
+            metadata_path = next(
+                (path for path in metadata_candidates if path.is_file()),
+                None,
+            )
+            key = (mode, planet_slug, epoch, arm)
             records[key] = {
                 "mode": mode,
                 "planet": planet,
-                "planet_slug": normalize_dataset_key(planet),
+                "planet_slug": planet_slug,
                 "ephemeris": ephemeris,
                 "epoch": epoch,
                 "arm": arm,
                 "raw_dir": str(raw_dir),
-                "inventory_metadata": str(metadata_path),
+                "inventory_metadata": str(metadata_path) if metadata_path else "",
+                "inventory_source": "raw_directory_scan",
             }
-    return [records[key] for key in sorted(records)]
-
-
-def discover_raw_only_transmission_inventory(
-    existing: list[dict[str, str]],
-    *,
-    planets: set[str],
-) -> list[dict[str, str]]:
-    """Add configured raw transmission epochs absent from canonical metadata."""
-
-    records = {
-        (row["mode"], row["planet_slug"], row["epoch"], row["arm"]): row
-        for row in existing
-    }
-    configured_planets = {
-        normalize_dataset_key(name): name for name in config_utils.list_planets()
-    }
-    raw_root = CANONICAL_HRS_ROOT / "transmission" / "raw"
-    if not raw_root.is_dir():
-        return [records[key] for key in sorted(records)]
-
-    for planet_dir in sorted(path for path in raw_root.iterdir() if path.is_dir()):
-        slug = normalize_dataset_key(planet_dir.name)
-        if planets and slug not in planets:
-            continue
-        planet = configured_planets.get(slug)
-        if planet is None:
-            raise ValueError(
-                f"Raw transmission directory {planet_dir} has no configured planet."
-            )
-        recommended = config_utils.get_params(planet, "Recommended")
-        timing_source = str(recommended.get("timing_source", "Recommended"))
-        ephemeris = (
-            timing_source
-            if timing_source in config_utils.list_ephemerides(planet)
-            else "Recommended"
-        )
-        for epoch_dir in sorted(path for path in planet_dir.iterdir() if path.is_dir()):
-            epoch = epoch_dir.name
-            if len(epoch) != 8 or not epoch.isdigit():
-                continue
-            for arm in config_utils.get_hrs_observation_arms(
-                planet,
-                epoch,
-                mode="transmission",
-            ):
-                found = False
-                for do_molecfit in (True, False):
-                    patterns = config_utils.get_data_patterns(
-                        epoch,
-                        planet,
-                        mode=arm,
-                        do_molecfit=do_molecfit,
-                        data_dir=str(epoch_dir),
-                    )
-                    exposure_selection = select_science_exposures(
-                        patterns,
-                        planet_name=planet,
-                        data_mode="transmission",
-                        observation_epoch=epoch,
-                        arm=arm,
-                        do_molecfit=do_molecfit,
-                    )
-                    if exposure_selection.usable_files:
-                        found = True
-                        break
-                if not found:
-                    continue
-                key = ("transmission", slug, epoch, arm)
-                records.setdefault(
-                    key,
-                    {
-                        "mode": "transmission",
-                        "planet": planet,
-                        "planet_slug": slug,
-                        "ephemeris": ephemeris,
-                        "epoch": epoch,
-                        "arm": arm,
-                        "raw_dir": str(epoch_dir),
-                        "inventory_metadata": "",
-                        "inventory_source": "raw_directory_scan",
-                    },
-                )
     return [records[key] for key in sorted(records)]
 
 
@@ -274,7 +188,7 @@ def _process_prepared_product(
             output_dir=output_dir,
         )
         return
-        prepare_emission_arm(
+    prepare_emission_arm(
         arm=record["arm"],
         args=args,
         planet_cfg=params,
@@ -382,8 +296,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--include-raw-only-transmission",
         action="store_true",
         help=(
-            "Add configured raw transmission epochs that do not yet have "
-            "canonical prepared metadata."
+            "Compatibility flag; raw transmission epochs are always included."
         ),
     )
     parser.add_argument(
@@ -422,11 +335,6 @@ def main() -> int:
         )
     planets = {normalize_dataset_key(value) for value in args.planet}
     inventory = discover_supported_inventory(modes=modes, planets=planets)
-    if args.include_raw_only_transmission and "transmission" in modes:
-        inventory = discover_raw_only_transmission_inventory(
-            inventory,
-            planets=planets,
-        )
     if not inventory:
         raise ValueError("No supported HRS datasets matched the requested inventory filters.")
     if args.execute and output_root.exists() and any(output_root.iterdir()):
@@ -449,7 +357,7 @@ def main() -> int:
         "product_scope": (
             "timeseries_only" if args.timeseries_only else "timeseries_and_collapsed"
         ),
-        "edge_trim_policy": "newest_adaptive_schema_v3_accepted_manifest_only",
+        "edge_trim_policy": "newest_adaptive_schema_v4_accepted_manifest_only",
         "datasets": [],
     }
 

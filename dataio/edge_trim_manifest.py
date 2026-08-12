@@ -19,7 +19,7 @@ MANIFEST_FILENAME = "proposed_edge_trim_manifest.json"
 REQUIRED_PRODUCTS = frozenset({"timeseries", "collapse_source"})
 DIAGNOSTIC_ARTIFACT_SUFFIXES = frozenset({".csv", ".json", ".md", ".pdf"})
 MANIFEST_KIND = "proposed_dataset_specific_edge_trim_calibration"
-ADAPTIVE_SCHEMA_VERSION = 3
+ADAPTIVE_SCHEMA_VERSION = 4
 ADAPTIVE_CANDIDATE_STRATEGY = "coarse_grid_with_transition_refinement"
 
 
@@ -101,6 +101,14 @@ def validate_accepted_edge_trim_manifest(
     settings = manifest.get("settings")
     if not isinstance(settings, dict):
         raise EdgeTrimManifestError(f"{path}: settings must be an object.")
+    if manifest.get("calibration_wavelength_frame") != "barycentric":
+        raise EdgeTrimManifestError(
+            f"{path}: calibration_wavelength_frame must be 'barycentric'."
+        )
+    if manifest.get("calibration_wavelength_medium") != "vacuum":
+        raise EdgeTrimManifestError(
+            f"{path}: calibration_wavelength_medium must be 'vacuum'."
+        )
     if settings.get("run_sysrem_finalists") is not True:
         raise EdgeTrimManifestError(
             f"{path}: accepted manifest must record run_sysrem_finalists=true."
@@ -118,7 +126,6 @@ def validate_accepted_edge_trim_manifest(
         "maximum_finalists": 256,
         "run_sysrem_finalists": True,
         "use_molecfit_for_red": True,
-        "apply_stellar_velocity_correction": True,
     }
     if set(settings) != set(required_settings):
         raise EdgeTrimManifestError(
@@ -308,7 +315,7 @@ def load_accepted_edge_trim_widths(
     epoch: str,
     arm: str,
 ) -> tuple[Path, tuple[float, float]]:
-    """Resolve one dataset's exact widths from an accepted schema-v3 manifest."""
+    """Resolve one dataset's exact widths from an accepted schema-v4 manifest."""
 
     key = (str(epoch), normalize_dataset_key(arm))
     selected_path, _manifest, rows = load_accepted_edge_trim_manifest(

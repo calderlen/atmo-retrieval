@@ -407,7 +407,7 @@ def create_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Apply this dataset's exact widths from an accepted adaptive schema-v3 "
+            "Apply this dataset's exact widths from an accepted adaptive schema-v4 "
             "calibration manifest"
         ),
     )
