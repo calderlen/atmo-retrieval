@@ -454,7 +454,6 @@ def select_products(
     product_subgroups: Iterable[str] | None = None,
     include_raw: bool = False,
     include_2d: bool = False,
-    all_science_products: bool = False,
     include_proprietary: bool = False,
     max_products: int | None = 200,
     max_file_bytes: int | None = 2 * 1024**3,
@@ -463,8 +462,6 @@ def select_products(
     """Select a bounded download set using an explicit scientific product profile."""
 
     product_profile = str(product_profile).lower()
-    if all_science_products:
-        product_profile = "all"
     if product_profile not in PRODUCT_PROFILES:
         raise ValueError(
             f"Unknown product profile {product_profile!r}; choose from {PRODUCT_PROFILES}"
@@ -1394,11 +1391,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--include-raw", action="store_true")
     parser.add_argument("--include-2d", action="store_true")
-    parser.add_argument(
-        "--all-science-products",
-        action="store_true",
-        help="Deprecated alias for --product-profile all",
-    )
     parser.add_argument("--include-proprietary", action="store_true")
     parser.add_argument("--token-env", default="MAST_API_TOKEN")
     parser.add_argument("--max-products", type=_positive_limit_count, default=200)
@@ -1507,7 +1499,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             product_subgroups=args.product_subgroup or None,
             include_raw=args.include_raw,
             include_2d=args.include_2d,
-            all_science_products=args.all_science_products,
             include_proprietary=args.include_proprietary,
             max_products=args.max_products,
             max_file_bytes=args.max_file_gb,
@@ -1524,7 +1515,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             products_count=len(products),
             observations=observations,
             selection={
-                "product_profile": "all" if args.all_science_products else args.product_profile,
+                "product_profile": args.product_profile,
                 "product_subgroups": list(args.product_subgroup),
                 "include_raw": bool(args.include_raw),
                 "include_2d": bool(args.include_2d),

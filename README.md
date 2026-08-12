@@ -380,8 +380,7 @@ modules:
 │   ├── collapse_transmission_timeseries_to_1d.py
 │   ├── lsd_doppler_shadow.py
 │   ├── prepare_emission_retrieval_timeseries.py
-│   ├── prepare_retrieval_timeseries.py
-│   └── tellurics.py
+│   └── prepare_retrieval_timeseries.py
 ├── environment.yml
 ├── physics
 │   ├── chemistry_draft.py

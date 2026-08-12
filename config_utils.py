@@ -1074,9 +1074,6 @@ def save_run_config(
         else:
             f.write("\nMCMC: SKIPPED (SVI diagnostic approximation only)\n")
 
-        if config.ENABLE_TELLURICS:
-            f.write("\nTelluric correction: ENABLED\n")
-
         f.write("\n" + "=" * 70 + "\n")
 
     print(f"Run configuration saved to {log_path}")
