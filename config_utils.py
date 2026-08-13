@@ -1006,7 +1006,9 @@ def save_run_config(
         f.write(f"Instrument: {config.INSTRUMENT}\n")
         f.write(f"Observing mode: {config.OBSERVING_MODE}\n")
         wav_min, wav_max = get_wavelength_range()
-        f.write(f"Wavelength range: {wav_min} - {wav_max} Angstroms\n")
+        f.write(
+            f"Configured arm wavelength range: {wav_min} - {wav_max} Angstroms\n"
+        )
         f.write(f"Spectral points: {config.N_SPECTRAL_POINTS}\n")
         f.write(f"Resolution mode: {config.RESOLUTION_MODE}\n")
         f.write(f"Resolution: R = {get_resolution():,}\n\n")
@@ -1023,6 +1025,15 @@ def save_run_config(
         if normalized_mode == "transmission":
             f.write(f"Reference pressure equals RT lower boundary: {reference_pressure_bar:g} bar\n")
         f.write(f"Temperature range: {config.T_LOW} - {config.T_HIGH} K\n")
+        f.write(
+            "Guillot log10(kappa_IR) bounds: "
+            f"{tuple(config.LOG_KAPPA_IR_BOUNDS)}\n"
+        )
+        f.write(
+            "Guillot log10(gamma) bounds: "
+            f"{tuple(config.LOG_GAMMA_BOUNDS)}\n"
+        )
+        f.write(f"FastChem temperature grid points: {config.FASTCHEM_N_TEMP}\n")
         f.write(f"Cloud width: {config.CLOUD_WIDTH}\n")
         f.write(f"Cloud integrated tau: {config.CLOUD_INTEGRATED_TAU}\n\n")
 

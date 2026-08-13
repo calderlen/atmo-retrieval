@@ -1,5 +1,6 @@
 """Opacity setup for molecular and atomic species."""
 
+import hashlib
 import re
 from time import time
 from typing import Callable
@@ -71,6 +72,45 @@ except Exception as exc:  # pragma: no cover - depends on external exojax instal
     ATOMIC_MASSES_DB = {}
     _ATOMIC_BACKEND_IMPORT_ERROR = exc
 OPA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def premodit_cache_signature(
+    nu_grid: np.ndarray,
+    diffmode: int,
+    T_low: float,
+    T_high: float,
+    cutwing: float | None = None,
+) -> str:
+    """Return a stable signature for the numerical PreMODIT grid settings."""
+    grid = np.ascontiguousarray(np.asarray(nu_grid, dtype="<f8"))
+    settings = np.asarray(
+        [float(diffmode), float(T_low), float(T_high), _resolve_cutwing(cutwing)],
+        dtype="<f8",
+    )
+    cache_key = hashlib.sha1()
+    cache_key.update(b"premodit-opacity-v1\0")
+    cache_key.update(grid.tobytes())
+    cache_key.update(settings.tobytes())
+    return cache_key.hexdigest()[:12]
+
+
+def premodit_cache_path(
+    name: str,
+    nu_grid: np.ndarray,
+    diffmode: int,
+    T_low: float,
+    T_high: float,
+    cutwing: float | None = None,
+) -> pathlib.Path:
+    """Return the coexistence-safe cache path for one PreMODIT opacity."""
+    signature = premodit_cache_signature(
+        nu_grid,
+        diffmode,
+        T_low,
+        T_high,
+        cutwing,
+    )
+    return OPA_CACHE_DIR / f"opa_{name}_{signature}.zarr"
 
 # Atomic mass lookup (most common isotopes)
 ATOMIC_MASSES = {
@@ -347,7 +387,14 @@ def build_premodit_from_snapshot(
         allow_32bit=True,
         cutwing=cutwing_val,
     )
-    opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
+    opa_path = premodit_cache_path(
+        mol,
+        nu_grid,
+        diffmode,
+        T_low,
+        T_high,
+        cutwing_val,
+    )
     try:
         saveopa(
             opa,
@@ -382,7 +429,14 @@ def load_or_build_opacity(
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
     cutwing_val = _resolve_cutwing(cutwing)
     if opa_load:
-        opa_path = OPA_CACHE_DIR / f"opa_{mol}.zarr"
+        opa_path = premodit_cache_path(
+            mol,
+            nu_grid,
+            diffmode,
+            T_low,
+            T_high,
+            cutwing_val,
+        )
         try:
             opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
             if not _opa_grid_matches(opa, nu_grid):
@@ -550,7 +604,14 @@ def load_atomic_opacities(
         cache_name = f"atom_{atom.replace(' ', '_')}"
 
         if opa_load:
-            opa_path = OPA_CACHE_DIR / f"opa_{cache_name}.zarr"
+            opa_path = premodit_cache_path(
+                cache_name,
+                nu_grid,
+                diffmode,
+                T_low,
+                T_high,
+                cutwing_val,
+            )
             try:
                 opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
                 if not _opa_grid_matches(opa, nu_grid):

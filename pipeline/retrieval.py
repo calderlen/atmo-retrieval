@@ -41,7 +41,12 @@ from physics.chemistry import (
     FreeVMR,
 )
 from physics.grid_setup import setup_wavenumber_grid, setup_spectral_operators
-from opacities import setup_cia_opacities, load_molecular_opacities, load_atomic_opacities
+from opacities import (
+    load_atomic_opacities,
+    load_molecular_opacities,
+    premodit_cache_signature,
+    setup_cia_opacities,
+)
 from physics.model import (
     BandpassObservationInputs,
     ChunkedSysremInputs,
@@ -2038,6 +2043,7 @@ def _component_output_filename(
 class SpectroscopicComponentBundle:
     name: str
     wav_obs: np.ndarray
+    grid_source_wavelength_range: tuple[float, float]
     data: np.ndarray
     sigma: np.ndarray
     pre_sysrem_data: np.ndarray | None
@@ -2061,6 +2067,41 @@ class BandpassConstraintBundle:
     name: str
     observation_config: object
     observation_inputs: BandpassObservationInputs
+
+
+def _append_resolved_spectral_grid_config(
+    output_dir: str | Path,
+    components: Sequence[SpectroscopicComponentBundle],
+) -> None:
+    """Append the data-resolved model grids after observations are loaded."""
+    log_path = Path(output_dir) / "run_config.log"
+    with log_path.open("a") as handle:
+        handle.write("\nRESOLVED SPECTRAL GRIDS\n")
+        handle.write("-" * 70 + "\n")
+        for component in components:
+            observed_min, observed_max = component.grid_source_wavelength_range
+            model_wavelength = 1.0e8 / np.asarray(component.nu_grid, dtype=float)
+            model_min = float(np.min(model_wavelength))
+            model_max = float(np.max(model_wavelength))
+            signature = premodit_cache_signature(
+                component.nu_grid,
+                config.DIFFMODE,
+                config.T_LOW,
+                config.T_HIGH,
+                config.PREMODIT_CUTWING,
+            )
+            handle.write(f"Component: {component.name}\n")
+            handle.write(
+                "  Observed wavelength range before thinning: "
+                f"{observed_min:.6f} - {observed_max:.6f} Angstroms\n"
+            )
+            handle.write(
+                f"  Model wavelength range: {model_min:.6f} - "
+                f"{model_max:.6f} Angstroms\n"
+            )
+            handle.write(f"  Model spectral points: {component.nu_grid.size}\n")
+            handle.write("  Grid source: complete prepared wavelength array before thinning\n")
+            handle.write(f"  Opacity grid signature: {signature}\n")
 
 
 def _posterior_sample_count(samples: dict[str, np.ndarray]) -> int:
@@ -3035,16 +3076,44 @@ def _prepare_observed_spectrum_arrays(
     return wav_obs, data, sigma, inst_nus
 
 
+def _resolve_model_wavelength_range(
+    wav_obs_before_thinning: np.ndarray,
+) -> tuple[float, float, float, float]:
+    """Resolve observed and padded model bounds from the complete data grid."""
+    wavelengths = np.asarray(wav_obs_before_thinning, dtype=float)
+    if wavelengths.ndim != 1 or wavelengths.size == 0:
+        raise ValueError("Model-grid wavelengths must be a non-empty one-dimensional array.")
+    if np.any(~np.isfinite(wavelengths)) or np.any(wavelengths <= 0.0):
+        raise ValueError("Model-grid wavelengths must be finite and positive.")
+    observed_min = float(np.min(wavelengths))
+    observed_max = float(np.max(wavelengths))
+    if observed_max <= observed_min:
+        raise ValueError("Model-grid wavelengths must span a positive interval.")
+    return (
+        observed_min,
+        observed_max,
+        observed_min - float(config.WAV_MIN_OFFSET),
+        observed_max + float(config.WAV_MAX_OFFSET),
+    )
+
+
 def _build_component_grid_and_ops(
     wav_obs: np.ndarray,
     instrument_resolution: float,
     *,
+    wav_obs_before_thinning: np.ndarray | None = None,
     stellar_vsini: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, object, object]:
     inst_nus = wav2nu(wav_obs, "AA")
+    grid_source = (
+        wav_obs
+        if wav_obs_before_thinning is None
+        else wav_obs_before_thinning
+    )
+    _, _, model_min, model_max = _resolve_model_wavelength_range(grid_source)
     nu_grid, _wav_grid, _res_high = setup_wavenumber_grid(
-        float(np.min(wav_obs)) - config.WAV_MIN_OFFSET,
-        float(np.max(wav_obs)) + config.WAV_MAX_OFFSET,
+        model_min,
+        model_max,
         config.N_SPECTRAL_POINTS,
         unit="AA",
     )
@@ -3083,12 +3152,18 @@ def _build_in_memory_timeseries_component_spec(
     region_name: str | None = None,
     pre_sysrem_data: np.ndarray | None = None,
     pre_sysrem_sigma: np.ndarray | None = None,
+    wav_obs_before_thinning: np.ndarray | None = None,
 ) -> dict[str, Any]:
     spec: dict[str, Any] = {
         "name": name,
         "mode": mode,
         "data_format": data_format,
         "wav_obs": np.asarray(wav_obs),
+        "wav_obs_before_thinning": (
+            np.asarray(wav_obs)
+            if wav_obs_before_thinning is None
+            else np.asarray(wav_obs_before_thinning)
+        ),
         "data": np.asarray(data),
         "sigma": np.asarray(sigma),
         "phase": np.asarray(phase),
@@ -3149,6 +3224,7 @@ def _build_primary_spectroscopic_component(
     name: str,
     mode: str,
     wav_obs: np.ndarray,
+    grid_source_wavelength_range: tuple[float, float],
     data: np.ndarray,
     sigma: np.ndarray,
     phase: np.ndarray,
@@ -3227,6 +3303,7 @@ def _build_primary_spectroscopic_component(
     return SpectroscopicComponentBundle(
         name=name,
         wav_obs=np.asarray(wav_obs),
+        grid_source_wavelength_range=grid_source_wavelength_range,
         data=np.asarray(data),
         sigma=np.asarray(sigma),
         pre_sysrem_data=None if pre_sysrem_data is None else np.asarray(pre_sysrem_data),
@@ -3716,6 +3793,14 @@ def _load_joint_spectroscopic_component(
             "SYSREM inputs were provided."
         )
 
+    wav_obs_before_thinning = np.asarray(
+        spec.get("wav_obs_before_thinning", wav_obs),
+        dtype=float,
+    ).copy()
+    observed_min, observed_max, _, _ = _resolve_model_wavelength_range(
+        wav_obs_before_thinning
+    )
+
     frozen_subset_indices = (
         None
         if frozen_timeseries_operator is None
@@ -3811,6 +3896,7 @@ def _load_joint_spectroscopic_component(
     inst_nus_component, nu_grid, sop_rot, sop_inst = _build_component_grid_and_ops(
         wav_obs,
         instrument_resolution,
+        wav_obs_before_thinning=wav_obs_before_thinning,
         stellar_vsini=(stellar_vsini if component_mode == "emission" else None),
     )
     opa_cias, opa_mols, opa_atoms = _load_opacity_bundle(
@@ -3865,6 +3951,7 @@ def _load_joint_spectroscopic_component(
     return SpectroscopicComponentBundle(
         name=name,
         wav_obs=np.asarray(wav_obs),
+        grid_source_wavelength_range=(observed_min, observed_max),
         data=np.asarray(data),
         sigma=np.asarray(sigma),
         pre_sysrem_data=None if pre_sysrem_data is None else np.asarray(pre_sysrem_data),
@@ -4190,6 +4277,8 @@ def run_retrieval(
     primary_pre_sysrem_sigma: np.ndarray | None = None
     primary_collapsed_emission: CollapsedEmissionInputs | None = None
     primary_collapsed_transmission: CollapsedTransmissionInputs | None = None
+    primary_wav_obs_before_thinning: np.ndarray | None = None
+    primary_grid_source_wavelength_range: tuple[float, float] | None = None
 
     full_arm_mode = (
         config.OBSERVING_MODE == "full"
@@ -4408,6 +4497,18 @@ def run_retrieval(
                     "Choose from {'timeseries', 'spectrum'}."
                 )
 
+        primary_wav_obs_before_thinning = np.asarray(wav_obs, dtype=float).copy()
+        (
+            primary_observed_min,
+            primary_observed_max,
+            _,
+            _,
+        ) = _resolve_model_wavelength_range(primary_wav_obs_before_thinning)
+        primary_grid_source_wavelength_range = (
+            primary_observed_min,
+            primary_observed_max,
+        )
+
         if primary_pre_sysrem_data is not None and primary_pre_sysrem_sigma is not None:
             primary_pre_sysrem_data = np.asarray(primary_pre_sysrem_data)
             primary_pre_sysrem_sigma = np.asarray(primary_pre_sysrem_sigma)
@@ -4526,14 +4627,26 @@ def run_retrieval(
                 "red and blue components build arm-specific grids in step 6."
             )
         else:
-            wav_min, wav_max = config_utils.get_wavelength_range()
+            if primary_wav_obs_before_thinning is None:
+                raise RuntimeError("Primary model-grid wavelengths were not captured.")
+            observed_min, observed_max, model_min, model_max = (
+                _resolve_model_wavelength_range(primary_wav_obs_before_thinning)
+            )
             nu_grid, _wav_grid, _res_high = setup_wavenumber_grid(
-                wav_min - config.WAV_MIN_OFFSET,
-                wav_max + config.WAV_MAX_OFFSET,
+                model_min,
+                model_max,
                 config.N_SPECTRAL_POINTS,
                 unit="AA",
             )
             _preflight_grid_checks(inst_nus, nu_grid)
+            print(
+                "  Complete observed range before thinning: "
+                f"{observed_min:.3f} - {observed_max:.3f} Angstroms"
+            )
+            print(
+                f"  Padded model range: {model_min:.3f} - "
+                f"{model_max:.3f} Angstroms"
+            )
 
             rotation_vsini_max = _rotation_operator_vsini_max(
                 params.get("v_sini_star") if mode == "emission" else None,
@@ -4656,6 +4769,11 @@ def run_retrieval(
             if (joint_spectra or bandpass_constraints)
             else None
         )
+        if (
+            primary_wav_obs_before_thinning is None
+            or primary_grid_source_wavelength_range is None
+        ):
+            raise RuntimeError("Primary model-grid wavelength range was not captured.")
 
         if full_arm_mode:
             primary_component_spec = _build_in_memory_timeseries_component_spec(
@@ -4677,6 +4795,7 @@ def run_retrieval(
                 region_name=primary_region_name,
                 pre_sysrem_data=primary_pre_sysrem_data,
                 pre_sysrem_sigma=primary_pre_sysrem_sigma,
+                wav_obs_before_thinning=primary_wav_obs_before_thinning,
             )
             primary_component_spec.update(
                 {
@@ -4706,6 +4825,7 @@ def run_retrieval(
                 name=primary_component_name,
                 mode=mode,
                 wav_obs=wav_obs,
+                grid_source_wavelength_range=primary_grid_source_wavelength_range,
                 data=data,
                 sigma=sigma,
                 phase=phase,
@@ -4845,6 +4965,8 @@ def run_retrieval(
                 for region_config in atmosphere_region_configs
             )
         )
+
+    _append_resolved_spectral_grid_config(output_dir, spectroscopic_components)
 
     # Run inference
     print("\n[7/7] Running Bayesian inference...")

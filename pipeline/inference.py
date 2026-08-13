@@ -115,7 +115,7 @@ def build_guide(
     prior_modes: dict[str, str] | None = None,
 ) -> AutoGuideList:
     prior_modes = dict(prior_modes or {})
-    guide = AutoGuideList(model_c)
+    guide = AutoGuideList(model_c, init_loc_fn=init_to_median)
     prior_guide = create_prior_guide(
         Mp_mean,
         Mp_std,

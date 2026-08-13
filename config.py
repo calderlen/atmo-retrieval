@@ -2827,8 +2827,11 @@ TRANSMISSION_PRESSURE_BTM = 1e0
 # transmission boundary so changing the grid cannot silently change the
 # radius-pressure meaning.
 TRANSMISSION_REFERENCE_PRESSURE_BAR = 1.0
-EMISSION_PRESSURE_TOP = 1e-4
-EMISSION_PRESSURE_BTM = 1e0
+# Cover the upper line-forming atmosphere and deep continuum anchoring used by
+# the KELT-20b emission analysis. This is the default for all emission runs;
+# transmission retains its independent pressure domain above.
+EMISSION_PRESSURE_TOP = 1e-6
+EMISSION_PRESSURE_BTM = 1e2
 
 # Temperature range [K]
 # Sets the common supported domain for PreMODIT, ART, and FastChem. Profiles

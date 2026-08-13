@@ -200,7 +200,7 @@ diagnostics, not production posterior samples.
 ### Image-specified HRS retrieval runners
 
 The dedicated runners in `scripts/` encode the initial retrieval plan: a
-transmission species ladder, the Fe I/Na I/Ca I dayside model, and the joint
+transmission species ladder, named emission cases, and the joint
 terminator+dayside likelihood. Inspect the resolved parameters and prepared
 data before starting an inference run:
 
@@ -209,7 +209,7 @@ conda run -n retrieval python scripts/run_transmission_retrievals.py --list
 conda run -n retrieval python scripts/run_transmission_retrievals.py \
   --case free_fe --epoch 20190504 --arm red --dry-run
 conda run -n retrieval python scripts/run_emission_retrievals.py \
-  --epoch 20210501 --arm red --dry-run
+  --case fe_only_hybrid --epoch 20210518 --arm blue --dry-run
 conda run -n retrieval python scripts/run_joint_retrievals.py \
   --transmission-epoch 20190504 --emission-epoch 20210501 \
   --arm red --dry-run
@@ -226,6 +226,26 @@ separate Fe I/Fe II velocity offsets. `equilibrium_fe` instead samples only
 `[M/H]` for the chemistry, fixes C/O to solar, and obtains Fe I/Fe II, H2, He,
 continuum abundances, and mean molecular weight from the FastChem grid. It does
 not create simultaneous free Fe VMR sites.
+
+The emission runner defaults to the original constant Fe I/Na I/Ca I case and
+also provides `fe_only_hybrid`, which retrieves a constant Fe I VMR while a
+FastChem grid supplies H, e-, and H- continuum profiles. Use `--atoms` and
+`--chemistry-model` for explicit overrides, for example
+`--atoms "Fe I,Ni I,Ca I" --chemistry-model fastchem_hybrid_grid`. Hybrid cases
+default to `input/fastchem/parameters.dat` and currently also sample
+`log_metallicity` and `C_O_ratio` for the continuum grid. Emission atmospheres
+default to 1e-6--1e2 bar; `--nlayer` controls the resolution across that fixed
+pressure domain. The emission runner uses the KELT-20b paper's Guillot priors,
+`log10(kappa_IR) ~ U(-4, 0)` and `log10(gamma) ~ U(0, 2)`, with numerical
+temperature support from 1500--7500 K. Desktop FastChem grids use at least 75
+temperature points over that interval.
+
+Standalone and joint spectroscopic components build their padded model grids
+from the complete prepared wavelength array before diagnostic spectral
+thinning. This automatically supports both PEPSI blue cross-disperser settings.
+The exact observed/model ranges and opacity-grid signature are appended to
+`run_config.log`; PreMODIT cache filenames include the same numerical-grid
+signature so CD-II and CD-III products coexist.
 
 Emission and joint retrievals require prepared time-series bundles because
 `Kp` is free. If a dry run reports missing files, prepare the emission epoch
