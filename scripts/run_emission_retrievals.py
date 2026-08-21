@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import config
 import config_utils
+from dataio.collapse_emission_timeseries_to_1d import EMISSION_COLLAPSE_SELECTIONS
 
 from pipeline.retrieval_plan import (
     REPO_ROOT,
@@ -162,9 +164,121 @@ def create_parser() -> argparse.ArgumentParser:
         default=REPO_ROOT / "input" / "fastchem" / "parameters.dat",
         help="FastChem parameters.dat used by fastchem_hybrid_grid cases.",
     )
+    parser.add_argument(
+        "--data-format",
+        choices=("timeseries", "spectrum"),
+        default="timeseries",
+        help="Load a prepared exposure time series or a collapsed 1D spectrum.",
+    )
+    parser.add_argument(
+        "--emission-selection",
+        choices=EMISSION_COLLAPSE_SELECTIONS,
+        default=None,
+        help=(
+            "Collapsed emission selection; required with --data-format spectrum."
+        ),
+    )
     parser.add_argument("--epoch", action="append", default=None)
     add_common_arguments(parser)
     return parser
+
+
+def _preflight_collapsed_emission(
+    *,
+    epochs: tuple[str, ...],
+    args: argparse.Namespace,
+) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    arms = tuple(config.FULL_ARM_MEMBERS) if args.arm == "full" else (args.arm,)
+    for epoch in epochs:
+        for arm in arms:
+            data_dir = config_utils.get_collapsed_emission_dir(
+                planet=args.planet,
+                epoch=epoch,
+                arm=arm,
+                selection=args.emission_selection,
+            )
+            required = (
+                data_dir / "wavelength_emission.npy",
+                data_dir / "spectrum_emission.npy",
+                data_dir / "uncertainty_emission.npy",
+                data_dir / "emission_collapse_operator.npz",
+                data_dir / "collapse_metadata.json",
+            )
+            missing = [path.name for path in required if not path.is_file()]
+            status = None
+            if not missing:
+                metadata = json.loads(
+                    (data_dir / "collapse_metadata.json").read_text(encoding="utf-8")
+                )
+                status = str(metadata.get("status", "")).strip().lower()
+            results.append(
+                {
+                    "data_dir": str(data_dir),
+                    "missing": missing,
+                    "status": status,
+                }
+            )
+    return results
+
+
+def _require_ready_collapsed_emission(
+    preflight: list[dict[str, object]],
+) -> None:
+    failures: list[str] = []
+    for row in preflight:
+        if row["missing"]:
+            failures.append(f"{row['data_dir']}: missing {', '.join(row['missing'])}")
+        elif row["status"] != "ready":
+            failures.append(
+                f"{row['data_dir']}: collapse status is {row['status']!r}, expected 'ready'"
+            )
+    if failures:
+        raise FileNotFoundError(
+            "Collapsed emission preflight failed:\n  - " + "\n  - ".join(failures)
+        )
+
+
+def _auxiliary_emission_specs(
+    *,
+    epochs: tuple[str, ...],
+    args: argparse.Namespace,
+    case: RetrievalCase,
+) -> list[dict[str, object]]:
+    if args.data_format == "timeseries":
+        return auxiliary_timeseries_specs(
+            mode="emission",
+            epochs=epochs,
+            args=args,
+            region_name="dayside",
+            atoms=case.atoms,
+        )
+
+    atom_config = atomic_species_dict(case.atoms)
+    arms = tuple(config.FULL_ARM_MEMBERS) if args.arm == "full" else (args.arm,)
+    return [
+        {
+            "name": f"emission_{arm}_{epoch}",
+            "mode": "emission",
+            "region_name": "dayside",
+            "data_format": "spectrum",
+            "data_dir": str(
+                config_utils.get_collapsed_emission_dir(
+                    planet=args.planet,
+                    epoch=epoch,
+                    arm=arm,
+                    selection=args.emission_selection,
+                )
+            ),
+            "radial_velocity_mode": "none",
+            "subtract_weighted_global_mean": True,
+            "atomic_species": atom_config,
+            "molpath_hitemp": {},
+            "molpath_exomol": {},
+        }
+        for epoch in epochs
+        for arm in arms
+    ]
 
 
 def main() -> int:
@@ -176,10 +290,28 @@ def main() -> int:
         return 0
 
     epochs = validate_epochs(args.epoch)
+    if args.data_format == "spectrum" and args.emission_selection is None:
+        raise ValueError(
+            "--data-format spectrum requires --emission-selection "
+            f"({', '.join(EMISSION_COLLAPSE_SELECTIONS)})."
+        )
+    if args.data_format == "timeseries" and args.emission_selection is not None:
+        raise ValueError(
+            "--emission-selection is only valid with --data-format spectrum."
+        )
+    if args.data_format == "spectrum" and args.no_sysrem:
+        raise ValueError(
+            "--no-sysrem is not valid for collapsed spectra; their saved collapse "
+            "operator already records the preprocessing applied to the source cube."
+        )
     case = _resolve_case(args, cases)
     configure_runtime(args, mode="emission", case_name=case.name)
     _configure_paper_emission_atmosphere()
-    preflight = preflight_timeseries(mode="emission", epochs=epochs, args=args)
+    preflight = (
+        preflight_timeseries(mode="emission", epochs=epochs, args=args)
+        if args.data_format == "timeseries"
+        else _preflight_collapsed_emission(epochs=epochs, args=args)
+    )
     fastchem_file = (
         args.fastchem_parameter_file
         if case.chemistry_model == "fastchem_hybrid_grid"
@@ -197,6 +329,8 @@ def main() -> int:
         "log_kappa_ir_bounds": config.LOG_KAPPA_IR_BOUNDS,
         "log_gamma_bounds": config.LOG_GAMMA_BOUNDS,
         "selected_case": args.case,
+        "data_format": args.data_format,
+        "emission_selection": args.emission_selection,
         "case_overrides": {
             "atoms": None if args.atoms is None else args.atoms,
             "chemistry_model": args.chemistry_model,
@@ -228,14 +362,15 @@ def main() -> int:
         raise FileNotFoundError(
             f"FastChem parameter file does not exist: {fastchem_file}"
         )
-    require_ready_timeseries(preflight, args)
+    if args.data_format == "timeseries":
+        require_ready_timeseries(preflight, args)
+    else:
+        _require_ready_collapsed_emission(preflight)
 
-    joint_spectra = auxiliary_timeseries_specs(
-        mode="emission",
+    joint_spectra = _auxiliary_emission_specs(
         epochs=epochs[1:],
         args=args,
-        region_name="dayside",
-        atoms=case.atoms,
+        case=case,
     )
     region = atmosphere_region_spec(
         case,
@@ -250,7 +385,8 @@ def main() -> int:
     run_retrieval(
         mode="emission",
         epoch=epochs[0],
-        data_format="timeseries",
+        data_format=args.data_format,
+        emission_selection=args.emission_selection,
         skip_svi=args.skip_svi,
         svi_only=args.svi_only,
         pt_profile=case.pt_profile,
@@ -262,7 +398,9 @@ def main() -> int:
         sigma_scale=args.sigma_scale,
         spectral_stride=args.spectral_stride,
         spectral_offset=args.spectral_offset,
-        apply_sysrem_override=False if args.no_sysrem else None,
+        apply_sysrem_override=(
+            False if args.data_format == "timeseries" and args.no_sysrem else None
+        ),
         shared_prior_modes=shared_prior_modes(args),
         primary_atomic_species=atomic_species_dict(case.atoms),
         primary_molpath_hitemp={},
