@@ -44,3 +44,9 @@ __jaxcache__/
 
 # Sample code from exojax
 sample/
+
+# Local generated data, databases, and diagnostics
+/cache/
+/db/
+/diagnostics/
+/reference/stellar_lsd_templates/*_pysme_lte_vacuum.json

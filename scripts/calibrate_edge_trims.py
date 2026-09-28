@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run diagnostic-only edge-trim calibrations without Jupyter."""
+"""Calibrate spectral edge trims and write diagnostic proposals."""
 
 from __future__ import annotations
 

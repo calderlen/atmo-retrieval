@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render cross-product spectral-processing diagnostics without Jupyter."""
+"""Compare prepared HRS spectra across epochs, arms, and product types."""
 
 from __future__ import annotations
 

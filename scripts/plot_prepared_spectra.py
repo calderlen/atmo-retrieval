@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render prepared HRS product diagnostics without Jupyter."""
+"""Plot prepared HRS spectra and their diagnostic products."""
 
 from __future__ import annotations
 

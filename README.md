@@ -14,28 +14,28 @@ Repeatable diagnostics and acquisition run without Jupyter:
 
 ```bash
 # Prepared HRS products, including both timeseries and collapse-source bundles.
-conda run -n retrieval python scripts/render_hrs_product_diagnostics.py \
+conda run -n retrieval python scripts/plot_prepared_spectra.py \
   --planet KELT-20b --mode transmission --product both
 
 # Cross-product spectral-processing diagnostics.
-conda run -n retrieval python scripts/render_spectral_processing_diagnostics.py \
+conda run -n retrieval python scripts/compare_prepared_spectra.py \
   --planet KELT-20b --mode transmission
 
 # Discover or run raw-exposure edge-trim calibrations. These commands write
 # diagnostic proposals only; they never regenerate prepared arrays.
-conda run -n retrieval python scripts/run_edge_trim_calibrations.py --list
-conda run -n retrieval python scripts/run_edge_trim_calibrations.py \
+conda run -n retrieval python scripts/calibrate_edge_trims.py --list
+conda run -n retrieval python scripts/calibrate_edge_trims.py \
   --planet KELT-20b --mode transmission
 
 # TESS transit fit and retrieval-ready bandpass table.
-conda run -n retrieval python scripts/run_tess_transit.py --planet KELT-20b
+conda run -n retrieval python scripts/fit_tess_transit.py --planet KELT-20b
 
 # Download the exact checked-in HST selection.
 conda run -n retrieval python scripts/download_mast_products.py \
   --output-dir output/mast/hst-selection
 
 # Reconstruct figures from a completed retrieval.
-conda run -n retrieval python scripts/render_retrieval_diagnostics.py \
+conda run -n retrieval python scripts/plot_retrieval_results.py \
   --run-dir output/kelt20b/Duck24/transmission/2026-04-02_03-53-01
 ```
 

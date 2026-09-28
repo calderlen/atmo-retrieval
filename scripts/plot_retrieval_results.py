@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render saved-run retrieval diagnostics without a notebook."""
+"""Plot results and diagnostics from a saved retrieval run."""
 
 from __future__ import annotations
 

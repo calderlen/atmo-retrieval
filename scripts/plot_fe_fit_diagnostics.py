@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot Fe-template diagnostics from a saved publication spectrum sidecar."""
+"""Plot Fe-fit diagnostics from a saved publication spectrum sidecar."""
 
 from __future__ import annotations
 
