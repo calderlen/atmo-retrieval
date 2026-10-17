@@ -55,18 +55,8 @@ from exojax.database.core_atom.io import air_to_vac
 import config
 import config_utils
 from config_utils import get_data_patterns, get_params, resolve_transit_midpoint
-from dataio.collapse_transmission_timeseries_to_1d import (
-    active_transit_mask,
-    build_out_of_transit_residuals,
-    compute_contact_phases,
-    do_sysrem,
-    get_bjd_tdb,
-    get_ephemeris_epoch_bjd_tdb,
-    get_orbital_phase,
-    get_sysrem_deep_mask,
-    get_telluric_edge_mask,
-    subtract_median_spectrum,
-)
+from dataio.timing import active_transit_mask, compute_contact_phases, get_bjd_tdb, get_ephemeris_epoch_bjd_tdb, get_orbital_phase
+from dataio.spectral_preprocessing import build_out_of_transit_residuals, do_sysrem, get_sysrem_deep_mask, get_telluric_edge_mask, subtract_median_spectrum
 from dataio.exposure_selection import (
     ScienceExposureSelection,
     select_science_exposures,
@@ -292,7 +282,7 @@ def load_raw_epoch_arm(
         mode=mode,
     )
 
-    from dataio.collapse_transmission_timeseries_to_1d import get_pepsi_data
+    from dataio.pepsi import get_pepsi_data
 
     prefer_molecfit = bool(settings.use_molecfit_for_red and arm == "red")
     velocity_metadata = {

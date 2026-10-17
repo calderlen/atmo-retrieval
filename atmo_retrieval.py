@@ -36,11 +36,8 @@ from dataio.collapse_emission_timeseries_to_1d import (
     EMISSION_COLLAPSE_SELECTIONS,
     canonicalize_emission_selection,
 )
-from pipeline.retrieval import (
-    make_bandpass_constraints_from_tbl,
-    make_joint_spectrum_component_from_tbl,
-    run_retrieval,
-)
+from pipeline.retrieval_setup import make_bandpass_constraints_from_tbl, make_joint_spectrum_component_from_tbl
+from pipeline.retrieval import run_retrieval
 from pipeline.retrieval_binned import run_phase_binned_retrieval
 
 

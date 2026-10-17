@@ -32,15 +32,9 @@ import numpy as np
 
 import config
 import config_utils
-from dataio.collapse_transmission_timeseries_to_1d import (
-    compute_contact_phases,
-    get_arm_edge_trim_mask,
-    get_bjd_tdb,
-    get_ephemeris_epoch_bjd_tdb,
-    get_orbital_phase,
-    get_pepsi_data,
-    get_sysrem_ignore_mask,
-)
+from dataio.timing import compute_contact_phases, get_bjd_tdb, get_ephemeris_epoch_bjd_tdb, get_orbital_phase
+from dataio.spectral_preprocessing import get_arm_edge_trim_mask, get_sysrem_ignore_mask
+from dataio.pepsi import get_pepsi_data
 from dataio.edge_trim_manifest import ACCEPTED_STATUS, load_accepted_edge_trim_manifest
 from dataio.stellar_lsd import (
     LSD_EDGE_TRIM_POLICY,

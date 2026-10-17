@@ -21,12 +21,11 @@ from scipy.ndimage import gaussian_filter
 import config
 import config_utils
 from physics.chemistry import ConstantVMR, FastChemHybridChemistry, FreeVMR
-from physics.model import (
-    compute_atmospheric_state_from_posterior,
-    planet_rv_kms,
-    reconstruct_temperature_profile,
-)
-from pipeline import retrieval as _retrieval
+from physics.posterior import compute_atmospheric_state_from_posterior, reconstruct_temperature_profile
+from physics.model import planet_rv_kms
+from pipeline import retrieval_setup as _setup
+from pipeline import retrieval_outputs as _outputs
+from physics import model as _model
 from pipeline.inference import build_guide, build_svi_optimizer
 from plotting.wavelength import pcolormesh_wavelength_segments
 from spectroscopy.spectral_diagnostics import (
@@ -54,7 +53,7 @@ class DiagnosticContext:
     atmosphere_region_configs: tuple[object, ...]
     observation_configs: tuple[object, ...]
     spectroscopic_component_names: tuple[str, ...]
-    spectroscopic_components: dict[str, _retrieval.SpectroscopicComponentBundle]
+    spectroscopic_components: dict[str, _setup.SpectroscopicComponentBundle]
     model_c: Any
     model_inputs: dict[str, object]
 
@@ -179,9 +178,9 @@ def build_diagnostic_context(
 
     with temporary_runtime_config(overrides):
         params = config_utils.get_params(planet, ephemeris)
-        model_params = _retrieval._coerce_model_params(params)
-        shared_art = _retrieval._build_art_for_mode(mode)
-        shared_region_name = _retrieval._default_region_name_for_mode(mode)
+        model_params = _setup._coerce_model_params(params)
+        shared_art = _setup._build_art_for_mode(mode)
+        shared_region_name = _model._default_region_name_for_mode(mode)
         instrument_resolution = config_utils.get_resolution(resolution_mode=resolution_mode)
         apply_sysrem_enabled = (
             bool(config.APPLY_SYSREM_DEFAULT) if apply_sysrem is None else bool(apply_sysrem)
@@ -216,7 +215,7 @@ def build_diagnostic_context(
                     spectral_offset=spectral_offset,
                 ),
             ]
-            shared_system = _retrieval.build_shared_system_config(params=model_params)
+            shared_system = _model.build_shared_system_config(params=model_params)
         else:
             resolved_data_dir = config_utils.get_timeseries_data_dir(
                 planet=planet,
@@ -237,12 +236,12 @@ def build_diagnostic_context(
                     spectral_offset=spectral_offset,
                 )
             ]
-            shared_system = _retrieval.build_shared_system_config(params=model_params)
+            shared_system = _model.build_shared_system_config(params=model_params)
 
-        loaded_components: list[_retrieval.SpectroscopicComponentBundle] = []
-        spectroscopic_components: dict[str, _retrieval.SpectroscopicComponentBundle] = {}
+        loaded_components: list[_setup.SpectroscopicComponentBundle] = []
+        spectroscopic_components: dict[str, _setup.SpectroscopicComponentBundle] = {}
         for spec in component_specs:
-            component = _retrieval._load_joint_spectroscopic_component(
+            component = _setup._load_joint_spectroscopic_component(
                 spec,
                 default_mode=mode,
                 default_tstar=model_params["T_star"],
@@ -264,7 +263,7 @@ def build_diagnostic_context(
         observations_payload = {
             component.name: component.observation_inputs for component in loaded_components
         }
-        atmosphere_region_configs, atmosphere_region_lookup = _retrieval._build_atmosphere_regions(
+        atmosphere_region_configs, atmosphere_region_lookup = _setup._build_atmosphere_regions(
             model_params=model_params,
             primary_mode=mode,
             primary_region_name=shared_region_name,
@@ -277,7 +276,7 @@ def build_diagnostic_context(
             ),
             atmosphere_regions=atmosphere_regions,
         )
-        model_c = _retrieval.create_joint_retrieval_model(
+        model_c = _model.create_joint_retrieval_model(
             shared_system=shared_system,
             atmosphere_regions=atmosphere_region_configs,
             observations=tuple(observation_configs),
@@ -307,7 +306,7 @@ def build_diagnostic_context(
 def _get_spectroscopic_component(
     context: DiagnosticContext,
     component_name: str,
-) -> _retrieval.SpectroscopicComponentBundle:
+) -> _setup.SpectroscopicComponentBundle:
     return context.spectroscopic_components[str(component_name)]
 
 
@@ -669,7 +668,7 @@ def load_saved_run_diagnostics(
         use_median=True,
         sample_prefix=context.shared_region_sample_prefix,
     )
-    model_timeseries, _ = _retrieval._compute_model_timeseries_for_plot(
+    model_timeseries, _ = _outputs._compute_model_timeseries_for_plot(
         posterior_samples=posterior,
         model_params=context.model_params,
         region_config=context.shared_region_config,
@@ -679,7 +678,7 @@ def load_saved_run_diagnostics(
     )
     if model_timeseries is None:
         raise RuntimeError("Could not reconstruct the saved-run model timeseries.")
-    observed_mean, observed_error = _retrieval._summarize_observed_spectrum(
+    observed_mean, observed_error = _outputs._summarize_observed_spectrum(
         component.data,
         component.sigma,
     )
@@ -952,7 +951,7 @@ def synthesize_processed_model_timeseries(
         atmo_state["params"] = dict(atmo_state["params"])
         atmo_state["params"].update(params)
 
-    model_ts = _retrieval._synthesize_timeseries_from_atmospheric_state(
+    model_ts = _outputs._synthesize_timeseries_from_atmospheric_state(
         atmo_state=atmo_state,
         model_params=context.model_params,
         region_config=context.shared_region_config,

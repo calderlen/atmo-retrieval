@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import corner
 
-from physics.model import reconstruct_temperature_profile
+from physics.posterior import reconstruct_temperature_profile
 
 
 _CORNER_LOG10_BASES = frozenset({"kappa_ir_cgs", "gamma"})

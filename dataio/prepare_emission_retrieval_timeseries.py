@@ -32,14 +32,8 @@ from dataio.collapse_emission_timeseries_to_1d import (
     describe_emission_selection,
     emission_selection_mask,
 )
-from dataio.collapse_transmission_timeseries_to_1d import (
-    arm_edge_trim_metadata,
-    get_bjd_tdb,
-    get_ephemeris_epoch_bjd_tdb,
-    get_orbital_phase,
-    get_sysrem_deep_mask,
-    get_sysrem_ignore_mask,
-)
+from dataio.spectral_preprocessing import arm_edge_trim_metadata, get_sysrem_deep_mask, get_sysrem_ignore_mask
+from dataio.timing import get_bjd_tdb, get_ephemeris_epoch_bjd_tdb, get_orbital_phase
 from dataio.edge_trim_manifest import load_accepted_edge_trim_widths
 from dataio.hrs_preparation import (
     load_hrs_arm,

@@ -1,18 +1,25 @@
+from __future__ import annotations
+
 import os
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Callable
-import numpy as np
-import jax
-import jax.numpy as jnp
-from jax.example_libraries import optimizers as jax_optimizers
 
-from numpyro.infer import SVI, Trace_ELBO
+import jax
+from jax import random
+from jax.example_libraries import optimizers as jax_optimizers
+import jax.numpy as jnp
+import numpy as np
 import numpyro
-import numpyro.distributions as dist
-import numpyro.optim as optim
 from numpyro import handlers
+import numpyro.distributions as dist
+from numpyro.infer import MCMC, NUTS, SVI, Trace_ELBO
 from numpyro.infer.autoguide import AutoMultivariateNormal, AutoGuideList
 from numpyro.infer.initialization import init_to_value, init_to_median
+import numpyro.optim as optim
+
+import config
+from pipeline.mcmc_diagnostics import DEFAULT_MCMC_EXTRA_FIELDS
 
 
 class _IndependentPriorGuide:
@@ -345,3 +352,97 @@ def run_svi(
     save_svi_outputs(params, losses, svi_median, output_dir)
 
     return params, losses, init_strategy, svi_median, guide
+
+
+@dataclass(frozen=True)
+class InferenceResult:
+    """Sampler state needed for posterior products; mcmc is None for SVI-only."""
+
+    mcmc: MCMC | None
+    rng_key: jax.Array
+    svi_params: dict | None
+    svi_losses: np.ndarray | None
+    svi_guide: object | None
+
+
+def run_inference(
+    model_c: Callable,
+    model_inputs: dict,
+    model_params: dict,
+    *,
+    output_dir: str | os.PathLike[str],
+    seed: int,
+    skip_svi: bool,
+    svi_only: bool,
+    shared_prior_modes: dict[str, str] | None,
+    save_mcmc_diagnostics: bool,
+) -> InferenceResult:
+    """Run the existing SVI warm start and NUTS sampling sequence."""
+    rng_key = random.PRNGKey(seed)
+
+    init_strategy = init_to_median(num_samples=config.INIT_TO_MEDIAN_SAMPLES)
+    svi_params: dict | None = None
+    svi_guide: object | None = None
+    svi_losses: np.ndarray | None = None
+
+    if not skip_svi:
+        svi_lr_message = f"  SVI warm-up: {config.SVI_NUM_STEPS} steps, LR={config.SVI_LEARNING_RATE}"
+        if config.SVI_LR_DECAY_STEPS is not None and config.SVI_LR_DECAY_RATE is not None:
+            svi_lr_message += (
+                " with exponential decay "
+                f"(steps={config.SVI_LR_DECAY_STEPS}, rate={config.SVI_LR_DECAY_RATE})"
+            )
+        print(svi_lr_message)
+        rng_key, rng_key_ = random.split(rng_key)
+        svi_params, svi_losses, init_strategy, _, svi_guide = run_svi(
+            model_c,
+            rng_key_,
+            model_inputs=model_inputs,
+            Mp_mean=model_params["M_p"],
+            Mp_std=model_params["M_p_err"],
+            Mp_upper_3sigma=model_params.get("M_p_upper_3sigma"),
+            Rp_mean=model_params["R_p"],
+            Rp_std=model_params["R_p_err"],
+            Rstar_mean=model_params["R_star"],
+            Rstar_std=model_params["R_star_err"],
+            output_dir=str(output_dir),
+            num_steps=config.SVI_NUM_STEPS,
+            lr=config.SVI_LEARNING_RATE,
+            lr_decay_steps=config.SVI_LR_DECAY_STEPS,
+            lr_decay_rate=config.SVI_LR_DECAY_RATE,
+            prior_modes=shared_prior_modes,
+        )
+
+        if svi_only:
+            return InferenceResult(None, rng_key, svi_params, svi_losses, svi_guide)
+
+    print(f"\n  Running HMC-NUTS sampling...")
+    print(f"  Warmup: {config.MCMC_NUM_WARMUP}, Samples: {config.MCMC_NUM_SAMPLES}")
+    print(f"  Chains: {config.MCMC_NUM_CHAINS}")
+    print(f"  Chain method: {config.MCMC_CHAIN_METHOD}")
+
+    print(f"  JAX default backend: {jax.default_backend()}")
+    print(f"  JAX local devices: {jax.local_devices()}")
+
+    kernel = NUTS(
+        model_c,
+        max_tree_depth=config.MCMC_MAX_TREE_DEPTH,
+        init_strategy=init_strategy,
+    )
+    mcmc = MCMC(
+        kernel,
+        num_warmup=config.MCMC_NUM_WARMUP,
+        num_samples=config.MCMC_NUM_SAMPLES,
+        num_chains=config.MCMC_NUM_CHAINS,
+        chain_method=config.MCMC_CHAIN_METHOD,
+    )
+
+    rng_key, rng_key_ = random.split(rng_key)
+    mcmc_run_kwargs = dict(model_inputs)
+    if save_mcmc_diagnostics:
+        mcmc_run_kwargs["extra_fields"] = DEFAULT_MCMC_EXTRA_FIELDS
+    mcmc.run(
+        rng_key_,
+        **mcmc_run_kwargs,
+    )
+    return InferenceResult(mcmc, rng_key, svi_params, svi_losses, svi_guide)

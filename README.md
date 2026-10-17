@@ -340,13 +340,20 @@ flowchart TD
 
     subgraph RT[Runtime retrieval path]
         B[pipeline/retrieval.py<br/>orchestration]
+        S[pipeline/retrieval_setup.py<br/>components and atmosphere regions]
+        R[pipeline/retrieval_inputs.py<br/>prepared arrays and frozen operators]
+        O[pipeline/retrieval_outputs.py<br/>posterior predictions and output products]
         C[config runtime settings]
-        D[dataio/load.py<br/>time-series and 1D spectrum loaders]
+        D[dataio/load.py<br/>1D spectrum and table loaders]
         D2[dataio/bandpass.py<br/>bandpass response loader]
+        P[dataio/phoenix.py<br/>stellar spectra and cache]
         E[physics/grid_setup.py<br/>spectral grid and operators]
         F[opacities/loader.py<br/>CIA molecular and atomic opacity loaders]
         G[opacities/atomic_sources.py<br/>Kurucz and VALD helpers]
         H[physics/model.py<br/>joint forward model]
+        Q[physics/opacity.py<br/>optical-depth calculations]
+        V[physics/observation_operators.py<br/>frozen model preprocessing]
+        W[physics/posterior.py<br/>atmospheric reconstruction]
         I[physics/pt.py<br/>P-T profiles]
         J[physics/chemistry.py<br/>composition]
         K[pipeline/inference.py<br/>SVI and NUTS]
@@ -355,22 +362,30 @@ flowchart TD
 
     A --> B
     A --> M
-    M --> D
+    M --> R
     M --> B
 
     B --> C
-    B --> D
-    B --> D2
-    B --> E
-    B --> F
+    B --> S
+    B --> O
+    S --> R
+    S --> D
+    S --> D2
+    S --> P
+    S --> E
+    S --> F
     F --> G
-    B --> H
+    S --> H
+    H --> Q
+    H --> V
     H --> I
     H --> J
     B --> K
-    B --> L
+    O --> W
+    W --> Q
+    O --> L
 
-    T1 -. used directly when data_format is timeseries .-> D
+    T1 -. used directly when data_format is timeseries .-> R
     T1 -. timeseries only .-> M
     T2 -. passed via joint-spectrum-tbl .-> B
     T3 -. passed via bandpass-tbl .-> B
@@ -381,6 +396,15 @@ flowchart TD
 
 - Solid arrows: normal code dependencies or execution flow.
 - Dashed arrows: optional inputs or direct data sources.
+
+Raw HRS preparation, calibration, and LSD workflows share `dataio/pepsi.py`
+for exposure loading and wavelength-frame reconstruction,
+`dataio/spectral_preprocessing.py` for residual construction, masks, and SYSREM,
+and `dataio/timing.py` for BJD conversion and phase selections. The collapsed
+transmission module owns transmission extraction and its command-line workflow.
+Model preprocessing input classes live with their JAX implementations in
+`physics/observation_operators.py`; total and per-species optical depths share
+the implementation in `physics/opacity.py`.
 
 modules:
 
@@ -396,6 +420,10 @@ modules:
 ├── dataio
 │   ├── bandpass.py
 │   ├── load.py
+│   ├── pepsi.py
+│   ├── phoenix.py
+│   ├── spectral_preprocessing.py
+│   ├── timing.py
 │   ├── collapse_emission_timeseries_to_1d.py
 │   ├── collapse_transmission_timeseries_to_1d.py
 │   ├── lsd_doppler_shadow.py
@@ -406,11 +434,17 @@ modules:
 │   ├── chemistry.py
 │   ├── grid_setup.py
 │   ├── model.py
+│   ├── observation_operators.py
+│   ├── opacity.py
+│   ├── posterior.py
 │   └── pt.py
 ├── pipeline
 │   ├── inference.py
 │   ├── memory_profile.py
 │   ├── retrieval_binned.py
+│   ├── retrieval_inputs.py
+│   ├── retrieval_setup.py
+│   ├── retrieval_outputs.py
 │   └── retrieval.py
 ├── plotting
 │   ├── __init__.py

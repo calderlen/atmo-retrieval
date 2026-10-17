@@ -26,14 +26,9 @@ import numpy as np
 from scipy.optimize import least_squares
 
 import config_utils
-from dataio.collapse_transmission_timeseries_to_1d import (
-    compute_contact_phases,
-    get_bjd_tdb,
-    get_ephemeris_epoch_bjd_tdb,
-    get_orbital_phase,
-    get_pepsi_data,
-    get_sysrem_ignore_mask,
-)
+from dataio.timing import compute_contact_phases, get_bjd_tdb, get_ephemeris_epoch_bjd_tdb, get_orbital_phase
+from dataio.pepsi import get_pepsi_data
+from dataio.spectral_preprocessing import get_sysrem_ignore_mask
 from dataio.lsd_doppler_shadow import (
     FIXED_LSD_SHADOW_METHOD,
     FIXED_LSD_SHADOW_SCHEMA_VERSION,

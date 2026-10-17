@@ -9,11 +9,8 @@ from typing import Any
 import numpy as np
 
 import config_utils
-from dataio.collapse_transmission_timeseries_to_1d import (
-    get_pepsi_data,
-    get_sysrem_chunk_indices,
-    get_sysrem_ignore_mask,
-)
+from dataio.pepsi import get_pepsi_data
+from dataio.spectral_preprocessing import get_sysrem_chunk_indices, get_sysrem_ignore_mask
 from dataio.stellar_lsd import load_stellar_velocity_result
 
 

@@ -30,19 +30,8 @@ import numpy as np
 import config
 from config import EPHEMERIS, FULL_ARM_MEMBERS, PHASE_BINS
 from config_utils import get_params, resolve_transit_midpoint
-from dataio.collapse_transmission_timeseries_to_1d import (
-    active_transit_mask,
-    arm_edge_trim_metadata,
-    build_out_of_transit_residuals,
-    compute_contact_phases,
-    do_sysrem,
-    get_bjd_tdb,
-    get_ephemeris_epoch_bjd_tdb,
-    get_orbital_phase,
-    get_phase_bin_mask,
-    get_sysrem_deep_mask,
-    get_sysrem_ignore_mask,
-)
+from dataio.timing import active_transit_mask, compute_contact_phases, get_bjd_tdb, get_ephemeris_epoch_bjd_tdb, get_orbital_phase, get_phase_bin_mask
+from dataio.spectral_preprocessing import arm_edge_trim_metadata, build_out_of_transit_residuals, do_sysrem, get_sysrem_deep_mask, get_sysrem_ignore_mask
 from dataio.edge_trim_manifest import load_accepted_edge_trim_widths
 from dataio.hrs_preparation import (
     load_hrs_arm,
