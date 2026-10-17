@@ -120,10 +120,7 @@ def download_kurucz_gfall(
         return dest
 
     url = f"{KURUCZ_BASE_URL}/{filename}"
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         with open(dest, "wb") as f:
             while True:
@@ -214,18 +211,9 @@ def create_atomic_snapshot(
     T_gQT = np.asarray(adb.T_gQT, dtype=np.float64)
     gQT = np.asarray(adb.gQT_284species, dtype=np.float64)[qt_idx]
 
-    lines = Lines(
-        nu_lines=nu_lines,
-        elower=elower,
-        line_strength_ref_original=Sij0,
-    )
+    lines = Lines(nu_lines=nu_lines, elower=elower, line_strength_ref_original=Sij0)
 
-    meta = MDBMeta(
-        dbtype="exomol",
-        molmass=float(molmass),
-        T_gQT=T_gQT,
-        gQT=gQT,
-    )
+    meta = MDBMeta(dbtype="exomol", molmass=float(molmass), T_gQT=T_gQT, gQT=gQT)
 
     nlines = len(nu_lines)
     # Kurucz/VALD do not supply these ExoMol broadening parameters by default.

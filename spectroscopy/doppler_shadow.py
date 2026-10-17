@@ -353,9 +353,7 @@ def _fit_shadow(
     )
     if planet_exclusion_kms is not None:
         fit_mask &= (
-            np.abs(
-                velocity[np.newaxis, :] - planet_velocity_kms[:, np.newaxis]
-            )
+            np.abs(velocity[np.newaxis, :] - planet_velocity_kms[:, np.newaxis])
             > float(planet_exclusion_kms)
         )
     n_parameters = 3
@@ -479,9 +477,7 @@ def _fit_shadow_with_lambda(
     )
     if planet_exclusion_kms is not None:
         fit_mask &= (
-            np.abs(
-                velocity[np.newaxis, :] - planet_velocity_kms[:, np.newaxis]
-            )
+            np.abs(velocity[np.newaxis, :] - planet_velocity_kms[:, np.newaxis])
             > float(planet_exclusion_kms)
         )
     n_parameters = 4
@@ -615,10 +611,7 @@ def _project_fixed_source_model(
 ) -> dict[str, Any]:
     """Project one fitted LSD shadow onto an exact prepared source grid."""
 
-    source_order = _match_source_exposures(
-        raw["bjd_tdb"],
-        prepared["source_bjd_tdb"],
-    )
+    source_order = _match_source_exposures(raw["bjd_tdb"], prepared["source_bjd_tdb"])
     projection_velocity, removed_velocity = _projection_velocity_grid(
         velocity_grid,
         prepared["metadata"],
@@ -665,10 +658,7 @@ def _enable_prepared_lsd_shadow(
         "source_model_sha256": projection["source_model_sha256"],
         "artifact_file": os.path.relpath(artifact_path, start=data_dir),
         "artifact_sha256": artifact_sha256,
-        "artifact_metadata_file": os.path.relpath(
-            artifact_json_path,
-            start=data_dir,
-        ),
+        "artifact_metadata_file": os.path.relpath(artifact_json_path, start=data_dir),
         "template_sha256": template_sha256,
     }
     model_preprocessing = str(metadata["model_preprocessing"])
@@ -721,14 +711,8 @@ def _save_diagnostic_pdf(
         "Residuals after fitted shadow",
     )
     common_limit = max(_color_limit(values) for values in maps)
-    in_transit = (phase >= float(contacts["T1"])) & (
-        phase <= float(contacts["T4"])
-    )
-    track_plot = np.where(
-        in_transit,
-        track_velocity + velocity_offset,
-        np.nan,
-    )
+    in_transit = (phase >= float(contacts["T1"])) & (phase <= float(contacts["T4"]))
+    track_plot = np.where(in_transit, track_velocity + velocity_offset, np.nan)
     planet_plot = np.where(in_transit, planet_velocity, np.nan)
     for axis, values, title in zip(axes, maps, titles):
         mesh = axis.pcolormesh(
@@ -1127,9 +1111,7 @@ def _fit_arm(
         artifact_metadata.setdefault("prepared_products", {})[product_name] = {
             "product_kind": prepared_product["metadata"]["product_kind"],
             "source_phase_sha256": _array_sha256(prepared_product["source_phase"]),
-            "source_bjd_tdb_sha256": _array_sha256(
-                prepared_product["source_bjd_tdb"]
-            ),
+            "source_bjd_tdb_sha256": _array_sha256(prepared_product["source_bjd_tdb"]),
             "source_wavelength_sha256": _array_sha256(
                 prepared_product["source_wavelength"]
             ),
@@ -1260,14 +1242,10 @@ def fit_doppler_shadow(args: DopplerShadowFitConfig) -> int:
         )
     args.lambda_angle_deg = float(configured_lambda)
     args.limb_darkening_u1 = float(
-        params["gamma1"]
-        if args.limb_darkening_u1 is None
-        else args.limb_darkening_u1
+        params["gamma1"] if args.limb_darkening_u1 is None else args.limb_darkening_u1
     )
     args.limb_darkening_u2 = float(
-        params["gamma2"]
-        if args.limb_darkening_u2 is None
-        else args.limb_darkening_u2
+        params["gamma2"] if args.limb_darkening_u2 is None else args.limb_darkening_u2
     )
 
     template_path = args.template

@@ -52,18 +52,12 @@ def _configured_exposure_ids(
         str(observation_epoch),
         str(arm).strip().lower(),
     )
-    configured = list(
-        getattr(config, "HRS_EXCLUDED_EXPOSURE_IDS", {}).get(key, ())
-    )
+    configured = list(getattr(config, "HRS_EXCLUDED_EXPOSURE_IDS", {}).get(key, ()))
     # Accept the former exact-filename configuration during migration.  Values
     # are canonicalized to exposure IDs so raw and derived products are treated
     # as the same science exposure.
-    configured.extend(
-        getattr(config, "HRS_EXCLUDED_EXPOSURE_FILES", {}).get(key, ())
-    )
-    return tuple(
-        dict.fromkeys(canonical_exposure_id(value) for value in configured)
-    )
+    configured.extend(getattr(config, "HRS_EXCLUDED_EXPOSURE_FILES", {}).get(key, ()))
+    return tuple(dict.fromkeys(canonical_exposure_id(value) for value in configured))
 
 
 @dataclass(frozen=True)
@@ -140,9 +134,7 @@ class ScienceExposureSelection:
             "n_discovered_files": len(self.discovered_files),
             "n_superseded_files": len(self.superseded_files),
             "n_configured_excluded_files": len(self.configured_excluded_files),
-            "n_snr_quality_excluded_files": len(
-                self.snr_quality_excluded_files
-            ),
+            "n_snr_quality_excluded_files": len(self.snr_quality_excluded_files),
             "n_excluded_files": len(self.excluded_files),
             "n_usable_files": len(self.usable_files),
             "configured_exposure_ids": list(self.configured_exposure_ids),
@@ -162,9 +154,7 @@ class ScienceExposureSelection:
                 "requires_both_arms_below_threshold": True,
                 "missing_or_nonfinite_snr": "pass",
                 "fallback_estimator": None,
-                "checks": [
-                    check.metadata() for check in self.snr_quality_checks
-                ],
+                "checks": [check.metadata() for check in self.snr_quality_checks],
             },
             "snr_quality_excluded_files": [
                 path.name for path in self.snr_quality_excluded_files
@@ -377,9 +367,7 @@ def _quality_checks(
     for index, row in enumerate(rows):
         companion, delta_s = companions.get(index, (None, float("nan")))
         q_snr = float(row["q_snr"])
-        companion_q = (
-            float("nan") if companion is None else float(companion["q_snr"])
-        )
+        companion_q = (float("nan") if companion is None else float(companion["q_snr"]))
         if index in excluded_indices:
             reason = "paired_below_hard_threshold"
         elif not np.isfinite(q_snr):
@@ -436,7 +424,6 @@ def apply_paired_snr_quality_rule(
     red_selection: ScienceExposureSelection,
 ) -> tuple[ScienceExposureSelection, ScienceExposureSelection]:
     """Apply the sole automatic S/N cut: both paired arms must have q < 0.4."""
-
 
     blue_rows = _header_snr_rows(blue_selection.usable_files)
     red_rows = _header_snr_rows(red_selection.usable_files)
@@ -496,9 +483,7 @@ def select_science_exposures(
     product_files: tuple[Path, ...] = ()
 
     for pattern in patterns:
-        discovered = tuple(
-            Path(path) for path in sorted(glob(pattern, recursive=True))
-        )
+        discovered = tuple(Path(path) for path in sorted(glob(pattern, recursive=True)))
         if not discovered:
             continue
         matched_pattern = str(pattern)

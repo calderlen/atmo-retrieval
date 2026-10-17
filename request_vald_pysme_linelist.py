@@ -428,7 +428,6 @@ def open_extract_stellar(driver) -> None:
     _wait(driver).until(EC.presence_of_element_located((By.NAME, "stwvl")))
 
 
-
 def _normalized(text: str | None) -> str:
     return " ".join((text or "").strip().lower().split())
 
@@ -437,10 +436,7 @@ def _click_control_with_text(driver, phrases: tuple[str, ...]) -> WebElement:
     """Click a visible link/button/input whose text or value contains a phrase."""
     phrases = tuple(_normalized(p) for p in phrases)
 
-    candidates = driver.find_elements(
-        By.XPATH,
-        "//a | //button | //input",
-    )
+    candidates = driver.find_elements(By.XPATH, "//a | //button | //input")
     for element in candidates:
         if not element.is_displayed():
             continue
@@ -496,9 +492,7 @@ def _choose_option_in_container(
 
         control_id = control.get_attribute("id")
         if control_id:
-            labels = container.find_elements(
-                By.XPATH, f".//label[@for={control_id!r}]"
-            )
+            labels = container.find_elements(By.XPATH, f".//label[@for={control_id!r}]")
             parts.extend(label.text for label in labels)
 
         # VALD forms are table-like; parent text often contains the option label.
@@ -567,11 +561,7 @@ def configure_vald_units(driver) -> None:
         setting_phrases=("energy unit", "energy"),
         desired_phrases=("ev",),
     )
-    _set_unit_setting(
-        driver,
-        setting_phrases=("medium",),
-        desired_phrases=("vacuum",),
-    )
+    _set_unit_setting(driver, setting_phrases=("medium",), desired_phrases=("vacuum",))
     _set_unit_setting(
         driver,
         setting_phrases=("wavelength unit", "wave unit"),
@@ -649,11 +639,7 @@ def fill_extract_stellar(driver, target: Target) -> None:
             names=("micturb", "vmicro", "vmic", "micro"),
             label_fragments=("microturbulence",),
         ),
-        "teff": _find_text_control(
-            driver,
-            names=("teff",),
-            label_fragments=("teff",),
-        ),
+        "teff": _find_text_control(driver, names=("teff",), label_fragments=("teff",)),
         "logg": _find_text_control(
             driver,
             names=("logg", "log_g"),

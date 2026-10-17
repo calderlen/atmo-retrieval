@@ -84,11 +84,7 @@ def _sample_svi_posterior(
         return None
 
     try:
-        svi_draws = guide.sample_posterior(
-            rng_key,
-            params,
-            sample_shape=(num_samples,),
-        )
+        svi_draws = guide.sample_posterior(rng_key, params, sample_shape=(num_samples,))
     except Exception as exc:
         print(f"  Warning: failed to sample SVI posterior for corner plots: {exc}")
         return None
@@ -109,11 +105,7 @@ def _summarize_observed_spectrum(
     if data_arr.ndim == 1:
         return data_arr, sigma_arr
 
-    valid = (
-        np.isfinite(data_arr)
-        & np.isfinite(sigma_arr)
-        & (sigma_arr > 0.0)
-    )
+    valid = (np.isfinite(data_arr) & np.isfinite(sigma_arr) & (sigma_arr > 0.0))
     weights = np.where(valid, 1.0 / np.square(sigma_arr), 0.0)
     weight_sum = np.sum(weights, axis=0)
     obs_mean = np.divide(
@@ -184,14 +176,10 @@ def _synthesize_timeseries_from_atmospheric_state(
     Tarr = jnp.asarray(atmo_state["Tarr"])
     mmw_profile = jnp.asarray(atmo_state["mmw"])
     collapsed_emission = component.observation_inputs.collapsed_emission
-    collapsed_transmission = (
-        component.observation_inputs.collapsed_transmission
-    )
+    collapsed_transmission = (component.observation_inputs.collapsed_transmission)
     frozen_timeseries = component.observation_inputs.frozen_timeseries
     collapsed_operator = (
-        collapsed_emission
-        if collapsed_emission is not None
-        else collapsed_transmission
+        collapsed_emission if collapsed_emission is not None else collapsed_transmission
     )
     phase = np.asarray(component.phase)
     if collapsed_operator is not None:
@@ -239,20 +227,14 @@ def _synthesize_timeseries_from_atmospheric_state(
         stellar_surface_flux=observation_config.stellar_surface_flux,
     )
     if collapsed_emission is not None:
-        model_ts = apply_collapsed_emission_operator(
-            model_ts,
-            collapsed_emission,
-        )
+        model_ts = apply_collapsed_emission_operator(model_ts, collapsed_emission)
     elif collapsed_transmission is not None:
         model_ts = apply_collapsed_transmission_operator(
             model_ts,
             collapsed_transmission,
         )
     elif frozen_timeseries is not None:
-        model_ts = apply_frozen_timeseries_operator(
-            model_ts,
-            frozen_timeseries,
-        )
+        model_ts = apply_frozen_timeseries_operator(model_ts, frozen_timeseries)
     model_ts = apply_model_pipeline_corrections(
         model_ts,
         subtract_weighted_global_mean=observation_config.subtract_weighted_global_mean,
@@ -442,11 +424,7 @@ def _component_publication_model_draws(
         successful_indices.append(int(index))
     if not spectra:
         raise ValueError("No posterior model draws could be reconstructed for this component.")
-    return (
-        np.asarray(spectra),
-        np.asarray(successful_indices, dtype=int),
-        warnings,
-    )
+    return (np.asarray(spectra), np.asarray(successful_indices, dtype=int), warnings)
 
 
 def _bandpass_publication_model_draws(
@@ -1131,7 +1109,6 @@ def write_retrieval_outputs(
     svi_guide = result.svi_guide
     mcmc.print_summary()
 
-    # Save results
     with open(os.path.join(output_dir, "mcmc_summary.txt"), "w") as f:
         with redirect_stdout(f):
             mcmc.print_summary()
@@ -1203,10 +1180,7 @@ def write_retrieval_outputs(
             Tint_fixed=shared_region_config.Tint_fixed,
         )
     except Exception as exc:
-        print(
-            "  Skipping temperature profile plot for HMC samples: "
-            f"{exc}"
-        )
+        print("  Skipping temperature profile plot for HMC samples: " f"{exc}")
 
     component_atmo_states: dict[str, dict] = {}
     print("\n  Computing atmospheric state from posterior...")
@@ -1458,9 +1432,7 @@ def write_retrieval_outputs(
             posterior_by_chain=posterior_sample_by_chain,
             svi_samples=svi_samples_for_plots,
             svi_losses=(
-                None
-                if svi_losses is None
-                else np.asarray(jax.device_get(svi_losses))
+                None if svi_losses is None else np.asarray(jax.device_get(svi_losses))
             ),
             model_params=model_params,
             atmosphere_region_lookup=atmosphere_region_lookup,
@@ -1559,10 +1531,7 @@ def write_svi_only_outputs(
                 Tint_fixed=shared_region_config.Tint_fixed,
             )
         except Exception as exc:
-            print(
-                "  Skipping temperature profile plot for SVI samples: "
-                f"{exc}"
-            )
+            print("  Skipping temperature profile plot for SVI samples: " f"{exc}")
         for component in spectroscopic_components:
             component_region = atmosphere_region_lookup[
                 component.observation_config.region_name

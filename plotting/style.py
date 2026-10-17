@@ -11,9 +11,7 @@ from typing import Any
 import matplotlib
 
 
-COMPUTER_MODERN_BRIGHT_FONTS = (
-    "CMU Bright",
-)
+COMPUTER_MODERN_BRIGHT_FONTS = ("CMU Bright",)
 
 COMPUTER_MODERN_BRIGHT_RCPARAMS = {
     "font.family": COMPUTER_MODERN_BRIGHT_FONTS,

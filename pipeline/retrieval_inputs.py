@@ -78,10 +78,7 @@ def _load_collapsed_emission_operator(
             arrays["selected_exposure_indices"],
             dtype=jnp.int32,
         ),
-        shift_left_indices=jnp.asarray(
-            arrays["shift_left_indices"],
-            dtype=jnp.int32,
-        ),
+        shift_left_indices=jnp.asarray(arrays["shift_left_indices"], dtype=jnp.int32),
         shift_fractions=jnp.asarray(arrays["shift_fractions"], dtype=float),
         coadd_weights=jnp.asarray(arrays["coadd_weights"], dtype=float),
         bin_indices=jnp.asarray(arrays["bin_indices"], dtype=jnp.int32),
@@ -105,10 +102,7 @@ def _load_collapsed_transmission_operator(
     metadata_path = data_dir / "collapse_metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     operator_path = data_dir / str(
-        metadata.get(
-            "collapse_operator_file",
-            "transmission_collapse_operator.npz",
-        )
+        metadata.get("collapse_operator_file", "transmission_collapse_operator.npz")
     )
     with np.load(operator_path) as raw:
         arrays = {name: np.asarray(raw[name]) for name in raw.files}
@@ -147,36 +141,22 @@ def _load_collapsed_transmission_operator(
 
     return CollapsedTransmissionInputs(
         source_wavelength=jnp.asarray(source_wavelength),
-        source_inst_nus=jnp.asarray(
-            wav2nu(source_wavelength[::-1], "AA")
-        ),
+        source_inst_nus=jnp.asarray(wav2nu(source_wavelength[::-1], "AA")),
         source_phase=jnp.asarray(source_phase, dtype=float),
         fixed_source_model=jnp.asarray(fixed_source_model, dtype=float),
-        active_exposure_mask=jnp.asarray(
-            arrays["active_exposure_mask"],
-            dtype=float,
-        ),
+        active_exposure_mask=jnp.asarray(arrays["active_exposure_mask"], dtype=float),
         selected_exposure_indices=jnp.asarray(
             arrays["selected_exposure_indices"],
             dtype=jnp.int32,
         ),
-        shift_left_indices=jnp.asarray(
-            arrays["shift_left_indices"],
-            dtype=jnp.int32,
-        ),
-        shift_fractions=jnp.asarray(
-            arrays["shift_fractions"],
-            dtype=float,
-        ),
+        shift_left_indices=jnp.asarray(arrays["shift_left_indices"], dtype=jnp.int32),
+        shift_fractions=jnp.asarray(arrays["shift_fractions"], dtype=float),
         coadd_weights=jnp.asarray(arrays["coadd_weights"], dtype=float),
         bin_indices=jnp.asarray(arrays["bin_indices"], dtype=jnp.int32),
         bin_weights=jnp.asarray(arrays["bin_weights"], dtype=float),
         output_wavelength=jnp.asarray(output_wavelength),
         output_indices=jnp.asarray(output_indices, dtype=jnp.int32),
-        kp_reference_kms=jnp.asarray(
-            arrays["kp_reference_kms"],
-            dtype=float,
-        ),
+        kp_reference_kms=jnp.asarray(arrays["kp_reference_kms"], dtype=float),
         velocity_offset_reference_kms=jnp.asarray(
             arrays["velocity_offset_reference_kms"],
             dtype=float,
@@ -328,11 +308,7 @@ def _load_sysrem_inputs(data_dir: str | Path) -> dict[str, np.ndarray]:
         raise FileNotFoundError(f"No SYSREM basis file found in {data_dir}.")
     if u_path.suffix == ".npz":
         with np.load(u_path) as data:
-            return {
-                name: np.asarray(data[name])
-                for name in data.files
-                if name != "V"
-            }
+            return {name: np.asarray(data[name]) for name in data.files if name != "V"}
     return {"U": np.load(u_path)}
 
 
@@ -365,9 +341,7 @@ def _build_model_chunked_sysrem(
         chunk_indices=tuple(jnp.asarray(indices, dtype=jnp.int32) for indices in sysrem.chunk_indices),
         U_chunks=tuple(jnp.asarray(U_chunk) for U_chunk in sysrem.U_chunks),
         sigma_chunks=tuple(
-            jnp.asarray(
-                sysrem.projection_sigma[:, np.asarray(indices, dtype=int)]
-            )
+            jnp.asarray(sysrem.projection_sigma[:, np.asarray(indices, dtype=int)])
             for indices in sysrem.chunk_indices
         ),
     )
@@ -401,9 +375,7 @@ def _subset_sysrem_inputs(
             projection_sigma=np.asarray(sysrem.projection_sigma)[indices],
         )
 
-    return SysremInputBundle(
-        U=np.asarray(sysrem.U)[indices],
-    )
+    return SysremInputBundle(U=np.asarray(sysrem.U)[indices])
 
 
 def _spectral_subset_indices(
@@ -557,10 +529,7 @@ def _prepare_observed_spectrum_arrays(
     return wav_obs, data, sigma, inst_nus
 
 
-def _scale_spectroscopic_sigma(
-    sigma: np.ndarray,
-    sigma_scale: float,
-) -> np.ndarray:
+def _scale_spectroscopic_sigma(sigma: np.ndarray, sigma_scale: float) -> np.ndarray:
     if sigma_scale == 1.0:
         return np.asarray(sigma)
     return np.asarray(sigma, dtype=float) * sigma_scale
@@ -573,11 +542,7 @@ def _subtract_inverse_variance_weighted_constant(
     """Project one wavelength-independent offset out of a 1D spectrum."""
     values = np.asarray(values, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
-    weights = 1.0 / np.clip(
-        sigma,
-        config.F32_FLOOR_RECIPSQ,
-        None,
-    ) ** 2
+    weights = 1.0 / np.clip(sigma, config.F32_FLOOR_RECIPSQ, None) ** 2
     weighted_mean = np.sum(weights * values) / np.clip(
         np.sum(weights),
         config.F32_FLOOR_RECIP,

@@ -31,9 +31,7 @@ PLANET = "KELT-20b"
 PLANET_SLUG = "kelt20b"
 EPHEMERIS = "Duck24"
 EPOCH = "20250601"
-CANONICAL_ROOT = (
-    PROJECT_ROOT / "input" / "hrs" / "transmission" / PLANET_SLUG / EPOCH
-)
+CANONICAL_ROOT = (PROJECT_ROOT / "input" / "hrs" / "transmission" / PLANET_SLUG / EPOCH)
 
 
 def create_parser() -> argparse.ArgumentParser:

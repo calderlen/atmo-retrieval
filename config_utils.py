@@ -104,9 +104,7 @@ def derive_planet_kp(planet_params: dict) -> dict:
     }
     missing = [name for name, value in required.items() if value is None]
     if missing:
-        raise ValueError(
-            "Cannot derive Kp without finite " + ", ".join(missing) + "."
-        )
+        raise ValueError("Cannot derive Kp without finite " + ", ".join(missing) + ".")
 
     semi_major_axis_au = float(required["a"])
     period_day = float(required["period"])
@@ -158,9 +156,7 @@ def derive_planet_kp(planet_params: dict) -> dict:
                 "M_p": "jupiter_mass",
             },
             "uncertainty": "not_propagated_without_coherent_posterior_samples",
-            "inputs": {
-                name: float(value) for name, value in required.items()
-            },
+            "inputs": {name: float(value) for name, value in required.items()},
         },
     }
 
@@ -293,9 +289,7 @@ def resolve_transit_midpoint(
             )
         midpoint = float(table[key])
         if not np.isfinite(midpoint):
-            raise ValueError(
-                f"The TTV midpoint configured for {key!r} must be finite."
-            )
+            raise ValueError(f"The TTV midpoint configured for {key!r} must be finite.")
         return midpoint
 
     epoch_number = round((observation_midpoint - reference) / period)
@@ -305,9 +299,7 @@ def resolve_transit_midpoint(
     if model == "quadratic":
         dperiod_depoch = float(planet_params.get("dperiod_depoch", np.nan))
         if not np.isfinite(dperiod_depoch):
-            raise ValueError(
-                "timing_model='quadratic' requires finite dperiod_depoch."
-            )
+            raise ValueError("timing_model='quadratic' requires finite dperiod_depoch.")
         return float(
             reference
             + epoch_number * period
@@ -365,9 +357,7 @@ def _pepsi_data_patterns(
                 patterns.append(f"{base_path}/**/{file_prefix}*.{mode}.{ext}")
         for extraction_mode in pepsi_slice_extraction_modes:
             for ext in pepsi_slice_exts:
-                patterns.append(
-                    f"{base_path}/{file_prefix}*.{extraction_mode}.{ext}"
-                )
+                patterns.append(f"{base_path}/{file_prefix}*.{extraction_mode}.{ext}")
                 patterns.append(
                     f"{base_path}/**/{file_prefix}*.{extraction_mode}.{ext}"
                 )
@@ -422,14 +412,8 @@ def get_pressure_bounds_for_mode(mode: str | None = None) -> tuple[float, float]
     """Return the atmospheric pressure range in bar for a retrieval mode."""
     normalized = _normalize_retrieval_mode(mode)
     if normalized == "transmission":
-        return (
-            config.TRANSMISSION_PRESSURE_TOP,
-            config.TRANSMISSION_PRESSURE_BTM,
-        )
-    return (
-        config.EMISSION_PRESSURE_TOP,
-        config.EMISSION_PRESSURE_BTM,
-    )
+        return (config.TRANSMISSION_PRESSURE_TOP, config.TRANSMISSION_PRESSURE_BTM)
+    return (config.EMISSION_PRESSURE_TOP, config.EMISSION_PRESSURE_BTM)
 
 
 def get_transmission_reference_pressure_bar() -> float:
@@ -647,12 +631,7 @@ def get_timeseries_data_dir(
     mode: str | None = None,
 ) -> Path:
     """Get the retrieval-ready, phase-selected time-series directory."""
-    return get_data_dir(
-        planet=planet,
-        arm=arm,
-        epoch=epoch,
-        mode=mode,
-    ) / "timeseries"
+    return get_data_dir(planet=planet, arm=arm, epoch=epoch, mode=mode) / "timeseries"
 
 
 def get_collapse_source_dir(
@@ -679,12 +658,7 @@ def get_full_arm_timeseries_dirs(
 ) -> dict[str, Path]:
     """Return retrieval-ready time-series directories for both arms."""
     return {
-        arm: get_timeseries_data_dir(
-            planet=planet,
-            arm=arm,
-            epoch=epoch,
-            mode=mode,
-        )
+        arm: get_timeseries_data_dir(planet=planet, arm=arm, epoch=epoch, mode=mode)
         for arm in config.FULL_ARM_MEMBERS
     }
 
@@ -949,9 +923,7 @@ def save_run_config(
             f.write(f"R_ref prior center: {params['R_p']} R_J\n")
             f.write(f"R_ref prior width: {params['R_p_err']} R_J\n")
             f.write(f"Reference pressure P_ref: {reference_pressure_bar:g} bar\n")
-            f.write(
-                "RT radius input: R_ref passed as radius_btm at P_ref\n"
-            )
+            f.write("RT radius input: R_ref passed as radius_btm at P_ref\n")
             f.write(
                 "Interpretation: adopted modeling convention; not a direct "
                 "measurement of R_1bar\n"
@@ -981,9 +953,7 @@ def save_run_config(
         f.write(f"Instrument: {config.INSTRUMENT}\n")
         f.write(f"Observing mode: {config.OBSERVING_MODE}\n")
         wav_min, wav_max = get_wavelength_range()
-        f.write(
-            f"Configured arm wavelength range: {wav_min} - {wav_max} Angstroms\n"
-        )
+        f.write(f"Configured arm wavelength range: {wav_min} - {wav_max} Angstroms\n")
         f.write(f"Spectral points: {config.N_SPECTRAL_POINTS}\n")
         f.write(f"Resolution mode: {config.RESOLUTION_MODE}\n")
         f.write(f"Resolution: R = {get_resolution():,}\n\n")
@@ -1004,10 +974,7 @@ def save_run_config(
             "Guillot log10(kappa_IR) bounds: "
             f"{tuple(config.LOG_KAPPA_IR_BOUNDS)}\n"
         )
-        f.write(
-            "Guillot log10(gamma) bounds: "
-            f"{tuple(config.LOG_GAMMA_BOUNDS)}\n"
-        )
+        f.write(f"Guillot log10(gamma) bounds: {tuple(config.LOG_GAMMA_BOUNDS)}\n")
         f.write(f"FastChem temperature grid points: {config.FASTCHEM_N_TEMP}\n")
         f.write(f"Cloud width: {config.CLOUD_WIDTH}\n")
         f.write(f"Cloud integrated tau: {config.CLOUD_INTEGRATED_TAU}\n\n")

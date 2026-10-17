@@ -57,10 +57,7 @@ import config_utils
 from config_utils import get_data_patterns, get_params, resolve_transit_midpoint
 from dataio.timing import active_transit_mask, compute_contact_phases, get_bjd_tdb, get_ephemeris_epoch_bjd_tdb, get_orbital_phase
 from dataio.spectral_preprocessing import build_out_of_transit_residuals, do_sysrem, get_sysrem_deep_mask, get_telluric_edge_mask, subtract_median_spectrum
-from dataio.exposure_selection import (
-    ScienceExposureSelection,
-    select_science_exposures,
-)
+from dataio.exposure_selection import (ScienceExposureSelection, select_science_exposures)
 from dataio.prepare_retrieval_timeseries import transmission_phase_selection_mask
 
 
@@ -83,9 +80,7 @@ _AIR_PROTECTED_EDGE_LINES = (
 PROTECTED_EDGE_LINES = tuple(
     {
         **line,
-        "rest_vacuum_A": float(
-            air_to_vac(np.asarray([line["rest_air_A"]]))[0]
-        ),
+        "rest_vacuum_A": float(air_to_vac(np.asarray([line["rest_air_A"]]))[0]),
         "rest_wavelength_medium": "vacuum",
         "provenance_wavelength_medium": "air",
     }
@@ -440,9 +435,7 @@ def build_pre_sysrem_branches(raw: Mapping[str, Any]) -> dict[str, dict[str, Any
     out_transit = (phase < contacts["T1"]) | (phase > contacts["T4"])
     active_transit = active_transit_mask(phase, planet_cfg)
     active_interval = (
-        "T14_grazing"
-        if bool(planet_cfg.get("grazing_transit", False))
-        else "T23"
+        "T14_grazing" if bool(planet_cfg.get("grazing_transit", False)) else "T23"
     )
     source_rows = out_transit | active_transit
     if not np.any(out_transit):
@@ -706,11 +699,7 @@ def _matched_baseline_mask(
         (float(lo), float(hi)) for lo, hi in table.get("telluric", [])
     ]
     matching_interval = next(
-        (
-            (lo, hi)
-            for lo, hi in telluric_intervals
-            if lo <= effective_edge_a <= hi
-        ),
+        ((lo, hi) for lo, hi in telluric_intervals if lo <= effective_edge_a <= hi),
         None,
     )
     if matching_interval is None:
@@ -1105,9 +1094,7 @@ def _hard_valid_score_row(row: Mapping[str, Any]) -> bool:
         for reason in str(row.get("rejection_reasons", "")).split(";")
         if reason
     }
-    return math.isfinite(quality_ratio) and reasons <= {
-        "quality_ratio_above_threshold"
-    }
+    return math.isfinite(quality_ratio) and reasons <= {"quality_ratio_above_threshold"}
 
 
 def _best_available_candidate_for_side(
@@ -1141,25 +1128,18 @@ def _best_available_candidate_for_side(
         options.append(
             {
                 "trim_nm": candidate,
-                "worst_quality_ratio": max(
-                    float(row["quality_ratio"]) for row in rows
-                ),
+                "worst_quality_ratio": max(float(row["quality_ratio"]) for row in rows),
             }
         )
     if not options:
         return None
     return min(
         options,
-        key=lambda option: (
-            option["worst_quality_ratio"],
-            option["trim_nm"],
-        ),
+        key=lambda option: (option["worst_quality_ratio"], option["trim_nm"]),
     )
 
 
-def _candidate_pair_plan(
-    score_rows: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
+def _candidate_pair_plan(score_rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     candidates_by_side: dict[str, list[float]] = {}
     threshold_candidates: dict[str, list[float]] = {}
     fallbacks: dict[str, dict[str, float]] = {}
@@ -1211,10 +1191,7 @@ def _post_sysrem_score_rows(
 ) -> list[dict[str, Any]]:
     rows = []
     for product, output in outputs.items():
-        for side, original_trim in (
-            ("left", left_trim_nm),
-            ("right", right_trim_nm),
-        ):
+        for side, original_trim in (("left", left_trim_nm), ("right", right_trim_nm)):
             # The output wavelength starts at the proposed boundary, so zero is
             # the exact evaluation offset on that finalist grid.
             row = score_candidate_side(
@@ -1487,9 +1464,7 @@ def _calibrate_epoch_arm(
         "candidate_strategy": "coarse_grid_with_transition_refinement",
         "coarse_candidates_nm": list(coarse_candidate_grid(settings)),
         "adaptive_refinement_intervals": refinement_intervals,
-        "tested_candidates_nm": {
-            side: list(tested_candidates[side]) for side in SIDES
-        },
+        "tested_candidates_nm": {side: list(tested_candidates[side]) for side in SIDES},
         "candidate_pair_order": "least_total_wavelength_removed",
         "n_joint_pre_sysrem_pairs": candidate_plan["n_threshold_pairs"],
         "n_candidate_pairs_including_fallback": len(pairs),
@@ -1580,10 +1555,7 @@ def _calibrate_epoch_arm(
         selected_outputs = finalist_outputs
         break
 
-    _save_figure(
-        _plot_score_curves(raw, pre_rows, settings, selected_pair),
-        score_path,
-    )
+    _save_figure(_plot_score_curves(raw, pre_rows, settings, selected_pair), score_path)
     figure_paths.append(score_path)
 
     if selected_pair is None or selected_outputs is None:
@@ -1758,10 +1730,7 @@ def run_edge_trim_calibration(
 
     settings = settings or CalibrationSettings()
     display_planet = resolve_planet_name(planet)
-    resolved_datasets = resolve_calibration_datasets(
-        epochs=epochs,
-        datasets=datasets,
-    )
+    resolved_datasets = resolve_calibration_datasets(epochs=epochs, datasets=datasets)
     resolved_epochs = tuple(dict.fromkeys(epoch for epoch, _arm in resolved_datasets))
     resolved_arms = tuple(dict.fromkeys(arm for _epoch, arm in resolved_datasets))
     generated = datetime.now(timezone.utc)

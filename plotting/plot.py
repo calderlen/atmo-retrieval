@@ -531,10 +531,7 @@ def _filter_corner_datasets(
                 break
 
     if dropped:
-        print(
-            "Skipping constant corner column(s): "
-            + ", ".join(dropped)
-        )
+        print("Skipping constant corner column(s): " + ", ".join(dropped))
 
     if not np.any(keep):
         return [], []
@@ -630,14 +627,7 @@ def save_retrieval_corner_plots(
         )
 
 
-# ==============================================================================
 # PHASE-RESOLVED ANALYSIS PLOTS
-# ==============================================================================
-
-# ==============================================================================
-# CONTRIBUTION FUNCTION PLOTS
-# ==============================================================================
-
 def plot_phase_trace(
     posteriors: dict,
     phase: np.ndarray,
@@ -646,45 +636,45 @@ def plot_phase_trace(
     show_exposures: bool = True,
 ) -> None:
     fig, ax = plt.subplots(figsize=(10, 5))
-    
+
     samples = posteriors.get("samples", posteriors)
-    
+
     if param in samples:
         param_samples = np.asarray(samples[param])
-        
+
         if param_samples.ndim == 1:
             mean = np.mean(param_samples)
             std = np.std(param_samples)
             q16, q84 = np.percentile(param_samples, [16, 84])
-            
+
             ax.axhline(mean, color='C0', lw=2, label=f'{param} = {mean:.2f} km/s')
             ax.axhspan(q16, q84, alpha=0.3, color='C0', label='68% CI')
-            
+
         elif param_samples.ndim == 2:
             n_samples, n_exp = param_samples.shape
-            
+
             means = np.mean(param_samples, axis=0)
             stds = np.std(param_samples, axis=0)
             q16 = np.percentile(param_samples, 16, axis=0)
             q84 = np.percentile(param_samples, 84, axis=0)
-            
+
             sort_idx = np.argsort(phase)
             phase_sorted = phase[sort_idx]
             means_sorted = means[sort_idx]
             q16_sorted = q16[sort_idx]
             q84_sorted = q84[sort_idx]
-            
-            ax.fill_between(phase_sorted, q16_sorted, q84_sorted, 
+
+            ax.fill_between(phase_sorted, q16_sorted, q84_sorted,
                           alpha=0.3, color='C0', label='68% CI')
             ax.plot(phase_sorted, means_sorted, 'C0-', lw=2, label='Mean')
-            
+
             if show_exposures:
-                ax.errorbar(phase, means, yerr=stds, fmt='o', color='C0', 
+                ax.errorbar(phase, means, yerr=stds, fmt='o', color='C0',
                           alpha=0.6, markersize=6, capsize=2)
-    
+
     if f"{param}_0" in samples:
         phase_fine = np.linspace(phase.min(), phase.max(), 200)
-        
+
         p0 = np.asarray(samples[f"{param}_0"])
         slope = np.asarray(samples[f"{param}_slope"])
         curves = p0[:, None] + slope[:, None] * phase_fine[None, :]
@@ -694,18 +684,18 @@ def plot_phase_trace(
         ax.fill_between(phase_fine, q16_curve, q84_curve,
                       alpha=0.3, color='C0', label='68% CI')
         ax.plot(phase_fine, mean_curve, 'C0-', lw=2, label='Linear trend')
-    
+
     ax.axhline(0, color='k', ls='--', alpha=0.5, lw=1)
     ax.axvline(0, color='k', ls=':', alpha=0.5, lw=1, label='Mid-transit')
-    
+
     ax.set_xlabel('Orbital Phase', fontsize=12)
     ax.set_ylabel(f'{param} [km/s]', fontsize=12)
     ax.set_title(f'{param} vs Orbital Phase', fontsize=13)
     ax.legend(loc='best', fontsize=10)
     ax.grid(True, alpha=0.3)
-    
+
     fig.tight_layout()
-    
+
     if save_path:
         save_path = save_figure_pdf(fig, save_path, dpi=200)
         plt.close(fig)
@@ -720,37 +710,36 @@ def plot_phase_comparison(
     save_path: str | None = None,
 ) -> None:
     colors = {'T12': 'C0', 'T23': 'C1', 'T34': 'C2'}
-    
+
     fig = None
     handles = []
     labels_legend = []
-    
+
     for bin_name, posteriors in bin_posteriors.items():
         if posteriors is None or "error" in posteriors:
             continue
-        
+
         samples = posteriors.get("samples", posteriors)
         data, labels = _corner_data(samples, params)
-        
+
         if data is None:
             continue
-        
+
         color = colors.get(bin_name, 'C3')
-        
+
         fig = corner.corner(
             data, labels=labels, color=color, bins=30, smooth=1.0,
             fig=fig, show_titles=(bin_name == list(bin_posteriors.keys())[0]),
             plot_contours=True, fill_contours=False,
             hist_kwargs={"alpha": 0.5},
         )
-        
-        # For legend
+
         handles.append(Line2D([0], [0], color=color, lw=2))
         labels_legend.append(bin_name)
-    
+
     if fig is not None:
         fig.legend(handles, labels_legend, loc='upper right', fontsize=12)
-        
+
         if save_path:
             save_path = save_figure_pdf(fig, save_path, dpi=200)
             plt.close(fig)
@@ -766,24 +755,21 @@ def plot_aliasing_matrix(
     threshold: float = 0.3,
 ) -> None:
     fig, ax = plt.subplots(figsize=(10, 8))
-    
+
     # Use diverging colormap centered at 0
     im = ax.imshow(matrix, cmap='RdBu_r', vmin=-1, vmax=1, aspect='equal')
-    
-    # Add colorbar
+
     cbar = plt.colorbar(im, ax=ax, label='Peak Correlation')
-    
-    # Set ticks and labels
+
     ax.set_xticks(np.arange(len(species_names)))
     ax.set_yticks(np.arange(len(species_names)))
     ax.set_xticklabels(species_names, rotation=45, ha='right', fontsize=9)
     ax.set_yticklabels(species_names, fontsize=9)
-    
-    # Add grid
+
     ax.set_xticks(np.arange(len(species_names) + 1) - 0.5, minor=True)
     ax.set_yticks(np.arange(len(species_names) + 1) - 0.5, minor=True)
     ax.grid(which='minor', color='w', linestyle='-', linewidth=0.5)
-    
+
     # Annotate cells with values above threshold
     for i in range(len(species_names)):
         for j in range(len(species_names)):
@@ -791,11 +777,11 @@ def plot_aliasing_matrix(
                 text_color = 'white' if np.abs(matrix[i, j]) > 0.7 else 'black'
                 ax.text(j, i, f'{matrix[i, j]:.2f}', ha='center', va='center',
                        fontsize=8, color=text_color, fontweight='bold')
-    
+
     ax.set_title(f'Species Aliasing Matrix\n(values shown where |r| >= {threshold})', fontsize=13)
-    
+
     fig.tight_layout()
-    
+
     if save_path:
         save_path = save_figure_pdf(fig, save_path, dpi=200)
         plt.close(fig)
@@ -812,23 +798,23 @@ def plot_ccf_pair(
     save_path: str | None = None,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 4))
-    
+
     ax.plot(velocities, ccf, 'C0-', lw=1.5)
     ax.axhline(0, color='k', ls='--', alpha=0.5, lw=1)
     ax.axvline(0, color='r', ls=':', alpha=0.7, lw=1, label='v = 0')
-    
+
     peak_idx = np.argmax(np.abs(ccf))
     ax.scatter(velocities[peak_idx], ccf[peak_idx], s=100, c='r', marker='*',
               zorder=5, label=f'Peak: r = {ccf[peak_idx]:.3f}')
-    
+
     ax.set_xlabel('Velocity [km/s]', fontsize=12)
     ax.set_ylabel('Cross-Correlation', fontsize=12)
     ax.set_title(f'{species_a} × {species_b} Template CCF', fontsize=13)
     ax.legend(loc='best', fontsize=10)
     ax.grid(True, alpha=0.3)
-    
+
     fig.tight_layout()
-    
+
     if save_path:
         save_path = save_figure_pdf(fig, save_path, dpi=200)
         plt.close(fig)
@@ -844,6 +830,7 @@ def _normalize_contribution(raw_contribution: np.ndarray) -> np.ndarray:
     return contribution / contribution_sum
 
 
+# Contribution function plots
 def compute_contribution_function(
     nu_grid: np.ndarray,
     dtau: np.ndarray,
@@ -852,22 +839,12 @@ def compute_contribution_function(
     dParr: np.ndarray,
     mode: str,
 ) -> np.ndarray:
-    """Compute contribution function from optical depth.
-    
-    The contribution function shows which atmospheric layers contribute
-    to the observed spectrum at each wavelength. For emission spectroscopy,
-    it represents the source function weighted by the optical depth gradient.
-    
-    Args:
-        nu_grid: Wavenumber grid (cm^-1)
-        dtau: Optical depth matrix, shape (n_layers, n_wavelength)
-        Tarr: Temperature array per layer
-        pressure: Pressure grid
-        dParr: Pressure differential per layer
-        mode: Retrieval mode, either "transmission" or "emission"
-        
-    Returns:
-        cf: Contribution function, shape (n_layers, n_wavelength)
+    """Return layer contributions with shape (n_layers, n_wavelength).
+
+    nu_grid is in cm^-1; dtau has the output shape, while Tarr, pressure,
+    and dParr are layer arrays. For emission, contributions weight the
+    source function by the optical-depth gradient. mode selects
+    transmission or emission.
     """
     mode = str(mode).lower().strip()
     dtau = np.asarray(dtau, dtype=float)
@@ -903,31 +880,15 @@ def plot_contribution_function(
     title: str | None = None,
     figsize: tuple[float, float] = (10, 6),
 ) -> np.ndarray:
-    """Plot contribution function showing pressure vs wavelength.
-    
-    The contribution function shows which atmospheric pressure levels 
-    contribute to the observed spectrum at each wavelength.
-    
-    Args:
-        nu_grid: Wavenumber grid (cm^-1)
-        dtau: Optical depth matrix, shape (n_layers, n_wavelength)
-        Tarr: Temperature array per layer
-        pressure: Pressure grid (bar)
-        dParr: Pressure differential per layer
-        mode: Retrieval mode, either "transmission" or "emission"
-        save_path: Path to save figure (if None, displays)
-        wavelength_unit: "AA" for Angstroms, "nm" for nanometers, "um" for microns
-        cmap: Colormap name
-        title: Plot title (auto-generated if None)
-        figsize: Figure size
-        
-    Returns:
-        cf: Computed contribution function array
+    """Plot pressure (bar) versus wavelength and return layer contributions.
+
+    nu_grid is in cm^-1, dtau has shape (n_layers, n_wavelength), and
+    Tarr, pressure, and dParr are layer arrays. mode selects transmission
+    or emission. wavelength_unit accepts AA, nm, or um; save_path=None
+    displays the figure.
     """
-    # Compute contribution function
     cf = compute_contribution_function(nu_grid, dtau, Tarr, pressure, dParr, mode=mode)
-    
-    # Convert wavenumber to desired wavelength unit
+
     if wavelength_unit == "AA":
         wave = 1e8 / nu_grid  # cm^-1 to Angstroms
         wave_label = "Wavelength (Angstroms)"
@@ -940,40 +901,38 @@ def plot_contribution_function(
     else:
         wave = nu_grid
         wave_label = "Wavenumber (cm$^{-1}$)"
-    
-    # Create plot
+
     fig, ax = plt.subplots(figsize=figsize)
-    
-    # Use pcolormesh for 2D plot
+
     # Note: wave may be in descending order (from wavenumber conversion)
     # So we need to handle this properly
     if wave[0] > wave[-1]:
         wave = wave[::-1]
         cf = cf[:, ::-1]
-    
+
     im = ax.pcolormesh(wave, pressure, cf, cmap=cmap, shading='auto')
-    
+
     ax.set_yscale('log')
     ax.invert_yaxis()
     ax.set_xlabel(wave_label, fontsize=12)
     ax.set_ylabel('Pressure (bar)', fontsize=12)
-    
+
     cbar = plt.colorbar(im, ax=ax, label='Contribution')
-    
+
     if title:
         ax.set_title(title, fontsize=13)
     else:
         ax.set_title('Atmospheric Contribution Function', fontsize=13)
-    
+
     fig.tight_layout()
-    
+
     if save_path:
         save_path = save_figure_pdf(fig, save_path, dpi=200)
         plt.close(fig)
         print(f"Contribution function plot saved to {save_path}")
     else:
         plt.show()
-    
+
     return cf
 
 
@@ -990,37 +949,21 @@ def plot_contribution_per_species(
     figsize_per_panel: tuple[float, float] = (8, 4),
     ncols: int = 2,
 ) -> dict[str, np.ndarray]:
-    """Plot contribution function for each species separately.
-    
-    Creates a multi-panel figure showing the contribution function
-    for each species, useful for understanding which species dominate
-    at different wavelengths and pressure levels.
-    
-    Args:
-        nu_grid: Wavenumber grid (cm^-1)
-        dtau_per_species: Dict mapping species name -> dtau array
-        Tarr: Temperature array per layer
-        pressure: Pressure grid (bar)
-        dParr: Pressure differential per layer
-        mode: Retrieval mode, either "transmission" or "emission"
-        save_path: Path to save figure
-        wavelength_unit: "AA", "nm", "um", or "cm-1"
-        cmap: Colormap name
-        figsize_per_panel: Size of each subplot
-        ncols: Number of columns in subplot grid
-        
-    Returns:
-        Dict mapping species name -> contribution function array
+    """Plot each species' layer contributions and return them by species.
+
+    nu_grid is in cm^-1; dtau_per_species maps names to optical-depth
+    arrays. Tarr, pressure (bar), and dParr are layer arrays. mode selects
+    transmission or emission; wavelength_unit accepts AA, nm, um, or cm-1.
     """
     n_species = len(dtau_per_species)
     if n_species == 0:
         print("No species to plot")
         return {}
-    
+
     nrows = (n_species + ncols - 1) // ncols
     fig_width = figsize_per_panel[0] * ncols
     fig_height = figsize_per_panel[1] * nrows
-    
+
     fig, axes = plt.subplots(nrows, ncols, figsize=(fig_width, fig_height))
     if n_species == 1:
         axes = np.array([[axes]])
@@ -1028,8 +971,7 @@ def plot_contribution_per_species(
         axes = axes.reshape(1, -1)
     elif ncols == 1:
         axes = axes.reshape(-1, 1)
-    
-    # Convert wavelength
+
     if wavelength_unit == "AA":
         wave = 1e8 / nu_grid
         wave_label = "Wavelength (Angstroms)"
@@ -1042,27 +984,26 @@ def plot_contribution_per_species(
     else:
         wave = nu_grid
         wave_label = "Wavenumber (cm$^{-1}$)"
-    
+
     # Handle wavelength ordering
     if wave[0] > wave[-1]:
         wave = wave[::-1]
         flip_wave = True
     else:
         flip_wave = False
-    
+
     cf_dict = {}
-    
+
     for idx, (species, dtau) in enumerate(dtau_per_species.items()):
         row = idx // ncols
         col = idx % ncols
         ax = axes[row, col]
-        
-        # Compute contribution function for this species
+
         cf = compute_contribution_function(nu_grid, dtau, Tarr, pressure, dParr, mode=mode)
         if flip_wave:
             cf = cf[:, ::-1]
         cf_dict[species] = cf
-        
+
         im = ax.pcolormesh(wave, pressure, cf, cmap=cmap, shading='auto')
         ax.set_yscale('log')
         ax.invert_yaxis()
@@ -1070,23 +1011,22 @@ def plot_contribution_per_species(
         ax.set_ylabel('Pressure (bar)', fontsize=10)
         ax.set_title(species, fontsize=11)
         plt.colorbar(im, ax=ax)
-    
-    # Hide empty subplots
+
     for idx in range(n_species, nrows * ncols):
         row = idx // ncols
         col = idx % ncols
         axes[row, col].set_visible(False)
-    
+
     fig.suptitle('Contribution Function by Species', fontsize=13, y=1.02)
     fig.tight_layout()
-    
+
     if save_path:
         save_path = save_figure_pdf(fig, save_path, dpi=200, bbox_inches='tight')
         plt.close(fig)
         print(f"Per-species contribution plot saved to {save_path}")
     else:
         plt.show()
-    
+
     return cf_dict
 
 
@@ -1103,60 +1043,45 @@ def plot_contribution_combined(
     species_to_show: list[str] | None = None,
     figsize: tuple[float, float] = (12, 8),
 ) -> None:
-    """Create combined contribution function plot with total and per-species panels.
-    
-    Shows the total contribution function alongside individual species
-    contributions.
-    
-    Args:
-        nu_grid: Wavenumber grid
-        dtau: Total optical depth matrix
-        dtau_per_species: Dict of per-species dtau
-        Tarr: Temperature profile
-        pressure: Pressure grid
-        dParr: Pressure differentials
-        mode: Retrieval mode, either "transmission" or "emission"
-        save_path: Path to save figure
-        wavelength_unit: Wavelength unit for x-axis
-        species_to_show: List of species to show (None = all)
-        figsize: Figure size
+    """Plot total and per-species contribution panels.
+
+    nu_grid is in cm^-1; dtau and dtau_per_species contain optical-depth
+    arrays. Tarr, pressure, and dParr are layer arrays. mode selects
+    transmission or emission; species_to_show=None includes all species.
     """
-    # Convert wavelength
     if wavelength_unit == "AA":
         wave = 1e8 / nu_grid
         wave_label = "Wavelength"
     else:
         wave = nu_grid
         wave_label = "Wavenumber"
-    
+
     if wave[0] > wave[-1]:
         wave = wave[::-1]
         flip = True
     else:
         flip = False
-    
-    # Filter species if requested
+
     if species_to_show is not None:
         filtered_dtau_per_species = {}
         for k, v in dtau_per_species.items():
             if k in species_to_show:
                 filtered_dtau_per_species[k] = v
         dtau_per_species = filtered_dtau_per_species
-    
+
     n_species = len(dtau_per_species)
-    
-    # Create figure with gridspec
+
     fig = plt.figure(figsize=figsize)
-    
+
     # Main panel for combined + species subpanels
     gs = fig.add_gridspec(2, max(2, (n_species + 1) // 2 + 1), height_ratios=[2, 1])
-    
+
     # Top panel: Total contribution function
     ax_total = fig.add_subplot(gs[0, :])
     cf_total = compute_contribution_function(nu_grid, dtau, Tarr, pressure, dParr, mode=mode)
     if flip:
         cf_total = cf_total[:, ::-1]
-    
+
     im = ax_total.pcolormesh(wave, pressure, cf_total, cmap='viridis', shading='auto')
     ax_total.set_yscale('log')
     ax_total.invert_yaxis()
@@ -1164,17 +1089,17 @@ def plot_contribution_combined(
     ax_total.set_ylabel('Pressure (bar)', fontsize=11)
     ax_total.set_title('Combined Contribution Function', fontsize=12)
     plt.colorbar(im, ax=ax_total, label='Contribution', shrink=0.8)
-    
+
     # Bottom panels: Per-species
     for idx, (species, sp_dtau) in enumerate(dtau_per_species.items()):
         if idx >= gs.ncols:
             break
         ax = fig.add_subplot(gs[1, idx])
-        
+
         cf_sp = compute_contribution_function(nu_grid, sp_dtau, Tarr, pressure, dParr, mode=mode)
         if flip:
             cf_sp = cf_sp[:, ::-1]
-        
+
         im_sp = ax.pcolormesh(wave, pressure, cf_sp, cmap='viridis', shading='auto')
         ax.set_yscale('log')
         ax.invert_yaxis()
@@ -1182,9 +1107,9 @@ def plot_contribution_combined(
         if idx == 0:
             ax.set_ylabel('P (bar)', fontsize=9)
         ax.set_title(species, fontsize=10)
-    
+
     fig.tight_layout()
-    
+
     if save_path:
         save_path = save_figure_pdf(fig, save_path, dpi=200, bbox_inches='tight')
         plt.close(fig)

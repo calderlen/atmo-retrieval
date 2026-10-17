@@ -109,7 +109,6 @@ def emission_phase_selection_mask(
         return emission_selection_mask(phase_01, "post_eclipse", planet_params)
 
 
-
 def _save_metadata(
     output_dir: Path,
     *,
@@ -437,9 +436,7 @@ def prepare_arm(
             "ephemeris_epoch_scale": str(planet_cfg["epoch_scale"]).lower(),
             "ephemeris_epoch_reference": planet_cfg["epoch_reference"],
             "ephemeris_epoch_bjd_tdb": reference_epoch_bjd_tdb,
-            "input_time_provenance": dict(
-                extras.get("input_time_provenance", {})
-            ),
+            "input_time_provenance": dict(extras.get("input_time_provenance", {})),
         }
     )
     t0 = resolve_transit_midpoint(

@@ -36,13 +36,8 @@ from dataio.hrs_diagnostic_products import discover_raw_calibration_inventory
 from dataio.prepare_emission_retrieval_timeseries import (
     prepare_arm as prepare_emission_arm,
 )
-from dataio.prepare_retrieval_timeseries import (
-    prepare_arm as prepare_transmission_arm,
-)
-from spectroscopy.doppler_shadow import (
-    DopplerShadowFitConfig,
-    fit_doppler_shadow,
-)
+from dataio.prepare_retrieval_timeseries import (prepare_arm as prepare_transmission_arm)
+from spectroscopy.doppler_shadow import (DopplerShadowFitConfig, fit_doppler_shadow)
 
 
 CANONICAL_HRS_ROOT = PROJECT_ROOT / "input" / "hrs"
@@ -220,11 +215,7 @@ def _collapse_products(record: dict[str, str], *, dataset_root: Path) -> list[di
     return results
 
 
-def _fit_transmission_lsd_shadow(
-    record: dict[str, str],
-    *,
-    dataset_root: Path,
-) -> None:
+def _fit_transmission_lsd_shadow(record: dict[str, str], *, dataset_root: Path) -> None:
     """Fit once and install exact-grid LSD models in both source products."""
 
     fit_doppler_shadow(
@@ -324,9 +315,7 @@ def main() -> int:
         "datasets": [],
     }
 
-    planned: list[
-        tuple[dict[str, str], tuple[float, float], str, str]
-    ] = []
+    planned: list[tuple[dict[str, str], tuple[float, float], str, str]] = []
     for record in inventory:
         widths, trim_source, trim_status = _edge_trim_for(
             record,
@@ -358,12 +347,7 @@ def main() -> int:
         planned,
         start=1,
     ):
-        key = (
-            record["mode"],
-            record["planet_slug"],
-            record["epoch"],
-            record["arm"],
-        )
+        key = (record["mode"], record["planet_slug"], record["epoch"], record["arm"])
         row = manifest_rows[key]
         dataset_root = output_root.joinpath(*key)
         row["status"] = "running"
@@ -392,10 +376,7 @@ def main() -> int:
                 apply_stellar_rest=bool(args.apply_stellar_rest),
             )
             if record["mode"] == "transmission":
-                _fit_transmission_lsd_shadow(
-                    record,
-                    dataset_root=dataset_root,
-                )
+                _fit_transmission_lsd_shadow(record, dataset_root=dataset_root)
             collapsed = _collapse_products(record, dataset_root=dataset_root)
         row["status"] = "complete"
         row["collapsed_statuses"] = [

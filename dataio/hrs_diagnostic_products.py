@@ -69,10 +69,7 @@ def discover_prepared_inventory(
         )
         if arm not in active_arms:
             continue
-        paths = {
-            name: root / mode / slug / epoch / arm / name
-            for name in PRODUCTS
-        }
+        paths = {name: root / mode / slug / epoch / arm / name for name in PRODUCTS}
         key = (mode, slug)
         inventory[key]["planet_display"] = display_planet
         inventory[key]["ephemerides"].add(metadata.get("ephemeris"))

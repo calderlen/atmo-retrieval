@@ -449,12 +449,7 @@ def _plot_velocity_scan(
     peak_index = int(np.nanargmax(snr_q[2]))
     zero_index = int(np.argmin(np.abs(velocities)))
 
-    fig, (snr_axis, alpha_axis) = plt.subplots(
-        2,
-        1,
-        figsize=(7.4, 6.1),
-        sharex=True,
-    )
+    fig, (snr_axis, alpha_axis) = plt.subplots(2, 1, figsize=(7.4, 6.1), sharex=True)
     snr_axis.fill_between(velocities, snr_q[0], snr_q[4], color="tab:orange", alpha=0.12)
     snr_axis.fill_between(velocities, snr_q[1], snr_q[3], color="tab:orange", alpha=0.28)
     snr_axis.plot(velocities, snr_q[2], color="tab:orange", lw=1.2)

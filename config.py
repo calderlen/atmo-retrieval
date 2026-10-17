@@ -13,9 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-# ==============================================================================
 # PLANET SYSTEM PARAMETERS
-# ==============================================================================
 
 # Active planet and ephemeris (can be overridden via CLI)
 PLANET = "KELT-20b"
@@ -24,9 +22,7 @@ EPHEMERIS = "Duck24"
 # Fallback defaults for Doppler shadow utilities
 DEFAULT_PERIOD_DAY = 1.0
 
-# ==============================================================================
 # Phase Bin Definitions
-# ==============================================================================
 
 # Standard transit contact points:
 # T1 = first contact (start of ingress)
@@ -1225,9 +1221,7 @@ PLANETS = {
     },
 }
 
-# ==============================================================================
 # RECOMMENDED COMPOSITE SYSTEM PROFILES
-# ==============================================================================
 #
 # These flat profiles intentionally combine the most useful timing, transit-
 # geometry, and stellar-line-profile measurements.  The older publication-
@@ -2685,13 +2679,7 @@ for _planet_profiles in PLANETS.values():
         _planet_profiles["Recommended"]["profile_kind"] = "recommended_composite"
 del _planet_profiles
 
-# ==============================================================================
-# INSTRUMENT CONFIGURATION
-# ==============================================================================
-
-# ==============================================================================
-# ACTIVE SELECTION (global state, can be modified at runtime)
-# ==============================================================================
+# Instrument configuration: active selection (global state).
 
 OBSERVATORY = "lbt"
 INSTRUMENT = "PEPSI"
@@ -2699,9 +2687,7 @@ OBSERVING_MODE = "full"
 RESOLUTION_MODE = "hr"  # Options: "standard" (R=50k), "hr" (R=130k), "uhr" (R=270k)
 
 
-# ==============================================================================
 # INSTRUMENT DATABASE
-# ==============================================================================
 
 # Common PEPSI header keys (shared across all modes)
 _PEPSI_HEADER_KEYS = {
@@ -2734,9 +2720,7 @@ _PEPSI_FITS_COLUMNS = {
 
 
 # TODO: maybe hardcoding the telluric regions is a bad idea
-# ==============================================================================
 # TELLURIC REGIONS (wavelength ranges in Angstroms)
-# ==============================================================================
 
 # From Lenhart et al. 2026 Table 2 (PEPSI observations)
 TELLURIC_REGIONS: dict[str, dict[str, list[tuple[float, float]]]] = {
@@ -2797,13 +2781,7 @@ INSTRUMENTS: dict[str, dict[str, dict]] = {
     },
 }
 
-# ==============================================================================
-# RADIATIVE TRANSFER MODEL PARAMETERS
-# ==============================================================================
-
-# ==============================================================================
-# RETRIEVAL MODE
-# ==============================================================================
+# Radiative transfer model: retrieval mode
 
 RETRIEVAL_MODE = "transmission"  # Options: "transmission", "emission"
 
@@ -2811,9 +2789,7 @@ RETRIEVAL_MODE = "transmission"  # Options: "transmission", "emission"
 TRANSMISSION_PT_PROFILE_DEFAULT = "isothermal"
 EMISSION_PT_PROFILE_DEFAULT = "guillot"
 
-# ==============================================================================
 # ATMOSPHERIC RT PARAMETERS
-# ==============================================================================
 
 DIFFMODE = 0
 NLAYER = 10 # number of atmospheric layers (runtime profiles below override)
@@ -2867,10 +2843,10 @@ LOG_KAPPA_IR_BOUNDS = (-3.0, -1.0)
 LOG_GAMMA_BOUNDS = (-1.0, 1.0)
 
 DEFAULT_KP = 169.0  # planet radial velocity semi-amplitude [km/s]
-DEFAULT_KP_ERR = 20.0 
+DEFAULT_KP_ERR = 20.0
 DEFAULT_RV_ABS = 0.0 # absolute stellar systemic velocity metadata [km/s]; not a model shift
 DEFAULT_RV_ABS_ERR = 1.0 # metadata uncertainty [km/s]
-DEFAULT_TSTAR = 6000.0 # stellar temperature [K] 
+DEFAULT_TSTAR = 6000.0 # stellar temperature [K]
 DEFAULT_RP_ERR = 0.1 # planet radius error (relative to Rp/Rs)
 DEFAULT_MP_ERR = 0.1 # planet mass error (relative to Mp/Ms)
 DEFAULT_RSTAR_ERR = 0.1 # stellar radius error (relative to Rstar)
@@ -2882,12 +2858,9 @@ DEFAULT_POSTERIOR_MP = 1.0 # Maximum Mp/Ms for posterior reconstruction
 # Pipeline behavior defaults
 APPLY_SYSREM_DEFAULT = True # Apply the stored SYSREM distortion operator to the model before the Gaussian likelihood. Requires U and V from data preprocessing.
 
-# ==============================================================================
 # SPECTRAL GRID PARAMETERS
-# ==============================================================================
 
 N_SPECTRAL_POINTS = 500000
-#N_SPECTRAL_POINTS = 50000
 WAV_MIN_OFFSET = 100  # Angstroms
 WAV_MAX_OFFSET = 100  # Angstroms
 
@@ -2895,20 +2868,12 @@ WAV_MAX_OFFSET = 100  # Angstroms
 # Line-wing truncation (relative to grid spacing). Set to None to use the default.
 PREMODIT_CUTWING = None
 
-# ==============================================================================
 # CLOUD/HAZE PARAMETERS
-# ==============================================================================
 
 CLOUD_WIDTH = 1.0 / 20.0  # Cloud width in log10(P)
-CLOUD_INTEGRATED_TAU = 30.0 
+CLOUD_INTEGRATED_TAU = 30.0
 
-# ==============================================================================
-# DATABASE, DATA, AND OUTPUT PATHS
-# ==============================================================================
-
-# ==============================================================================
-# BASE DIRECTORIES
-# ==============================================================================
+# Database, data, and output paths: base directories
 
 # Root of the project.
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -2934,9 +2899,7 @@ PHOENIX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 OPA_CACHE_DIR = CACHE_DIR / "opacity"
 OPA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ==============================================================================
 # DATABASE PATHS
-# ==============================================================================
 
 DB_ROOT_DIR = PROJECT_ROOT / "db"
 DB_ROOT_DIR.mkdir(exist_ok=True)
@@ -3049,9 +3012,7 @@ ATOMIC_SPECIES = {
     "Y II": {"element": "Y", "ionization": 1},
 }
 
-# ==============================================================================
 # DATA PATHS
-# ==============================================================================
 
 FULL_ARM_MEMBERS: tuple[str, ...] = ("red", "blue")
 
@@ -3089,9 +3050,7 @@ else:
 
 del _DEFAULT_PLANET_SLUG
 
-# ==============================================================================
 # OUTPUT CONFIGURATION
-# ==============================================================================
 
 # Default output directory for phase-binned runs
 DEFAULT_PHASE_BINNED_OUTPUT_DIR = PROJECT_ROOT / "output" / "phase_binned"
@@ -3109,9 +3068,7 @@ OPA_SAVE = False
 USE_KURUCZ = True
 USE_VALD = True
 
-# ==============================================================================
 # DEFAULT SPECIES SELECTION
-# ==============================================================================
 # Species detected in literature (used by default unless --all-species is set)
 # Based on high-resolution detections from multiple instruments (PEPSI, HARPS-N,
 # CARMENES, EXPRES, FIES) - see literature compilation table.
@@ -3137,22 +3094,14 @@ DEFAULT_SPECIES = {
 # Set to True to use DEFAULT_SPECIES by default, False to use all available species
 USE_DEFAULT_SPECIES = True
 
-# ==============================================================================
-# INFERENCE PARAMETERS
-# ==============================================================================
-
-# ==============================================================================
-# SVI PARAMETERS
-# ==============================================================================
+# Inference: SVI parameters
 
 SVI_NUM_STEPS = 2000
 SVI_LEARNING_RATE = 0.001
 SVI_LR_DECAY_STEPS = None
 SVI_LR_DECAY_RATE = None
 
-# ==============================================================================
 # MCMC PARAMETERS
-# ==============================================================================
 
 MCMC_NUM_WARMUP = 2000
 MCMC_NUM_SAMPLES = 2000
@@ -3165,10 +3114,7 @@ MCMC_REQUIRE_GPU_PER_CHAIN = False
 # TODO: if MCMC_NUM_CHAINS = 4 w/o parallel gpus then 4 chains will run sequentially, which is not ideal. see how t correctly make this code run in parallel on GPUs, then change this parameter before a run
 
 
-
-# ==============================================================================
 # INFERENCE BEHAVIOR DEFAULTS
-# ==============================================================================
 
 INIT_TO_MEDIAN_SAMPLES = 100
 
@@ -3178,35 +3124,23 @@ QUICK_MCMC_WARMUP = 100
 QUICK_MCMC_SAMPLES = 100
 QUICK_MCMC_CHAINS = 1
 
-# ==============================================================================
-# CHEMISTRY PARAMETERS
-# ==============================================================================
-
-# ==============================================================================
-# VMR PRIOR RANGES
-# ==============================================================================
+# Chemistry: VMR prior ranges
 
 # Logarithmic VMR prior bounds for trace species
 LOG_VMR_MIN = -12.0  # Minimum log10(VMR)
 LOG_VMR_MAX = -2.0   # Maximum log10(VMR)
 
-# ==============================================================================
 # BULK COMPOSITION
-# ==============================================================================
 
 # H2/He number ratio (solar ~10-11, hot Jupiters often use ~6-7)
 H2_HE_RATIO = 6.0
 
-# ==============================================================================
 # FREE CHEMISTRY PROFILE PARAMETERIZATION
-# ==============================================================================
 
 # Number of nodes for altitude-dependent VMR profiles
 N_VMR_NODES = 5
 
-# ==============================================================================
 # EQUILIBRIUM CHEMISTRY
-# ==============================================================================
 
 # Metallicity [M/H] prior range (log10 relative to solar)
 METALLICITY_RANGE = (-2.0, 3.0)
@@ -3217,9 +3151,7 @@ CO_RATIO_RANGE = (0.1, 2.0)
 # Solar elemental abundance table (Asplund 2020; log epsilon format)
 SOLAR_ABUNDANCE_FILE = "reference/abundances/asplund_2020_extended.dat"
 
-# ==============================================================================
 # FASTCHEM GRID PARAMETERS
-# ==============================================================================
 
 FASTCHEM_N_TEMP = 50
 FASTCHEM_N_PRESSURE = 50
@@ -3239,9 +3171,7 @@ FASTCHEM_HYBRID_N_CO_RATIO = 17
 FASTCHEM_HYBRID_METALLICITY_RANGE = METALLICITY_RANGE
 FASTCHEM_HYBRID_CO_RATIO_RANGE = CO_RATIO_RANGE
 
-# ==============================================================================
 # DISEQUILIBRIUM CHEMISTRY
-# ==============================================================================
 
 # Eddy diffusion coefficient Kzz [cm^2/s] prior range
 LOG_KZZ_RANGE = (6.0, 12.0)
@@ -3249,9 +3179,7 @@ LOG_KZZ_RANGE = (6.0, 12.0)
 # Quench pressure range [bar]
 LOG_QUENCH_P_RANGE = (-6.0, 2.0)
 
-# ==============================================================================
 # NUMERICAL GUARD CONSTANTS
-# ==============================================================================
 
 # Machine epsilon for float32 around 1.0. Used for relative comparisons/tolerances.
 F32_EPS = float(np.finfo(np.float32).eps)
@@ -3272,9 +3200,7 @@ MMW_RT_MAX = 50.0
 # audit of the actual opacity databases rather than an arbitrary guess.
 PREMODIT_NEGATIVE_ROUNDOFF_RTOL = F32_EPS
 
-# ==============================================================================
 # DATA PREPARATION DEFAULTS
-# ==============================================================================
 
 # Data prep defaults
 DEFAULT_DATA_PLANET = PLANET
@@ -3358,9 +3284,7 @@ DEFAULT_SYSREM_STOP_TOL = 1e-4
 DEFAULT_REGRID_MAX_NATIVE_GAP_FACTOR = 5.0
 DEFAULT_TELLURIC_EDGE_MASK_WIDTH_A = 3.0
 
-# ==============================================================================
 # PHOTOMETRY DEFAULTS
-# ==============================================================================
 
 TESS_BANDPASS_URL = "https://heasarc.gsfc.nasa.gov/docs/tess/data/tess-response-function-v2.0.csv"
 TESS_BANDPASS_PATH = REFERENCE_BANDPASS_DIR / "tess-response-function-v2.0.csv"
@@ -3422,9 +3346,7 @@ TESS_TRANSIT_CASES = {
 # Physical constants in SI units used by broadband reflection calculations.
 AU_M = 1.495978707e11
 
-# ==============================================================================
 # RUNTIME PROFILES
-# ==============================================================================
 
 CONFIG_PROFILE_ENVVAR = "ATMO_CONFIG_PROFILE"
 DEFAULT_RUNTIME_PROFILE = "desktop"

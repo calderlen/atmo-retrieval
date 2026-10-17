@@ -237,11 +237,7 @@ def build_joint_tess_dataset(
 
         finite_err = flux_err[np.isfinite(flux_err) & (flux_err > 0)]
         err_fill = float(np.median(finite_err)) if finite_err.size else 5.0e-4
-        flux_err = np.where(
-            np.isfinite(flux_err) & (flux_err > 0),
-            flux_err,
-            err_fill,
-        )
+        flux_err = np.where(np.isfinite(flux_err) & (flux_err > 0), flux_err, err_fill)
 
         x_parts.append(np.ascontiguousarray(sector_flat.time.value[window_mask], dtype=np.float64))
         y_parts.append(np.ascontiguousarray(flux[window_mask] - 1.0, dtype=np.float64))
@@ -730,11 +726,7 @@ def _run_emcee_sampler(
                 progress=True,
             )
             sampler.reset()
-            sampler.run_mcmc(
-                state,
-                config.emcee_production_steps,
-                progress=True,
-            )
+            sampler.run_mcmc(state, config.emcee_production_steps, progress=True)
             return sampler, True, worker_count
 
     sampler = emcee.EnsembleSampler(
@@ -951,7 +943,6 @@ def write_tess_bandpass_tbl(
     observable = str(constraint["observable"])
     value = float(constraint["value"])
     sigma = float(constraint["sigma"])
-
 
     transit_depth_fraction = value if observable == "transit_depth" else value**2
     if observable == "transit_depth":

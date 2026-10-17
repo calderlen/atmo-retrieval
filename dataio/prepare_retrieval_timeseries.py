@@ -131,9 +131,7 @@ def _save_metadata(
         "regrid": bool(regrid),
         "subtract_median": bool(subtract_median),
         "run_sysrem": bool(run_sysrem),
-        "out_of_transit_master_division": bool(
-            out_of_transit_master_division
-        ),
+        "out_of_transit_master_division": bool(out_of_transit_master_division),
         "fixed_doppler_shadow": {
             "schema_version": 1,
             "enabled": False,
@@ -337,9 +335,7 @@ def prepare_arm(
             "ephemeris_epoch_scale": str(planet_cfg["epoch_scale"]).lower(),
             "ephemeris_epoch_reference": planet_cfg["epoch_reference"],
             "ephemeris_epoch_bjd_tdb": reference_epoch_bjd_tdb,
-            "input_time_provenance": dict(
-                extras.get("input_time_provenance", {})
-            ),
+            "input_time_provenance": dict(extras.get("input_time_provenance", {})),
         }
     )
     t0 = resolve_transit_midpoint(
@@ -361,10 +357,7 @@ def prepare_arm(
     if collapse_source:
         contacts = compute_contact_phases(planet_cfg)
         active_transit = active_transit_mask(phase, planet_cfg)
-        out_transit = (
-            (phase < contacts["T1"])
-            | (phase > contacts["T4"])
-        )
+        out_transit = ((phase < contacts["T1"]) | (phase > contacts["T4"]))
         source_rows = out_transit | active_transit
         phase = phase[source_rows]
         jd = np.asarray(jd)[source_rows]
@@ -375,11 +368,7 @@ def prepare_arm(
         data = data[source_rows]
         sigma = sigma[source_rows]
         out_transit = out_transit[source_rows]
-        data, sigma = build_out_of_transit_residuals(
-            data,
-            sigma,
-            out_transit,
-        )
+        data, sigma = build_out_of_transit_residuals(data, sigma, out_transit)
         extras = subset_loader_frame_extras(extras, source_rows)
         extras.update({
             "pre_sysrem_flux": np.asarray(data, dtype=float).copy(),
@@ -664,12 +653,7 @@ def main() -> int:
                 arm=arm,
                 product_kind=args.product_kind,
             )
-        prepare_arm(
-            arm=arm,
-            args=args,
-            planet_cfg=planet_cfg,
-            output_dir=output_dir,
-        )
+        prepare_arm(arm=arm, args=args, planet_cfg=planet_cfg, output_dir=output_dir)
 
     return 0
 

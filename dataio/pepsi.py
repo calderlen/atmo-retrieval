@@ -56,9 +56,6 @@ def _calendar_mid_exposure_jd_utc(header, exptime_seconds: float) -> float | Non
     return None
 
 
-# ==============================================================================
-# DATA PREPARATION FUNCTIONS
-# ==============================================================================
 def regrid_to_common_wavelength(
     wave: np.ndarray,
     flux: np.ndarray,
@@ -200,11 +197,9 @@ _INTRODUCED_SHIFTS_MPS = {
     "20240312": -75200.0,
 }
 
-
 _LEGACY_DATASET_VELOCITY_OFFSET_MPS = {
     ("KELT-20b", "20190504", "red"): 3223.4,
 }
-
 
 _PLANET_MOLECFIT_VELOCITY_OFFSET_MPS = {
     "WASP-76b": 0.0,
@@ -212,18 +207,13 @@ _PLANET_MOLECFIT_VELOCITY_OFFSET_MPS = {
     "TOI-1518b": 11170.0,
 }
 
-
 _MOLECFIT_CORRECTED_PREFIX = "SCIENCE_TELLURIC_CORR_"
-
 
 _MOLECFIT_FITS_SUFFIX = ".fits"
 
-
 _SPEED_OF_LIGHT_MPS = 299792458.0
 
-
 _SPEED_OF_LIGHT_KMS = _SPEED_OF_LIGHT_MPS / 1000.0
-
 
 _REMOVED_VELOCITY_HISTORY_RE = re.compile(
     r"Radial\s+velocity\s+([A-Z0-9_+\-]+)\s*=\s*"
@@ -253,9 +243,7 @@ def _air_wavelength_to_vacuum(wavelength_air: np.ndarray) -> np.ndarray:
 def _molecfit_raw_product_name(molecfit_path: str | os.PathLike[str]) -> str:
     """Return the original PEPSI product name encoded in a Molecfit output."""
     name = Path(molecfit_path).name
-    raw_name = name[
-        len(_MOLECFIT_CORRECTED_PREFIX) : -len(_MOLECFIT_FITS_SUFFIX)
-    ]
+    raw_name = name[len(_MOLECFIT_CORRECTED_PREFIX) : -len(_MOLECFIT_FITS_SUFFIX)]
     return raw_name
 
 
@@ -376,7 +364,6 @@ def parse_pepsi_velocity_frame(header) -> dict[str, object]:
         observer_removed = float(observer_header)
         stellar_removed = float(stellar_header)
         stellar_documented = True
-
 
     instrument_removed = history_value("CCFOFF") or 0.0
 
@@ -526,7 +513,6 @@ def _barycentric_molecfit_wavelength(
             raw_header = raw_hdu[0].header.copy()
             raw_air_wave = _wavelength_angstrom(raw_data, raw_column_config)
 
-
         raw_vacuum_wave = _air_wavelength_to_vacuum(raw_air_wave)
         frame_info = parse_pepsi_velocity_frame(raw_header)
         frame_info = {
@@ -605,10 +591,7 @@ def _paired_snr_filtered_selection(
             companion_selection,
         )
         return blue_selection
-    _, red_selection = apply_paired_snr_quality_rule(
-        companion_selection,
-        selection,
-    )
+    _, red_selection = apply_paired_snr_quality_rule(companion_selection, selection)
     return red_selection
 
 
@@ -665,12 +648,10 @@ def get_pepsi_data(
         )
     wavelength_frame = str(wavelength_frame).strip().lower()
 
-    # Get config for this instrument
     header_keys = get_header_keys()
     col_cfg = get_fits_columns(molecfit=do_molecfit)
     raw_col_cfg = get_fits_columns(molecfit=False)
 
-    # Get file patterns from instrument config
     patterns = get_data_patterns(
         observation_epoch, planet_name, mode=arm, do_molecfit=do_molecfit, data_dir=data_dir
     )
@@ -711,9 +692,7 @@ def get_pepsi_data(
             f"{config.HRS_PAIRED_SNR_Q_THRESHOLD:g} exposure(s) before preprocessing: "
             + ", ".join(snr_quality_excluded_files)
         )
-    excluded_exposure_files = [
-        path.name for path in exposure_selection.excluded_files
-    ]
+    excluded_exposure_files = [path.name for path in exposure_selection.excluded_files]
 
     n_spectra = len(spectra_files)
     input_exposure_files = [Path(path).name for path in spectra_files]
@@ -753,7 +732,6 @@ def get_pepsi_data(
             data = hdu[1].data.copy()
             header = hdu[0].header.copy()
 
-        # Get column names from instrument config
         flux_tag, error_tag = col_cfg["flux"], col_cfg["error"]
         loaded_wave = _wavelength_angstrom(data, col_cfg)
         frame_info: dict[str, object] | None = None
@@ -945,9 +923,7 @@ def get_pepsi_data(
             f"{header_keys['snr']} header; saving those snr.npy entries as NaN."
         )
 
-    # ====================
     # Preprocessing pipeline
-    # ====================
 
     # Step 1: Regrid to common wavelength (before sorting, fixes sub-pixel drift)
     if regrid:
@@ -979,9 +955,7 @@ def get_pepsi_data(
     observer_velocity_removed_mps = observer_velocity_removed_mps[obs_order]
     stellar_velocity_removed_mps = stellar_velocity_removed_mps[obs_order]
     instrument_velocity_removed_mps = instrument_velocity_removed_mps[obs_order]
-    synthetic_molecfit_shift_undone_mps = (
-        synthetic_molecfit_shift_undone_mps[obs_order]
-    )
+    synthetic_molecfit_shift_undone_mps = (synthetic_molecfit_shift_undone_mps[obs_order])
     velocity_history_recipe = [velocity_history_recipe[index] for index in obs_order]
     velocity_history_entries = [velocity_history_entries[index] for index in obs_order]
     velocity_frame_parse_error = [

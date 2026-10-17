@@ -170,11 +170,7 @@ def plot_stacked_spectra(stacked: Mapping[str, Any]):
     return figure
 
 
-def plot_line_diagnostic(
-    line_result: Mapping[str, np.ndarray],
-    *,
-    title: str,
-):
+def plot_line_diagnostic(line_result: Mapping[str, np.ndarray], *, title: str):
     """Plot a sampled line matrix and its weighted coadd."""
 
     velocity = np.asarray(line_result["velocity_kms"])

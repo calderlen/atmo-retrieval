@@ -172,11 +172,7 @@ def _phases(
         reference_epoch_bjd_tdb=epoch_bjd_tdb,
         observation_epoch=observation_epoch,
     )
-    phase = get_orbital_phase(
-        bjd_tdb,
-        midpoint_bjd_tdb,
-        float(params["period"]),
-    )
+    phase = get_orbital_phase(bjd_tdb, midpoint_bjd_tdb, float(params["period"]))
     return np.asarray(bjd_tdb, dtype=float), np.asarray(phase, dtype=float)
 
 
@@ -234,12 +230,7 @@ def _measure_arm(
     diagnostics_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     print(f"\nMeasuring {planet} {mode} {epoch} {arm}...")
-    loaded, extras = _load_arm(
-        planet=planet,
-        mode=mode,
-        epoch=epoch,
-        arm=arm,
-    )
+    loaded, extras = _load_arm(planet=planet, mode=mode, epoch=epoch, arm=arm)
     wavelength, flux, error, jd, _snr, _exptime, _airmass, n_exposures, _npix = loaded
     wavelength = np.asarray(wavelength, dtype=float)
     flux = np.asarray(flux, dtype=float)
@@ -252,9 +243,7 @@ def _measure_arm(
     )
     if mode == "transmission" and not include_in_transit:
         contacts = compute_contact_phases(params)
-        selected_by_observation = (phase < contacts["T1"]) | (
-            phase > contacts["T4"]
-        )
+        selected_by_observation = (phase < contacts["T1"]) | (phase > contacts["T4"])
         selection_name = "out_of_transit"
     else:
         selected_by_observation = np.ones(n_exposures, dtype=bool)
@@ -410,12 +399,8 @@ def _measure_arm(
         "pipeline_removed_stellar_velocity_kms": float(
             np.nanmedian(stellar_removed_kms)
         ),
-        "observer_velocity_removed_kms": float(
-            np.nanmedian(observer_removed_kms)
-        ),
-        "instrument_velocity_removed_kms": float(
-            np.nanmedian(instrument_removed_kms)
-        ),
+        "observer_velocity_removed_kms": float(np.nanmedian(observer_removed_kms)),
+        "instrument_velocity_removed_kms": float(np.nanmedian(instrument_removed_kms)),
         "velocity_history_recipe": sorted(
             {"+".join(recipe) for recipe in extras["velocity_history_recipe"]}
         ),
@@ -433,9 +418,7 @@ def _measure_arm(
         "median_fractional_model_rms": float(
             np.nanmedian(measured["fractional_model_rms"])
         ),
-        "median_profile_asymmetry": float(
-            np.nanmedian(measured["profile_asymmetry"])
-        ),
+        "median_profile_asymmetry": float(np.nanmedian(measured["profile_asymmetry"])),
         "used_exposure_indices": summary["used_exposure_indices"],
         "profile_file": str(profile_path.resolve()),
         "profile_qc_plot": str(profile_qc_plot_path.resolve()),
@@ -473,9 +456,7 @@ def _measure_arm(
     return result, arrays
 
 
-def _validate_blue_arm(
-    arms: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
+def _validate_blue_arm(arms: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Accept a dataset only from a valid blue-arm measurement."""
     blue = arms[SYSTEMIC_VELOCITY_ARM]
     if not blue["arm_measurement_valid"]:
@@ -493,9 +474,7 @@ def _validate_blue_arm(
     }
 
 
-def _blue_only_exposures(
-    rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+def _blue_only_exposures(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Prepare the blue-arm rows for the joint fit."""
     blue_rows: list[dict[str, Any]] = []
     for row in rows:
@@ -556,26 +535,11 @@ def _plot_arm_profile_qc(
 
     exposure = np.arange(passed.size)
     point_colors = np.where(passed, "#2a8f5b", "#c43c35")
-    axes[0, 1].scatter(
-        exposure,
-        measured["fractional_model_rms"],
-        c=point_colors,
-        s=20,
-    )
+    axes[0, 1].scatter(exposure, measured["fractional_model_rms"], c=point_colors, s=20)
     axes[0, 1].axhline(maximum_fractional_model_rms, color="black", ls="--", lw=1)
-    axes[1, 0].scatter(
-        exposure,
-        measured["profile_asymmetry"],
-        c=point_colors,
-        s=20,
-    )
+    axes[1, 0].scatter(exposure, measured["profile_asymmetry"], c=point_colors, s=20)
     axes[1, 0].axhline(maximum_profile_asymmetry, color="black", ls="--", lw=1)
-    axes[1, 1].scatter(
-        exposure,
-        measured["effective_rank"],
-        c=point_colors,
-        s=20,
-    )
+    axes[1, 1].scatter(exposure, measured["effective_rank"], c=point_colors, s=20)
 
     axes[0, 0].set(
         xlabel="Barycentric velocity (km/s)",
@@ -625,13 +589,7 @@ def _plot_dataset(
             color=color,
             label="blue LSD",
         )
-        axes[0].plot(
-            values["velocity_kms"],
-            model,
-            color=color,
-            ls="--",
-            alpha=0.8,
-        )
+        axes[0].plot(values["velocity_kms"], model, color=color, ls="--", alpha=0.8)
         axes[1].errorbar(
             values["phase"][selected],
             values["centroid_kms"][selected],
@@ -724,12 +682,8 @@ def _measurement_rows(
                     arrays["lsd_residual_velocity_kms"][index]
                 ),
                 "stellar_rv_barycentric_kms": float(arrays["centroid_kms"][index]),
-                "stellar_rv_stat_err_kms": float(
-                    arrays["centroid_err_kms"][index]
-                ),
-                "fractional_model_rms": float(
-                    arrays["fractional_model_rms"][index]
-                ),
+                "stellar_rv_stat_err_kms": float(arrays["centroid_err_kms"][index]),
+                "fractional_model_rms": float(arrays["fractional_model_rms"][index]),
                 "profile_asymmetry": float(arrays["profile_asymmetry"][index]),
                 "profile_qc_passed": bool(arrays["profile_qc_passed"][index]),
                 "selected_by_observation": bool(

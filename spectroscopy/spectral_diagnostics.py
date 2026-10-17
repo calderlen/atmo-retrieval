@@ -56,10 +56,7 @@ def phase_order(bundle: Mapping[str, Any]) -> np.ndarray:
     return np.argsort(np.where(np.isfinite(phase), phase, np.inf), kind="stable")
 
 
-def finite_good(
-    values: np.ndarray,
-    sigma: np.ndarray | None = None,
-) -> np.ndarray:
+def finite_good(values: np.ndarray, sigma: np.ndarray | None = None) -> np.ndarray:
     """Return the standard finite and positive-uncertainty diagnostic mask."""
 
     mask = np.isfinite(values)
@@ -78,11 +75,7 @@ def typical_spacing(wavelength: np.ndarray) -> float:
     return float(np.median(positive)) if positive.size else float("nan")
 
 
-def wavelength_gap_mask(
-    wavelength: np.ndarray,
-    *,
-    gap_factor: float = 8.0,
-) -> np.ndarray:
+def wavelength_gap_mask(wavelength: np.ndarray, *, gap_factor: float = 8.0) -> np.ndarray:
     """Flag boundaries whose spacing is much larger than the native spacing."""
 
     wave = wave_1d(wavelength)

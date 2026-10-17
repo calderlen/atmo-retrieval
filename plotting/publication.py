@@ -581,10 +581,7 @@ def plot_bandpass_posterior_predictive(
     observed = float(observed)
     observed_error = float(observed_error)
 
-    q025, q16, q50, q84, q975 = np.percentile(
-        draws,
-        [2.5, 16.0, 50.0, 84.0, 97.5],
-    )
+    q025, q16, q50, q84, q975 = np.percentile(draws, [2.5, 16.0, 50.0, 84.0, 97.5])
     lower = min(q025, observed - 3.5 * observed_error)
     upper = max(q975, observed + 3.5 * observed_error)
     padding = max(0.08 * (upper - lower), np.finfo(float).eps)
@@ -622,9 +619,7 @@ def plot_bandpass_posterior_predictive(
         "observed": np.asarray(observed),
         "observed_error": np.asarray(observed_error),
         "model_draws": draws,
-        "model_quantiles_2p5_16_50_84_97p5": np.asarray(
-            [q025, q16, q50, q84, q975]
-        ),
+        "model_quantiles_2p5_16_50_84_97p5": np.asarray([q025, q16, q50, q84, q975]),
         "component_name": np.asarray(component_name, dtype="U"),
         "observable": np.asarray(observable, dtype="U"),
     }

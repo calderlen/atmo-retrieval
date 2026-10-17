@@ -11,7 +11,6 @@ from config import OBSERVATORY, PHASE_BINS
 
 PEPSI_INPUT_TIME_SCALE = "utc"
 
-
 PEPSI_BJD_TDB_VALIDATION_TOLERANCE_SECONDS = 0.1
 
 
@@ -60,21 +59,8 @@ def get_phase_boundaries(params: dict) -> dict[str, tuple[float, float]]:
     }
 
 
-def get_phase_bin_mask(
-    phase: np.ndarray,
-    bin_name: str,
-    params: dict,
-) -> np.ndarray:
-    """Get boolean mask for exposures in a given phase bin.
-
-    Args:
-        phase: Orbital phase array (0 = mid-transit)
-        bin_name: One of 'T12', 'T23', 'T34', or 'full'
-        params: Planet parameters dict containing 'duration', 'period', and optionally 'tau'
-
-    Returns:
-        Boolean mask array, True for exposures in the specified bin.
-    """
+def get_phase_bin_mask(phase: np.ndarray, bin_name: str, params: dict) -> np.ndarray:
+    """Select T12, T23, T34, or full-transit exposures; phase zero is mid-transit."""
     if bin_name == "full":
         # Full transit: T1 to T4
         contacts = compute_contact_phases(params)
@@ -85,19 +71,8 @@ def get_phase_bin_mask(
     return (phase >= lo) & (phase <= hi)
 
 
-def get_phase_bin_indices(
-    phase: np.ndarray,
-    params: dict,
-) -> dict[str, np.ndarray]:
-    """Get indices for all phase bins.
-
-    Args:
-        phase: Orbital phase array (0 = mid-transit)
-        params: Planet parameters dict
-
-    Returns:
-        Dict mapping bin_name -> array of indices for that bin.
-    """
+def get_phase_bin_indices(phase: np.ndarray, params: dict) -> dict[str, np.ndarray]:
+    """Map configured phase-bin names to exposure indices; phase zero is mid-transit."""
     result = {}
     for bin_name in PHASE_BINS:
         mask = get_phase_bin_mask(phase, bin_name, params)
@@ -105,26 +80,12 @@ def get_phase_bin_indices(
     return result
 
 
-def summarize_phase_coverage(
-    phase: np.ndarray,
-    params: dict,
-) -> dict[str, dict]:
-    """Summarize phase coverage for each transit bin.
-
-    Args:
-        phase: Orbital phase array
-        params: Planet parameters dict
-
-    Returns:
-        Dict with bin statistics (count, phase range, etc.)
-    """
+def summarize_phase_coverage(phase: np.ndarray, params: dict) -> dict[str, dict]:
+    """Summarize exposure counts and phase limits for each transit bin."""
     contacts = compute_contact_phases(params)
     bin_indices = get_phase_bin_indices(phase, params)
 
-    summary = {
-        "contacts": contacts,
-        "bins": {}
-    }
+    summary = {"contacts": contacts, "bins": {}}
 
     for bin_name, indices in bin_indices.items():
         if len(indices) > 0:

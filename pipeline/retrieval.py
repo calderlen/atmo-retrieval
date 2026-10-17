@@ -85,7 +85,6 @@ def run_retrieval(
     sigma_scale = float(sigma_scale)
     spectral_stride, spectral_offset = int(spectral_stride), int(spectral_offset)
     epochs = _normalize_epoch_values(epoch)
-    # Create timestamped output directory
     base_dir = config.DIR_SAVE or config_utils.get_output_dir()
     sanitized_label = sanitize_diagnostic_label(diagnostic_label)
     if sanitized_label is not None:
@@ -93,7 +92,6 @@ def run_retrieval(
     output_dir = config_utils.create_timestamped_dir(base_dir)
     print(f"\nOutput directory: {output_dir}")
 
-    # Save run configuration
     config_utils.save_run_config(
         output_dir=output_dir,
         mode=mode,

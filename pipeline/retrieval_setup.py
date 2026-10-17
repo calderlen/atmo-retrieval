@@ -77,13 +77,10 @@ from dataio.phoenix import (
 
 DEFAULT_ROTATION_VSINI_MAX_KMS = 100.0
 
-
 STELLAR_ROTATION_VSINI_MARGIN = 1.10
 
 
-def _rotation_operator_vsini_max(
-    stellar_vsini: float | None,
-) -> float:
+def _rotation_operator_vsini_max(stellar_vsini: float | None) -> float:
     """Return rotation-kernel support for the planet and star."""
     try:
         stellar_vsini_value = float(stellar_vsini)
@@ -236,9 +233,7 @@ def _build_spectroscopic_observation_inputs(
         phase=jnp.asarray(phase),
         U=(
             None
-            if frozen_timeseries is not None
-            or sysrem is None
-            or sysrem.U is None
+            if frozen_timeseries is not None or sysrem is None or sysrem.U is None
             else jnp.asarray(sysrem.U)
         ),
         chunked_sysrem=(
@@ -369,9 +364,7 @@ def _build_component_grid_and_ops(
 ) -> tuple[np.ndarray, np.ndarray, object, object]:
     inst_nus = wav2nu(wav_obs, "AA")
     grid_source = (
-        wav_obs
-        if wav_obs_before_thinning is None
-        else wav_obs_before_thinning
+        wav_obs if wav_obs_before_thinning is None else wav_obs_before_thinning
     )
     _, _, model_min, model_max = _resolve_model_wavelength_range(grid_source)
     nu_grid, _wav_grid, _res_high = setup_wavenumber_grid(
@@ -694,10 +687,7 @@ def make_bandpass_constraints_from_tbl(tbl_path: str | Path) -> list[dict[str, A
         raw_bandwidth_values = []
         for value in data_by_col["BANDWIDTH"]:
             raw_bandwidth_values.append(np.nan if value is None else float(value))
-        raw_bandwidth = np.asarray(
-            raw_bandwidth_values,
-            dtype=float,
-        )
+        raw_bandwidth = np.asarray(raw_bandwidth_values, dtype=float)
         if raw_bandwidth.size == wav_angstrom.size:
             bandwidth_values = _convert_unit_to_micron(
                 raw_bandwidth,
@@ -825,12 +815,8 @@ def _build_atmosphere_regions(
             composition_solver=composition_solver,
             name=region_name,
             sample_prefix=spec.get("sample_prefix"),
-            velocity_offset_mode=str(
-                spec.get("velocity_offset_mode", "shared")
-            ),
-            velocity_offset_species=tuple(
-                spec.get("velocity_offset_species", ())
-            ),
+            velocity_offset_mode=str(spec.get("velocity_offset_mode", "shared")),
+            velocity_offset_species=tuple(spec.get("velocity_offset_species", ())),
             velocity_offset_bounds_kms=tuple(
                 spec.get("velocity_offset_bounds_kms", (-20.0, 20.0))
             ),
@@ -881,17 +867,11 @@ def _load_joint_spectroscopic_component(
     stellar_vsini = spec.get("v_sini_star", default_stellar_vsini)
     stellar_limb_darkening_u1 = spec.get(
         "gamma1",
-        spec.get(
-            "stellar_limb_darkening_u1",
-            default_stellar_limb_darkening_u1,
-        ),
+        spec.get("stellar_limb_darkening_u1", default_stellar_limb_darkening_u1),
     )
     stellar_limb_darkening_u2 = spec.get(
         "gamma2",
-        spec.get(
-            "stellar_limb_darkening_u2",
-            default_stellar_limb_darkening_u2,
-        ),
+        spec.get("stellar_limb_darkening_u2", default_stellar_limb_darkening_u2),
     )
     phoenix_cache_dir = spec.get("phoenix_cache_dir", default_phoenix_cache_dir)
     sigma_scale = float(spec.get("sigma_scale", default_sigma_scale))
@@ -1344,15 +1324,9 @@ def prepare_retrieval(
 
     if full_arm_mode:
         arm_dirs = (
-            config_utils.get_full_arm_timeseries_dirs(
-                epoch=primary_epoch,
-                mode=mode,
-            )
+            config_utils.get_full_arm_timeseries_dirs(epoch=primary_epoch, mode=mode)
             if data_format == "timeseries"
-            else config_utils.get_full_arm_data_dirs(
-                epoch=primary_epoch,
-                mode=mode,
-            )
+            else config_utils.get_full_arm_data_dirs(epoch=primary_epoch, mode=mode)
         )
         if mode == "emission" and emission_selection is not None:
             arm_dirs = {
@@ -1539,7 +1513,6 @@ def prepare_retrieval(
         )
         print(f"  Wavelength range: {wav_obs.min():.1f} - {wav_obs.max():.1f} Angstroms")
 
-        # Convert to wavenumber
         inst_nus = wav2nu(wav_obs, "AA")
 
         # Ensure wavenumber grid and data are in ascending order
@@ -1578,10 +1551,7 @@ def prepare_retrieval(
             )
         elif mode == "transmission" and data_format == "spectrum":
             primary_collapsed_transmission = (
-                _load_collapsed_transmission_operator(
-                    resolved_data_dir,
-                    wav_obs,
-                )
+                _load_collapsed_transmission_operator(resolved_data_dir, wav_obs)
             )
 
         sigma = _scale_spectroscopic_sigma(sigma, sigma_scale)
@@ -1593,7 +1563,6 @@ def prepare_retrieval(
         if sigma_scale != 1.0:
             print(f"  Applied spectroscopic sigma scale: x{sigma_scale:g}")
 
-    # Setup instrumental resolution
     print("\n[2/7] Setting up instrumental resolution...")
     with _StepTimer("Step 2/7"):
         Rinst = config_utils.get_resolution()
@@ -1606,7 +1575,6 @@ def prepare_retrieval(
     opa_mols = None
     opa_atoms = None
 
-    # Setup wavenumber grid
     print("\n[3/7] Building wavenumber grid...")
     with _StepTimer("Step 3/7"):
         if full_arm_mode:
@@ -1629,10 +1597,7 @@ def prepare_retrieval(
                 "  Complete observed range before thinning: "
                 f"{observed_min:.3f} - {observed_max:.3f} Angstroms"
             )
-            print(
-                f"  Padded model range: {model_min:.3f} - "
-                f"{model_max:.3f} Angstroms"
-            )
+            print(f"  Padded model range: {model_min:.3f} - " f"{model_max:.3f} Angstroms")
 
             rotation_vsini_max = _rotation_operator_vsini_max(
                 params.get("v_sini_star") if mode == "emission" else None,
@@ -1748,9 +1713,7 @@ def prepare_retrieval(
         )
         primary_radial_velocity_mode = "orbital" if primary_is_timeseries else "none"
         primary_sample_prefix = (
-            primary_component_name
-            if (joint_spectra or bandpass_constraints)
-            else None
+            primary_component_name if (joint_spectra or bandpass_constraints) else None
         )
 
         if full_arm_mode:

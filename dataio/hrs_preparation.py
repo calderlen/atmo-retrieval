@@ -180,7 +180,6 @@ def valid_sorted_column_indices(
     data = np.asarray(data, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
 
-
     valid = np.isfinite(wavelength) & (wavelength > 0.0)
     valid &= np.all(np.isfinite(data), axis=0)
     valid &= np.all(np.isfinite(sigma), axis=0)

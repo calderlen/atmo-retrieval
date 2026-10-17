@@ -15,7 +15,6 @@ CIA_COLLISION_PAIRS: tuple[tuple[str, str, str], ...] = (
     ("H2He", "H2", "He"),
 )
 
-
 CONTINUUM_SPECIES_MASSES: dict[str, float] = {
     "H": float(molinfo.molmass_isotope("H", db_HIT=False)),
     "H-": float(molinfo.molmass_isotope("H", db_HIT=False) + 5.48579909065e-4),
@@ -71,11 +70,7 @@ def _compute_cia_opacity_terms(
             jnp.asarray(cia.nu_grid) <= cia_nu_max
         )
         in_support_finite = jnp.all(
-            jnp.where(
-                supported_nu[None, :],
-                jnp.isfinite(logacia_matrix_raw),
-                True,
-            )
+            jnp.where(supported_nu[None, :], jnp.isfinite(logacia_matrix_raw), True)
         )
         # Outside the CIA database support, zero opacity is intentional. An
         # invalid value inside support is replaced only for safe evaluation

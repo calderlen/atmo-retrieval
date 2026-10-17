@@ -41,23 +41,17 @@ from physics.opacity import _compute_opacity_terms, _sum_opacity_terms
 
 RetrievalMode = Literal["transmission", "emission"]
 
-
 PTProfileMode = Literal[
     "guillot", "isothermal", "gradient", "madhu_seager", "free", "pspline", "gp"
 ]
 
-
 AtmosphereRegionName = Literal["terminator", "dayside"]
-
 
 RVBehavior = Literal["orbital", "none"]
 
-
 VelocityOffsetMode = Literal["shared", "region", "species", "none"]
 
-
 SystemPriorMode = Literal["fixed", "normal", "upper_limit"]
-
 
 BandpassObservable = Literal["flux_ratio", "eclipse_depth", "radius_ratio", "transit_depth"]
 
@@ -82,8 +76,6 @@ def _run_rt_for_mode(
         return art.run(dtau, Tarr_rt, nu_grid)
 
 
-# the below dataclasses are all configuration objects, they describe how to build and sample the model
-# system paramaters that are shared across all atmospheric regions and observation types in a joint retrieval
 @dataclass(frozen=True)
 class SharedSystemConfig:
     Kp_mean: float
@@ -105,8 +97,7 @@ class SharedSystemConfig:
     Rstar_prior_mode: SystemPriorMode = "normal"
 
 
-# TODO: ensure these region-specific data-ignorant params in the dataclass shold be region-specific, or if some of these should be shared between atmopsheric regions
-# paramaters that are region-specific (so emission vs. transmission), but shared across all observation types in a joint retrieval.
+# TODO: Review which region parameters should be shared between atmospheric regions.
 @dataclass(frozen=True)
 class AtmosphereRegionConfig:
     name: str
@@ -130,8 +121,7 @@ class AtmosphereRegionConfig:
     velocity_offset_bounds_kms: tuple[float, float] = (-20.0, 20.0)
 
 
-# TODO: vice versa from above, ensure these observation-specific data-ignorant params in the dataclass should be observation-specific, or if some of these should be shared between observation types
-# parameters that are specific to an observation type (e.g. high-res spectroscopy vs. broadband photometry) for a given atmospheric region
+# TODO: Review which observation parameters should be shared between observation types.
 @dataclass(frozen=True)
 class SpectroscopicObservationConfig:
     name: str
@@ -156,7 +146,6 @@ class SpectroscopicObservationConfig:
     sample_prefix: str | None = None
 
 
-# paramaters for bandpass observation
 @dataclass(frozen=True)
 class BandpassObservationConfig:
     name: str
@@ -183,7 +172,6 @@ class BandpassObservationConfig:
 ObservationConfig = SpectroscopicObservationConfig | BandpassObservationConfig
 
 
-# the full configuration for a joint retrieval, including shared system parameters, region-specific atmospheric parameters, and observation-specific parameters for all observations included in the retrieval
 @dataclass(frozen=True)
 class JointRetrievalModelConfig:
     shared_system: SharedSystemConfig
@@ -191,9 +179,7 @@ class JointRetrievalModelConfig:
     observations: tuple[ObservationConfig, ...]
 
 
-# the below observation input clases are state objects, holding the realized values for a retrieval sample after the configs have been used
-
-# the computed atmospheric state for a given atmospheric region, reconstructed from the posterior samples, and the shared system state for a given retrieval sample
+# Realized system and atmosphere states for a posterior sample.
 class SharedSystemState(NamedTuple):
     Kp: jnp.ndarray
     v_sys: jnp.ndarray
@@ -271,9 +257,7 @@ def _safe_temperature_profile(
     return temperature_safe, is_valid
 
 
-def _safe_mmw_profile(
-    mmw_raw: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+def _safe_mmw_profile(mmw_raw: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Apply the current RT numerical support limits to one shared MMW copy."""
     mmw_raw = jnp.asarray(mmw_raw)
     is_valid = jnp.all(jnp.isfinite(mmw_raw)) & jnp.all(
@@ -291,9 +275,7 @@ def _safe_mmw_profile(
     return mmw_safe, is_valid
 
 
-def _safe_nonnegative_profile(
-    value: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+def _safe_nonnegative_profile(value: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     value = jnp.asarray(value)
     is_valid = jnp.all(jnp.isfinite(value)) & jnp.all(value >= 0.0)
     safe = jnp.nan_to_num(
@@ -305,7 +287,6 @@ def _safe_nonnegative_profile(
     return safe, is_valid
 
 
-# given a retrieval mode, return the default atmospheric region name to use if not specified in the configs
 def _default_region_name_for_mode(mode: RetrievalMode) -> AtmosphereRegionName:
     if mode == "transmission":
         return "terminator"
@@ -314,11 +295,7 @@ def _default_region_name_for_mode(mode: RetrievalMode) -> AtmosphereRegionName:
 
 
 # Compute the planet radial velocity in a stellar-rest wavelength frame.
-def planet_rv_kms(
-    phase: jnp.ndarray,
-    Kp_kms: float,
-    v_sys_kms: float,
-) -> jnp.ndarray:
+def planet_rv_kms(phase: jnp.ndarray, Kp_kms: float, v_sys_kms: float) -> jnp.ndarray:
     return Kp_kms * jnp.sin(2.0 * jnp.pi * phase) + v_sys_kms
 
 
@@ -444,11 +421,7 @@ def compute_model_timeseries(
     # instrumental profile to Fs. Keep that prepared denominator fixed in the
     # stellar-rest frame; only the planet follows the orbital velocity.
     stellar_spectrum = sop_inst.sampling(Fs, 0.0, inst_nus)
-    return (
-        planet_ts
-        / stellar_spectrum[None, :]
-        * (radius_btm / Rstar) ** 2
-    )
+    return planet_ts / stellar_spectrum[None, :] * (radius_btm / Rstar) ** 2
 
 
 def _normalize_chunked_sysrem_inputs(
@@ -481,9 +454,7 @@ def _normalize_spectroscopic_observation_inputs(
         sigma = sigma[None, :]
 
     if chunked_sysrem is not None:
-        chunked_sysrem = _normalize_chunked_sysrem_inputs(
-            chunked_sysrem,
-        )
+        chunked_sysrem = _normalize_chunked_sysrem_inputs(chunked_sysrem)
     if frozen_timeseries is not None:
         source_phase = jnp.asarray(frozen_timeseries.source_phase)
         active_mask = jnp.asarray(frozen_timeseries.active_exposure_mask)
@@ -507,9 +478,7 @@ def _normalize_spectroscopic_observation_inputs(
             chunked_sysrem=(
                 None
                 if frozen_timeseries.chunked_sysrem is None
-                else _normalize_chunked_sysrem_inputs(
-                    frozen_timeseries.chunked_sysrem,
-                )
+                else _normalize_chunked_sysrem_inputs(frozen_timeseries.chunked_sysrem)
             ),
             fixed_source_model=fixed_source_model,
         )
@@ -530,10 +499,7 @@ def _normalize_spectroscopic_observation_inputs(
         bin_indices = jnp.asarray(collapsed_emission.bin_indices, dtype=jnp.int32)
         bin_weights = jnp.asarray(collapsed_emission.bin_weights)
         output_wavelength = jnp.asarray(collapsed_emission.output_wavelength)
-        output_indices = jnp.asarray(
-            collapsed_emission.output_indices,
-            dtype=jnp.int32,
-        )
+        output_indices = jnp.asarray(collapsed_emission.output_indices, dtype=jnp.int32)
 
         collapsed_emission = CollapsedEmissionInputs(
             source_wavelength=source_wavelength,
@@ -547,34 +513,22 @@ def _normalize_spectroscopic_observation_inputs(
             bin_weights=bin_weights,
             output_wavelength=output_wavelength,
             output_indices=output_indices,
-            kp_reference_kms=jnp.asarray(
-                collapsed_emission.kp_reference_kms
-            ),
+            kp_reference_kms=jnp.asarray(collapsed_emission.kp_reference_kms),
             velocity_offset_reference_kms=jnp.asarray(
                 collapsed_emission.velocity_offset_reference_kms
             ),
             chunked_sysrem=(
                 None
                 if collapsed_emission.chunked_sysrem is None
-                else _normalize_chunked_sysrem_inputs(
-                    collapsed_emission.chunked_sysrem,
-                )
+                else _normalize_chunked_sysrem_inputs(collapsed_emission.chunked_sysrem)
             ),
         )
     if collapsed_transmission is not None:
-        source_wavelength = jnp.asarray(
-            collapsed_transmission.source_wavelength
-        )
-        source_inst_nus = jnp.asarray(
-            collapsed_transmission.source_inst_nus
-        )
+        source_wavelength = jnp.asarray(collapsed_transmission.source_wavelength)
+        source_inst_nus = jnp.asarray(collapsed_transmission.source_inst_nus)
         source_phase = jnp.asarray(collapsed_transmission.source_phase)
-        fixed_source_model = jnp.asarray(
-            collapsed_transmission.fixed_source_model
-        )
-        active_mask = jnp.asarray(
-            collapsed_transmission.active_exposure_mask
-        )
+        fixed_source_model = jnp.asarray(collapsed_transmission.fixed_source_model)
+        active_mask = jnp.asarray(collapsed_transmission.active_exposure_mask)
         selected_indices = jnp.asarray(
             collapsed_transmission.selected_exposure_indices,
             dtype=jnp.int32,
@@ -583,20 +537,11 @@ def _normalize_spectroscopic_observation_inputs(
             collapsed_transmission.shift_left_indices,
             dtype=jnp.int32,
         )
-        shift_fractions = jnp.asarray(
-            collapsed_transmission.shift_fractions
-        )
-        coadd_weights = jnp.asarray(
-            collapsed_transmission.coadd_weights
-        )
-        bin_indices = jnp.asarray(
-            collapsed_transmission.bin_indices,
-            dtype=jnp.int32,
-        )
+        shift_fractions = jnp.asarray(collapsed_transmission.shift_fractions)
+        coadd_weights = jnp.asarray(collapsed_transmission.coadd_weights)
+        bin_indices = jnp.asarray(collapsed_transmission.bin_indices, dtype=jnp.int32)
         bin_weights = jnp.asarray(collapsed_transmission.bin_weights)
-        output_wavelength = jnp.asarray(
-            collapsed_transmission.output_wavelength
-        )
+        output_wavelength = jnp.asarray(collapsed_transmission.output_wavelength)
         output_indices = jnp.asarray(
             collapsed_transmission.output_indices,
             dtype=jnp.int32,
@@ -615,9 +560,7 @@ def _normalize_spectroscopic_observation_inputs(
             bin_weights=bin_weights,
             output_wavelength=output_wavelength,
             output_indices=output_indices,
-            kp_reference_kms=jnp.asarray(
-                collapsed_transmission.kp_reference_kms
-            ),
+            kp_reference_kms=jnp.asarray(collapsed_transmission.kp_reference_kms),
             velocity_offset_reference_kms=jnp.asarray(
                 collapsed_transmission.velocity_offset_reference_kms
             ),
@@ -1068,9 +1011,7 @@ def _evaluate_spectroscopic_component(
     collapsed_transmission = observation_inputs.collapsed_transmission
     frozen_timeseries = observation_inputs.frozen_timeseries
     collapsed_operator = (
-        collapsed_emission
-        if collapsed_emission is not None
-        else collapsed_transmission
+        collapsed_emission if collapsed_emission is not None else collapsed_transmission
     )
 
     def _resolved_velocity_offset(
@@ -1133,20 +1074,14 @@ def _evaluate_spectroscopic_component(
         stellar_surface_flux=component_config.stellar_surface_flux,
     )
     if collapsed_emission is not None:
-        model_ts = apply_collapsed_emission_operator(
-            model_ts,
-            collapsed_emission,
-        )
+        model_ts = apply_collapsed_emission_operator(model_ts, collapsed_emission)
     elif collapsed_transmission is not None:
         model_ts = apply_collapsed_transmission_operator(
             model_ts,
             collapsed_transmission,
         )
     elif frozen_timeseries is not None:
-        model_ts = apply_frozen_timeseries_operator(
-            model_ts,
-            frozen_timeseries,
-        )
+        model_ts = apply_frozen_timeseries_operator(model_ts, frozen_timeseries)
     model_ts = apply_model_pipeline_corrections(
         model_ts,
         subtract_weighted_global_mean=component_config.subtract_weighted_global_mean,
@@ -1493,10 +1428,7 @@ def build_spectroscopic_observation_config(
                 stellar_limb_darkening_u1,
                 stellar_limb_darkening_u2,
             )
-        stellar_surface_flux_arr = sop_inst.ipgauss(
-            stellar_surface_flux_arr,
-            beta_inst,
-        )
+        stellar_surface_flux_arr = sop_inst.ipgauss(stellar_surface_flux_arr, beta_inst)
 
     return SpectroscopicObservationConfig(
         name=name,

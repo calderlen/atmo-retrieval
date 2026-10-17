@@ -16,19 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 warnings.filterwarnings("once")
 
-# JAX GPU allocator configuration. Must be set before any jax import.
-# Default JAX behavior is to preallocate ~75% of GPU memory into a BFC (Best-Fit
-# with Coalescing) pool at startup. That pool is fast for JAX's own allocations
-# but collides with cuFFT, which exojax PreModit uses for the line-broadening
-# convolution: cuFFT asks BFC for its plan scratch (~8 MB) and gets RESOURCE_EXHAUSTED
-# when the pool is fully committed or fragmented.
-#
-# "platform" routes allocations through cudaMalloc/cudaFree directly, letting JAX,
-# cuFFT, and cuDNN all share the native CUDA allocator. Slightly slower per-op than
-# BFC but guarantees clean coexistence with cuFFT on tight-GPU retrievals. Pair with
-# PREALLOCATE=false so nothing is reserved upfront.
-#os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
-#os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# Optional platform allocation lets JAX and cuFFT share GPU memory without preallocation.
 
 import config
 import config_utils
@@ -201,23 +189,14 @@ def _build_multi_epoch_joint_spectra(
                     for arm in config.FULL_ARM_MEMBERS
                 }
             else:
-                arm_dirs = config_utils.get_full_arm_data_dirs(
-                    epoch=epoch,
-                    mode=mode,
-                )
-            arm_entries = (
-                ("red", arm_dirs["red"]),
-                ("blue", arm_dirs["blue"]),
-            )
+                arm_dirs = config_utils.get_full_arm_data_dirs(epoch=epoch, mode=mode)
+            arm_entries = (("red", arm_dirs["red"]), ("blue", arm_dirs["blue"]))
         else:
             arm_entries = (
                 (
                     str(config.OBSERVING_MODE),
                     (
-                        config_utils.get_timeseries_data_dir(
-                            epoch=epoch,
-                            mode=mode,
-                        )
+                        config_utils.get_timeseries_data_dir(epoch=epoch, mode=mode)
                         if data_format == "timeseries"
                         else (
                             config_utils.get_collapsed_transmission_dir(
@@ -225,10 +204,7 @@ def _build_multi_epoch_joint_spectra(
                                 arm=config.OBSERVING_MODE,
                             )
                             if mode == "transmission"
-                            else config_utils.get_data_dir(
-                                epoch=epoch,
-                                mode=mode,
-                            )
+                            else config_utils.get_data_dir(epoch=epoch, mode=mode)
                         )
                     ),
                 ),
@@ -820,8 +796,7 @@ def apply_cli_overrides(args):
     if args.resolution_mode:
         config.RESOLUTION_MODE = args.resolution_mode
 
-    # Validate planet/ephemeris combination
-    params = config_utils.get_params()  # Will raise if invalid
+    params = config_utils.get_params()
 
     if args.emission_selection is not None:
         if args.mode != "emission" or args.data_format != "spectrum":
@@ -1054,7 +1029,7 @@ def apply_cli_overrides(args):
 def print_config_summary(config, args):
     params = config_utils.get_params()
     epochs = _normalize_epoch_args(args.epoch)
-    
+
     print("\n" + "="*70)
     print("CONFIGURATION SUMMARY")
     print("="*70)
@@ -1167,7 +1142,6 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
         emission_selection=args.emission_selection,
     )
 
-    # Print configuration summary
     print_config_summary(runtime_config, args)
 
     pt_profile = config_utils.resolve_pt_profile_for_mode(args.mode, args.pt_profile)
@@ -1214,12 +1188,10 @@ def main():
     runtime_config = config
     config_utils.apply_runtime_profile(args.profile)
 
-    # Load config
     if args.config:
         print(f"Loading custom config: {args.config}")
         custom_config = load_custom_config(args.config)
         runtime_config = apply_custom_config(custom_config)
-    # Apply CLI overrides
     runtime_config = apply_cli_overrides(args)
     primary_epoch = args.epoch[0]
 

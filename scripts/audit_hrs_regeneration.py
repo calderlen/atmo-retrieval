@@ -100,11 +100,7 @@ def _audit_collapsed_products(
         else:
             metadata = _load_json(path / "collapse_metadata.json")
             status = metadata["status"]
-        row = {
-            "path": _relative(path, root),
-            "selection": selection,
-            "status": status,
-        }
+        row = {"path": _relative(path, root), "selection": selection, "status": status}
         if status == "skipped":
             row["skip_reason"] = metadata["skip_reason"]
         else:

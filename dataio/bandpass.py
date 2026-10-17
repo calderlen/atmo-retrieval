@@ -55,7 +55,6 @@ def load_tess_bandpass(
     wavelength_m = wavelength_nm_arr[mask] * 1.0e-9
     response_clean = response_arr[mask]
 
-
     order = np.argsort(wavelength_m)
     wavelength_m = wavelength_m[order]
     response_clean = response_clean[order]

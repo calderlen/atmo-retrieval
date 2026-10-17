@@ -66,8 +66,6 @@ def numpyro_madhu_seager(art: object, T_low: float, T_high: float) -> jnp.ndarra
     return madhu_seager_profile(art, T_deep, T_high, P_trans, delta_P)
 
 
-
-
 def free_temperature_profile(
     art: object,
     n_layers: int = 5,

@@ -118,7 +118,6 @@ def build_lsd_normal_system(
     template_flux = np.asarray(template_flux, dtype=float)
     velocity_grid = np.asarray(velocity_grid, dtype=float)
 
-
     valid = (
         np.isfinite(wavelength)
         & (wavelength > 0.0)
@@ -194,9 +193,7 @@ def build_shared_lsd_basis(
         symmetric = 0.5 * (matrix + matrix.T)
         maximum_eigenvalue = float(np.max(np.linalg.eigvalsh(symmetric)))
         if not np.isfinite(maximum_eigenvalue) or maximum_eigenvalue <= 0.0:
-            raise ValueError(
-                f"Exposure {index} has a singular LSD normal matrix."
-            )
+            raise ValueError(f"Exposure {index} has a singular LSD normal matrix.")
         normalized_matrices[index] = symmetric / maximum_eigenvalue
 
     shared_matrix = np.mean(normalized_matrices, axis=0)
@@ -392,9 +389,7 @@ def extract_lsd_profiles(
             effective_rank[index] = extracted["effective_rank"]
             n_pixels[index] = extracted["n_pixels"]
             reduced_chi2[index] = extracted["chi2"] / extracted["dof"]
-            projected_condition_number[index] = extracted[
-                "projected_condition_number"
-            ]
+            projected_condition_number[index] = extracted["projected_condition_number"]
 
         return {
             "velocity_kms": np.asarray(velocity_grid, dtype=float),
@@ -473,7 +468,6 @@ def synthesize_spectrum_from_lsd_profile(
     profile_was_1d = profiles.ndim == 1
     if profile_was_1d:
         profiles = profiles[np.newaxis, :]
-
 
     doppler_factors = velocity_to_doppler_factor(velocity_grid)
     template_depression = 1.0 - template_flux
@@ -555,9 +549,7 @@ def rotational_gaussian_profile(
 
     native_step = float(spacing[0])
     if float(vsini_kms) >= native_step:
-        shape = rotation_chord(
-            (velocity_kms - float(centroid_kms)) / float(vsini_kms)
-        )
+        shape = rotation_chord((velocity_kms - float(centroid_kms)) / float(vsini_kms))
         shape = gaussian_filter1d(
             shape,
             sigma=instrumental_sigma_kms / native_step,

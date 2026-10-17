@@ -130,12 +130,7 @@ def _reconstruction_operations(
                 "velocity_kms": instrument_removed_kms,
             },
         ]
-    return [
-        {
-            "operation": "unclassified_loader_frame_path",
-            "velocity_kms": None,
-        }
-    ]
+    return [{"operation": "unclassified_loader_frame_path", "velocity_kms": None}]
 
 
 def build_wavelength_frame_contract(
@@ -220,9 +215,7 @@ def build_wavelength_frame_contract(
             "molecfit_header_reconstruction",
         }
         input_medium = (
-            "vacuum"
-            if frame_source == "molecfit_header_reconstruction"
-            else "air"
+            "vacuum" if frame_source == "molecfit_header_reconstruction" else "air"
         )
         exposure_rows.append(
             {

@@ -24,9 +24,7 @@ from config import FULL_ARM_MEMBERS
 
 SPEED_OF_LIGHT_KMS = 299792.458
 EMISSION_COLLAPSE_SCHEMA_VERSION = 4
-COLLAPSE_COVERAGE_POLICY = (
-    "all_selected_exposures_in_bounds_and_within_native_segment"
-)
+COLLAPSE_COVERAGE_POLICY = ("all_selected_exposures_in_bounds_and_within_native_segment")
 
 EMISSION_COLLAPSE_SELECTIONS = (
     "full_emission",
@@ -60,9 +58,7 @@ def canonicalize_emission_selection(selection: str) -> str:
     return _SELECTION_ALIASES.get(key, key.replace("-", "_"))
 
 
-def emission_eclipse_boundaries(
-    planet_params: dict[str, Any],
-) -> tuple[float, float]:
+def emission_eclipse_boundaries(planet_params: dict[str, Any]) -> tuple[float, float]:
     """Return secondary-eclipse ingress and egress phases around phase 0.5."""
     duration = planet_params["duration"]
     period = planet_params["period"]
@@ -101,10 +97,7 @@ def emission_selection_mask(
     return pre | post
 
 
-def describe_emission_selection(
-    selection: str,
-    planet_params: dict[str, Any],
-) -> str:
+def describe_emission_selection(selection: str, planet_params: dict[str, Any]) -> str:
     """Return a reproducible human-readable definition of a phase selection."""
     canonical = canonicalize_emission_selection(selection)
     ingress, egress = emission_eclipse_boundaries(planet_params)
@@ -112,10 +105,7 @@ def describe_emission_selection(
         return f"phase(mod 1) in [0.25, {ingress:.12f})"
     if canonical == "post_eclipse":
         return f"phase(mod 1) in ({egress:.12f}, 0.75]"
-    return (
-        f"phase(mod 1) in [0.25, {ingress:.12f}) or "
-        f"({egress:.12f}, 0.75]"
-    )
+    return (f"phase(mod 1) in [0.25, {ingress:.12f}) or " f"({egress:.12f}, 0.75]")
 
 
 def collapsed_emission_dir(
@@ -128,20 +118,13 @@ def collapsed_emission_dir(
     """Return the standard directory for one collapsed emission product."""
     canonical = canonicalize_emission_selection(selection)
     return (
-        config_utils.get_data_dir(
-            planet=planet,
-            epoch=epoch,
-            arm=arm,
-            mode="emission",
-        )
+        config_utils.get_data_dir(planet=planet, epoch=epoch, arm=arm, mode="emission")
         / "collapsed"
         / canonical
     )
 
 
-def load_frozen_sysrem_arrays(
-    data_dir: Path,
-) -> dict[str, np.ndarray]:
+def load_frozen_sysrem_arrays(data_dir: Path) -> dict[str, np.ndarray]:
     """Read the source cube's frozen SYSREM operator."""
     with np.load(data_dir / "U_sysrem.npz") as raw:
         U = np.asarray(raw["U_sysrem"], dtype=float)
@@ -172,7 +155,6 @@ def apply_emission_collapse_operator(
     bin_weights = np.asarray(operator["bin_weights"], dtype=float)
     output_wavelength = np.asarray(operator["output_wavelength"], dtype=float)
     output_uncertainty = np.asarray(operator["output_uncertainty"], dtype=float)
-
 
     exposure_indices = np.arange(data.shape[0])[:, None]
     left_data = data[exposure_indices, left_indices]
@@ -235,11 +217,7 @@ def build_emission_collapse_operator(
         shift_query_full,
         side="left",
     )
-    shift_right_indices_full = np.clip(
-        shift_right_indices_full,
-        1,
-        wavelength.size - 1,
-    )
+    shift_right_indices_full = np.clip(shift_right_indices_full, 1, wavelength.size - 1)
     shift_left_indices_full = shift_right_indices_full - 1
     left_wavelength_full = wavelength[shift_left_indices_full]
     right_wavelength_full = wavelength[shift_right_indices_full]
@@ -294,11 +272,7 @@ def build_emission_collapse_operator(
     covered_source_indices = np.flatnonzero(common_coverage).astype(np.int32)
     covered_wavelength = wavelength[common_coverage]
     shift_left_indices = shift_left_indices_full[:, common_coverage]
-    shift_fractions = np.clip(
-        shift_fractions_full[:, common_coverage],
-        0.0,
-        1.0,
-    )
+    shift_fractions = np.clip(shift_fractions_full[:, common_coverage], 0.0, 1.0)
 
     exposure_indices = np.arange(sigma.shape[0])[:, None]
     left_sigma = sigma[exposure_indices, shift_left_indices]
@@ -362,24 +336,16 @@ def build_emission_collapse_operator(
         "output_uncertainty": output_uncertainty,
         "covered_source_indices": covered_source_indices,
         "n_source_wavelengths": np.asarray(wavelength.size, dtype=np.int32),
-        "n_covered_wavelengths": np.asarray(
-            covered_wavelength.size,
-            dtype=np.int32,
-        ),
+        "n_covered_wavelengths": np.asarray(covered_wavelength.size, dtype=np.int32),
         "n_dropped_out_of_bounds": np.asarray(
             np.count_nonzero(~all_exposures_in_bounds),
             dtype=np.int32,
         ),
         "n_dropped_gap_crossing": np.asarray(
-            np.count_nonzero(
-                all_exposures_in_bounds & ~all_exposures_gap_safe
-            ),
+            np.count_nonzero(all_exposures_in_bounds & ~all_exposures_gap_safe),
             dtype=np.int32,
         ),
-        "max_native_gap_factor": np.asarray(
-            max_native_gap_factor,
-            dtype=float,
-        ),
+        "max_native_gap_factor": np.asarray(max_native_gap_factor, dtype=float),
         "max_native_gap_angstrom": np.asarray(maximum_gap, dtype=float),
     }
 
@@ -483,9 +449,7 @@ def collapse_epoch_arm(
         ),
         "eccentricity": float(params.get("eccentricity", 0.0)),
         "omega_planet_deg": (
-            None
-            if params.get("omega") is None
-            else float(params.get("omega"))
+            None if params.get("omega") is None else float(params.get("omega"))
         ),
         "velocity_offset_reference_kms": 0.0,
         "source_data_dir": str(data_dir),
@@ -494,9 +458,7 @@ def collapse_epoch_arm(
         "source_run_sysrem": source_metadata.get("run_sysrem"),
         "wavelength_medium": source_metadata.get("wavelength_medium"),
         "wavelength_frame": source_metadata.get("wavelength_frame"),
-        "wavelength_frame_contract": source_metadata.get(
-            "wavelength_frame_contract"
-        ),
+        "wavelength_frame_contract": source_metadata.get("wavelength_frame_contract"),
         "arm_edge_trim": source_metadata.get("arm_edge_trim"),
         "n_source_exposures": int(phase.size),
         "n_selected_exposures": int(selected_indices.size),
@@ -542,10 +504,7 @@ def collapse_epoch_arm(
     np.save(output_dir / _PRODUCT_FILENAMES[2], uncertainty_1d)
     np.savez_compressed(
         output_dir / _PRODUCT_FILENAMES[3],
-        schema_version=np.asarray(
-            EMISSION_COLLAPSE_SCHEMA_VERSION,
-            dtype=np.int32,
-        ),
+        schema_version=np.asarray(EMISSION_COLLAPSE_SCHEMA_VERSION, dtype=np.int32),
         source_wavelength=np.asarray(wavelength, dtype=float),
         source_phase=np.asarray(phase, dtype=float),
         selected_exposure_indices=np.asarray(selected_indices, dtype=np.int32),
@@ -594,25 +553,17 @@ def collapse_epoch_arm(
             "n_dropped_out_of_bounds": int(
                 collapse_operator["n_dropped_out_of_bounds"]
             ),
-            "n_dropped_gap_crossing": int(
-                collapse_operator["n_dropped_gap_crossing"]
-            ),
+            "n_dropped_gap_crossing": int(collapse_operator["n_dropped_gap_crossing"]),
             "retained_unbinned_wavelength_fraction": float(
                 int(collapse_operator["n_covered_wavelengths"])
                 / wavelength.size
             ),
-            "max_native_gap_factor": float(
-                collapse_operator["max_native_gap_factor"]
-            ),
+            "max_native_gap_factor": float(collapse_operator["max_native_gap_factor"]),
             "max_native_gap_angstrom": float(
                 collapse_operator["max_native_gap_angstrom"]
             ),
-            "shift_fraction_min": float(
-                np.min(collapse_operator["shift_fractions"])
-            ),
-            "shift_fraction_max": float(
-                np.max(collapse_operator["shift_fractions"])
-            ),
+            "shift_fraction_min": float(np.min(collapse_operator["shift_fractions"])),
+            "shift_fraction_max": float(np.max(collapse_operator["shift_fractions"])),
             "wavelength_min_angstrom": float(np.min(wavelength_1d)),
             "wavelength_max_angstrom": float(np.max(wavelength_1d)),
             "n_output_wavelengths": int(wavelength_1d.size),

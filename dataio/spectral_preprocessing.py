@@ -11,25 +11,15 @@ def subtract_median_spectrum(
     flux: np.ndarray,
     error: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Subtract median spectrum to remove stellar lines and time-invariant tellurics.
+    """Subtract the time-median spectrum and propagate its uncertainty.
 
-    Computes the per-wavelength median across all exposures and subtracts it,
-    yielding residual spectra. Error propagation accounts for the uncertainty
-    in the median estimate.
-
-    Args:
-        flux: Flux arrays, shape (n_spectra, npix)
-        error: Error arrays, shape (n_spectra, npix)
-
-    Returns:
-        residual_flux: Median-subtracted flux, shape (n_spectra, npix)
-        residual_error: Propagated uncertainties, shape (n_spectra, npix)
-        median_flux: The subtracted median spectrum, shape (npix,)
+    flux and error have shape (n_spectra, npix). Return residual flux,
+    propagated errors (both the input shape), and median flux (npix,).
+    The median removes stellar lines and time-invariant tellurics.
     """
     n_spectra = flux.shape[0]
     npix = flux.shape[1]
 
-    # Compute median spectrum
     median_flux = np.median(flux, axis=0)
 
     # Median error estimation from https://mathworld.wolfram.com/StatisticalMedian.html
@@ -38,7 +28,6 @@ def subtract_median_spectrum(
     correction_factor = np.sqrt(4 * little_n / (np.pi * n_spectra))
     median_error = np.sqrt(np.sum(error**2, axis=0)) / n_spectra / correction_factor
 
-    # Subtract median from each spectrum
     residual_flux = flux - median_flux[np.newaxis, :]
 
     # Propagate errors: sigma_residual^2 = sigma_flux^2 + sigma_median^2
@@ -76,10 +65,7 @@ def get_sysrem_chunk_indices(
     return ("non_telluric",), (no_tellurics,), telluric_mask
 
 
-def get_sysrem_deep_mask(
-    wave: np.ndarray,
-    arm: str,
-) -> np.ndarray:
+def get_sysrem_deep_mask(wave: np.ndarray, arm: str) -> np.ndarray:
     """Return wavelengths that should be ignored after Molecfit correction."""
     wave = np.asarray(wave, dtype=float)
 
@@ -178,11 +164,7 @@ def arm_edge_trim_metadata(
 
     lo = float(np.nanmin(wave[finite]))
     hi = float(np.nanmax(wave[finite]))
-    trim_mask = get_arm_edge_trim_mask(
-        wave,
-        arm,
-        explicit_widths_A=explicit_widths_A,
-    )
+    trim_mask = get_arm_edge_trim_mask(wave, arm, explicit_widths_A=explicit_widths_A)
     return {
         "left_trim_A": left_width,
         "right_trim_A": right_width,
@@ -270,7 +252,6 @@ def do_sysrem(
     """
     n_spectra = residual_flux.shape[0]
 
-    # Work with copies to avoid modifying input
     corrected_flux = residual_flux.copy()
     corrected_error = residual_error.copy()
 
@@ -295,7 +276,6 @@ def do_sysrem(
 
     max_systematics = get_sysrem_max_systematics(arm)
     min_systematics = get_sysrem_min_systematics(arm)
-
 
     max_n_sys = max(max_systematics)
     U_sysrem = np.full((n_spectra, max_n_sys, chunks), np.nan, dtype=float)

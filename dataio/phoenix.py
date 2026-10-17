@@ -90,9 +90,7 @@ def _build_phoenix_surface_flux_cache_path(
             dtype=np.float64,
         ).tobytes()
     )
-    cache_key.update(
-        np.asarray(target_wavelength_angstrom, dtype=np.float64).tobytes()
-    )
+    cache_key.update(np.asarray(target_wavelength_angstrom, dtype=np.float64).tobytes())
     input_hash = cache_key.hexdigest()[:16]
     filename = (
         "phoenix_"

@@ -180,10 +180,7 @@ def main() -> int:
     sme.specific_intensities_only = False
     sme.ipres = 0.0
     sme.atmo.source = str(args.atmosphere)
-    sme.linelist, header_normalization = _load_vald_for_pysme(
-        linelist_path,
-        ValdFile,
-    )
+    sme.linelist, header_normalization = _load_vald_for_pysme(linelist_path, ValdFile)
     sme.wave = wavelength_segments
 
     print(

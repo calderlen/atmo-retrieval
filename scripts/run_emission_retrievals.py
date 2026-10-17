@@ -98,9 +98,7 @@ def _resolve_case(
     base = cases[args.case]
     atoms = base.atoms if args.atoms is None else args.atoms
     chemistry_model = (
-        base.chemistry_model
-        if args.chemistry_model is None
-        else args.chemistry_model
+        base.chemistry_model if args.chemistry_model is None else args.chemistry_model
     )
     if atoms == base.atoms and chemistry_model == base.chemistry_model:
         return base
@@ -261,11 +259,7 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    joint_spectra = _auxiliary_emission_specs(
-        epochs=epochs[1:],
-        args=args,
-        case=case,
-    )
+    joint_spectra = _auxiliary_emission_specs(epochs=epochs[1:], args=args, case=case)
     region = atmosphere_region_spec(
         case,
         name="dayside",

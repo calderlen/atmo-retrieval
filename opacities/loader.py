@@ -21,7 +21,6 @@ from radis.api import dbmanager as radis_dbmanager
 from radis.api.hitempapi import login_to_hitran
 
 
-
 # Opacity cache directory (relative to project root)
 from config import DB_KURUCZ, DB_VALD, OPA_CACHE_DIR, USE_KURUCZ, USE_VALD
 from .atomic_sources import (
@@ -61,13 +60,7 @@ def premodit_cache_path(
     cutwing: float | None = None,
 ) -> pathlib.Path:
     """Return the coexistence-safe cache path for one PreMODIT opacity."""
-    signature = premodit_cache_signature(
-        nu_grid,
-        diffmode,
-        T_low,
-        T_high,
-        cutwing,
-    )
+    signature = premodit_cache_signature(nu_grid, diffmode, T_low, T_high, cutwing)
     return OPA_CACHE_DIR / f"opa_{name}_{signature}.zarr"
 
 
@@ -211,14 +204,7 @@ def build_premodit_from_snapshot(
         allow_32bit=True,
         cutwing=cutwing_val,
     )
-    opa_path = premodit_cache_path(
-        mol,
-        nu_grid,
-        diffmode,
-        T_low,
-        T_high,
-        cutwing_val,
-    )
+    opa_path = premodit_cache_path(mol, nu_grid, diffmode, T_low, T_high, cutwing_val)
     saveopa(opa, str(opa_path), format="zarr", aux={"molmass": molmass})
     return opa
 
@@ -370,7 +356,6 @@ def load_atomic_opacities(
     if not atomic_species:
         return opa_atoms, jnp.array(atommass_list)
 
-    # Get defaults from config if not specified
     if use_kurucz is None:
         use_kurucz = USE_KURUCZ
     if use_vald is None:

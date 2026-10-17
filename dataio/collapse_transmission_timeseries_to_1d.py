@@ -62,18 +62,12 @@ def calculate_transmission_spectrum(
         transit_params.get('T0_scale', transit_params.get('epoch_scale')),
         transit_params.get('T0_reference', transit_params.get('epoch_reference')),
     )
-    orbital_phase = get_orbital_phase(
-        bjd_tdb,
-        epoch_bjd_tdb,
-        transit_params['period'],
-    )
+    orbital_phase = get_orbital_phase(bjd_tdb, epoch_bjd_tdb, transit_params['period'])
 
     contacts = compute_contact_phases(transit_params)
     active_transit = active_transit_mask(orbital_phase, transit_params)
     active_interval = (
-        "T14_grazing"
-        if bool(transit_params.get("grazing_transit", False))
-        else "T23"
+        "T14_grazing" if bool(transit_params.get("grazing_transit", False)) else "T23"
     )
     out_transit = (orbital_phase < contacts["T1"]) | (orbital_phase > contacts["T4"])
 
@@ -81,11 +75,7 @@ def calculate_transmission_spectrum(
     print(f"Out-of-transit: {np.sum(out_transit)} exposures")
     print(f"Orbital phase range: {orbital_phase.min():.4f} to {orbital_phase.max():.4f}")
 
-    residual, residual_error = build_out_of_transit_residuals(
-        flux,
-        error,
-        out_transit,
-    )
+    residual, residual_error = build_out_of_transit_residuals(flux, error, out_transit)
 
     active_phase = orbital_phase[active_transit]
     planet_velocity = planet_radial_velocity_kms(
@@ -186,12 +176,7 @@ def bin_spectrum(
     return wave_binned, flux_binned, error_binned
 
 
-def collapsed_transmission_dir(
-    *,
-    planet: str,
-    epoch: str,
-    arm: str,
-) -> Path:
+def collapsed_transmission_dir(*, planet: str, epoch: str, arm: str) -> Path:
     """Return the standard directory for a collapsed transmission product."""
     return config_utils.get_collapsed_transmission_dir(
         planet=planet,
@@ -203,11 +188,7 @@ def collapsed_transmission_dir(
 def _load_transmission_collapse_source(
     data_dir: Path,
 ) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    dict,
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict,
 ]:
     metadata = json.loads((data_dir / "timeseries_prep.json").read_text(encoding="utf-8"))
     wavelength = np.asarray(np.load(data_dir / "wavelength.npy"), dtype=float)
@@ -265,11 +246,7 @@ def collapse_transmission_epoch_arm(
     else:
         source_dir = Path(source_dir)
     if output_dir is None:
-        output_dir = collapsed_transmission_dir(
-            planet=planet,
-            epoch=epoch,
-            arm=arm,
-        )
+        output_dir = collapsed_transmission_dir(planet=planet, epoch=epoch, arm=arm)
     else:
         output_dir = Path(output_dir)
     wavelength, data, sigma, phase, source_metadata = (
@@ -301,27 +278,18 @@ def collapse_transmission_epoch_arm(
         bin_size=bin_size,
     )
     wavelength_1d, spectrum_1d, uncertainty_1d = (
-        apply_emission_collapse_operator(
-            data[selected_indices],
-            fixed,
-        )
+        apply_emission_collapse_operator(data[selected_indices], fixed)
     )
     frozen_sysrem = load_frozen_sysrem_arrays(source_dir) if source_metadata["run_sysrem"] else None
 
     output_dir.mkdir(parents=True, exist_ok=True)
     np.save(output_dir / "wavelength_transmission.npy", wavelength_1d)
     np.save(output_dir / "spectrum_transmission.npy", spectrum_1d)
-    np.save(
-        output_dir / "uncertainty_transmission.npy",
-        uncertainty_1d,
-    )
+    np.save(output_dir / "uncertainty_transmission.npy", uncertainty_1d)
     operator_name = "transmission_collapse_operator.npz"
     np.savez_compressed(
         output_dir / operator_name,
-        schema_version=np.asarray(
-            TRANSMISSION_COLLAPSE_SCHEMA_VERSION,
-            dtype=np.int32,
-        ),
+        schema_version=np.asarray(TRANSMISSION_COLLAPSE_SCHEMA_VERSION, dtype=np.int32),
         source_wavelength=wavelength,
         source_phase=phase,
         fixed_source_model=fixed_source_model,
@@ -376,9 +344,7 @@ def collapse_transmission_epoch_arm(
         ),
         "eccentricity": float(params.get("eccentricity", 0.0)),
         "omega_planet_deg": (
-            None
-            if params.get("omega") is None
-            else float(params.get("omega"))
+            None if params.get("omega") is None else float(params.get("omega"))
         ),
         "velocity_offset_reference_kms": 0.0,
         "source_data_dir": str(source_dir),
@@ -386,9 +352,7 @@ def collapse_transmission_epoch_arm(
         "fixed_doppler_shadow": fixed_shadow_metadata,
         "wavelength_medium": source_metadata.get("wavelength_medium"),
         "wavelength_frame": source_metadata.get("wavelength_frame"),
-        "wavelength_frame_contract": source_metadata.get(
-            "wavelength_frame_contract"
-        ),
+        "wavelength_frame_contract": source_metadata.get("wavelength_frame_contract"),
         "arm_edge_trim": source_metadata.get("arm_edge_trim"),
         "n_source_exposures": int(phase.size),
         "n_selected_exposures": int(selected_indices.size),
@@ -397,25 +361,17 @@ def collapse_transmission_epoch_arm(
         "collapse_operator_file": operator_name,
         "wavelength_coverage_policy": COLLAPSE_COVERAGE_POLICY,
         "n_source_wavelengths": int(wavelength.size),
-        "n_covered_unbinned_wavelengths": int(
-            fixed["n_covered_wavelengths"]
-        ),
+        "n_covered_unbinned_wavelengths": int(fixed["n_covered_wavelengths"]),
         "n_dropped_wavelengths": int(
             wavelength.size - int(fixed["n_covered_wavelengths"])
         ),
-        "n_dropped_out_of_bounds": int(
-            fixed["n_dropped_out_of_bounds"]
-        ),
-        "n_dropped_gap_crossing": int(
-            fixed["n_dropped_gap_crossing"]
-        ),
+        "n_dropped_out_of_bounds": int(fixed["n_dropped_out_of_bounds"]),
+        "n_dropped_gap_crossing": int(fixed["n_dropped_gap_crossing"]),
         "retained_unbinned_wavelength_fraction": float(
             int(fixed["n_covered_wavelengths"]) / wavelength.size
         ),
         "max_native_gap_factor": float(fixed["max_native_gap_factor"]),
-        "max_native_gap_angstrom": float(
-            fixed["max_native_gap_angstrom"]
-        ),
+        "max_native_gap_angstrom": float(fixed["max_native_gap_angstrom"]),
         "shift_fraction_min": float(np.min(fixed["shift_fractions"])),
         "shift_fraction_max": float(np.max(fixed["shift_fractions"])),
         "n_output_wavelengths": int(wavelength_1d.size),

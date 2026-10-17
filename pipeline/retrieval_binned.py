@@ -27,10 +27,7 @@ def run_phase_binned_retrieval(
         phase_bins = list(config.PHASE_BINS.keys())
     if base_output_dir is None:
         base_output_dir = config.DEFAULT_PHASE_BINNED_OUTPUT_DIR
-    resolved_data_dir = config_utils.get_timeseries_data_dir(
-        epoch=epoch,
-        mode=mode,
-    )
+    resolved_data_dir = config_utils.get_timeseries_data_dir(epoch=epoch, mode=mode)
 
     wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
 
@@ -44,15 +41,12 @@ def run_phase_binned_retrieval(
 
     sysrem_inputs = None
     if apply_sysrem:
-        sysrem_inputs = _build_sysrem_inputs(
-            _load_sysrem_inputs(resolved_data_dir),
-        )
+        sysrem_inputs = _build_sysrem_inputs(_load_sysrem_inputs(resolved_data_dir))
         print(
             f"Loaded SYSREM auxiliaries for phase-binned retrieval: "
             f"{_describe_sysrem_inputs(sysrem_inputs)}"
         )
-    
-    # Print phase coverage summary
+
     coverage = summarize_phase_coverage(phase, params)
     print("\n" + "=" * 70)
     print("PHASE-BINNED RETRIEVAL")
@@ -69,34 +63,31 @@ def run_phase_binned_retrieval(
         else:
             print(f"  {bin_name}: NO EXPOSURES (will skip)")
     print("=" * 70 + "\n")
-    
+
     results = {}
-    
+
     for bin_name in phase_bins:
         bin_info = coverage["bins"].get(bin_name, {})
         if bin_info.get("count", config.DEFAULT_BIN_INFO_COUNT) == 0:
             print(f"\nSkipping {bin_name}: no exposures in this phase bin")
             results[bin_name] = None
             continue
-        
+
         print(f"\n{'='*70}")
         print(f"Running retrieval for phase bin: {bin_name} ({config.PHASE_BINS[bin_name]})")
         print(f"{'='*70}")
-        
-        # Filter data to this phase bin
+
         indices = np.array(bin_info.get("indices", []), dtype=int)
         data_bin = data[indices]
         sigma_bin = sigma[indices]
         phase_bin = phase[indices]
         sysrem_bin = _subset_sysrem_inputs(sysrem_inputs, indices)
-        
+
         print(f"Filtered to {len(phase_bin)} exposures")
-        
-        # Set up output directory for this bin
+
         bin_output_dir = os.path.join(base_output_dir, bin_name)
         os.makedirs(bin_output_dir, exist_ok=True)
-        
-        # Run retrieval
+
         previous_dir = config.DIR_SAVE
         try:
             config.DIR_SAVE = str(bin_output_dir)
@@ -112,7 +103,6 @@ def run_phase_binned_retrieval(
             )
             results[bin_name] = {"output_dir": str(bin_output_dir)}
 
-            # Save bin-specific info
             np.savez(
                 os.path.join(bin_output_dir, "phase_bin_info.npz"),
                 bin_name=bin_name,
@@ -123,13 +113,12 @@ def run_phase_binned_retrieval(
             )
         finally:
             config.DIR_SAVE = previous_dir
-    
-    # Generate comparison if we have multiple successful retrievals
+
     successful_bins = []
     for b, r in results.items():
         if isinstance(r, dict) and "samples" in r and "error" not in r:
             successful_bins.append(b)
-    
+
     if len(successful_bins) >= 2:
         comparison_dir = os.path.join(base_output_dir, "comparison")
         os.makedirs(comparison_dir, exist_ok=True)
@@ -141,7 +130,7 @@ def run_phase_binned_retrieval(
             output_dir=comparison_dir,
         )
         results["comparison"] = comparison
-    
+
     return results
 
 
@@ -151,37 +140,35 @@ def compare_phase_posteriors(
     output_dir: str | None = None,
 ) -> dict:
     bin_names = list(posteriors.keys())
-    
+
     if len(bin_names) < 2:
         return {"error": "Need at least 2 bins for comparison"}
-    
+
     if params_to_compare is None:
         all_params = set()
         for post in posteriors.values():
             if isinstance(post, dict) and "samples" in post:
                 all_params.update(post["samples"].keys())
-        
-        # Filter to interesting parameters
+
         params_to_compare = []
         for p in all_params:
             if p == "v_sys" or p.startswith("logVMR") or p == "Kp":
                 params_to_compare.append(p)
-    
+
     comparison = {
         "bins": bin_names,
         "parameters": params_to_compare,
         "statistics": {},
     }
-    
+
     print("\n" + "=" * 70)
     print("PHASE BIN COMPARISON")
     print("=" * 70)
-    
+
     for param in params_to_compare:
         param_stats = {}
         samples_by_bin = {}
-        
-        # Collect samples for this parameter
+
         for bin_name in bin_names:
             post = posteriors[bin_name]
             if isinstance(post, dict) and "samples" in post:
@@ -191,11 +178,10 @@ def compare_phase_posteriors(
                     if samples.ndim > 1:
                         samples = samples.mean(axis=-1)  # Take mean across exposures
                     samples_by_bin[bin_name] = samples
-        
+
         if len(samples_by_bin) < 2:
             continue
-        
-        # Compute summary statistics for each bin
+
         for bin_name, samples in samples_by_bin.items():
             param_stats[f"{bin_name}_mean"] = float(np.mean(samples))
             param_stats[f"{bin_name}_std"] = float(np.std(samples))
@@ -203,21 +189,20 @@ def compare_phase_posteriors(
             q16, q84 = np.percentile(samples, [16, 84])
             param_stats[f"{bin_name}_q16"] = float(q16)
             param_stats[f"{bin_name}_q84"] = float(q84)
-        
-        # Pairwise comparisons
+
         bin_list = list(samples_by_bin.keys())
         for i, bin_a in enumerate(bin_list):
             for bin_b in bin_list[i+1:]:
                 samples_a = samples_by_bin[bin_a]
                 samples_b = samples_by_bin[bin_b]
-                
+
                 # Kolmogorov-Smirnov comparison
                 ks_stat, ks_pval = stats.ks_2samp(samples_a, samples_b)
                 param_stats[f"ks_{bin_a}_vs_{bin_b}"] = {
                     "statistic": float(ks_stat),
                     "p_value": float(ks_pval),
                 }
-                
+
                 # Difference of means (with uncertainty)
                 diff_mean = np.mean(samples_a) - np.mean(samples_b)
                 # Bootstrap uncertainty on difference
@@ -228,24 +213,22 @@ def compare_phase_posteriors(
                     idx_b = np.random.randint(0, len(samples_b), len(samples_b))
                     diff_samples.append(np.mean(samples_a[idx_a]) - np.mean(samples_b[idx_b]))
                 diff_std = np.std(diff_samples)
-                
+
                 param_stats[f"diff_{bin_a}_minus_{bin_b}"] = {
                     "mean": float(diff_mean),
                     "std": float(diff_std),
                     "significance": float(abs(diff_mean) / diff_std) if diff_std > 0 else 0,
                 }
-        
+
         comparison["statistics"][param] = param_stats
-        
-        # Print summary
+
         print(f"\n{param}:")
         for bin_name in bin_names:
             if bin_name in samples_by_bin:
                 mean = param_stats[f"{bin_name}_mean"]
                 std = param_stats[f"{bin_name}_std"]
                 print(f"  {bin_name}: {mean:.3f} +/- {std:.3f}")
-        
-        # Print KS comparison results
+
         for i, bin_a in enumerate(bin_list):
             for bin_b in bin_list[i+1:]:
                 key = f"ks_{bin_a}_vs_{bin_b}"
@@ -253,10 +236,9 @@ def compare_phase_posteriors(
                     pval = param_stats[key]["p_value"]
                     sig = "***" if pval < 0.001 else "**" if pval < 0.01 else "*" if pval < 0.05 else ""
                     print(f"  KS comparison {bin_a} vs {bin_b}: p = {pval:.4f} {sig}")
-    
+
     print("=" * 70 + "\n")
-    
-    # Save comparison results
+
     if output_dir:
         # Convert numpy types to Python types for JSON serialization
         def convert_to_serializable(obj):
@@ -275,19 +257,18 @@ def compare_phase_posteriors(
                     converted.append(convert_to_serializable(v))
                 return converted
             return obj
-        
+
         comparison_serializable = convert_to_serializable(comparison)
-        
+
         with open(os.path.join(output_dir, "comparison.json"), "w") as f:
             json.dump(comparison_serializable, f, indent=2)
-        
-        # Also save as text summary
+
         with open(os.path.join(output_dir, "comparison_summary.txt"), "w") as f:
             f.write("Phase Bin Comparison Summary\n")
             f.write("=" * 70 + "\n\n")
             f.write(f"Bins compared: {', '.join(bin_names)}\n")
             f.write(f"Parameters: {', '.join(params_to_compare)}\n\n")
-            
+
             for param, stats in comparison["statistics"].items():
                 f.write(f"\n{param}:\n")
                 f.write("-" * 40 + "\n")
@@ -298,9 +279,9 @@ def compare_phase_posteriors(
                             f.write(f"    {k}: {v}\n")
                     else:
                         f.write(f"  {key}: {value}\n")
-        
+
         print(f"Comparison saved to {output_dir}")
-    
+
     return comparison
 
 
@@ -311,31 +292,31 @@ def detect_asymmetry(
 ) -> dict:
     if "T12" not in posteriors or "T34" not in posteriors:
         return {"error": "Need both T12 and T34 bins for asymmetry comparison"}
-    
+
     samples_ingress = posteriors["T12"]["samples"][param]
     samples_egress = posteriors["T34"]["samples"][param]
-    
+
     if samples_ingress.ndim > 1:
         samples_ingress = samples_ingress.mean(axis=-1)
     if samples_egress.ndim > 1:
         samples_egress = samples_egress.mean(axis=-1)
-    
+
     # Compute difference distribution
     # Sample with replacement to match array sizes
     n_samples = min(len(samples_ingress), len(samples_egress))
     idx_in = np.random.randint(0, len(samples_ingress), n_samples)
     idx_eg = np.random.randint(0, len(samples_egress), n_samples)
-    
+
     diff = samples_ingress[idx_in] - samples_egress[idx_eg]
-    
+
     diff_mean = np.mean(diff)
     diff_std = np.std(diff)
     significance = abs(diff_mean) / diff_std if diff_std > 0 else 0
-    
+
     # Is difference consistent with zero?
     q16, q50, q84 = np.percentile(diff, [16, 50, 84])
     consistent_with_zero = (q16 <= 0 <= q84)
-    
+
     result = {
         "parameter": param,
         "ingress_mean": float(np.mean(samples_ingress)),
@@ -353,8 +334,7 @@ def detect_asymmetry(
             "q84": float(q84),
         },
     }
-    
-    # Interpretation
+
     if result["asymmetry_detected"]:
         if diff_mean > 0:
             result["interpretation"] = f"{param} is larger at ingress than egress"
@@ -362,5 +342,5 @@ def detect_asymmetry(
             result["interpretation"] = f"{param} is larger at egress than ingress"
     else:
         result["interpretation"] = f"No significant asymmetry in {param}"
-    
+
     return result

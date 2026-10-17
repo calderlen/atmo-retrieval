@@ -456,9 +456,7 @@ def select_products(
     product_profile = str(product_profile).lower()
 
     explicit_subgroups = product_subgroups is not None
-    requested_subgroups = {
-        _canonical_name(item) for item in (product_subgroups or ())
-    }
+    requested_subgroups = {_canonical_name(item) for item in (product_subgroups or ())}
     if not explicit_subgroups:
         if product_profile == "direct":
             requested_subgroups = set(DIRECT_PRODUCT_SUBGROUPS)

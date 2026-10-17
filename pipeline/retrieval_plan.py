@@ -41,10 +41,7 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         default="red",
         help="PEPSI arm selection; full loads red and blue as separate components.",
     )
-    parser.add_argument(
-        "--profile",
-        default=config_utils.get_runtime_profile_name(),
-    )
+    parser.add_argument("--profile", default=config_utils.get_runtime_profile_name())
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-svi", action="store_true")

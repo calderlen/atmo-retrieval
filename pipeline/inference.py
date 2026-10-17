@@ -99,11 +99,7 @@ def create_prior_guide(
         distributions["Rp"] = dist.TruncatedNormal(Rp_mean, Rp_std, low=0.5)
         centers["Rp"] = Rp_mean
     if prior_modes.get("Rstar", "normal") != "fixed":
-        distributions["Rstar"] = dist.TruncatedNormal(
-            Rstar_mean,
-            Rstar_std,
-            low=0.0,
-        )
+        distributions["Rstar"] = dist.TruncatedNormal(Rstar_mean, Rstar_std, low=0.0)
         centers["Rstar"] = Rstar_mean
     return _IndependentPriorGuide(distributions, centers)
 
@@ -236,12 +232,7 @@ def _run_svi_with_logging(
     start = perf_counter()
 
     print("  SVI: JAX compile starting; first update may take a while...", flush=True)
-    initial_result = svi.run(
-        rng_key,
-        1,
-        progress_bar=False,
-        **model_inputs,
-    )
+    initial_result = svi.run(rng_key, 1, progress_bar=False, **model_inputs)
     initial_losses = np.atleast_1d(
         np.asarray(jax.device_get(initial_result.losses), dtype=float)
     )
@@ -441,8 +432,5 @@ def run_inference(
     mcmc_run_kwargs = dict(model_inputs)
     if save_mcmc_diagnostics:
         mcmc_run_kwargs["extra_fields"] = DEFAULT_MCMC_EXTRA_FIELDS
-    mcmc.run(
-        rng_key_,
-        **mcmc_run_kwargs,
-    )
+    mcmc.run(rng_key_, **mcmc_run_kwargs)
     return InferenceResult(mcmc, rng_key, svi_params, svi_losses, svi_guide)

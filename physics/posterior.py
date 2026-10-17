@@ -55,11 +55,7 @@ def _posterior_site_value(
     return posterior_params[site_name]
 
 
-def _collect_indexed_site_values(
-    local_params: dict,
-    *,
-    prefix: str,
-) -> list[object]:
+def _collect_indexed_site_values(local_params: dict, *, prefix: str) -> list[object]:
     indexed_values: list[tuple[int, object]] = []
     for key, value in local_params.items():
         if not key.startswith(prefix):
@@ -71,11 +67,7 @@ def _collect_indexed_site_values(
     return [value for _, value in sorted(indexed_values)]
 
 
-def _summarize_posterior_samples(
-    posterior_samples: dict,
-    *,
-    use_median: bool,
-) -> dict:
+def _summarize_posterior_samples(posterior_samples: dict, *, use_median: bool) -> dict:
     reducer = np.median if use_median else np.mean
     summary = {}
     for key, values in posterior_samples.items():
@@ -113,14 +105,8 @@ def reconstruct_temperature_profile(
 
         # ``Rp`` is the legacy posterior site name; semantically it is the
         # sampled reference radius used at the RT lower boundary.
-        R_ref = _posterior_site_value(
-            posterior_params,
-            "Rp",
-        )
-        Mp = _posterior_site_value(
-            posterior_params,
-            "Mp",
-        )
+        R_ref = _posterior_site_value(posterior_params, "Rp")
+        Mp = _posterior_site_value(posterior_params, "Mp")
         g_btm = gravity_surface(R_ref, Mp)
 
         return guillot_profile(
@@ -470,10 +456,7 @@ def compute_atmospheric_state_from_posterior(
     sample_prefix: str | None = None,
 ) -> dict:
     art = region_config.art
-    params = _summarize_posterior_samples(
-        posterior_samples,
-        use_median=use_median,
-    )
+    params = _summarize_posterior_samples(posterior_samples, use_median=use_median)
 
     mol_names = list(region_config.mol_names)
     atom_names = list(region_config.atom_names)
@@ -618,7 +601,6 @@ def compute_atmospheric_state_from_posterior(
         if np.any(~np.isfinite(profile_np)) or np.any(profile_np < 0.0):
             raise ValueError(f"Posterior reconstruction produced an invalid {label} profile.")
 
-    # Compute gravity profile
     # ``Rp`` remains the persisted posterior site for compatibility; its
     # runtime meaning is the adopted reference radius at the RT lower
     # boundary.
@@ -649,7 +631,6 @@ def compute_atmospheric_state_from_posterior(
     if not bool(np.asarray(opacity_valid)):
         raise ValueError("Posterior reconstruction produced an invalid opacity term.")
 
-    # Compute per-species dtau
     dtau_per_species = compute_opacity_per_species(
         art=art,
         opa_mols=opa_mols,

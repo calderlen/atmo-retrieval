@@ -64,9 +64,7 @@ def planet_orbital_state_from_transit_phase(
         np.sqrt(1.0 - eccentricity**2) * np.sin(eccentric_anomaly),
         np.cos(eccentric_anomaly) - eccentricity,
     )
-    separation_over_semimajor_axis = (
-        1.0 - eccentricity * np.cos(eccentric_anomaly)
-    )
+    separation_over_semimajor_axis = (1.0 - eccentricity * np.cos(eccentric_anomaly))
     return {
         "true_anomaly_rad": true_anomaly,
         "separation_over_semimajor_axis": separation_over_semimajor_axis,

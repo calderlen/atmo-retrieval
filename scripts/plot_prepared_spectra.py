@@ -101,10 +101,7 @@ def _save(figure, path: Path) -> str | None:
 
 def _line_rows_and_figures(bundle: dict[str, Any], output_dir: Path, max_lines: int):
     wavelength = wave_1d(bundle["wavelength"])
-    params = config_utils.get_params(
-        bundle["planet"],
-        bundle["metadata"]["ephemeris"],
-    )
+    params = config_utils.get_params(bundle["planet"], bundle["metadata"]["ephemeris"])
     eccentricity = float(params["eccentricity"])
     velocity = planet_radial_velocity_kms(
         np.asarray(bundle["phase"], dtype=float),
@@ -119,11 +116,7 @@ def _line_rows_and_figures(bundle: dict[str, Any], output_dir: Path, max_lines: 
         if float(np.nanmin(wavelength)) <= rest <= float(np.nanmax(wavelength))
     ][:max_lines]
     for index, (label, rest) in enumerate(selected, start=1):
-        result = stack_line_window(
-            bundle,
-            rest_vacuum_A=rest,
-            velocity_kms=velocity,
-        )
+        result = stack_line_window(bundle, rest_vacuum_A=rest, velocity_kms=velocity)
         finite = np.asarray(result["coadd"])[np.isfinite(result["coadd"])]
         rows.append(
             {

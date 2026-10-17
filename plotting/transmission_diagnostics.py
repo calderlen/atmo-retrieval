@@ -480,14 +480,7 @@ def _planet_frame_species_products(
     return products
 
 
-def _planet_velocity(
-    phase,
-    kp_kms,
-    vsys_kms,
-    *,
-    eccentricity=0.0,
-    omega_deg=None,
-):
+def _planet_velocity(phase, kp_kms, vsys_kms, *, eccentricity=0.0, omega_deg=None):
     if kp_kms is None:
         return None
     return planet_radial_velocity_kms(
@@ -934,12 +927,7 @@ def plot_residual_quality_summary(
 
     row_rms = _masked_rms(data, valid, axis=1)
     row_noise = _masked_rms(sigma, valid, axis=1)
-    standardized = np.divide(
-        data,
-        sigma,
-        out=np.full_like(data, np.nan),
-        where=valid,
-    )
+    standardized = np.divide(data, sigma, out=np.full_like(data, np.nan), where=valid)
     row_chi2 = np.divide(
         np.sum(np.where(valid, np.square(standardized), 0.0), axis=1),
         np.sum(valid, axis=1),

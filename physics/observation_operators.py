@@ -199,10 +199,7 @@ def apply_collapsed_transmission_operator(
     fixed_source_model = jnp.asarray(operator.fixed_source_model)
     model_wavelength_order = model_ts[:, ::-1]
     model_wavelength_order = model_wavelength_order + fixed_source_model
-    residual_ts = (
-        model_wavelength_order
-        * operator.active_exposure_mask[:, None]
-    )
+    residual_ts = (model_wavelength_order * operator.active_exposure_mask[:, None])
     if operator.chunked_sysrem is not None:
         residual_ts = sysrem_model_distortion_chunked(
             residual_ts,
@@ -240,21 +237,14 @@ def apply_frozen_timeseries_operator(
         model_ts = model_ts + fixed_source_model
 
     processed = model_ts * operator.active_exposure_mask[:, None]
-    median_subtracted = processed - jnp.median(
-        processed,
-        axis=0,
-        keepdims=True,
-    )
+    median_subtracted = processed - jnp.median(processed, axis=0, keepdims=True)
     processed = jnp.where(
         jnp.asarray(operator.subtract_time_median),
         median_subtracted,
         processed,
     )
     if operator.chunked_sysrem is not None:
-        processed = sysrem_model_distortion_chunked(
-            processed,
-            operator.chunked_sysrem,
-        )
+        processed = sysrem_model_distortion_chunked(processed, operator.chunked_sysrem)
     return processed[operator.selected_exposure_indices]
 
 
@@ -282,10 +272,6 @@ def apply_model_pipeline_corrections(
         if chunked_sysrem is not None:
             model_ts = sysrem_model_distortion_chunked(model_ts, chunked_sysrem)
         else:
-            model_ts = sysrem_model_distortion_per_pixel(
-                model_ts,
-                U,
-                sigma,
-            )
+            model_ts = sysrem_model_distortion_per_pixel(model_ts, U, sigma)
 
     return model_ts

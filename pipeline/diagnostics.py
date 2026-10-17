@@ -28,10 +28,7 @@ from pipeline import retrieval_outputs as _outputs
 from physics import model as _model
 from pipeline.inference import build_guide, build_svi_optimizer
 from plotting.wavelength import pcolormesh_wavelength_segments
-from spectroscopy.spectral_diagnostics import (
-    coadd_in_planet_rest_frame,
-    nan_box_smooth,
-)
+from spectroscopy.spectral_diagnostics import (coadd_in_planet_rest_frame, nan_box_smooth)
 
 
 _FULL_ATOMIC_SPECIES = deepcopy(config.ATOMIC_SPECIES)
@@ -187,10 +184,7 @@ def build_diagnostic_context(
         )
 
         if observing_mode == "full":
-            arm_dirs = config_utils.get_full_arm_timeseries_dirs(
-                epoch=epoch,
-                mode=mode,
-            )
+            arm_dirs = config_utils.get_full_arm_timeseries_dirs(epoch=epoch, mode=mode)
             component_specs = [
                 _build_timeseries_component_spec(
                     name="spectroscopy_red",
@@ -473,10 +467,7 @@ def build_diag_config_from_run_dir(
         or saved.get("Chemistry model")
         or _infer_chemistry_model_from_run_dir(run_dir)
     )
-    molecules = [
-        *saved.get("molecules_hitemp", []),
-        *saved.get("molecules_exomol", []),
-    ]
+    molecules = [*saved.get("molecules_hitemp", []), *saved.get("molecules_exomol", [])]
     fastchem_parameter_file = saved.get("FastChem parameter file")
     if not fastchem_parameter_file and str(resolved_chemistry_model) == "fastchem_hybrid_grid":
         default_fastchem_path = Path("input/fastchem/parameters.dat")
@@ -876,7 +867,6 @@ def default_kp_vsys_grids(
     return kp_grid, v_sys_grid
 
 
-
 def _normal_logpdf(value: float, mean: float, std: float) -> float:
     z = (value - mean) / std
     return float(-0.5 * z * z - math.log(std) - 0.5 * math.log(2.0 * math.pi))
@@ -1029,17 +1019,9 @@ def scan_kp_vsys_surface(
                 component_name=component_name,
                 atmo_state=atmo_state,
             )
-            logl = spectroscopic_log_likelihood(
-                observed,
-                model_ts,
-                sigma,
-            )
+            logl = spectroscopic_log_likelihood(observed, model_ts, sigma)
             prior = (
-                _shared_system_log_prior(
-                    context,
-                    kp=float(kp),
-                    v_sys=float(v_sys),
-                )
+                _shared_system_log_prior(context, kp=float(kp), v_sys=float(v_sys))
                 if include_log_prior
                 else 0.0
             )
@@ -1118,7 +1100,6 @@ def plot_kp_vsys_surface(
     return ax
 
 
-
 def plot_processed_timeseries_comparison(
     context: DiagnosticContext,
     *,
@@ -1153,7 +1134,7 @@ def plot_processed_timeseries_comparison(
         arrays.append(arr)
         labels.append(label)
 
-    # ── Row 1: raw panels (observed + models) ──
+    # Row 1: observed and model panels.
     ncols = len(arrays)
     has_diff = show_difference and len(model_arrays) == 2
     nrows = 3 if has_diff else 1
@@ -1196,7 +1177,7 @@ def plot_processed_timeseries_comparison(
         m1 = model_arrays[model_labels[0]]
         m2 = model_arrays[model_labels[1]]
 
-        # ── Row 2: direct data-minus-model residuals ──
+        # Row 2: data-minus-model residuals.
         resid_labels = []
         resid_arrays = []
         for mlabel, marr in model_arrays.items():
@@ -1245,7 +1226,7 @@ def plot_processed_timeseries_comparison(
             all_axes[1, col].set_xlabel("Wavelength [A]")
             fig.colorbar(im_r, ax=all_axes[1, col], label="Residual flux", shrink=0.85)
 
-        # ── Row 3: cross-correlation-style 1D summaries ──
+        # Row 3: cross-correlation-style 1D summaries.
         # Collapse wavelength dimension to show phase-dependent signal strength
         for idx, (mlabel, marr) in enumerate(model_arrays.items()):
             # Per-exposure cross-correlation SNR
@@ -1351,11 +1332,7 @@ def run_multiseed_svi(
             loss=Trace_ELBO(num_particles=elbo_num_particles),
         )
         rng_key = random.PRNGKey(int(seed))
-        svi_result = svi.run(
-            rng_key,
-            int(num_steps),
-            **context.model_inputs,
-        )
+        svi_result = svi.run(rng_key, int(num_steps), **context.model_inputs)
         losses = np.asarray(jax.device_get(svi_result.losses))
         median = guide[-1].median(svi_result.params)
         median_cpu = {}
