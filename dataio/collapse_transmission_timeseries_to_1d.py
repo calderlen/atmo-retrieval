@@ -6,7 +6,6 @@ here. The command-line entry point consumes a dedicated full-exposure
 """
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -25,25 +24,19 @@ from config import (
     EPHEMERIS,
     OBSERVATORY,
     PHASE_BINS,
-    PLANETS,
     TELLURIC_REGIONS,
 )
 from config_utils import (
     get_data_patterns,
     get_header_keys,
     get_fits_columns,
-    get_resolution,
 )
-from dataio.lsd_doppler_shadow import (
-    FIXED_LSD_SHADOW_METHOD,
-    FIXED_LSD_SHADOW_SCHEMA_VERSION,
-)
+from dataio.orbital_velocity import planet_radial_velocity_kms
 from dataio.exposure_selection import (
     ScienceExposureSelection,
     apply_paired_snr_quality_rule,
     select_science_exposures,
 )
-from dataio.orbital_velocity import planet_radial_velocity_kms
 
 
 PEPSI_INPUT_TIME_SCALE = "utc"
@@ -192,11 +185,7 @@ def regrid_to_common_wavelength(
             continue
 
         spacing = np.diff(native_wave)
-        positive_spacing = spacing[spacing > 0.0]
-        if positive_spacing.size == 0:
-            continue
-
-        max_gap = float(max_native_gap_factor) * float(np.median(positive_spacing))
+        max_gap = float(max_native_gap_factor) * float(np.median(spacing))
         segment_starts = np.r_[0, np.flatnonzero(spacing > max_gap) + 1]
         segment_stops = np.r_[segment_starts[1:], native_wave.size]
 
@@ -297,11 +286,6 @@ def get_sysrem_chunk_indices(
 
     ``arm='full'`` is not supported: run SYSREM independently per arm.
     """
-    if arm == "full":
-        raise ValueError(
-            "arm='full' is not supported by get_sysrem_chunk_indices. "
-            "Run SYSREM independently for 'red' and 'blue'."
-        )
 
     wave = np.asarray(wave, dtype=float)
 
@@ -324,11 +308,6 @@ def get_sysrem_deep_mask(
     arm: str,
 ) -> np.ndarray:
     """Return wavelengths that should be ignored after Molecfit correction."""
-    if arm == "full":
-        raise ValueError(
-            "arm='full' is not supported by get_sysrem_deep_mask. "
-            "Call with 'red' or 'blue' separately."
-        )
     wave = np.asarray(wave, dtype=float)
 
     telluric_config = TELLURIC_REGIONS.get(arm, {"telluric": [], "deep_mask": []})
@@ -346,11 +325,6 @@ def get_telluric_edge_mask(
     edge_width_angstrom: float = config.DEFAULT_TELLURIC_EDGE_MASK_WIDTH_A,
 ) -> np.ndarray:
     """Return columns close to configured telluric/deep-mask boundaries."""
-    if arm == "full":
-        raise ValueError(
-            "arm='full' is not supported by get_telluric_edge_mask. "
-            "Call with 'red' or 'blue' separately."
-        )
     wave = np.asarray(wave, dtype=float)
 
     edge_width_angstrom = float(edge_width_angstrom)
@@ -368,26 +342,6 @@ def get_telluric_edge_mask(
     return edge_mask
 
 
-def _validated_edge_trim_widths(
-    explicit_widths_A: tuple[float, float],
-) -> tuple[float, float]:
-    """Validate the exact left/right widths supplied by a manifest consumer."""
-
-    if len(explicit_widths_A) != 2:
-        raise ValueError("Explicit edge-trim widths must contain left and right values.")
-    left_width, right_width = (float(value) for value in explicit_widths_A)
-    if (
-        not np.isfinite(left_width)
-        or not np.isfinite(right_width)
-        or left_width < 0.0
-        or right_width < 0.0
-    ):
-        raise ValueError(
-            "Explicit edge-trim widths must be finite, non-negative Angstrom values."
-        )
-    return left_width, right_width
-
-
 def get_arm_edge_trim_mask(
     wave: np.ndarray,
     arm: str,
@@ -395,11 +349,6 @@ def get_arm_edge_trim_mask(
     explicit_widths_A: tuple[float, float] | None = None,
 ) -> np.ndarray:
     """Return columns selected by exact, explicitly supplied trim widths."""
-    if arm == "full":
-        raise ValueError(
-            "arm='full' is not supported by get_arm_edge_trim_mask. "
-            "Call with 'red' or 'blue' separately."
-        )
     wave = np.asarray(wave, dtype=float)
 
     finite = np.isfinite(wave)
@@ -407,7 +356,7 @@ def get_arm_edge_trim_mask(
     if not np.any(finite) or explicit_widths_A is None:
         return edge_mask
 
-    left_width, right_width = _validated_edge_trim_widths(explicit_widths_A)
+    left_width, right_width = tuple(float(value) for value in explicit_widths_A)
     if left_width <= 0.0 and right_width <= 0.0:
         return edge_mask
 
@@ -436,7 +385,7 @@ def arm_edge_trim_metadata(
     widths = (
         None
         if explicit_widths_A is None
-        else _validated_edge_trim_widths(explicit_widths_A)
+        else tuple(float(value) for value in explicit_widths_A)
     )
     left_width, right_width = (0.0, 0.0) if widths is None else widths
     if not np.any(finite):
@@ -495,22 +444,12 @@ def get_sysrem_ignore_mask(
 
 
 def get_sysrem_max_systematics(arm: str) -> list[int]:
-    if arm == "full":
-        raise ValueError(
-            "arm='full' is not supported by get_sysrem_max_systematics. "
-            "Call with 'red' or 'blue' separately."
-        )
     if arm == "red":
         return list(config.DEFAULT_SYSREM_MAX_SYSTEMATICS_RED)
     return list(config.DEFAULT_SYSREM_MAX_SYSTEMATICS_OTHER)
 
 
 def get_sysrem_min_systematics(arm: str) -> list[int]:
-    if arm == "full":
-        raise ValueError(
-            "arm='full' is not supported by get_sysrem_min_systematics. "
-            "Call with 'red' or 'blue' separately."
-        )
     if arm == "red":
         return list(config.DEFAULT_SYSREM_MIN_SYSTEMATICS_RED)
     return list(config.DEFAULT_SYSREM_MIN_SYSTEMATICS_OTHER)
@@ -584,20 +523,6 @@ def do_sysrem(
     max_systematics = get_sysrem_max_systematics(arm)
     min_systematics = get_sysrem_min_systematics(arm)
 
-    # Ensure per-chunk settings have the correct length.
-    if len(max_systematics) < chunks:
-        max_systematics = max_systematics + [max_systematics[-1]] * (chunks - len(max_systematics))
-    if len(min_systematics) < chunks:
-        min_systematics = min_systematics + [min_systematics[-1]] * (chunks - len(min_systematics))
-
-    for chunk, (min_n_sys, max_n_sys_chunk) in enumerate(zip(min_systematics, max_systematics)):
-        if min_n_sys < 0:
-            raise ValueError(f"SYSREM minimum systematics must be non-negative; got {min_n_sys}.")
-        if min_n_sys > max_n_sys_chunk:
-            raise ValueError(
-                f"SYSREM chunk {chunk + 1} minimum systematics ({min_n_sys}) "
-                f"exceeds maximum systematics ({max_n_sys_chunk})."
-            )
 
     max_n_sys = max(max_systematics)
     U_sysrem = np.full((n_spectra, max_n_sys, chunks), np.nan, dtype=float)
@@ -823,29 +748,6 @@ def get_phase_bin_mask(
     return (phase >= lo) & (phase <= hi)
 
 
-def filter_data_by_phase(
-    data: np.ndarray,
-    sigma: np.ndarray,
-    phase: np.ndarray,
-    bin_name: str,
-    params: dict,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Filter time-series data to specific phase bin.
-    
-    Args:
-        data: Flux/spectra array, shape (n_spectra, npix)
-        sigma: Uncertainty array, shape (n_spectra, npix)
-        phase: Orbital phase array, shape (n_spectra,)
-        bin_name: Phase bin name ('T12', 'T23', 'T34', or 'full')
-        params: Planet parameters dict
-    
-    Returns:
-        Tuple of (filtered_data, filtered_sigma, filtered_phase)
-    """
-    mask = get_phase_bin_mask(phase, bin_name, params)
-    return data[mask], sigma[mask], phase[mask]
-
-
 def get_phase_bin_indices(
     phase: np.ndarray,
     params: dict,
@@ -957,11 +859,8 @@ _PLANET_MOLECFIT_VELOCITY_OFFSET_MPS = {
 
 _MOLECFIT_CORRECTED_PREFIX = "SCIENCE_TELLURIC_CORR_"
 _MOLECFIT_FITS_SUFFIX = ".fits"
-_MAX_PIXEL_SPACING_RATIO_DEVIATION = 1.0e-3
-_PEPSI_VELOCITY_SUM_TOLERANCE_MPS = 100.0
 _SPEED_OF_LIGHT_MPS = 299792458.0
 _SPEED_OF_LIGHT_KMS = _SPEED_OF_LIGHT_MPS / 1000.0
-_SUPPORTED_WAVELENGTH_FRAMES = frozenset({"native", "barycentric"})
 _REMOVED_VELOCITY_HISTORY_RE = re.compile(
     r"Radial\s+velocity\s+([A-Z0-9_+\-]+)\s*=\s*"
     r"([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+\-]?\d+)?)\s*m/s\s+is\s+removed",
@@ -970,13 +869,9 @@ _REMOVED_VELOCITY_HISTORY_RE = re.compile(
 
 
 def _wavelength_angstrom(data, column_config: dict) -> np.ndarray:
-    """Read a configured FITS wavelength column and return Angstroms."""
+    """Read the configured wavelength column in Angstroms."""
     wavelength = np.asarray(data[column_config["wave"]], dtype=float).copy()
-    unit = str(column_config["wave_unit"]).lower()
-    if unit == "micron":
-        wavelength *= 10000.0
-    elif unit != "angstrom":
-        raise ValueError(f"Unsupported PEPSI wavelength unit: {unit!r}")
+    wavelength *= {"micron": 10000.0, "angstrom": 1.0}[str(column_config["wave_unit"]).lower()]
     return wavelength
 
 
@@ -994,18 +889,9 @@ def _air_wavelength_to_vacuum(wavelength_air: np.ndarray) -> np.ndarray:
 def _molecfit_raw_product_name(molecfit_path: str | os.PathLike[str]) -> str:
     """Return the original PEPSI product name encoded in a Molecfit output."""
     name = Path(molecfit_path).name
-    if not name.startswith(_MOLECFIT_CORRECTED_PREFIX) or not name.endswith(
-        _MOLECFIT_FITS_SUFFIX
-    ):
-        raise ValueError(
-            "Could not identify the original PEPSI exposure from Molecfit file "
-            f"{name!r}."
-        )
     raw_name = name[
         len(_MOLECFIT_CORRECTED_PREFIX) : -len(_MOLECFIT_FITS_SUFFIX)
     ]
-    if not raw_name:
-        raise ValueError(f"Molecfit filename {name!r} has no source product name.")
     return raw_name
 
 
@@ -1034,24 +920,11 @@ def _resolve_molecfit_raw_product(
 
     if not matches:
         return None
-    if len(matches) > 1:
-        locations = ", ".join(sorted(matches))
-        raise RuntimeError(
-            f"Found multiple possible raw products for '{molecfit_path.name}': "
-            f"{locations}"
-        )
     return next(iter(matches.values()))
 
 
 def _finite_header_velocity_mps(header, key: str) -> float | None:
-    """Return a finite FITS velocity value in m/s, or None when unavailable."""
-    if key not in header:
-        return None
-    try:
-        value = float(header[key])
-    except (TypeError, ValueError):
-        return None
-    return value if np.isfinite(value) else None
+    return float(header[key]) if key in header else None
 
 
 def _history_mentions(header, key: str) -> bool:
@@ -1083,10 +956,6 @@ def parse_pepsi_velocity_frame(header) -> dict[str, object]:
     observatory/solar-system-barycenter velocity.
     """
     entries = _velocity_history_entries(header)
-    if not entries:
-        raise ValueError(
-            "PEPSI FITS header does not document a removed velocity term in HISTORY."
-        )
 
     removed: list[tuple[str, float]] = []
     for entry in entries:
@@ -1094,7 +963,6 @@ def parse_pepsi_velocity_frame(header) -> dict[str, object]:
         if match is None:
             continue
         removed.append((match.group(1).upper(), float(match.group(2))))
-    labels = {label for label, _value in removed}
 
     observer_header = _finite_header_velocity_mps(header, "SSBVEL")
     observer_header_key = "SSBVEL"
@@ -1110,15 +978,13 @@ def parse_pepsi_velocity_frame(header) -> dict[str, object]:
             return None
         return float(np.sum(values))
 
-    observer_removed = 0.0
+    observer_removed = None
     stellar_removed = 0.0
-    observer_documented = False
     stellar_documented = False
 
     standalone_observer = history_value("SSBVEL", "OBSVEL")
     if standalone_observer is not None:
         observer_removed = standalone_observer
-        observer_documented = True
 
     standalone_stellar = history_value("RADVEL")
     if standalone_stellar is not None:
@@ -1127,11 +993,6 @@ def parse_pepsi_velocity_frame(header) -> dict[str, object]:
 
     combined_observer_stellar = history_value("OBSVEL+RADVEL")
     if combined_observer_stellar is not None:
-        if observer_header is None and stellar_header is None:
-            raise ValueError(
-                "OBSVEL+RADVEL was removed, but neither component is available "
-                "in the PEPSI FITS header."
-            )
         if observer_header is None:
             observer_header = combined_observer_stellar - float(stellar_header)
             observer_header_key = "OBSVEL(derived)"
@@ -1139,28 +1000,10 @@ def parse_pepsi_velocity_frame(header) -> dict[str, object]:
             stellar_header = combined_observer_stellar - float(observer_header)
         observer_removed = float(observer_header)
         stellar_removed = float(stellar_header)
-        observer_documented = True
         stellar_documented = True
-        reconstructed = observer_removed + stellar_removed
-        if not np.isclose(
-            reconstructed,
-            combined_observer_stellar,
-            rtol=0.0,
-            atol=_PEPSI_VELOCITY_SUM_TOLERANCE_MPS,
-        ):
-            raise ValueError(
-                "PEPSI OBSVEL+RADVEL HISTORY value is inconsistent with its "
-                f"components: {combined_observer_stellar:.3f} != "
-                f"{reconstructed:.3f} m/s."
-            )
 
     combined_sst = history_value("SSTVEL")
     if combined_sst is not None:
-        if observer_header is None and stellar_header is None:
-            raise ValueError(
-                "SSTVEL was removed, but neither SSBVEL/OBSVEL nor RADVEL is "
-                "available in the PEPSI FITS header."
-            )
         if observer_header is None:
             observer_header = combined_sst - float(stellar_header)
             observer_header_key = "observer_velocity(derived)"
@@ -1168,41 +1011,10 @@ def parse_pepsi_velocity_frame(header) -> dict[str, object]:
             stellar_header = combined_sst - float(observer_header)
         observer_removed = float(observer_header)
         stellar_removed = float(stellar_header)
-        observer_documented = True
         stellar_documented = True
-        reconstructed = observer_removed + stellar_removed
-        if not np.isclose(
-            reconstructed,
-            combined_sst,
-            rtol=0.0,
-            atol=_PEPSI_VELOCITY_SUM_TOLERANCE_MPS,
-        ):
-            raise ValueError(
-                "PEPSI SSTVEL HISTORY value is inconsistent with its components: "
-                f"{combined_sst:.3f} != {reconstructed:.3f} m/s."
-            )
 
-    if not observer_documented:
-        raise ValueError(
-            "PEPSI FITS HISTORY does not document removal of OBSVEL, SSBVEL, "
-            "OBSVEL+RADVEL, or SSTVEL; a barycentric grid cannot be reconstructed."
-        )
 
     instrument_removed = history_value("CCFOFF") or 0.0
-    recognized = {
-        "OBSVEL",
-        "SSBVEL",
-        "RADVEL",
-        "OBSVEL+RADVEL",
-        "SSTVEL",
-        "CCFOFF",
-    }
-    unknown = sorted(labels - recognized)
-    if unknown:
-        raise ValueError(
-            "Unsupported PEPSI removed-velocity HISTORY term(s): "
-            + ", ".join(unknown)
-        )
 
     return {
         "observer_velocity_removed_mps": float(observer_removed),
@@ -1219,8 +1031,6 @@ def parse_pepsi_velocity_frame(header) -> dict[str, object]:
 def _doppler_factor_velocity_mps(velocity_mps: float) -> float:
     """Return the relativistic wavelength factor for a velocity in m/s."""
     beta = float(velocity_mps) / _SPEED_OF_LIGHT_MPS
-    if not np.isfinite(beta) or abs(beta) >= 1.0:
-        raise ValueError("Velocity must be finite and smaller than the speed of light.")
     return float(np.sqrt((1.0 + beta) / (1.0 - beta)))
 
 
@@ -1291,69 +1101,8 @@ def _shift_wavelength_to_stellar_rest(
 ) -> np.ndarray:
     """Remove a measured residual RV using positive velocity for recession."""
     beta = float(residual_velocity_kms) / _SPEED_OF_LIGHT_KMS
-    if not np.isfinite(beta) or abs(beta) >= 1.0:
-        raise ValueError("stellar_rest_velocity_kms must be finite and smaller than c.")
     doppler_factor = np.sqrt((1.0 + beta) / (1.0 - beta))
     return np.asarray(wavelength, dtype=float) / doppler_factor
-
-
-def _validate_one_to_one_wavelength_ordering(
-    reference_wave: np.ndarray,
-    candidate_wave: np.ndarray,
-    *,
-    reference_label: str,
-    candidate_label: str,
-) -> None:
-    """Verify that two wavelength arrays retain the same one-to-one pixel order."""
-    reference_wave = np.asarray(reference_wave, dtype=float)
-    candidate_wave = np.asarray(candidate_wave, dtype=float)
-    if reference_wave.ndim != 1 or candidate_wave.ndim != 1:
-        raise ValueError(
-            f"{reference_label} and {candidate_label} wavelengths must be 1D."
-        )
-    if reference_wave.size != candidate_wave.size:
-        raise ValueError(
-            f"{reference_label} and {candidate_label} pixel counts differ: "
-            f"{reference_wave.size} != {candidate_wave.size}."
-        )
-    if reference_wave.size < 2:
-        raise ValueError("PEPSI wavelength arrays must contain at least two pixels.")
-    if not np.all(np.isfinite(reference_wave)) or not np.all(
-        np.isfinite(candidate_wave)
-    ):
-        raise ValueError(
-            f"{reference_label} and {candidate_label} wavelengths must be finite."
-        )
-
-    reference_step = np.diff(reference_wave)
-    candidate_step = np.diff(candidate_wave)
-    same_increasing_order = np.all(reference_step > 0.0) and np.all(
-        candidate_step > 0.0
-    )
-    same_decreasing_order = np.all(reference_step < 0.0) and np.all(
-        candidate_step < 0.0
-    )
-    if not (same_increasing_order or same_decreasing_order):
-        raise ValueError(
-            f"{reference_label} and {candidate_label} do not have the same "
-            "strictly monotonic pixel ordering."
-        )
-
-    spacing_ratio = candidate_step / reference_step
-    median_ratio = float(np.median(spacing_ratio))
-    if not np.isfinite(median_ratio) or median_ratio <= 0.0:
-        raise ValueError(
-            f"{reference_label} and {candidate_label} have incompatible pixel spacing."
-        )
-    maximum_relative_deviation = float(
-        np.max(np.abs(spacing_ratio / median_ratio - 1.0))
-    )
-    if maximum_relative_deviation > _MAX_PIXEL_SPACING_RATIO_DEVIATION:
-        raise ValueError(
-            f"{candidate_label} does not preserve the pixel-spacing structure of "
-            f"{reference_label}; maximum relative spacing-ratio deviation is "
-            f"{maximum_relative_deviation:.3e}."
-        )
 
 
 def _canonical_molecfit_wavelength(
@@ -1369,90 +1118,21 @@ def _canonical_molecfit_wavelength(
     molecfit_column_config: dict,
     jd_header_key: str,
 ) -> tuple[np.ndarray, Path | None, float, tuple[str, ...]]:
-    """Restore a Molecfit grid with the original PEPSI loader correction.
-
-    When the original PEPSI exposure is available, it is used to verify the
-    one-to-one flux-pixel mapping. It does not determine the velocity
-    correction.
-    """
+    """Restore the Molecfit grid with the original loader correction."""
     raw_path = _resolve_molecfit_raw_product(molecfit_path, data_dir)
-    molecfit_wave = _wavelength_angstrom(
-        molecfit_data,
-        molecfit_column_config,
-    )
+    molecfit_wave = _wavelength_angstrom(molecfit_data, molecfit_column_config)
     correction_mps, correction_keys = _molecfit_velocity_correction_mps(
         molecfit_header,
         observation_epoch=observation_epoch,
         planet_name=planet_name,
         arm=arm,
     )
-    canonical_wave = _shift_wavelength_velocity_mps(molecfit_wave, correction_mps)
-
-    if raw_path is not None:
-        with fits.open(raw_path) as raw_hdu:
-            raw_data = raw_hdu[1].data
-            raw_header = raw_hdu[0].header.copy()
-            raw_air_wave = _wavelength_angstrom(raw_data, raw_column_config)
-            raw_flux = np.asarray(
-                raw_data[raw_column_config["flux"]],
-                dtype=float,
-            ).copy()
-
-        if raw_air_wave.size != len(molecfit_data):
-            raise ValueError(
-                f"Raw product '{raw_path.name}' and Molecfit output "
-                f"'{Path(molecfit_path).name}' have different pixel counts: "
-                f"{raw_air_wave.size} != {len(molecfit_data)}."
-            )
-
-        if jd_header_key in raw_header and jd_header_key in molecfit_header:
-            raw_jd = float(raw_header[jd_header_key])
-            molecfit_jd = float(molecfit_header[jd_header_key])
-            if not np.isclose(raw_jd, molecfit_jd, rtol=0.0, atol=1.0e-5):
-                raise ValueError(
-                    f"Raw product '{raw_path.name}' and Molecfit output "
-                    f"'{Path(molecfit_path).name}' have inconsistent {jd_header_key}: "
-                    f"{raw_jd} != {molecfit_jd}."
-                )
-
-        _validate_one_to_one_wavelength_ordering(
-            _air_wavelength_to_vacuum(raw_air_wave),
-            molecfit_wave,
-            reference_label=f"vacuum-converted raw grid '{raw_path.name}'",
-            candidate_label=f"Molecfit output grid '{Path(molecfit_path).name}'",
-        )
-
-        molecfit_input_path = raw_path.with_name(raw_path.name + ".fits")
-        if molecfit_input_path.is_file():
-            with fits.open(molecfit_input_path) as input_hdu:
-                input_data = input_hdu[1].data
-                input_wave = _wavelength_angstrom(
-                    input_data,
-                    molecfit_column_config,
-                )
-                input_flux = np.asarray(
-                    input_data[molecfit_column_config["flux"]],
-                    dtype=float,
-                ).copy()
-            _validate_one_to_one_wavelength_ordering(
-                canonical_wave,
-                input_wave,
-                reference_label=f"corrected Molecfit grid '{Path(molecfit_path).name}'",
-                candidate_label=f"Molecfit input grid '{molecfit_input_path.name}'",
-            )
-            if input_flux.shape != raw_flux.shape or not np.allclose(
-                input_flux,
-                raw_flux,
-                rtol=1.0e-7,
-                atol=1.0e-10,
-                equal_nan=True,
-            ):
-                raise ValueError(
-                    f"Molecfit input '{molecfit_input_path.name}' does not preserve "
-                    f"the flux-pixel ordering of raw product '{raw_path.name}'."
-                )
-
-    return canonical_wave, raw_path, correction_mps, correction_keys
+    return (
+        _shift_wavelength_velocity_mps(molecfit_wave, correction_mps),
+        raw_path,
+        correction_mps,
+        correction_keys,
+    )
 
 
 def _barycentric_molecfit_wavelength(
@@ -1482,29 +1162,8 @@ def _barycentric_molecfit_wavelength(
             raw_header = raw_hdu[0].header.copy()
             raw_air_wave = _wavelength_angstrom(raw_data, raw_column_config)
 
-        if raw_air_wave.size != len(molecfit_data):
-            raise ValueError(
-                f"Raw product '{raw_path.name}' and Molecfit output "
-                f"'{Path(molecfit_path).name}' have different pixel counts: "
-                f"{raw_air_wave.size} != {len(molecfit_data)}."
-            )
-        if jd_header_key in raw_header and jd_header_key in molecfit_header:
-            raw_jd = float(raw_header[jd_header_key])
-            molecfit_jd = float(molecfit_header[jd_header_key])
-            if not np.isclose(raw_jd, molecfit_jd, rtol=0.0, atol=1.0e-5):
-                raise ValueError(
-                    f"Raw product '{raw_path.name}' and Molecfit output "
-                    f"'{Path(molecfit_path).name}' have inconsistent {jd_header_key}: "
-                    f"{raw_jd} != {molecfit_jd}."
-                )
 
         raw_vacuum_wave = _air_wavelength_to_vacuum(raw_air_wave)
-        _validate_one_to_one_wavelength_ordering(
-            raw_vacuum_wave,
-            molecfit_wave,
-            reference_label=f"vacuum-converted raw grid '{raw_path.name}'",
-            candidate_label=f"Molecfit output grid '{Path(molecfit_path).name}'",
-        )
         frame_info = parse_pepsi_velocity_frame(raw_header)
         frame_info = {
             **frame_info,
@@ -1641,11 +1300,6 @@ def get_pepsi_data(
             mode=data_mode,
         )
     wavelength_frame = str(wavelength_frame).strip().lower()
-    if wavelength_frame not in _SUPPORTED_WAVELENGTH_FRAMES:
-        raise ValueError(
-            f"Unsupported wavelength_frame={wavelength_frame!r}; expected one of "
-            f"{sorted(_SUPPORTED_WAVELENGTH_FRAMES)}."
-        )
 
     # Get config for this instrument
     header_keys = get_header_keys()
@@ -1674,9 +1328,6 @@ def get_pepsi_data(
         data_dir=data_dir,
     )
     matched_pattern = exposure_selection.matched_pattern
-    if not exposure_selection.discovered_files:
-        print(f'No files found for {observation_epoch}_{planet_name} ({arm}) in {data_dir}')
-        return None
 
     spectra_files = [str(path) for path in exposure_selection.usable_files]
     configured_excluded_files = [
@@ -1696,23 +1347,9 @@ def get_pepsi_data(
             f"{config.HRS_PAIRED_SNR_Q_THRESHOLD:g} exposure(s) before preprocessing: "
             + ", ".join(snr_quality_excluded_files)
         )
-    for check in exposure_selection.fits_object_checks:
-        if check.accepted:
-            continue
-        print(
-            "Excluded FITS OBJECT mismatch/unverifiable exposure before "
-            f"preprocessing: {check.path.name} "
-            f"(OBJECT={check.observed_name!r}; reason={check.rejection_reason})."
-        )
     excluded_exposure_files = [
         path.name for path in exposure_selection.excluded_files
     ]
-    if not spectra_files:
-        print(
-            f"No usable files remain for {observation_epoch}_{planet_name} "
-            f"({arm}) after exposure-level QC exclusions."
-        )
-        return None
 
     n_spectra = len(spectra_files)
     input_exposure_files = [Path(path).name for path in spectra_files]
@@ -1794,8 +1431,8 @@ def get_pepsi_data(
                 wavelength_velocity_components[i] = rest_correction_keys
                 if i == 0:
                     keys = ", ".join(rest_correction_keys) or "no nonzero terms"
-                    validation = (
-                        f" Raw product '{raw_path.name}' validates the pixel mapping."
+                    raw_source = (
+                        f" Raw product '{raw_path.name}' is paired with this exposure."
                         if raw_path is not None
                         else " Original raw product unavailable; using FITS-header reconstruction."
                     )
@@ -1803,16 +1440,11 @@ def get_pepsi_data(
                         "Molecfit velocity restoration: original PEPSI recipe using "
                         f"{keys} "
                         f"(correction={rest_correction_mps:.3f} m/s)."
-                        f"{validation}"
+                        f"{raw_source}"
                     )
         else:
             loaded_wave = _air_wavelength_to_vacuum(loaded_wave)
-            try:
-                frame_info = parse_pepsi_velocity_frame(header)
-            except ValueError as exc:
-                if wavelength_frame == "barycentric":
-                    raise ValueError(f"{Path(spectrum).name}: {exc}") from exc
-                velocity_frame_parse_error[i] = str(exc)
+            frame_info = parse_pepsi_velocity_frame(header)
             if wavelength_frame == "barycentric" and frame_info is not None:
                 loaded_wave = _raw_pipeline_wavelength_to_barycentric(
                     loaded_wave,
@@ -1831,10 +1463,7 @@ def get_pepsi_data(
                     )
 
         if frame_info is None and velocity_frame_parse_error[i] is None:
-            try:
-                frame_info = parse_pepsi_velocity_frame(header)
-            except ValueError as exc:
-                velocity_frame_parse_error[i] = str(exc)
+            frame_info = parse_pepsi_velocity_frame(header)
         if frame_info is not None:
             observer_velocity_removed_mps[i] = float(
                 frame_info["observer_velocity_removed_mps"]
@@ -1903,14 +1532,6 @@ def get_pepsi_data(
             exptime[i] = float(exptime_val)
 
         input_time_key = header_keys["jd"]
-        declared_time_scale = str(
-            header.get(header_keys.get("timesys", "TIMESYS"), "")
-        ).strip().lower()
-        if declared_time_scale and declared_time_scale not in {"ut", "utc"}:
-            raise ValueError(
-                f"PEPSI {input_time_key} is configured as UTC, but "
-                f"'{Path(spectrum).name}' declares TIMESYS={declared_time_scale!r}."
-            )
         jd[i] = float(header[input_time_key])  # UTC mid-exposure by PEPSI contract
         calendar_midpoint = _calendar_mid_exposure_jd_utc(header, exptime[i])
         if calendar_midpoint is not None:
@@ -1935,23 +1556,6 @@ def get_pepsi_data(
     }
     if n_spectra > 1 and float(np.ptp(jd)) == 0.0:
         constant_header_jd = float(jd[0])
-        complete_calendar_times = bool(
-            np.all(np.isfinite(calendar_midpoint_jd_utc))
-        )
-        varying_calendar_times = bool(
-            complete_calendar_times
-            and float(np.ptp(calendar_midpoint_jd_utc)) > 0.0
-        )
-        if not varying_calendar_times:
-            missing_count = int(
-                np.count_nonzero(~np.isfinite(calendar_midpoint_jd_utc))
-            )
-            raise ValueError(
-                f"All {n_spectra} exposures have identical {input_time_key}="
-                f"{jd[0]:.9f}, and a varying UTC midpoint cannot be reconstructed "
-                "from DATE-OBS + UT-OBS + EXPTIME/2 "
-                f"({missing_count} incomplete or unparseable calendar timestamps)."
-            )
         jd = calendar_midpoint_jd_utc.copy()
         reconstructed_source = "DATE-OBS+UT-OBS+EXPTIME/2"
         input_time_provenance.update(
@@ -2137,10 +1741,6 @@ def get_bjd_tdb(
     alternate input path.
     """
     jd_utc = np.asarray(jd_utc, dtype=float)
-    if not np.all(np.isfinite(jd_utc)):
-        raise ValueError("UTC Julian dates must all be finite.")
-    if validation_tolerance_seconds <= 0.0:
-        raise ValueError("BJD_TDB validation tolerance must be positive.")
 
     observatory_location = EarthLocation.of_site(OBSERVATORY)
     observed_times = Time(
@@ -2168,11 +1768,6 @@ def get_bjd_tdb(
     }
     if header_bjd_tdb is not None:
         header_bjd_tdb = np.asarray(header_bjd_tdb, dtype=float)
-        if header_bjd_tdb.shape != bjd_tdb.shape:
-            raise ValueError(
-                "Header JD-TDB shape does not match the input UTC time shape: "
-                f"{header_bjd_tdb.shape} != {bjd_tdb.shape}."
-            )
         validated = np.isfinite(header_bjd_tdb)
         n_validated = int(np.count_nonzero(validated))
         diagnostics["header_validation_count"] = n_validated
@@ -2182,14 +1777,8 @@ def get_bjd_tdb(
             ) * 86400.0
             max_abs_residual = float(np.max(np.abs(residual_seconds)))
             diagnostics["header_validation_max_abs_residual_seconds"] = max_abs_residual
-            if max_abs_residual > validation_tolerance_seconds:
-                raise ValueError(
-                    "Computed BJD_TDB disagrees with the PEPSI JD-TDB header: "
-                    f"max |residual|={max_abs_residual:.6f} s exceeds "
-                    f"{validation_tolerance_seconds:.6f} s."
-                )
             print(
-                f"Validated computed BJD_TDB against JD-TDB for {n_validated} "
+                f"Compared computed BJD_TDB with JD-TDB for {n_validated} "
                 f"exposures (max |residual|={max_abs_residual:.6f} s)."
             )
 
@@ -2204,18 +1793,7 @@ def get_ephemeris_epoch_bjd_tdb(
     epoch_reference: str,
 ) -> float:
     """Normalize a barycentric ephemeris epoch to the TDB timescale."""
-    reference = str(epoch_reference).strip().lower().replace("_", "-")
-    if reference not in {"barycenter", "barycentric", "solar-system-barycenter"}:
-        raise ValueError(
-            "Ephemeris epoch_reference must explicitly identify the barycenter; "
-            f"got {epoch_reference!r}."
-        )
     scale = str(epoch_scale).strip().lower()
-    if scale not in {"tdb", "tt", "tai", "utc"}:
-        raise ValueError(
-            "Unsupported or missing ephemeris epoch_scale. Expected one of "
-            f"tdb/tt/tai/utc, got {epoch_scale!r}."
-        )
     epoch_time = Time(float(epoch), format="jd", scale=scale)
     return float(epoch_time.tdb.jd)
 
@@ -2227,12 +1805,6 @@ def get_orbital_phase(
 ) -> np.ndarray:
     """Calculate phase from canonical BJD_TDB observation and epoch values."""
     bjd_tdb = np.asarray(bjd_tdb, dtype=float)
-    if not np.all(np.isfinite(bjd_tdb)):
-        raise ValueError("BJD_TDB values must all be finite.")
-    if not np.isfinite(epoch_bjd_tdb):
-        raise ValueError("The BJD_TDB ephemeris epoch must be finite.")
-    if not np.isfinite(period) or period <= 0.0:
-        raise ValueError("The orbital period must be finite and positive.")
 
     orbital_phase = (bjd_tdb - epoch_bjd_tdb) / period
     orbital_phase -= np.round(np.mean(orbital_phase))
@@ -2467,44 +2039,11 @@ def _load_transmission_collapse_source(
     np.ndarray,
     dict,
 ]:
-    expected = {
-        "wavelength": data_dir / "wavelength.npy",
-        "data": data_dir / "data.npy",
-        "sigma": data_dir / "sigma.npy",
-        "phase": data_dir / "phase.npy",
-    }
-    missing = [path.name for path in expected.values() if not path.exists()]
-    if missing:
-        raise FileNotFoundError(
-            f"{data_dir} is missing transmission collapse-source files: "
-            f"{', '.join(missing)}."
-        )
-    metadata_path = data_dir / "timeseries_prep.json"
-    if not metadata_path.exists():
-        raise FileNotFoundError(
-            f"{data_dir} is missing timeseries_prep.json."
-        )
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"Could not parse {metadata_path}: {exc}") from exc
-    if metadata.get("product_kind") != "collapse-source":
-        raise ValueError(
-            f"{data_dir} is not a collapse-source product."
-        )
-    if metadata.get("phase_bin") != "all":
-        raise ValueError(
-            f"{data_dir} must be prepared with phase_bin='all'."
-        )
-    if metadata.get("out_of_transit_master_division") is not True:
-        raise ValueError(
-            f"{data_dir} was not prepared using out-of-transit master division."
-        )
-
-    wavelength = np.asarray(np.load(expected["wavelength"]), dtype=float)
-    data = np.asarray(np.load(expected["data"]), dtype=float)
-    sigma = np.asarray(np.load(expected["sigma"]), dtype=float)
-    phase = np.asarray(np.load(expected["phase"]), dtype=float)
+    metadata = json.loads((data_dir / "timeseries_prep.json").read_text(encoding="utf-8"))
+    wavelength = np.asarray(np.load(data_dir / "wavelength.npy"), dtype=float)
+    data = np.asarray(np.load(data_dir / "data.npy"), dtype=float)
+    sigma = np.asarray(np.load(data_dir / "sigma.npy"), dtype=float)
+    phase = np.asarray(np.load(data_dir / "phase.npy"), dtype=float)
     return wavelength, data, sigma, phase, metadata
 
 
@@ -2515,50 +2054,9 @@ def _load_required_lsd_shadow_source_model(
     wavelength: np.ndarray,
     phase: np.ndarray,
 ) -> tuple[np.ndarray, dict]:
-    """Load the mandatory shared-basis LSD model for a collapse source."""
-
-    shadow = metadata.get("fixed_doppler_shadow")
-    if not isinstance(shadow, dict) or not bool(shadow.get("enabled", False)):
-        raise ValueError(
-            f"{data_dir} has no enabled shared-basis LSD Doppler shadow. Run "
-            "python -m spectroscopy.doppler_shadow after preparing both source products."
-        )
-    if int(shadow.get("schema_version", -1)) != FIXED_LSD_SHADOW_SCHEMA_VERSION:
-        raise ValueError(
-            f"{data_dir} has unsupported fixed LSD shadow schema "
-            f"{shadow.get('schema_version')!r}; expected "
-            f"{FIXED_LSD_SHADOW_SCHEMA_VERSION}."
-        )
-    if str(shadow.get("method")) != FIXED_LSD_SHADOW_METHOD:
-        raise ValueError(
-            f"{data_dir} does not use the required {FIXED_LSD_SHADOW_METHOD} method."
-        )
-    model_name = str(shadow.get("source_model_file", ""))
-    model_path = (data_dir / model_name).resolve()
-    if not model_name or model_path.parent != data_dir.resolve():
-        raise ValueError("The fixed LSD source model must live in its source directory.")
-    if not model_path.is_file():
-        raise FileNotFoundError(f"Required fixed LSD source model is missing: {model_path}")
-    actual_sha256 = hashlib.sha256(model_path.read_bytes()).hexdigest()
-    if actual_sha256 != str(shadow.get("source_model_sha256", "")):
-        raise ValueError(f"Fixed LSD source-model hash mismatch for {model_path}.")
-    model = np.asarray(np.load(model_path), dtype=float)
-    expected_shape = (phase.size, wavelength.size)
-    if model.shape != expected_shape or np.any(~np.isfinite(model)):
-        raise ValueError(
-            f"{model_path} must be finite with shape {expected_shape}; got {model.shape}."
-        )
-    required_provenance = (
-        "artifact_file",
-        "artifact_sha256",
-        "artifact_metadata_file",
-        "template_sha256",
-    )
-    missing = [name for name in required_provenance if not shadow.get(name)]
-    if missing:
-        raise ValueError(
-            f"{data_dir} fixed LSD provenance is missing: {', '.join(missing)}."
-        )
+    """Read the source cube's fixed LSD shadow model."""
+    shadow = metadata["fixed_doppler_shadow"]
+    model = np.asarray(np.load(data_dir / shadow["source_model_file"]), dtype=float)
     return model, dict(shadow)
 
 
@@ -2620,10 +2118,6 @@ def collapse_transmission_epoch_arm(
         "T14_grazing" if bool(params.get("grazing_transit", False)) else "T23"
     )
     selected_indices = np.flatnonzero(active_transit)
-    if selected_indices.size == 0:
-        raise ValueError(
-            f"No exposures fall inside the active {active_interval} interval."
-        )
 
     selected_phase = phase[selected_indices]
     selected_sigma = sigma[selected_indices]
@@ -2642,11 +2136,7 @@ def collapse_transmission_epoch_arm(
             fixed,
         )
     )
-    frozen_sysrem = load_frozen_sysrem_arrays(source_dir)
-    if source_metadata.get("run_sysrem") is True and frozen_sysrem is None:
-        raise FileNotFoundError(
-            f"{source_dir} declares run_sysrem=true but U_sysrem.npz is missing."
-        )
+    frozen_sysrem = load_frozen_sysrem_arrays(source_dir) if source_metadata["run_sysrem"] else None
 
     output_dir.mkdir(parents=True, exist_ok=True)
     np.save(output_dir / "wavelength_transmission.npy", wavelength_1d)

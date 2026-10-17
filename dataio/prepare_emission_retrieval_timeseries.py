@@ -26,7 +26,6 @@ from typing import Any
 import numpy as np
 
 import config
-import config_utils
 from config import EPHEMERIS, FULL_ARM_MEMBERS
 from config_utils import get_params, resolve_transit_midpoint
 from dataio.collapse_emission_timeseries_to_1d import (
@@ -39,7 +38,6 @@ from dataio.collapse_transmission_timeseries_to_1d import (
     get_ephemeris_epoch_bjd_tdb,
     get_orbital_phase,
     get_sysrem_deep_mask,
-    get_sysrem_chunk_indices,
     get_sysrem_ignore_mask,
 )
 from dataio.edge_trim_manifest import load_accepted_edge_trim_widths
@@ -47,6 +45,8 @@ from dataio.hrs_preparation import (
     load_hrs_arm,
     output_dir_for,
     requested_stellar_velocity_correction,
+    save_sysrem_products,
+    valid_sorted_column_indices,
 )
 from dataio.wavelength_frame_contract import build_wavelength_frame_contract
 
@@ -61,56 +61,6 @@ EMISSION_PHASE_BINS = {
 }
 
 
-def _sanitize_columns(
-    wavelength: np.ndarray,
-    data: np.ndarray,
-    sigma: np.ndarray,
-    *,
-    arm: str | None = None,
-    edge_trim_widths_A: tuple[float, float] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    wavelength = np.asarray(wavelength, dtype=float)
-    data = np.asarray(data, dtype=float)
-    sigma = np.asarray(sigma, dtype=float)
-
-    if wavelength.ndim != 1:
-        raise ValueError(f"Expected 1D wavelength grid, got shape {wavelength.shape}.")
-    if data.ndim != 2 or sigma.ndim != 2:
-        raise ValueError(f"Expected 2D data/sigma matrices, got {data.shape=} and {sigma.shape=}.")
-    if data.shape != sigma.shape:
-        raise ValueError(f"data shape {data.shape} does not match sigma shape {sigma.shape}.")
-    if data.shape[1] != wavelength.size:
-        raise ValueError(
-            f"Spectral axis mismatch: data.shape[1]={data.shape[1]} "
-            f"but wavelength.size={wavelength.size}."
-        )
-
-    valid = np.isfinite(wavelength) & (wavelength > 0.0)
-    valid &= np.all(np.isfinite(data), axis=0)
-    valid &= np.all(np.isfinite(sigma), axis=0)
-    valid &= np.all(sigma > 0.0, axis=0)
-    if arm is not None:
-        valid &= ~get_sysrem_ignore_mask(
-            wavelength,
-            arm,
-            explicit_edge_trim_widths_A=edge_trim_widths_A,
-        )
-
-    if not np.any(valid):
-        raise ValueError("No valid spectral columns remain after masking.")
-
-    valid_indices = np.flatnonzero(valid)
-    wavelength = wavelength[valid]
-    data = data[:, valid]
-    sigma = sigma[:, valid]
-
-    sort_idx = np.argsort(wavelength)
-    wavelength = wavelength[sort_idx]
-    data = data[:, sort_idx]
-    sigma = sigma[:, sort_idx]
-    return wavelength, data, sigma, valid_indices[sort_idx]
-
-
 def _phase_mod_1(phase: np.ndarray) -> np.ndarray:
     return np.mod(np.asarray(phase, dtype=float), 1.0)
 
@@ -121,21 +71,8 @@ def _circular_phase_distance(phase: np.ndarray, center: float) -> np.ndarray:
     return np.minimum(delta, 1.0 - delta)
 
 
-def _is_valid_numeric(value: Any) -> bool:
-    try:
-        return value is not None and bool(np.isfinite(float(value)))
-    except (TypeError, ValueError):
-        return False
-
-
 def _eclipse_half_width_phase(planet_params: dict[str, Any]) -> float:
-    duration = planet_params.get("duration")
-    period = planet_params.get("period")
-    if not _is_valid_numeric(duration):
-        raise ValueError("Emission eclipse binning requires a finite planet duration.")
-    if not _is_valid_numeric(period) or float(period) <= 0.0:
-        raise ValueError("Emission phase calculations require a finite positive orbital period.")
-    return float(duration) / (2.0 * float(period))
+    return float(planet_params["duration"]) / (2.0 * float(planet_params["period"]))
 
 
 def _phase_bin_definition(phase_bin: str, planet_params: dict[str, Any]) -> str:
@@ -154,7 +91,6 @@ def _phase_bin_definition(phase_bin: str, planet_params: dict[str, Any]) -> str:
         return describe_emission_selection("pre_eclipse", planet_params)
     if phase_bin == "post_eclipse":
         return describe_emission_selection("post_eclipse", planet_params)
-    raise ValueError(f"Unknown emission phase bin: {phase_bin}")
 
 
 def emission_phase_selection_mask(
@@ -178,51 +114,6 @@ def emission_phase_selection_mask(
     if phase_bin == "post_eclipse":
         return emission_selection_mask(phase_01, "post_eclipse", planet_params)
 
-    raise ValueError(f"Unknown emission phase bin: {phase_bin}")
-
-
-def _chunk_labels_from_indices(
-    n_wave: int,
-    chunk_indices: tuple[np.ndarray, ...],
-) -> np.ndarray:
-    labels = np.full(n_wave, -1, dtype=int)
-    for chunk_id, indices in enumerate(chunk_indices):
-        labels[np.asarray(indices, dtype=int)] = chunk_id
-    if np.any(labels < 0):
-        missing = int(np.sum(labels < 0))
-        raise ValueError(f"{missing} wavelength columns were not assigned to any SYSREM chunk.")
-    return labels
-
-
-def _sysrem_basis_counts(U_full: np.ndarray) -> np.ndarray:
-    U_full = np.asarray(U_full, dtype=float)
-    if U_full.ndim == 2:
-        U_full = U_full[:, :, np.newaxis]
-    if U_full.ndim != 3:
-        raise ValueError(f"Unsupported U_sysrem shape: {U_full.shape}")
-
-    counts = []
-    for chunk in range(U_full.shape[2]):
-        counts.append(int(np.sum(np.any(np.isfinite(U_full[:, :, chunk]), axis=0))))
-    return np.asarray(counts, dtype=int)
-
-
-def _sysrem_diagnostics_for_save(extras: dict[str, Any]) -> dict[str, np.ndarray]:
-    keys = (
-        "sysrem_stddev_before",
-        "sysrem_stddev_after",
-        "sysrem_delta_stddev",
-        "sysrem_component_attempted",
-        "sysrem_component_accepted",
-        "sysrem_min_systematics",
-        "sysrem_max_systematics",
-        "sysrem_stop_delta_stddev",
-    )
-    return {
-        key: np.asarray(extras[key])
-        for key in keys
-        if extras.get(key) is not None
-    }
 
 
 def _save_metadata(
@@ -303,7 +194,8 @@ def _save_metadata(
         "wavelength_frame": wavelength_frame_contract["wavelength_frame"],
         "wavelength_frame_contract": wavelength_frame_contract,
     }
-    if _is_valid_numeric(planet_params.get("duration")) and _is_valid_numeric(planet_params.get("period")):
+    duration = planet_params.get("duration")
+    if duration is not None and np.isfinite(float(duration)):
         metadata["eclipse_half_width_phase"] = _eclipse_half_width_phase(planet_params)
 
     (output_dir / "timeseries_prep.json").write_text(
@@ -445,38 +337,13 @@ def main() -> int:
         )
 
     planet_cfg = get_params(args.planet, args.ephemeris)
-    period = planet_cfg.get("period")
-    ra = planet_cfg.get("RA")
-    dec = planet_cfg.get("Dec")
-    reference_epoch = planet_cfg.get("epoch")
-    missing = []
-    for name, value in (
-        ("period", period),
-        ("RA", ra),
-        ("Dec", dec),
-        ("epoch", reference_epoch),
-    ):
-        if not _is_valid_numeric(value) and name == "period":
-            missing.append(name)
-        elif value is None or (name in {"RA", "Dec"} and not str(value).strip()):
-            missing.append(name)
-        elif name == "epoch" and not _is_valid_numeric(value):
-            missing.append(name)
-    if missing:
-        raise ValueError(f"Missing required planet parameters for {args.planet}: {', '.join(missing)}.")
-    if args.phase_bin == "eclipse" and not _is_valid_numeric(planet_cfg.get("duration")):
-        raise ValueError(
-            f"Emission eclipse binning requires a finite duration for {args.planet} ({args.ephemeris})."
-        )
+    period = planet_cfg["period"]
+    ra = planet_cfg["RA"]
+    dec = planet_cfg["Dec"]
+    reference_epoch = planet_cfg["epoch"]
 
     if args.arm == "full":
         arms_to_run: tuple[str, ...] = FULL_ARM_MEMBERS
-        if args.output_dir:
-            raise ValueError(
-                "--output-dir is not supported with --arm full because red and blue are "
-                "written to separate directories. Run each arm explicitly with an "
-                "--output-dir, or drop --output-dir to use the default per-arm paths."
-            )
     else:
         arms_to_run = (args.arm,)
 
@@ -636,13 +503,15 @@ def prepare_arm(
         explicit_widths_A=edge_trim_widths_A,
         source=edge_trim_source,
     )
-    wave_1d, _source_data_masked, source_sigma, column_indices = _sanitize_columns(
+    column_indices = valid_sorted_column_indices(
         wave_1d,
         source_data,
         source_sigma,
         arm=arm,
         edge_trim_widths_A=edge_trim_widths_A,
     )
+    wave_1d = np.asarray(wave_1d, dtype=float)[column_indices]
+    source_sigma = source_sigma[:, column_indices]
     data = data[:, column_indices]
     sigma = sigma[:, column_indices]
     spectral_column_masking = {
@@ -681,39 +550,15 @@ def prepare_arm(
         has_sysrem=np.asarray(args.run_sysrem, dtype=bool),
     )
 
-    if args.run_sysrem:
-        U_full = extras.get("U_sysrem")
-        if U_full is None:
-            raise ValueError("SYSREM requested but U_sysrem was not returned by preprocessing.")
-        U_full = np.asarray(U_full)
-        if U_full.shape[0] != source_phase.size:
-            raise ValueError(
-                "SYSREM basis exposure axis does not match the frozen source "
-                f"sequence: {U_full.shape[0]} versus {source_phase.size}."
-            )
-        chunk_names, chunk_indices, _ = get_sysrem_chunk_indices(wave_1d, arm)
-        chunk_labels = _chunk_labels_from_indices(wave_1d.size, chunk_indices)
-        basis_counts = _sysrem_basis_counts(U_full)
-        sysrem_diagnostics = _sysrem_diagnostics_for_save(extras)
-        np.savez_compressed(
-            output_dir / "U_sysrem.npz",
-            U_sysrem=U_full,
-            chunk_labels=chunk_labels,
-            basis_counts=basis_counts,
-            projection_sigma=source_sigma,
-            chunk_names=np.asarray(chunk_names, dtype="U32"),
-            **sysrem_diagnostics,
-        )
-        print(
-            "  Saved chunked SYSREM bundle: "
-            f"{len(chunk_names)} chunks, basis counts={basis_counts.tolist()}"
-        )
-        if "sysrem_delta_stddev" in sysrem_diagnostics:
-            print("  Saved SYSREM component diagnostics: sysrem_delta_stddev and acceptance masks")
-    else:
-        # Do not leave a basis from an older preparation run beside a newly
-        # exported non-SYSREM cube.
-        (output_dir / "U_sysrem.npz").unlink(missing_ok=True)
+    save_sysrem_products(
+        output_dir,
+        wavelength=wave_1d,
+        arm=arm,
+        n_source_exposures=source_phase.size,
+        source_sigma=source_sigma,
+        extras=extras,
+        run_sysrem=args.run_sysrem,
+    )
 
     wavelength_frame_contract = build_wavelength_frame_contract(
         extras,

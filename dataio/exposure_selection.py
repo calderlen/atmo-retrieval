@@ -39,12 +39,6 @@ def canonical_exposure_id(path_or_name: str | Path) -> str:
     return match.group(1).lower() if match is not None else name.lower()
 
 
-def normalize_fits_object_name(value: str) -> str:
-    """Normalize harmless FITS OBJECT spelling differences for comparison."""
-
-    return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
-
-
 def _configured_exposure_ids(
     *,
     planet_name: str,
@@ -69,87 +63,6 @@ def _configured_exposure_ids(
     )
     return tuple(
         dict.fromkeys(canonical_exposure_id(value) for value in configured)
-    )
-
-
-def _configured_nominal_object_names(planet_name: str) -> tuple[str, ...]:
-    planet_key = _planet_key(planet_name)
-    configured = tuple(
-        str(value).strip()
-        for value in getattr(config, "HRS_NOMINAL_FITS_OBJECT_NAMES", {}).get(
-            planet_key,
-            (),
-        )
-        if str(value).strip()
-    )
-    if not configured:
-        raise ValueError(
-            f"No nominal FITS OBJECT name is configured for HRS target "
-            f"{planet_name!r} ({planet_key})."
-        )
-    normalized = tuple(normalize_fits_object_name(value) for value in configured)
-    if any(not value for value in normalized):
-        raise ValueError(
-            f"HRS target {planet_name!r} has an empty nominal FITS OBJECT name."
-        )
-    return configured
-
-
-@dataclass(frozen=True)
-class FitsObjectCheck:
-    """FITS OBJECT validation result for one candidate science file."""
-
-    path: Path
-    observed_name: str | None
-    normalized_name: str | None
-    accepted: bool
-    rejection_reason: str | None
-
-    def metadata(self) -> dict[str, object]:
-        return {
-            "file": self.path.name,
-            "observed_name": self.observed_name,
-            "normalized_name": self.normalized_name,
-            "accepted": self.accepted,
-            "rejection_reason": self.rejection_reason,
-        }
-
-
-def _check_fits_object(
-    path: Path,
-    *,
-    accepted_normalized_names: frozenset[str],
-) -> FitsObjectCheck:
-    try:
-        header = fits.getheader(path, 0)
-    except (OSError, ValueError) as exc:
-        return FitsObjectCheck(
-            path=path,
-            observed_name=None,
-            normalized_name=None,
-            accepted=False,
-            rejection_reason=(
-                f"unreadable_fits_header:{type(exc).__name__}:{exc}"
-            ),
-        )
-    raw_value = header.get("OBJECT")
-    observed_name = None if raw_value is None else str(raw_value).strip()
-    if not observed_name:
-        return FitsObjectCheck(
-            path=path,
-            observed_name=observed_name,
-            normalized_name=None,
-            accepted=False,
-            rejection_reason="missing_fits_object",
-        )
-    normalized_name = normalize_fits_object_name(observed_name)
-    accepted = normalized_name in accepted_normalized_names
-    return FitsObjectCheck(
-        path=path,
-        observed_name=observed_name,
-        normalized_name=normalized_name,
-        accepted=accepted,
-        rejection_reason=None if accepted else "fits_object_mismatch",
     )
 
 
@@ -205,10 +118,7 @@ class ScienceExposureSelection:
     discovered_files: tuple[Path, ...]
     superseded_files: tuple[Path, ...]
     configured_exposure_ids: tuple[str, ...]
-    nominal_fits_object_names: tuple[str, ...]
     configured_excluded_files: tuple[Path, ...]
-    fits_object_checks: tuple[FitsObjectCheck, ...]
-    fits_object_rejected_files: tuple[Path, ...]
     excluded_files: tuple[Path, ...]
     usable_files: tuple[Path, ...]
     snr_quality_checks: tuple[SnrQualityCheck, ...] = ()
@@ -230,26 +140,16 @@ class ScienceExposureSelection:
             "n_discovered_files": len(self.discovered_files),
             "n_superseded_files": len(self.superseded_files),
             "n_configured_excluded_files": len(self.configured_excluded_files),
-            "n_fits_object_rejected_files": len(
-                self.fits_object_rejected_files
-            ),
             "n_snr_quality_excluded_files": len(
                 self.snr_quality_excluded_files
             ),
             "n_excluded_files": len(self.excluded_files),
             "n_usable_files": len(self.usable_files),
             "configured_exposure_ids": list(self.configured_exposure_ids),
-            "nominal_fits_object_names": list(self.nominal_fits_object_names),
             "discovered_files": [path.name for path in self.discovered_files],
             "superseded_files": [path.name for path in self.superseded_files],
             "configured_excluded_files": [
                 path.name for path in self.configured_excluded_files
-            ],
-            "fits_object_checks": [
-                check.metadata() for check in self.fits_object_checks
-            ],
-            "fits_object_rejected_files": [
-                path.name for path in self.fits_object_rejected_files
             ],
             "snr_quality": {
                 "policy": SNR_QUALITY_POLICY,
@@ -278,24 +178,18 @@ class ScienceExposureSelection:
 
 
 def _safe_float(value: object) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float("nan")
+    return float("nan") if value is None else float(value)
 
 
 def _exptime_seconds(value: object) -> float:
     if isinstance(value, str):
         fields = value.split(":")
         if len(fields) == 3:
-            try:
-                return (
-                    float(fields[0]) * 3600.0
-                    + float(fields[1]) * 60.0
-                    + float(fields[2])
-                )
-            except ValueError:
-                return float("nan")
+            return (
+                float(fields[0]) * 3600.0
+                + float(fields[1]) * 60.0
+                + float(fields[2])
+            )
     return _safe_float(value)
 
 
@@ -543,14 +437,6 @@ def apply_paired_snr_quality_rule(
 ) -> tuple[ScienceExposureSelection, ScienceExposureSelection]:
     """Apply the sole automatic S/N cut: both paired arms must have q < 0.4."""
 
-    identity_fields = ("planet_key", "data_mode", "observation_epoch")
-    if any(
-        getattr(blue_selection, field) != getattr(red_selection, field)
-        for field in identity_fields
-    ):
-        raise ValueError("Blue/red S/N selections do not describe the same observation.")
-    if blue_selection.arm != "blue" or red_selection.arm != "red":
-        raise ValueError("Paired S/N quality requires blue and red selections.")
 
     blue_rows = _header_snr_rows(blue_selection.usable_files)
     red_rows = _header_snr_rows(red_selection.usable_files)
@@ -638,10 +524,6 @@ def select_science_exposures(
         observation_epoch=observation_epoch,
         arm=arm,
     )
-    nominal_object_names = _configured_nominal_object_names(planet_name)
-    accepted_normalized_names = frozenset(
-        normalize_fits_object_name(value) for value in nominal_object_names
-    )
     excluded_id_set = frozenset(configured_ids)
     configured_excluded_files = tuple(
         path
@@ -649,22 +531,8 @@ def select_science_exposures(
         if canonical_exposure_id(path) in excluded_id_set
     )
     configured_excluded_set = set(configured_excluded_files)
-    header_candidates = tuple(
-        path for path in product_files if path not in configured_excluded_set
-    )
-    fits_object_checks = tuple(
-        _check_fits_object(
-            path,
-            accepted_normalized_names=accepted_normalized_names,
-        )
-        for path in header_candidates
-    )
-    fits_object_rejected_files = tuple(
-        check.path for check in fits_object_checks if not check.accepted
-    )
-    excluded_set = configured_excluded_set | set(fits_object_rejected_files)
-    excluded_files = tuple(path for path in product_files if path in excluded_set)
-    usable_files = tuple(path for path in product_files if path not in excluded_set)
+    excluded_files = configured_excluded_files
+    usable_files = tuple(path for path in product_files if path not in configured_excluded_set)
 
     return ScienceExposureSelection(
         planet_key=_planet_key(planet_name),
@@ -676,10 +544,7 @@ def select_science_exposures(
         discovered_files=discovered_files,
         superseded_files=superseded_files,
         configured_exposure_ids=configured_ids,
-        nominal_fits_object_names=nominal_object_names,
         configured_excluded_files=configured_excluded_files,
-        fits_object_checks=fits_object_checks,
-        fits_object_rejected_files=fits_object_rejected_files,
         excluded_files=excluded_files,
         usable_files=usable_files,
     )

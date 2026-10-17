@@ -26,11 +26,7 @@ from pipeline.retrieval_plan import (
     configure_runtime,
     intent_manifest,
     model_param_overrides,
-    preflight_timeseries,
-    print_plan,
-    require_ready_timeseries,
     shared_prior_modes,
-    validate_epochs,
 )
 
 
@@ -44,22 +40,13 @@ PAPER_LOG_GAMMA_BOUNDS = (0.0, 2.0)
 def _configure_paper_emission_atmosphere() -> None:
     """Apply the KELT-20b paper's P-T prior and its required support."""
     temperature_low, temperature_high = PAPER_TEMPERATURE_RANGE_K
-    config_utils.set_runtime_config("T_LOW", temperature_low)
-    config_utils.set_runtime_config("T_HIGH", temperature_high)
-    config_utils.set_runtime_config("FASTCHEM_T_MIN", temperature_low)
-    config_utils.set_runtime_config("FASTCHEM_T_MAX", temperature_high)
-    config_utils.set_runtime_config(
-        "FASTCHEM_N_TEMP",
-        max(int(config.FASTCHEM_N_TEMP), PAPER_FASTCHEM_N_TEMP_MIN),
-    )
-    config_utils.set_runtime_config(
-        "LOG_KAPPA_IR_BOUNDS",
-        PAPER_LOG_KAPPA_IR_BOUNDS,
-    )
-    config_utils.set_runtime_config(
-        "LOG_GAMMA_BOUNDS",
-        PAPER_LOG_GAMMA_BOUNDS,
-    )
+    config.T_LOW = temperature_low
+    config.T_HIGH = temperature_high
+    config.FASTCHEM_T_MIN = temperature_low
+    config.FASTCHEM_T_MAX = temperature_high
+    config.FASTCHEM_N_TEMP = max(int(config.FASTCHEM_N_TEMP), PAPER_FASTCHEM_N_TEMP_MIN)
+    config.LOG_KAPPA_IR_BOUNDS = PAPER_LOG_KAPPA_IR_BOUNDS
+    config.LOG_GAMMA_BOUNDS = PAPER_LOG_GAMMA_BOUNDS
 
 
 def _cases() -> dict[str, RetrievalCase]:
@@ -92,16 +79,7 @@ def _cases() -> dict[str, RetrievalCase]:
 
 
 def _parse_atoms(value: str) -> tuple[str, ...]:
-    names = tuple(name.strip() for name in value.split(",") if name.strip())
-    if not names:
-        raise argparse.ArgumentTypeError("--atoms requires at least one species name.")
-    if len(set(names)) != len(names):
-        raise argparse.ArgumentTypeError("--atoms contains duplicate species names.")
-    try:
-        atomic_species_dict(names)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
-    return names
+    return tuple(name.strip() for name in value.split(",") if name.strip())
 
 
 def _case_slug(atoms: tuple[str, ...], chemistry_model: str) -> str:
@@ -183,62 +161,6 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _preflight_collapsed_emission(
-    *,
-    epochs: tuple[str, ...],
-    args: argparse.Namespace,
-) -> list[dict[str, object]]:
-    results: list[dict[str, object]] = []
-    arms = tuple(config.FULL_ARM_MEMBERS) if args.arm == "full" else (args.arm,)
-    for epoch in epochs:
-        for arm in arms:
-            data_dir = config_utils.get_collapsed_emission_dir(
-                planet=args.planet,
-                epoch=epoch,
-                arm=arm,
-                selection=args.emission_selection,
-            )
-            required = (
-                data_dir / "wavelength_emission.npy",
-                data_dir / "spectrum_emission.npy",
-                data_dir / "uncertainty_emission.npy",
-                data_dir / "emission_collapse_operator.npz",
-                data_dir / "collapse_metadata.json",
-            )
-            missing = [path.name for path in required if not path.is_file()]
-            status = None
-            if not missing:
-                metadata = json.loads(
-                    (data_dir / "collapse_metadata.json").read_text(encoding="utf-8")
-                )
-                status = str(metadata.get("status", "")).strip().lower()
-            results.append(
-                {
-                    "data_dir": str(data_dir),
-                    "missing": missing,
-                    "status": status,
-                }
-            )
-    return results
-
-
-def _require_ready_collapsed_emission(
-    preflight: list[dict[str, object]],
-) -> None:
-    failures: list[str] = []
-    for row in preflight:
-        if row["missing"]:
-            failures.append(f"{row['data_dir']}: missing {', '.join(row['missing'])}")
-        elif row["status"] != "ready":
-            failures.append(
-                f"{row['data_dir']}: collapse status is {row['status']!r}, expected 'ready'"
-            )
-    if failures:
-        raise FileNotFoundError(
-            "Collapsed emission preflight failed:\n  - " + "\n  - ".join(failures)
-        )
-
-
 def _auxiliary_emission_specs(
     *,
     epochs: tuple[str, ...],
@@ -289,29 +211,10 @@ def main() -> int:
             print(f"{listed_case.name:20s} {listed_case.description}")
         return 0
 
-    epochs = validate_epochs(args.epoch)
-    if args.data_format == "spectrum" and args.emission_selection is None:
-        raise ValueError(
-            "--data-format spectrum requires --emission-selection "
-            f"({', '.join(EMISSION_COLLAPSE_SELECTIONS)})."
-        )
-    if args.data_format == "timeseries" and args.emission_selection is not None:
-        raise ValueError(
-            "--emission-selection is only valid with --data-format spectrum."
-        )
-    if args.data_format == "spectrum" and args.no_sysrem:
-        raise ValueError(
-            "--no-sysrem is not valid for collapsed spectra; their saved collapse "
-            "operator already records the preprocessing applied to the source cube."
-        )
+    epochs = tuple(epoch.strip() for epoch in args.epoch)
     case = _resolve_case(args, cases)
     configure_runtime(args, mode="emission", case_name=case.name)
     _configure_paper_emission_atmosphere()
-    preflight = (
-        preflight_timeseries(mode="emission", epochs=epochs, args=args)
-        if args.data_format == "timeseries"
-        else _preflight_collapsed_emission(epochs=epochs, args=args)
-    )
     fastchem_file = (
         args.fastchem_parameter_file
         if case.chemistry_model == "fastchem_hybrid_grid"
@@ -344,7 +247,6 @@ def main() -> int:
         manifest_extra.update(
             {
                 "fastchem_parameter_file": str(fastchem_file),
-                "fastchem_parameter_file_exists": fastchem_file.exists(),
                 "free_hybrid_parameters": ("log_metallicity", "C_O_ratio"),
                 "fastchem_continuum_species": ("H-", "e-", "H"),
             }
@@ -355,17 +257,9 @@ def main() -> int:
         args=args,
         extra=manifest_extra,
     )
-    print_plan(manifest, preflight)
+    print(json.dumps(manifest, indent=2, sort_keys=True))
     if args.dry_run:
         return 0
-    if fastchem_file is not None and not fastchem_file.is_file():
-        raise FileNotFoundError(
-            f"FastChem parameter file does not exist: {fastchem_file}"
-        )
-    if args.data_format == "timeseries":
-        require_ready_timeseries(preflight, args)
-    else:
-        _require_ready_collapsed_emission(preflight)
 
     joint_spectra = _auxiliary_emission_specs(
         epochs=epochs[1:],

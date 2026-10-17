@@ -28,7 +28,6 @@ from typing import Any
 import numpy as np
 
 import config
-import config_utils
 from config import EPHEMERIS, FULL_ARM_MEMBERS, PHASE_BINS
 from config_utils import get_params, resolve_transit_midpoint
 from dataio.collapse_transmission_timeseries_to_1d import (
@@ -42,7 +41,6 @@ from dataio.collapse_transmission_timeseries_to_1d import (
     get_orbital_phase,
     get_phase_bin_mask,
     get_sysrem_deep_mask,
-    get_sysrem_chunk_indices,
     get_sysrem_ignore_mask,
 )
 from dataio.edge_trim_manifest import load_accepted_edge_trim_widths
@@ -50,6 +48,8 @@ from dataio.hrs_preparation import (
     load_hrs_arm,
     output_dir_for,
     requested_stellar_velocity_correction,
+    save_sysrem_products,
+    valid_sorted_column_indices,
 )
 from dataio.wavelength_frame_contract import (
     build_wavelength_frame_contract,
@@ -66,93 +66,6 @@ def transmission_phase_selection_mask(
     if phase_bin == "all":
         return np.ones_like(phase, dtype=bool)
     return get_phase_bin_mask(phase, phase_bin, planet_params)
-
-
-def _valid_sorted_column_indices(
-    wavelength: np.ndarray,
-    data: np.ndarray,
-    sigma: np.ndarray,
-    *,
-    arm: str | None = None,
-    edge_trim_widths_A: tuple[float, float] | None = None,
-) -> np.ndarray:
-    wavelength = np.asarray(wavelength, dtype=float)
-    data = np.asarray(data, dtype=float)
-    sigma = np.asarray(sigma, dtype=float)
-
-    if wavelength.ndim != 1:
-        raise ValueError(f"Expected 1D wavelength grid, got shape {wavelength.shape}.")
-    if data.ndim != 2 or sigma.ndim != 2:
-        raise ValueError(f"Expected 2D data/sigma matrices, got {data.shape=} and {sigma.shape=}.")
-    if data.shape != sigma.shape:
-        raise ValueError(f"data shape {data.shape} does not match sigma shape {sigma.shape}.")
-    if data.shape[1] != wavelength.size:
-        raise ValueError(
-            f"Spectral axis mismatch: data.shape[1]={data.shape[1]} "
-            f"but wavelength.size={wavelength.size}."
-        )
-
-    valid = np.isfinite(wavelength) & (wavelength > 0.0)
-    valid &= np.all(np.isfinite(data), axis=0)
-    valid &= np.all(np.isfinite(sigma), axis=0)
-    valid &= np.all(sigma > 0.0, axis=0)
-    if arm is not None:
-        valid &= ~get_sysrem_ignore_mask(
-            wavelength,
-            arm,
-            explicit_edge_trim_widths_A=edge_trim_widths_A,
-        )
-
-    if not np.any(valid):
-        raise ValueError("No valid spectral columns remain after masking.")
-
-    valid_indices = np.flatnonzero(valid)
-    sort_idx = np.argsort(wavelength[valid_indices])
-    return valid_indices[sort_idx]
-
-
-def _chunk_labels_from_indices(
-    n_wave: int,
-    chunk_indices: tuple[np.ndarray, ...],
-) -> np.ndarray:
-    labels = np.full(n_wave, -1, dtype=int)
-    for chunk_id, indices in enumerate(chunk_indices):
-        labels[np.asarray(indices, dtype=int)] = chunk_id
-    if np.any(labels < 0):
-        missing = int(np.sum(labels < 0))
-        raise ValueError(f"{missing} wavelength columns were not assigned to any SYSREM chunk.")
-    return labels
-
-
-def _sysrem_basis_counts(U_full: np.ndarray) -> np.ndarray:
-    U_full = np.asarray(U_full, dtype=float)
-    if U_full.ndim == 2:
-        U_full = U_full[:, :, np.newaxis]
-    if U_full.ndim != 3:
-        raise ValueError(f"Unsupported U_sysrem shape: {U_full.shape}")
-
-    counts = []
-    for chunk in range(U_full.shape[2]):
-        counts.append(int(np.sum(np.any(np.isfinite(U_full[:, :, chunk]), axis=0))))
-    return np.asarray(counts, dtype=int)
-
-
-def _sysrem_diagnostics_for_save(extras: dict[str, Any]) -> dict[str, np.ndarray]:
-    keys = (
-        "sysrem_stddev_before",
-        "sysrem_stddev_after",
-        "sysrem_delta_stddev",
-        "sysrem_component_attempted",
-        "sysrem_component_accepted",
-        "sysrem_min_systematics",
-        "sysrem_max_systematics",
-        "sysrem_stop_delta_stddev",
-    )
-    return {
-        key: np.asarray(extras[key])
-        for key in keys
-        if extras.get(key) is not None
-    }
 
 
 def _save_metadata(
@@ -573,7 +486,7 @@ def prepare_arm(
         explicit_widths_A=edge_trim_widths_A,
         source=edge_trim_source,
     )
-    column_indices = _valid_sorted_column_indices(
+    column_indices = valid_sorted_column_indices(
         wave_1d,
         source_data,
         source_sigma,
@@ -634,44 +547,15 @@ def prepare_arm(
         np.save(output_dir / "pre_sysrem_data.npy", pre_sysrem_data)
         np.save(output_dir / "pre_sysrem_sigma.npy", pre_sysrem_sigma)
 
-    if args.run_sysrem:
-        U_full = extras.get("U_sysrem")
-        if U_full is None:
-            raise ValueError("SYSREM requested but U_sysrem was not returned by preprocessing.")
-        U_full = np.asarray(U_full)
-        if U_full.shape[0] != source_phase.size:
-            raise ValueError(
-                "SYSREM basis exposure axis does not match the frozen source "
-                f"sequence: {U_full.shape[0]} versus {source_phase.size}."
-            )
-        chunk_names, chunk_indices, _ = get_sysrem_chunk_indices(wave_1d, arm)
-        chunk_labels = _chunk_labels_from_indices(wave_1d.size, chunk_indices)
-        basis_counts = _sysrem_basis_counts(U_full)
-        sysrem_diagnostics = _sysrem_diagnostics_for_save(extras)
-        np.savez_compressed(
-            output_dir / "U_sysrem.npz",
-            U_sysrem=U_full,
-            chunk_labels=chunk_labels,
-            basis_counts=basis_counts,
-            projection_sigma=source_sigma,
-            chunk_names=np.asarray(chunk_names, dtype="U32"),
-            **sysrem_diagnostics,
-        )
-        print(
-            "  Saved chunked SYSREM bundle: "
-            f"{len(chunk_names)} chunks, basis counts={basis_counts.tolist()}"
-        )
-        if "sysrem_delta_stddev" in sysrem_diagnostics:
-            print("  Saved SYSREM component diagnostics: sysrem_delta_stddev and acceptance masks")
-    else:
-        # Conditional products from an earlier SYSREM run must not survive
-        # beside a newly exported non-SYSREM cube.
-        for filename in (
-            "U_sysrem.npz",
-            "pre_sysrem_data.npy",
-            "pre_sysrem_sigma.npy",
-        ):
-            (output_dir / filename).unlink(missing_ok=True)
+    save_sysrem_products(
+        output_dir,
+        wavelength=wave_1d,
+        arm=arm,
+        n_source_exposures=source_phase.size,
+        source_sigma=source_sigma,
+        extras=extras,
+        run_sysrem=args.run_sysrem,
+    )
 
     contacts = compute_contact_phases(planet_cfg)
     wavelength_frame_contract = build_wavelength_frame_contract(
@@ -780,19 +664,6 @@ def main() -> int:
         arms_to_run = (args.arm,)
 
     planet_cfg = get_params(args.planet, args.ephemeris)
-    missing = []
-    required_parameters = ["period", "duration", "RA", "Dec", "epoch"]
-    if not bool(planet_cfg.get("grazing_transit", False)):
-        required_parameters.append("tau")
-    for name in required_parameters:
-        value = planet_cfg.get(name)
-        if value is None or value != value:
-            missing.append(name)
-    if missing:
-        raise ValueError(
-            f"Missing required planet parameters for {args.planet}: {', '.join(missing)}."
-        )
-
     for arm in arms_to_run:
         if args.output_dir:
             output_dir = Path(args.output_dir)

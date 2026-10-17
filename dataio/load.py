@@ -171,30 +171,11 @@ def parse_nasa_archive_tbl(
 
 
 def _select_value_column(columns: list[str], mode: str | None) -> str:
-    candidates = []
-    if mode == "emission":
-        candidates = [
-            "ESPECLIPDEP",
-            "SPECLIPDEP",
-            "SPECDEP",
-        ]
-    elif mode == "transmission":
-        candidates = [
-            "SPECTRANSDEP",
-            "SPECTRANDEP",
-            "SPECTRANSDEPTH",
-            "PL_TRANDEP",
-            "SPECDEP",
-        ]
-
-    for name in candidates:
-        if name in columns:
-            return name
-
-    raise ValueError(
-        "Could not infer value column from header. "
-        f"Available columns: {columns}"
-    )
+    candidates = {
+        "emission": ("ESPECLIPDEP", "SPECLIPDEP", "SPECDEP"),
+        "transmission": ("SPECTRANSDEP", "SPECTRANDEP", "SPECTRANSDEPTH", "PL_TRANDEP", "SPECDEP"),
+    }[mode]
+    return next(name for name in candidates if name in columns)
 
 
 def _select_error_columns(columns: list[str], value_col: str) -> tuple[str | None, str | None]:
@@ -245,8 +226,6 @@ def load_nasa_archive_spectrum(
             mode = "emission"
         elif "transit" in spec_type_lower or "transmission" in spec_type_lower:
             mode = "transmission"
-        else:
-            raise ValueError("Could not infer mode from SPEC_TYPE; provide mode='emission' or 'transmission'.")
 
     if value_column is None:
         value_column = _select_value_column(columns, mode)

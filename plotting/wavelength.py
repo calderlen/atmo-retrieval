@@ -12,27 +12,20 @@ def wavelength_segment_slices(
     *,
     gap_factor: float = 5.0,
 ) -> tuple[slice, ...]:
-    """Return contiguous slices separated by unusually large wavelength steps."""
+    """Split a finite 1-D wavelength grid at unusually large steps."""
 
     wavelength = np.asarray(wavelength, dtype=float)
-    if wavelength.ndim != 1 or wavelength.size == 0:
-        raise ValueError("Wavelength coordinates must be a nonempty 1-D array.")
     if wavelength.size == 1:
         return (slice(0, 1),)
-    if not np.all(np.isfinite(wavelength)):
-        raise ValueError("Wavelength coordinates must all be finite.")
 
     steps = np.abs(np.diff(wavelength))
     positive = steps[steps > 0.0]
-    if positive.size == 0:
-        raise ValueError("Wavelength coordinates must not all be identical.")
     typical_step = float(np.nanmedian(positive))
     gap_after = np.flatnonzero(steps > float(gap_factor) * typical_step)
     indices = np.arange(wavelength.size)
     return tuple(
         slice(int(group[0]), int(group[-1]) + 1)
         for group in np.split(indices, gap_after + 1)
-        if group.size
     )
 
 
@@ -63,14 +56,10 @@ def pcolormesh_wavelength_segments(
 
     wavelength = np.asarray(wavelength, dtype=float)
     matrix = np.asarray(matrix)
-    if matrix.ndim != 2 or matrix.shape[1] != wavelength.size:
-        raise ValueError("Matrix columns must match the 1-D wavelength array.")
     if y_edges is None:
         y_edges = np.arange(matrix.shape[0] + 1, dtype=float) - 0.5
     else:
         y_edges = np.asarray(y_edges, dtype=float)
-    if y_edges.shape != (matrix.shape[0] + 1,):
-        raise ValueError("y_edges must have exactly one more value than matrix rows.")
 
     meshes = []
     for segment in wavelength_segment_slices(wavelength, gap_factor=gap_factor):
@@ -98,8 +87,6 @@ def plot_wavelength_segments(
 
     wavelength = np.asarray(wavelength, dtype=float)
     values = np.asarray(values)
-    if values.ndim != 1 or values.shape != wavelength.shape:
-        raise ValueError("Line values must match the 1-D wavelength array.")
 
     lines = []
     label = kwargs.pop("label", None)
@@ -125,10 +112,6 @@ def fill_between_wavelength_segments(
     wavelength = np.asarray(wavelength, dtype=float)
     lower = np.asarray(lower)
     upper = np.asarray(upper)
-    if lower.ndim != 1 or lower.shape != wavelength.shape:
-        raise ValueError("Lower envelope must match the 1-D wavelength array.")
-    if upper.ndim != 1 or upper.shape != wavelength.shape:
-        raise ValueError("Upper envelope must match the 1-D wavelength array.")
 
     collections = []
     label = kwargs.pop("label", None)

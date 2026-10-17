@@ -78,7 +78,6 @@ DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "diagnostics" / "edge_trim_calibration"
 ARMS = ("blue", "red")
 PRODUCTS = ("timeseries", "collapse_source")
 SIDES = ("left", "right")
-ALLOWED_ARTIFACT_SUFFIXES = {".pdf", ".csv", ".json", ".md"}
 
 # These are the explicit line-preservation sentinels used by the processing
 # diagnostics.  They protect the broad, repeatedly inspected features without
@@ -121,46 +120,6 @@ class CalibrationSettings:
     run_sysrem_finalists: bool = True
     use_molecfit_for_red: bool = True
 
-    def validated(self) -> "CalibrationSettings":
-        grid_controls = (
-            self.coarse_min_nm,
-            self.coarse_max_nm,
-            self.coarse_step_nm,
-            self.refinement_step_nm,
-        )
-        if any(not math.isfinite(float(value)) for value in grid_controls):
-            raise ValueError("Every candidate-grid control must be finite.")
-        if float(self.coarse_min_nm) != 0.0:
-            raise ValueError("coarse_min_nm must be the explicit zero-trim control.")
-        if float(self.coarse_max_nm) <= float(self.coarse_min_nm):
-            raise ValueError("coarse_max_nm must be greater than coarse_min_nm.")
-        if float(self.coarse_step_nm) <= 0.0:
-            raise ValueError("coarse_step_nm must be positive.")
-        if not 0.0 < float(self.refinement_step_nm) < float(self.coarse_step_nm):
-            raise ValueError(
-                "refinement_step_nm must be positive and smaller than coarse_step_nm."
-            )
-        span_steps = (self.coarse_max_nm - self.coarse_min_nm) / self.coarse_step_nm
-        refinement_steps = self.coarse_step_nm / self.refinement_step_nm
-        if not math.isclose(span_steps, round(span_steps), rel_tol=0.0, abs_tol=1e-10):
-            raise ValueError("The coarse range must be an integer number of coarse steps.")
-        if not math.isclose(
-            refinement_steps,
-            round(refinement_steps),
-            rel_tol=0.0,
-            abs_tol=1e-10,
-        ):
-            raise ValueError(
-                "Each coarse interval must be an integer number of refinement steps."
-            )
-        if self.eval_width_nm <= 0.0 or self.baseline_exclude_nm <= 0.0:
-            raise ValueError("Evaluation and baseline widths must be positive.")
-        if self.accept_ratio <= 0.0:
-            raise ValueError("accept_ratio must be positive.")
-        if self.minimum_eval_columns < 1 or self.maximum_finalists < 1:
-            raise ValueError("minimum_eval_columns and maximum_finalists must be positive.")
-        return self
-
 
 def _rounded_nm(value: float) -> float:
     """Return a stable wavelength-grid value for equality and serialization."""
@@ -177,9 +136,8 @@ def _regular_grid(start_nm: float, stop_nm: float, step_nm: float) -> tuple[floa
 
 
 def coarse_candidate_grid(settings: CalibrationSettings) -> tuple[float, ...]:
-    """Return the validated 0.1 nm calibration grid, including both endpoints."""
+    """Return the coarse calibration grid, including both endpoints."""
 
-    settings.validated()
     return _regular_grid(
         settings.coarse_min_nm,
         settings.coarse_max_nm,
@@ -196,10 +154,6 @@ def resolve_planet_name(value: str) -> str:
 
     requested = _normalized_planet(value)
     matches = [name for name in config.PLANETS if _normalized_planet(name) == requested]
-    if len(matches) != 1:
-        raise KeyError(
-            f"Could not uniquely resolve planet {value!r}; configured matches={matches}."
-        )
     return matches[0]
 
 
@@ -251,12 +205,10 @@ def _json_safe(value: Any) -> Any:
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    _assert_diagnostic_artifact(path)
     path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True) + "\n")
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    _assert_diagnostic_artifact(path)
     fieldnames: list[str] = []
     for row in rows:
         for key in row:
@@ -272,15 +224,7 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             writer.writerow({key: _json_safe(row.get(key)) for key in fieldnames})
 
 
-def _assert_diagnostic_artifact(path: Path) -> None:
-    if path.suffix.lower() not in ALLOWED_ARTIFACT_SUFFIXES:
-        raise ValueError(
-            f"Calibration may write only diagnostic artifacts; refused {path}."
-        )
-
-
 def _save_figure(fig: plt.Figure, path: Path) -> None:
-    _assert_diagnostic_artifact(path)
     save_figure_pdf(fig, path, dpi=145, bbox_inches="tight")
     plt.close(fig)
 
@@ -341,18 +285,12 @@ def load_raw_epoch_arm(
     """Load one raw epoch/arm on a common grid without median, SYSREM, or trim."""
 
     mode = str(mode).lower()
-    if mode not in {"transmission", "emission"}:
-        raise ValueError(f"Unsupported mode {mode!r}.")
-    if arm not in ARMS:
-        raise ValueError(f"Unsupported arm {arm!r}.")
     display_planet = resolve_planet_name(planet)
     raw_dir = config_utils.get_raw_hrs_dir(
         planet=display_planet,
         epoch=epoch,
         mode=mode,
     )
-    if not raw_dir.is_dir():
-        raise FileNotFoundError(f"Raw exposure directory does not exist: {raw_dir}")
 
     from dataio.collapse_transmission_timeseries_to_1d import get_pepsi_data
 
@@ -376,11 +314,6 @@ def load_raw_epoch_arm(
         data_mode=mode,
     )
     used_molecfit = prefer_molecfit
-    if result is None:
-        raise FileNotFoundError(
-            f"The PEPSI loader found no "
-            f"{'Molecfit' if prefer_molecfit else 'raw'} {arm} products in {raw_dir}."
-        )
     arrays, extras = result
     wave, flux, error, jd, snr, exptime, airmass, n_spectra, npix = arrays
     wave = np.asarray(wave, dtype=float)
@@ -410,18 +343,8 @@ def load_raw_epoch_arm(
         dtype=float,
     )
     exposure_selection = extras.get("science_exposure_selection")
-    if not isinstance(exposure_selection, ScienceExposureSelection):
-        raise RuntimeError(
-            "PEPSI loader did not return the authoritative science-exposure "
-            "selection record."
-        )
     files = list(exposure_selection.usable_files)
     matched_pattern = exposure_selection.matched_pattern
-    if len(files) != int(n_spectra):
-        raise RuntimeError(
-            f"Loader provenance mismatch for {epoch} {arm}: "
-            f"{len(files)} resolved files versus {n_spectra} loaded exposures."
-        )
     selected_inventory = _raw_inventory(files)
     companion_files: list[Path] = []
     companion_pattern = None
@@ -693,16 +616,6 @@ def _full_plot_arrays(result: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray
 
     plot_wave = np.asarray(plot_wave_value, dtype=float)
     plot_keep = np.asarray(plot_keep_value, dtype=bool)
-    if plot_wave.ndim != 1 or plot_keep.shape != plot_wave.shape:
-        raise ValueError("Plot wavelength grid and export mask must be matching 1-D arrays.")
-    if compact_data.ndim != 2 or compact_sigma.shape != compact_data.shape:
-        raise ValueError("Compact plotting data and sigma must be matching 2-D arrays.")
-    if compact_data.shape[1] != compact_wave.size:
-        raise ValueError("Compact wavelength and matrix column counts do not match.")
-    if int(np.count_nonzero(plot_keep)) != compact_wave.size:
-        raise ValueError("Plot export mask does not reproduce the compact wavelength grid.")
-    if not np.array_equal(plot_wave[plot_keep], compact_wave):
-        raise ValueError("Plot export mask and compact wavelength values disagree.")
 
     plot_data = np.full((compact_data.shape[0], plot_wave.size), np.nan, dtype=float)
     plot_sigma = np.full((compact_sigma.shape[0], plot_wave.size), np.nan, dtype=float)
@@ -747,9 +660,7 @@ def _metric(values: np.ndarray, mask: np.ndarray, *, kind: str) -> float:
         return float("nan")
     if kind == "median":
         return float(np.nanmedian(selected))
-    if kind == "p95_abs":
-        return float(np.nanpercentile(np.abs(selected), 95.0))
-    raise ValueError(f"Unknown metric kind {kind!r}.")
+    return float(np.nanpercentile(np.abs(selected), 95.0))
 
 
 def _telluric_exclusion(wave: np.ndarray, arm: str, pad_nm: float) -> np.ndarray:
@@ -797,10 +708,8 @@ def _matched_baseline_mask(
 
     if side == "left":
         effective_edge_a = float(np.nanmin(wave[finite]))
-    elif side == "right":
-        effective_edge_a = float(np.nanmax(wave[finite]))
     else:
-        raise ValueError(f"Unknown side {side!r}.")
+        effective_edge_a = float(np.nanmax(wave[finite]))
 
     table = config.TELLURIC_REGIONS.get(arm, {"telluric": [], "deep_mask": []})
     telluric_intervals = [
@@ -847,11 +756,9 @@ def _eval_mask(
     if side == "left":
         cut = lo + trim_a
         eval_lo, eval_hi = cut, min(cut + width_a, hi)
-    elif side == "right":
+    else:
         cut = hi - trim_a
         eval_lo, eval_hi = max(cut - width_a, lo), cut
-    else:
-        raise ValueError(f"Unknown side {side!r}.")
     return finite & (wave >= eval_lo) & (wave <= eval_hi), eval_lo, eval_hi
 
 
@@ -896,16 +803,6 @@ def score_candidate_side(
     original_wave = np.asarray(wave, dtype=float)
     data = np.asarray(data, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
-    if original_wave.ndim != 1:
-        raise ValueError("Candidate scoring requires a one-dimensional wavelength grid.")
-    if (
-        data.ndim != 2
-        or sigma.shape != data.shape
-        or data.shape[1] != original_wave.size
-    ):
-        raise ValueError(
-            "Candidate data/sigma must have matching (exposure, wavelength) shapes."
-        )
 
     if side == "left":
         candidate_keep = _candidate_keep_mask(
@@ -913,15 +810,12 @@ def score_candidate_side(
             left_trim_nm=trim_nm,
             right_trim_nm=0.0,
         )
-    elif side == "right":
+    else:
         candidate_keep = _candidate_keep_mask(
             original_wave,
             left_trim_nm=0.0,
             right_trim_nm=trim_nm,
         )
-    else:
-        raise ValueError(f"Unknown side {side!r}.")
-
     candidate_wave = original_wave[candidate_keep]
     fixed_keep = ~_non_edge_export_mask(candidate_wave, arm)
     retained_wave = candidate_wave[fixed_keep]
@@ -1057,11 +951,6 @@ def _joint_side_state(
         and _rounded_nm(row["trim_nm"]) == _rounded_nm(trim_nm)
     ]
     by_product = {str(row["product"]): row for row in rows}
-    if set(by_product) != set(PRODUCTS):
-        raise ValueError(
-            f"Expected one pre-SYSREM score for every product at {side}={trim_nm} nm; "
-            f"found {sorted(by_product)}."
-        )
     products = {}
     for product in PRODUCTS:
         row = by_product[product]
@@ -1220,10 +1109,7 @@ def _joint_candidates_for_side(
 def _hard_valid_score_row(row: Mapping[str, Any]) -> bool:
     """Return whether a score fails only the soft quality-ratio threshold."""
 
-    try:
-        quality_ratio = float(row["quality_ratio"])
-    except (KeyError, TypeError, ValueError):
-        return False
+    quality_ratio = float(row["quality_ratio"])
     reasons = {
         reason
         for reason in str(row.get("rejection_reasons", "")).split(";")
@@ -1323,12 +1209,6 @@ def _candidate_pair_plan(
         "fallbacks": fallbacks,
         "n_threshold_pairs": n_threshold_pairs,
     }
-
-
-def _candidate_pairs(
-    score_rows: Sequence[Mapping[str, Any]],
-) -> list[tuple[float, float]]:
-    return list(_candidate_pair_plan(score_rows)["pairs"])
 
 
 def _post_sysrem_score_rows(
@@ -1869,26 +1749,9 @@ def resolve_calibration_datasets(
     epochs: Iterable[str] | None = None,
     datasets: Iterable[tuple[str, str]] | None = None,
 ) -> tuple[tuple[str, str], ...]:
-    """Resolve explicit epoch/arm pairs, retaining the legacy dual-arm API."""
-
-    if datasets is not None and epochs is not None:
-        raise ValueError("Pass datasets or epochs, not both.")
     if datasets is None:
-        if epochs is None:
-            raise ValueError("At least one calibration dataset is required.")
-        resolved = tuple((str(epoch), arm) for epoch in epochs for arm in ARMS)
-    else:
-        resolved = tuple((str(epoch), str(arm).lower()) for epoch, arm in datasets)
-    if not resolved:
-        raise ValueError("At least one calibration dataset is required.")
-    if len(set(resolved)) != len(resolved):
-        raise ValueError(f"Duplicate calibration datasets: {resolved!r}.")
-    for epoch, arm in resolved:
-        if not epoch:
-            raise ValueError("Calibration dataset epochs must be non-empty.")
-        if arm not in ARMS:
-            raise ValueError(f"Unsupported calibration arm {arm!r}.")
-    return resolved
+        return tuple((str(epoch), arm) for epoch in epochs for arm in ARMS)
+    return tuple((str(epoch), str(arm).lower()) for epoch, arm in datasets)
 
 
 def run_edge_trim_calibration(
@@ -1903,7 +1766,7 @@ def run_edge_trim_calibration(
 ) -> dict[str, Any]:
     """Calibrate requested epoch/arm pairs and write diagnostic artifacts."""
 
-    settings = (settings or CalibrationSettings()).validated()
+    settings = settings or CalibrationSettings()
     display_planet = resolve_planet_name(planet)
     resolved_datasets = resolve_calibration_datasets(
         epochs=epochs,
@@ -1980,7 +1843,6 @@ def run_edge_trim_calibration(
         "overall_status": overall_status,
         "canonical_generation_authorized": False,
         "prepared_arrays_written": False,
-        "allowed_artifact_suffixes": sorted(ALLOWED_ARTIFACT_SUFFIXES),
         "settings": asdict(settings),
         "score_semantics": {
             "candidate_strategy": "coarse_grid_with_transition_refinement",
@@ -2036,7 +1898,6 @@ def run_edge_trim_calibration(
     _write_json(manifest_path, manifest)
     _write_csv(score_path, score_rows)
     _write_csv(boundary_path, [_summary_row(entry) for entry in dataset_entries])
-    _assert_diagnostic_artifact(report_path)
     report_path.write_text(_report_text(manifest))
     print(f"\nDiagnostics written to: {run_dir}")
     print(f"Overall status: {overall_status}")

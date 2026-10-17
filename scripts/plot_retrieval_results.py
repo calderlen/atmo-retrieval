@@ -37,8 +37,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.temperature_draws < 1 or args.max_trace_parameters < 1:
-        raise SystemExit("--temperature-draws and --max-trace-parameters must be positive.")
     import matplotlib.pyplot as plt
     import numpy as np
 
@@ -68,8 +66,6 @@ def main() -> None:
     stem = _slug(products["component_name"])
 
     posterior_rows = posterior_summary_rows(products["posterior"])
-    if not posterior_rows:
-        raise ValueError("The saved posterior contains no finite numeric samples.")
     posterior_table = output_dir / "posterior_summary.csv"
     with posterior_table.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(posterior_rows[0]))

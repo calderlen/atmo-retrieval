@@ -46,9 +46,6 @@ def get_samples_by_chain(mcmc: Any) -> tuple[dict[str, np.ndarray], list[str]]:
     warnings: list[str] = []
     try:
         samples = mcmc.get_samples(group_by_chain=True)
-    except TypeError:
-        warnings.append("mcmc.get_samples(group_by_chain=True) is unavailable; using flattened samples.")
-        samples = mcmc.get_samples()
     except Exception as exc:
         warnings.append(f"failed to get chain-grouped samples: {exc}")
         return {}, warnings
@@ -60,13 +57,6 @@ def get_extra_fields_by_chain(mcmc: Any) -> tuple[dict[str, np.ndarray], list[st
     warnings: list[str] = []
     try:
         fields = mcmc.get_extra_fields(group_by_chain=True)
-    except TypeError:
-        warnings.append("mcmc.get_extra_fields(group_by_chain=True) is unavailable; using default shape.")
-        try:
-            fields = mcmc.get_extra_fields()
-        except Exception as exc:
-            warnings.append(f"failed to get extra fields: {exc}")
-            return {}, warnings
     except Exception as exc:
         warnings.append(f"failed to get extra fields: {exc}")
         return {}, warnings
@@ -223,15 +213,7 @@ def _nan_stat(array: np.ndarray | None, stat: str) -> float | None:
     values = _finite_values(array)
     if values.size == 0:
         return None
-    if stat == "median":
-        return float(np.median(values))
-    if stat == "min":
-        return float(np.min(values))
-    if stat == "max":
-        return float(np.max(values))
-    if stat == "std":
-        return float(np.std(values))
-    raise ValueError(f"Unknown stat: {stat}")
+    return float(getattr(np, stat)(values))
 
 
 def _field(extra_fields: Mapping[str, np.ndarray], *names: str) -> np.ndarray | None:

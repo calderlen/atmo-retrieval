@@ -83,8 +83,6 @@ def create_prior_guide(
         if prior_modes.get("Mp") == "upper_limit" or (
             "Mp" not in prior_modes and Mp_upper_3sigma is not None
         ):
-            if Mp_upper_3sigma is None or Mp_upper_3sigma <= 0.5:
-                raise ValueError("Mp upper-limit guide requires Mp_upper_3sigma > 0.5.")
             distributions["Mp"] = dist.Uniform(0.5, Mp_upper_3sigma)
             centers["Mp"] = Mp_upper_3sigma / 3.0
         else:
@@ -183,9 +181,6 @@ def build_svi_optimizer(
     decay_steps: int | None = None,
     decay_rate: float | None = None,
 ) -> optim._NumPyroOptim:
-    if (decay_steps is None) != (decay_rate is None):
-        raise ValueError("SVI learning-rate decay requires both decay_steps and decay_rate.")
-
     if decay_steps is not None and decay_rate is not None:
         schedule = jax_optimizers.exponential_decay(lr, decay_steps, decay_rate)
         return optim.Adam(schedule)
@@ -230,9 +225,6 @@ def _run_svi_with_logging(
     model_inputs: dict[str, object],
     report_interval: int | None = None,
 ) -> tuple[dict, jnp.ndarray]:
-    if num_steps < 1:
-        raise ValueError("num_steps must be a positive integer.")
-
     interval = max(1, int(report_interval or _default_svi_report_interval(num_steps)))
     start = perf_counter()
 

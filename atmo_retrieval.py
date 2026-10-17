@@ -1,4 +1,5 @@
 import argparse
+from contextlib import contextmanager
 from datetime import datetime
 import importlib.util
 import json
@@ -82,74 +83,8 @@ class _TeeStream:
             except Exception:
                 self._log_failed = True
 
-    def isatty(self):
-        return bool(getattr(self._stream, "isatty", lambda: False)())
-
-    def fileno(self):
-        return self._stream.fileno()
-
-    @property
-    def encoding(self):
-        return getattr(self._stream, "encoding", None)
-
-    @property
-    def errors(self):
-        return getattr(self._stream, "errors", None)
-
     def __getattr__(self, name):
         return getattr(self._stream, name)
-
-
-class _RunTranscriptLog:
-    def __init__(self, log_path: Path, log_file, original_stdout, original_stderr):
-        self.log_path = log_path
-        self._log_file = log_file
-        self._original_stdout = original_stdout
-        self._original_stderr = original_stderr
-        self._stdout_tee = _TeeStream(original_stdout, log_file, "stdout")
-        self._stderr_tee = _TeeStream(original_stderr, log_file, "stderr")
-        self.enabled = True
-
-    def start(self):
-        sys.stdout = self._stdout_tee
-        sys.stderr = self._stderr_tee
-
-    def write_exception(self):
-        if not self.enabled:
-            return
-        try:
-            self._log_file.write("\nUnhandled exception:\n")
-            self._log_file.write(traceback.format_exc())
-            self._log_file.flush()
-        except Exception:
-            pass
-
-    def close(self):
-        if not self.enabled:
-            return
-        try:
-            sys.stdout.flush()
-            sys.stderr.flush()
-        finally:
-            if sys.stdout is self._stdout_tee:
-                sys.stdout = self._original_stdout
-            if sys.stderr is self._stderr_tee:
-                sys.stderr = self._original_stderr
-            try:
-                self._log_file.close()
-            finally:
-                self.enabled = False
-
-
-class _NoopTranscriptLog:
-    enabled = False
-    log_path = None
-
-    def write_exception(self):
-        return None
-
-    def close(self):
-        return None
 
 
 def _compact_filename_slug(value, *, default: str = "run") -> str:
@@ -164,37 +99,39 @@ def _filename_slug(value, *, default: str = "run") -> str:
     return slug or default
 
 
-def _start_run_transcript_log(runtime_config, args):
+@contextmanager
+def _run_transcript_log(runtime_config, args):
+    log_dir = Path(runtime_config.DIR_SAVE) / "logs"
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    planet_part = _compact_filename_slug(runtime_config.PLANET, default="planet")
+    mode_part = _filename_slug(args.mode, default="mode")
+    epoch_part = _filename_slug("_".join(args.epoch), default="noepoch")
+    log_path = log_dir / f"{planet_part}_{mode_part}_{epoch_part}_{timestamp}.log"
     try:
-        log_dir = Path(runtime_config.DIR_SAVE) / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-
-        epochs = getattr(args, "epoch", None) or []
-        if isinstance(epochs, str):
-            epoch_text = epochs
-        else:
-            epoch_text = "_".join(str(epoch) for epoch in epochs) or "noepoch"
-
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        planet_part = _compact_filename_slug(
-            getattr(runtime_config, "PLANET", getattr(args, "planet", None)),
-            default="planet",
-        )
-        mode_part = _filename_slug(
-            getattr(args, "mode", getattr(runtime_config, "RETRIEVAL_MODE", None)),
-            default="mode",
-        )
-        epoch_part = _filename_slug(epoch_text, default="noepoch")
-        log_path = log_dir / f"{planet_part}_{mode_part}_{epoch_part}_{timestamp}.log"
-
         log_file = log_path.open("a", encoding="utf-8", buffering=1)
-        transcript = _RunTranscriptLog(log_path, log_file, sys.stdout, sys.stderr)
-        transcript.start()
-        print(f"Run terminal log: {log_path}", flush=True)
-        return transcript
-    except Exception as exc:
+    except OSError as exc:
         print(f"Warning: failed to start run transcript log: {exc}", file=sys.stderr, flush=True)
-        return _NoopTranscriptLog()
+        yield
+        return
+
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    with log_file:
+        sys.stdout = _TeeStream(original_stdout, log_file, "stdout")
+        stderr_tee = _TeeStream(original_stderr, log_file, "stderr")
+        sys.stderr = stderr_tee
+        try:
+            print(f"Run terminal log: {log_path}", flush=True)
+            yield
+        except BaseException:
+            if not stderr_tee._log_failed:
+                try:
+                    log_file.write("\nUnhandled exception:\n" + traceback.format_exc())
+                except OSError:
+                    pass
+            raise
+        finally:
+            sys.stdout, sys.stderr = original_stdout, original_stderr
 
 
 def _normalize_epoch_args(raw_epochs) -> list[str]:
@@ -863,7 +800,7 @@ def load_custom_config(config_path):
 def apply_custom_config(custom_config):
     for name in dir(custom_config):
         if name.isupper():
-            config_utils.set_runtime_config(name, getattr(custom_config, name))
+            setattr(config, name, getattr(custom_config, name))
 
     return config
 
@@ -874,17 +811,17 @@ def apply_cli_overrides(args):
 
     # Planet and ephemeris selection
     if args.planet:
-        config_utils.set_runtime_config("PLANET", args.planet)
+        config.PLANET = args.planet
     if args.ephemeris:
-        config_utils.set_runtime_config("EPHEMERIS", args.ephemeris)
+        config.EPHEMERIS = args.ephemeris
 
     # Retrieval mode and observing mode must be synced before derived paths are built.
     if args.mode:
-        config_utils.set_runtime_config("RETRIEVAL_MODE", args.mode)
+        config.RETRIEVAL_MODE = args.mode
     if args.wavelength_range:
-        config_utils.set_runtime_config("OBSERVING_MODE", args.wavelength_range)
+        config.OBSERVING_MODE = args.wavelength_range
     if args.resolution_mode:
-        config_utils.set_runtime_config("RESOLUTION_MODE", args.resolution_mode)
+        config.RESOLUTION_MODE = args.resolution_mode
 
     # Validate planet/ephemeris combination
     params = config_utils.get_params()  # Will raise if invalid
@@ -903,23 +840,23 @@ def apply_cli_overrides(args):
 
     # Chemistry model
     if args.chemistry_model:
-        config_utils.set_runtime_config("CHEMISTRY_MODEL_DEFAULT", args.chemistry_model)
+        config.CHEMISTRY_MODEL_DEFAULT = args.chemistry_model
     if args.fastchem_parameter_file:
-        config_utils.set_runtime_config("FASTCHEM_PARAMETER_FILE", args.fastchem_parameter_file)
+        config.FASTCHEM_PARAMETER_FILE = args.fastchem_parameter_file
     if args.nlayer is not None:
         if args.nlayer < 1:
             raise ValueError("--nlayer must be >= 1.")
-        config_utils.set_runtime_config("NLAYER", args.nlayer)
+        config.NLAYER = args.nlayer
     if args.n_spectral_points is not None:
         if args.n_spectral_points < 1:
             raise ValueError("--n-spectral-points must be >= 1.")
-        config_utils.set_runtime_config("N_SPECTRAL_POINTS", args.n_spectral_points)
+        config.N_SPECTRAL_POINTS = args.n_spectral_points
 
     # Output directory (auto-set based on planet/ephemeris/mode)
     if args.output:
-        config_utils.set_runtime_config("DIR_SAVE", args.output)
+        config.DIR_SAVE = args.output
     else:
-        config_utils.set_runtime_config("DIR_SAVE", config_utils.get_output_dir())
+        config.DIR_SAVE = config_utils.get_output_dir()
     os.makedirs(config.DIR_SAVE, exist_ok=True)
 
     # HITRAN credentials (for HITEMP downloads)
@@ -934,9 +871,9 @@ def apply_cli_overrides(args):
     # components. Leave DATA_DIR unset in that case; run_retrieval() reads per-
     # arm directories via config_utils.get_full_arm_data_dirs().
     if config.OBSERVING_MODE == "full":
-        config_utils.set_runtime_config("DATA_DIR", None)
-        config_utils.set_runtime_config("TRANSMISSION_DATA", None)
-        config_utils.set_runtime_config("EMISSION_DATA", None)
+        config.DATA_DIR = None
+        config.TRANSMISSION_DATA = None
+        config.EMISSION_DATA = None
     else:
         if args.mode == "emission" and args.emission_selection is not None:
             resolved_data_dir = config_utils.get_collapsed_emission_dir(
@@ -961,28 +898,22 @@ def apply_cli_overrides(args):
                 epoch=primary_epoch,
                 mode=args.mode,
             )
-        config_utils.set_runtime_config("DATA_DIR", resolved_data_dir)
-        config_utils.set_runtime_config(
-            "TRANSMISSION_DATA",
-            config_utils.get_transmission_paths(
+        config.DATA_DIR = resolved_data_dir
+        config.TRANSMISSION_DATA = config_utils.get_transmission_paths(
                 epoch=primary_epoch,
                 collapsed=args.data_format == "spectrum",
-            ),
-        )
-        config_utils.set_runtime_config(
-            "EMISSION_DATA",
-            config_utils.get_emission_paths(
+            )
+        config.EMISSION_DATA = config_utils.get_emission_paths(
                 epoch=primary_epoch,
                 selection=args.emission_selection,
-            ),
-        )
+            )
 
     # Quick mode
     if args.quick:
-        config_utils.set_runtime_config("SVI_NUM_STEPS", config.QUICK_SVI_STEPS)
-        config_utils.set_runtime_config("MCMC_NUM_WARMUP", config.QUICK_MCMC_WARMUP)
-        config_utils.set_runtime_config("MCMC_NUM_SAMPLES", config.QUICK_MCMC_SAMPLES)
-        config_utils.set_runtime_config("MCMC_NUM_CHAINS", config.QUICK_MCMC_CHAINS)
+        config.SVI_NUM_STEPS = config.QUICK_SVI_STEPS
+        config.MCMC_NUM_WARMUP = config.QUICK_MCMC_WARMUP
+        config.MCMC_NUM_SAMPLES = config.QUICK_MCMC_SAMPLES
+        config.MCMC_NUM_CHAINS = config.QUICK_MCMC_CHAINS
         print(
             f"Quick mode: {config.QUICK_SVI_STEPS} SVI steps, "
             f"{config.QUICK_MCMC_SAMPLES} MCMC samples"
@@ -990,37 +921,37 @@ def apply_cli_overrides(args):
 
     # Inference parameters
     if args.svi_steps is not None:
-        config_utils.set_runtime_config("SVI_NUM_STEPS", args.svi_steps)
+        config.SVI_NUM_STEPS = args.svi_steps
     if args.svi_learning_rate is not None:
         if args.svi_learning_rate <= 0:
             raise ValueError("--svi-learning-rate must be > 0.")
-        config_utils.set_runtime_config("SVI_LEARNING_RATE", args.svi_learning_rate)
+        config.SVI_LEARNING_RATE = args.svi_learning_rate
     if args.no_svi_lr_decay:
-        config_utils.set_runtime_config("SVI_LR_DECAY_STEPS", None)
-        config_utils.set_runtime_config("SVI_LR_DECAY_RATE", None)
+        config.SVI_LR_DECAY_STEPS = None
+        config.SVI_LR_DECAY_RATE = None
     if args.svi_lr_decay_steps is not None:
         if args.svi_lr_decay_steps < 1:
             raise ValueError("--svi-lr-decay-steps must be >= 1.")
-        config_utils.set_runtime_config("SVI_LR_DECAY_STEPS", args.svi_lr_decay_steps)
+        config.SVI_LR_DECAY_STEPS = args.svi_lr_decay_steps
     if args.svi_lr_decay_rate is not None:
         if not (0 < args.svi_lr_decay_rate < 1):
             raise ValueError("--svi-lr-decay-rate must be between 0 and 1.")
-        config_utils.set_runtime_config("SVI_LR_DECAY_RATE", args.svi_lr_decay_rate)
+        config.SVI_LR_DECAY_RATE = args.svi_lr_decay_rate
     if (config.SVI_LR_DECAY_STEPS is None) != (config.SVI_LR_DECAY_RATE is None):
         raise ValueError(
             "SVI exponential decay requires both SVI_LR_DECAY_STEPS and "
             "SVI_LR_DECAY_RATE to be set."
         )
     if args.mcmc_warmup is not None:
-        config_utils.set_runtime_config("MCMC_NUM_WARMUP", args.mcmc_warmup)
+        config.MCMC_NUM_WARMUP = args.mcmc_warmup
     if args.mcmc_samples is not None:
-        config_utils.set_runtime_config("MCMC_NUM_SAMPLES", args.mcmc_samples)
+        config.MCMC_NUM_SAMPLES = args.mcmc_samples
     if args.mcmc_chains is not None:
-        config_utils.set_runtime_config("MCMC_NUM_CHAINS", args.mcmc_chains)
+        config.MCMC_NUM_CHAINS = args.mcmc_chains
     if args.mcmc_chain_method is not None:
-        config_utils.set_runtime_config("MCMC_CHAIN_METHOD", args.mcmc_chain_method)
+        config.MCMC_CHAIN_METHOD = args.mcmc_chain_method
     if args.require_gpu_per_chain:
-        config_utils.set_runtime_config("MCMC_REQUIRE_GPU_PER_CHAIN", True)
+        config.MCMC_REQUIRE_GPU_PER_CHAIN = True
     if config.MCMC_REQUIRE_GPU_PER_CHAIN and config.MCMC_CHAIN_METHOD != "parallel":
         raise ValueError("--require-gpu-per-chain requires --mcmc-chain-method parallel.")
 
@@ -1034,16 +965,16 @@ def apply_cli_overrides(args):
     if args.spectral_offset >= args.spectral_stride:
         raise ValueError("--spectral-offset must be smaller than --spectral-stride.")
     if args.no_sysrem:
-        config_utils.set_runtime_config("APPLY_SYSREM_DEFAULT", False)
+        config.APPLY_SYSREM_DEFAULT = False
 
     # Opacity options
     if args.build_opacities:
-        config_utils.set_runtime_config("OPA_LOAD", False)
-        config_utils.set_runtime_config("OPA_SAVE", True)
+        config.OPA_LOAD = False
+        config.OPA_SAVE = True
     elif args.load_opacities:
-        config_utils.set_runtime_config("OPA_LOAD", True)
+        config.OPA_LOAD = True
     if args.save_opacities:
-        config_utils.set_runtime_config("OPA_SAVE", True)
+        config.OPA_SAVE = True
 
     # Species selection
     def _parse_csv(value: str) -> list[str]:
@@ -1079,14 +1010,14 @@ def apply_cli_overrides(args):
         for k, v in config.MOLPATH_EXOMOL.items():
             if k in default_mols:
                 default_molpath_exomol[k] = v
-        config_utils.set_runtime_config("ATOMIC_SPECIES", default_atomic_species)
-        config_utils.set_runtime_config("MOLPATH_HITEMP", default_molpath_hitemp)
-        config_utils.set_runtime_config("MOLPATH_EXOMOL", default_molpath_exomol)
+        config.ATOMIC_SPECIES = default_atomic_species
+        config.MOLPATH_HITEMP = default_molpath_hitemp
+        config.MOLPATH_EXOMOL = default_molpath_exomol
         print(f"Using default detected species (pass --all-species for full set)")
 
     if args.no_molecules:
-        config_utils.set_runtime_config("MOLPATH_HITEMP", {})
-        config_utils.set_runtime_config("MOLPATH_EXOMOL", {})
+        config.MOLPATH_HITEMP = {}
+        config.MOLPATH_EXOMOL = {}
         if args.molecules:
             print("Warning: --no-molecules overrides --molecules.")
     elif args.molecules:
@@ -1102,11 +1033,11 @@ def apply_cli_overrides(args):
         missing = wanted - set(mol_h.keys()) - set(mol_e.keys())
         if missing:
             print(f"Warning: Unknown molecules ignored: {', '.join(sorted(missing))}")
-        config_utils.set_runtime_config("MOLPATH_HITEMP", mol_h)
-        config_utils.set_runtime_config("MOLPATH_EXOMOL", mol_e)
+        config.MOLPATH_HITEMP = mol_h
+        config.MOLPATH_EXOMOL = mol_e
 
     if args.no_atoms:
-        config_utils.set_runtime_config("ATOMIC_SPECIES", {})
+        config.ATOMIC_SPECIES = {}
         if args.atoms:
             print("Warning: --no-atoms overrides --atoms.")
     elif args.atoms:
@@ -1118,7 +1049,7 @@ def apply_cli_overrides(args):
         missing = wanted - set(atoms.keys())
         if missing:
             print(f"Warning: Unknown atoms ignored: {', '.join(sorted(missing))}")
-        config_utils.set_runtime_config("ATOMIC_SPECIES", atoms)
+        config.ATOMIC_SPECIES = atoms
 
     return config
 
@@ -1251,73 +1182,29 @@ def _run_configured_retrieval(runtime_config, args, primary_epoch):
     for tbl_path in args.bandpass_tbl or []:
         bandpass_constraints.extend(make_bandpass_constraints_from_tbl(tbl_path))
 
-    # Run retrieval
-    if args.all_phase_bins:
+    run_kwargs = dict(
+        mode=args.mode,
+        data_format=args.data_format,
+        skip_svi=args.skip_svi,
+        svi_only=args.svi_only,
+        pt_profile=pt_profile,
+        chemistry_model=args.chemistry_model,
+        fastchem_parameter_file=args.fastchem_parameter_file,
+        seed=args.seed,
+        joint_spectra=joint_spectra or None,
+        bandpass_constraints=bandpass_constraints or None,
+        **diagnostic_run_kwargs,
+    )
+    if args.all_phase_bins or args.phase_bin:
         run_phase_binned_retrieval(
-            phase_bins=["T12", "T23", "T34"],
-            mode=args.mode,
+            phase_bins=["T12", "T23", "T34"] if args.all_phase_bins else [args.phase_bin],
             epoch=primary_epoch,
-            data_format=args.data_format,
-            skip_svi=args.skip_svi,
-            svi_only=args.svi_only,
-            pt_profile=pt_profile,
-            chemistry_model=args.chemistry_model,
-            fastchem_parameter_file=args.fastchem_parameter_file,
-            seed=args.seed,
-            joint_spectra=joint_spectra or None,
-            bandpass_constraints=bandpass_constraints or None,
-            **diagnostic_run_kwargs,
+            **run_kwargs,
         )
-
-    elif args.phase_bin:
-        run_phase_binned_retrieval(
-            phase_bins=[args.phase_bin],
-            mode=args.mode,
-            epoch=primary_epoch,
-            data_format=args.data_format,
-            skip_svi=args.skip_svi,
-            svi_only=args.svi_only,
-            pt_profile=pt_profile,
-            chemistry_model=args.chemistry_model,
-            fastchem_parameter_file=args.fastchem_parameter_file,
-            seed=args.seed,
-            joint_spectra=joint_spectra or None,
-            bandpass_constraints=bandpass_constraints or None,
-            **diagnostic_run_kwargs,
-        )
-
-    elif args.mode == "transmission":
-        run_retrieval(
-            mode="transmission",
-            epoch=args.epoch,
-            data_format=args.data_format,
-            skip_svi=args.skip_svi,
-            svi_only=args.svi_only,
-            pt_profile=pt_profile,
-            chemistry_model=args.chemistry_model,
-            fastchem_parameter_file=args.fastchem_parameter_file,
-            seed=args.seed,
-            joint_spectra=joint_spectra or None,
-            bandpass_constraints=bandpass_constraints or None,
-            **diagnostic_run_kwargs,
-        )
-
-    elif args.mode == "emission":
-        run_retrieval(
-            mode="emission",
-            epoch=args.epoch,
-            data_format=args.data_format,
-            emission_selection=args.emission_selection,
-            skip_svi=args.skip_svi,
-            svi_only=args.svi_only,
-            pt_profile=pt_profile,
-            chemistry_model=args.chemistry_model,
-            fastchem_parameter_file=args.fastchem_parameter_file,
-            seed=args.seed,
-            joint_spectra=joint_spectra or None,
-            bandpass_constraints=bandpass_constraints or None,
-            **diagnostic_run_kwargs,
-        )
+    else:
+        if args.mode == "emission":
+            run_kwargs["emission_selection"] = args.emission_selection
+        run_retrieval(epoch=args.epoch, **run_kwargs)
 
     return 0
 
@@ -1339,14 +1226,8 @@ def main():
     runtime_config = apply_cli_overrides(args)
     primary_epoch = args.epoch[0]
 
-    transcript_log = _start_run_transcript_log(runtime_config, args)
-    try:
+    with _run_transcript_log(runtime_config, args):
         return _run_configured_retrieval(runtime_config, args, primary_epoch)
-    except BaseException:
-        transcript_log.write_exception()
-        raise
-    finally:
-        transcript_log.close()
 
 
 if __name__ == "__main__":

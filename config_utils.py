@@ -71,15 +71,6 @@ SHADOW_PARAMETER_FIELDS = (
 )
 
 
-_REMOVED_RUNTIME_CONFIG_NAMES = frozenset(
-    {
-        "PRESSURE" + "_TOP",
-        "PRESSURE" + "_BTM",
-        "PT" + "_PROFILE" + "_DEFAULT",
-    }
-)
-
-
 def _finite_float(value) -> float | None:
     try:
         result = float(value)
@@ -561,13 +552,6 @@ def _planet_slug(planet: str) -> str:
     return planet.strip().lower().replace("-", "").replace(" ", "")
 
 
-def _normalize_retrieval_mode(mode: str | None) -> str:
-    resolved = (mode or config.RETRIEVAL_MODE).strip().lower()
-    if resolved not in {"transmission", "emission"}:
-        raise ValueError(f"Unsupported retrieval mode: {mode!r}")
-    return resolved
-
-
 def get_hrs_observation_arms(
     planet: str,
     epoch: str,
@@ -831,15 +815,6 @@ def create_timestamped_dir(base_dir: str | Path) -> Path:
     return timestamped_dir
 
 
-def set_runtime_config(name: str, value) -> None:
-    """Update a config variable at module scope."""
-    if name in _REMOVED_RUNTIME_CONFIG_NAMES:
-        raise ValueError(
-            f"{name} was removed. Use explicit mode-specific atmospheric config names."
-        )
-    setattr(config, name, value)
-
-
 def list_runtime_profiles() -> tuple[str, ...]:
     """Return available named runtime profiles."""
     return tuple(config.CONFIG_PROFILES.keys())
@@ -867,7 +842,7 @@ def apply_runtime_profile(profile_name: str) -> str:
     normalized = _normalize_runtime_profile_name(profile_name)
     profile = config.CONFIG_PROFILES[normalized]
     for name, value in profile["overrides"].items():
-        set_runtime_config(name, value)
+        setattr(config, name, value)
     config._active_runtime_profile = normalized
     return normalized
 

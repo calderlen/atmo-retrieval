@@ -403,7 +403,6 @@ modules:
 │   └── prepare_retrieval_timeseries.py
 ├── environment.yml
 ├── physics
-│   ├── chemistry_draft.py
 │   ├── chemistry.py
 │   ├── grid_setup.py
 │   ├── model.py

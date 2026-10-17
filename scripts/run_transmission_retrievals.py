@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -22,11 +23,7 @@ from pipeline.retrieval_plan import (
     configure_runtime,
     intent_manifest,
     model_param_overrides,
-    preflight_timeseries,
-    print_plan,
-    require_ready_timeseries,
     shared_prior_modes,
-    validate_epochs,
 )
 
 
@@ -112,10 +109,9 @@ def main() -> int:
             print(f"{case.name:20s} {case.description}")
         return 0
 
-    epochs = validate_epochs(args.epoch)
+    epochs = tuple(epoch.strip() for epoch in args.epoch)
     case = cases[args.case]
     configure_runtime(args, mode="transmission", case_name=case.name)
-    preflight = preflight_timeseries(mode="transmission", epochs=epochs, args=args)
     fastchem_file = (
         args.fastchem_parameter_file
         if case.chemistry_model == "fastchem_equilibrium_metallicity_grid"
@@ -131,7 +127,6 @@ def main() -> int:
         manifest_extra.update(
             {
                 "fastchem_parameter_file": str(fastchem_file),
-                "fastchem_parameter_file_exists": fastchem_file.exists(),
                 "fixed_C_O": "solar",
                 "free_chemistry_parameters": ("log_metallicity",),
             }
@@ -142,10 +137,9 @@ def main() -> int:
         args=args,
         extra=manifest_extra,
     )
-    print_plan(manifest, preflight)
+    print(json.dumps(manifest, indent=2, sort_keys=True))
     if args.dry_run:
         return 0
-    require_ready_timeseries(preflight, args)
 
     joint_spectra = auxiliary_timeseries_specs(
         mode="transmission",

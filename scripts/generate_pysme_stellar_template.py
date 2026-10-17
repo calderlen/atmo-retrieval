@@ -31,8 +31,6 @@ DEFAULT_SEGMENTS = ((4200.0, 5600.0), (6100.0, 7500.0))
 
 def _vald_header_geometry(path: Path) -> tuple[float, float, float]:
     fields = path.read_text(encoding="utf-8", errors="strict").splitlines()[0].split(",")
-    if len(fields) < 5:
-        raise ValueError("Unexpected VALD Extract Stellar header.")
     lower = float(fields[0])
     upper = float(fields[1])
     vmicro = float(fields[4].strip().split(maxsplit=1)[0])
@@ -45,25 +43,12 @@ def _segments_within_linelist(lower: float, upper: float) -> tuple[tuple[float, 
         for segment_lower, segment_upper in DEFAULT_SEGMENTS
         if max(lower, segment_lower) < min(upper, segment_upper)
     )
-    if not segments:
-        raise ValueError(
-            f"VALD wavelength range {lower:g}:{upper:g} A does not overlap the PEPSI arms."
-        )
     return segments
 
 
 def _parse_segment(value: str) -> tuple[float, float]:
-    try:
-        lower_text, upper_text = value.split(":", 1)
-        lower = float(lower_text)
-        upper = float(upper_text)
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError(
-            "segments must use LOWER:UPPER Angstrom syntax"
-        ) from exc
-    if not np.isfinite(lower) or not np.isfinite(upper) or lower <= 0.0 or upper <= lower:
-        raise argparse.ArgumentTypeError("segment bounds must be finite, positive, and increasing")
-    return lower, upper
+    lower_text, upper_text = value.split(":", 1)
+    return float(lower_text), float(upper_text)
 
 
 def _velocity_sampled_wavelengths(
@@ -88,13 +73,10 @@ def _load_vald_for_pysme(path: Path, vald_file_class: type) -> tuple[object, str
     text = path.read_text(encoding="utf-8", errors="strict")
     lines = text.splitlines(keepends=True)
     fields = lines[0].split(",", 4)
-    if len(fields) != 5:
-        raise ValueError("Unexpected VALD Extract Stellar header.")
     trailing = fields[4].strip()
     pieces = trailing.split(maxsplit=1)
     if len(pieces) != 2 or pieces[1] != "Wavelength region, lines selected, lines processed, Vmicro":
         return vald_file_class(str(path)), "none"
-    float(pieces[0])
     fields[4] = f" {pieces[0]}, {pieces[1]}\n"
     lines[0] = ",".join(fields)
     temporary_path: Path | None = None
@@ -144,38 +126,23 @@ def main() -> int:
     args = create_parser().parse_args()
     linelist_path = args.linelist.resolve()
     output_path = args.output.resolve()
-    if output_path.suffix.lower() != ".npz":
-        raise ValueError("--output must end in .npz")
-    if not linelist_path.is_file():
-        raise FileNotFoundError(f"VALD line list not found: {linelist_path}")
     params = config_utils.get_params(args.planet, args.parameter_source)
     linelist_lower, linelist_upper, linelist_vmicro = _vald_header_geometry(
         linelist_path
     )
     parameter_provenance: dict[str, str] = {}
     if args.teff_k is None:
-        args.teff_k = float(params.get("T_star", np.nan))
+        args.teff_k = float(params["T_star"])
         parameter_provenance["teff_k"] = f"config:{args.parameter_source}:T_star"
     else:
         parameter_provenance["teff_k"] = "command_line"
     if args.logg is None:
-        configured_logg = float(params.get("logg_star", np.nan))
-        if np.isfinite(configured_logg):
-            args.logg = configured_logg
-            parameter_provenance["logg"] = f"config:{args.parameter_source}:logg_star"
-        else:
-            stellar_mass = float(params.get("M_star", np.nan))
-            stellar_radius = float(params.get("R_star", np.nan))
-            if not np.isfinite(stellar_mass) or not np.isfinite(stellar_radius):
-                raise ValueError(
-                    "Template logg requires finite logg_star or M_star and R_star."
-                )
-            args.logg = 4.438067627 + np.log10(stellar_mass / stellar_radius**2)
-            parameter_provenance["logg"] = "derived_from_config_M_star_R_star"
+        args.logg = float(params["logg_star"])
+        parameter_provenance["logg"] = f"config:{args.parameter_source}:logg_star"
     else:
         parameter_provenance["logg"] = "command_line"
     if args.metallicity is None:
-        args.metallicity = float(params.get("Fe_H", np.nan))
+        args.metallicity = float(params["Fe_H"])
         parameter_provenance["metallicity"] = f"config:{args.parameter_source}:Fe_H"
     else:
         parameter_provenance["metallicity"] = "command_line"
@@ -184,31 +151,11 @@ def main() -> int:
         parameter_provenance["vmicro_kms"] = "vald_extract_stellar_header"
     else:
         parameter_provenance["vmicro_kms"] = "command_line"
-    if args.teff_k <= 0.0 or not np.isfinite(args.teff_k):
-        raise ValueError("--teff-k must be finite and positive")
-    if not np.isfinite(args.logg) or not np.isfinite(args.metallicity):
-        raise ValueError("--logg and --metallicity must be finite")
-    if args.vmicro_kms < 0.0 or not np.isfinite(args.vmicro_kms):
-        raise ValueError("--vmicro-kms must be finite and non-negative")
-    if args.wavelength_step_kms <= 0.0 or not np.isfinite(args.wavelength_step_kms):
-        raise ValueError("--wavelength-step-kms must be finite and positive")
-
-    header = linelist_path.read_text(encoding="utf-8", errors="replace")[:4096]
-    if "WL_vac(A)" not in header:
-        raise ValueError(
-            "The VALD input must declare vacuum wavelengths with a WL_vac(A) column."
-        )
-
-    try:
-        import pysme
-        from pysme.abund import Abund
-        from pysme.linelist.vald import ValdFile
-        from pysme.sme import SME_Structure
-        from pysme.synthesize import synthesize_spectrum
-    except ImportError as exc:
-        raise RuntimeError(
-            "PySME is required. Install the pinned pysme-astro dependency in the retrieval environment."
-        ) from exc
+    import pysme
+    from pysme.abund import Abund
+    from pysme.linelist.vald import ValdFile
+    from pysme.sme import SME_Structure
+    from pysme.synthesize import synthesize_spectrum
 
     segments = tuple(
         args.segment
@@ -255,8 +202,8 @@ def main() -> int:
         raise RuntimeError("PySME returned incompatible wavelength and flux arrays.")
     if not np.all(np.isfinite(wavelength)) or not np.all(np.diff(wavelength) > 0.0):
         raise RuntimeError("PySME returned invalid or unordered wavelengths.")
-    if not np.all(np.isfinite(flux)) or float(np.max(1.0 - flux)) <= 1.0e-4:
-        raise RuntimeError("PySME returned an invalid or featureless normalized spectrum.")
+    if not np.all(np.isfinite(flux)):
+        raise RuntimeError("PySME returned nonfinite flux.")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(

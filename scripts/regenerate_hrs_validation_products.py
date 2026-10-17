@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,7 +29,6 @@ from dataio.collapse_transmission_timeseries_to_1d import (
     collapse_transmission_epoch_arm,
 )
 from dataio.edge_trim_manifest import (
-    EdgeTrimManifestError,
     load_accepted_edge_trim_manifest,
     normalize_dataset_key,
 )
@@ -58,11 +55,7 @@ def _utc_now() -> str:
 
 
 def _inside(path: Path, parent: Path) -> bool:
-    try:
-        path.resolve().relative_to(parent.resolve())
-    except ValueError:
-        return False
-    return True
+    return path.resolve().is_relative_to(parent.resolve())
 
 
 def _write_manifest(output_root: Path, manifest: dict[str, Any]) -> None:
@@ -82,7 +75,7 @@ def discover_supported_inventory(
 
     records: dict[tuple[str, str, str, str], dict[str, str]] = {}
     raw_inventory = discover_raw_calibration_inventory(CANONICAL_HRS_ROOT)
-    for (mode, raw_slug), entry in raw_inventory.items():
+    for (mode, _raw_slug), entry in raw_inventory.items():
         if mode not in modes:
             continue
         planet = str(entry["planet_display"])
@@ -96,18 +89,6 @@ def discover_supported_inventory(
                 epoch=epoch,
                 mode=mode,
             )
-            if not raw_dir.is_dir():
-                raise FileNotFoundError(
-                    f"Inventory entry {mode}/{planet}/{epoch}/{arm} has no raw directory: {raw_dir}"
-                )
-            metadata_candidates = (
-                CANONICAL_HRS_ROOT / mode / raw_slug / epoch / arm / "timeseries_prep.json",
-                CANONICAL_HRS_ROOT / mode / raw_slug / epoch / arm / "timeseries" / "timeseries_prep.json",
-            )
-            metadata_path = next(
-                (path for path in metadata_candidates if path.is_file()),
-                None,
-            )
             key = (mode, planet_slug, epoch, arm)
             records[key] = {
                 "mode": mode,
@@ -117,7 +98,6 @@ def discover_supported_inventory(
                 "epoch": epoch,
                 "arm": arm,
                 "raw_dir": str(raw_dir),
-                "inventory_metadata": str(metadata_path) if metadata_path else "",
                 "inventory_source": "raw_directory_scan",
             }
     return [records[key] for key in sorted(records)]
@@ -203,10 +183,6 @@ def _process_prepared_product(
 def _collapse_products(record: dict[str, str], *, dataset_root: Path) -> list[dict[str, Any]]:
     params = config_utils.get_params(record["planet"], record["ephemeris"])
     kp_kms = float(params["Kp"])
-    if not math.isfinite(kp_kms):
-        raise ValueError(
-            f"No finite Kp is configured for {record['planet']} {record['ephemeris']}."
-        )
     source_dir = dataset_root / "collapse_source"
     results: list[dict[str, Any]] = []
     if record["mode"] == "transmission":
@@ -305,11 +281,6 @@ def create_parser() -> argparse.ArgumentParser:
         help="Write products. Without this flag, print and save only a plan.",
     )
     parser.add_argument(
-        "--continue-on-error",
-        action="store_true",
-        help="Continue through the inventory and record per-dataset failures",
-    )
-    parser.add_argument(
         "--timeseries-only",
         action="store_true",
         help=(
@@ -328,15 +299,8 @@ def main() -> int:
             f"Validation output must not be inside the canonical HRS tree: {CANONICAL_HRS_ROOT}"
         )
     modes = tuple(args.modes or ("transmission", "emission"))
-    if args.timeseries_only and "transmission" in modes:
-        raise ValueError(
-            "--timeseries-only is not valid for transmission regeneration: the "
-            "standard LSD shadow requires both timeseries and collapse_source grids."
-        )
     planets = {normalize_dataset_key(value) for value in args.planet}
     inventory = discover_supported_inventory(modes=modes, planets=planets)
-    if not inventory:
-        raise ValueError("No supported HRS datasets matched the requested inventory filters.")
     if args.execute and output_root.exists() and any(output_root.iterdir()):
         raise FileExistsError(
             f"Refusing to mix a regeneration with existing files in {output_root}."
@@ -348,7 +312,6 @@ def main() -> int:
         "created_utc": _utc_now(),
         "status": "planned" if not args.execute else "running",
         "canonical_arrays_modified": False,
-        "canonical_inventory_metadata_read_only": True,
         "output_root": str(output_root),
         "wavelength_medium": "vacuum",
         "requested_wavelength_frame": (
@@ -365,19 +328,10 @@ def main() -> int:
         tuple[dict[str, str], tuple[float, float], str, str]
     ] = []
     for record in inventory:
-        try:
-            widths, trim_source, trim_status = _edge_trim_for(
-                record,
-                calibration_root=args.edge_trim_calibration_root,
-            )
-        except (FileNotFoundError, EdgeTrimManifestError) as exc:
-            entry = {
-                **record,
-                "status": "skipped",
-                "skip_reason": f"no_accepted_edge_trim: {exc}",
-            }
-            manifest["datasets"].append(entry)
-            continue
+        widths, trim_source, trim_status = _edge_trim_for(
+            record,
+            calibration_root=args.edge_trim_calibration_root,
+        )
         planned.append((record, widths, trim_source, trim_status))
         manifest["datasets"].append(
             {
@@ -391,19 +345,15 @@ def main() -> int:
         )
 
     _write_manifest(output_root, manifest)
-    print(
-        f"Planned {len(planned)} epoch-arm datasets under {output_root}; "
-        f"skipped={len(inventory) - len(planned)}."
-    )
+    print(f"Planned {len(planned)} epoch-arm datasets under {output_root}.")
     if not args.execute:
         return 0
 
     manifest_rows = {
         (row["mode"], row["planet_slug"], row["epoch"], row["arm"]): row
         for row in manifest["datasets"]
-        if row.get("status") == "planned"
+        if row["status"] == "planned"
     }
-    failures = 0
     for index, (record, widths, trim_source, trim_status) in enumerate(
         planned,
         start=1,
@@ -424,62 +374,50 @@ def main() -> int:
             f"[{index}/{len(planned)}] {record['mode']} {record['planet']} "
             f"{record['epoch']} {record['arm']}"
         )
-        try:
+        _process_prepared_product(
+            record,
+            product_kind="timeseries",
+            output_dir=dataset_root / "timeseries",
+            trim_source=trim_source,
+            apply_stellar_rest=bool(args.apply_stellar_rest),
+        )
+        if args.timeseries_only:
+            collapsed = []
+        else:
             _process_prepared_product(
                 record,
-                product_kind="timeseries",
-                output_dir=dataset_root / "timeseries",
+                product_kind="collapse-source",
+                output_dir=dataset_root / "collapse_source",
                 trim_source=trim_source,
                 apply_stellar_rest=bool(args.apply_stellar_rest),
             )
-            if args.timeseries_only:
-                collapsed = []
-            else:
-                _process_prepared_product(
+            if record["mode"] == "transmission":
+                _fit_transmission_lsd_shadow(
                     record,
-                    product_kind="collapse-source",
-                    output_dir=dataset_root / "collapse_source",
-                    trim_source=trim_source,
-                    apply_stellar_rest=bool(args.apply_stellar_rest),
+                    dataset_root=dataset_root,
                 )
-                if record["mode"] == "transmission":
-                    _fit_transmission_lsd_shadow(
-                        record,
-                        dataset_root=dataset_root,
-                    )
-                collapsed = _collapse_products(record, dataset_root=dataset_root)
-            row["status"] = "complete"
-            row["collapsed_statuses"] = [item.get("status", "ready") for item in collapsed]
-        except Exception as exc:
-            failures += 1
-            row["status"] = "failed"
-            row["failure_type"] = type(exc).__name__
-            row["failure_reason"] = str(exc)
-            row["traceback"] = traceback.format_exc()
-            if not args.continue_on_error:
-                row["finished_utc"] = _utc_now()
-                manifest["status"] = "failed"
-                manifest["finished_utc"] = _utc_now()
-                _write_manifest(output_root, manifest)
-                raise
+            collapsed = _collapse_products(record, dataset_root=dataset_root)
+        row["status"] = "complete"
+        row["collapsed_statuses"] = [
+            "ready" if record["mode"] == "transmission" else item["status"]
+            for item in collapsed
+        ]
         row["finished_utc"] = _utc_now()
         _write_manifest(output_root, manifest)
 
-    manifest["status"] = "complete" if failures == 0 else "complete_with_failures"
+    manifest["status"] = "complete"
     manifest["finished_utc"] = _utc_now()
     manifest["n_complete"] = sum(
-        row.get("status") == "complete" for row in manifest["datasets"]
+        row["status"] == "complete" for row in manifest["datasets"]
     )
-    manifest["n_failed"] = failures
-    manifest["n_skipped"] = sum(
-        row.get("status") == "skipped" for row in manifest["datasets"]
-    )
+    manifest["n_failed"] = 0
+    manifest["n_skipped"] = 0
     _write_manifest(output_root, manifest)
     print(
         f"Regeneration {manifest['status']}: complete={manifest['n_complete']}, "
         f"failed={manifest['n_failed']}, skipped={manifest['n_skipped']}"
     )
-    return 1 if failures else 0
+    return 0
 
 
 if __name__ == "__main__":

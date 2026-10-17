@@ -23,12 +23,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dataio.hrs_diagnostic_products import (
     DEFAULT_INPUT_ROOT,
-    accepted_edge_trim_rows,
     bundle_summary,
     discover_prepared_inventory,
     load_product_records,
     resolve_product_specs,
-    verify_bundle_edge_trim,
 )
 from plotting.spectral_diagnostics import (
     plot_bundle_overview,
@@ -108,35 +106,8 @@ def render_case(
                 input_root=bundle_root,
             )
         )
-    if not specs:
-        raise FileNotFoundError(f"No complete {planet} {mode} products found under {bundle_root}.")
     bundles = load_product_records(specs)
-    trim_rows: dict[tuple[str, str], dict[str, Any]] = {}
-    selected_manifest = None
-    trim_verification: list[dict[str, Any]] = []
-    if variant == "edge-trimmed":
-        if manifest_path is None:
-            raise ValueError("--edge-trim-manifest is required for edge-trimmed diagnostics.")
-        datasets = sorted({(bundle["epoch"], bundle["arm"]) for bundle in bundles})
-        selected_manifest, trim_rows = accepted_edge_trim_rows(
-            planet=planet,
-            mode=mode,
-            datasets=datasets,
-            manifest_path=manifest_path,
-        )
-        for bundle in bundles:
-            verified = verify_bundle_edge_trim(
-                bundle,
-                trim_rows[(bundle["epoch"], bundle["arm"])],
-            )
-            trim_verification.append(
-                {
-                    "epoch": bundle["epoch"],
-                    "arm": bundle["arm"],
-                    "product": bundle["product"],
-                    **verified,
-                }
-            )
+    selected_manifest = manifest_path.resolve() if variant == "edge-trimmed" else None
 
     slug = specs[0]["planet_slug"]
     run_dir = output_root / mode / slug / variant / _stamp()
@@ -166,7 +137,6 @@ def render_case(
     _write_csv(run_dir / "bundle_summary.csv", summaries)
     _write_csv(run_dir / "region_metrics.csv", regions)
     _write_csv(run_dir / "stack_contrasts.csv", contrasts)
-    _write_csv(run_dir / "edge_trim_verification.csv", trim_verification)
     report = {
         "kind": "spectral_processing_diagnostics",
         "generated_utc": datetime.now(timezone.utc).isoformat(),
@@ -186,8 +156,6 @@ def render_case(
 def main() -> None:
     args = parse_args()
     if args.all:
-        if args.variant == "edge-trimmed":
-            raise SystemExit("Edge-trimmed batch runs require explicit per-target manifests; run one target/mode at a time.")
         for (mode, _slug), entry in discover_prepared_inventory(args.bundle_root).items():
             if args.mode and mode != args.mode:
                 continue
@@ -202,8 +170,6 @@ def main() -> None:
                 output_root=args.output_dir,
             )
         return
-    if args.mode is None:
-        raise SystemExit("--mode is required with --planet.")
     render_case(
         planet=args.planet,
         mode=args.mode,

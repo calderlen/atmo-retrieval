@@ -193,8 +193,6 @@ def _robust_symmetric_limit(values, percentile=99.2, floor=2e-5):
 
 
 def _velocity_grid(window_kms, bin_kms):
-    if window_kms <= 0 or bin_kms <= 0:
-        raise ValueError("window_kms and bin_kms must be positive")
     count = int(math.floor(2.0 * window_kms / bin_kms)) + 1
     return np.linspace(-float(window_kms), float(window_kms), count)
 
@@ -236,16 +234,11 @@ def _sample_line_window(
     wave = np.asarray(bundle["wavelength"], dtype=float)
     data = np.asarray(bundle["data"], dtype=float)
     sigma = np.asarray(bundle["sigma"], dtype=float)
-    if data.shape != sigma.shape or data.ndim != 2 or wave.size != data.shape[1]:
-        raise ValueError(
-            f"Incompatible bundle shapes: wave={wave.shape}, data={data.shape}, sigma={sigma.shape}"
-        )
-
     sample_wave = _wavelength_at_velocity(rest_vacuum_A, velocity_grid)
     margin_A = rest_vacuum_A * float(max_interp_gap_kms) / C_KMS
     lo = float(np.nanmin(sample_wave) - margin_A)
     hi = float(np.nanmax(sample_wave) + margin_A)
-    native = np.flatnonzero(np.isfinite(wave) & (wave >= lo) & (wave <= hi))
+    native = np.flatnonzero((wave >= lo) & (wave <= hi))
     if native.size < int(minimum_native_pixels):
         return None
 
@@ -304,25 +297,16 @@ def _sample_line_planet_frame(
     wave = np.asarray(bundle["wavelength"], dtype=float)
     data = np.asarray(bundle["data"], dtype=float)
     sigma = np.asarray(bundle["sigma"], dtype=float)
-    if data.shape != sigma.shape or data.ndim != 2 or wave.size != data.shape[1]:
-        raise ValueError(
-            f"Incompatible bundle shapes: wave={wave.shape}, data={data.shape}, sigma={sigma.shape}"
-        )
-
     output_wave = _wavelength_at_velocity(rest_vacuum_A, velocity_grid)
     if trail is None:
         trail = np.zeros(data.shape[0], dtype=float)
     else:
         trail = np.asarray(trail, dtype=float)
-    if trail.shape != (data.shape[0],):
-        raise ValueError(
-            f"Planet trail has shape {trail.shape}; expected ({data.shape[0]},)"
-        )
     sample_wave = _relativistic_doppler_factor(trail)[:, None] * output_wave[None, :]
     margin_A = rest_vacuum_A * float(max_interp_gap_kms) / C_KMS
     lo = float(np.nanmin(sample_wave) - margin_A)
     hi = float(np.nanmax(sample_wave) + margin_A)
-    native = np.flatnonzero(np.isfinite(wave) & (wave >= lo) & (wave <= hi))
+    native = np.flatnonzero((wave >= lo) & (wave <= hi))
     if native.size < int(minimum_native_pixels):
         return None
 
@@ -383,8 +367,8 @@ def line_coverage_rows(
         n_pixels = int(np.count_nonzero((wave >= bounds[0]) & (wave <= bounds[1])))
         rows.append(
             {
-                "epoch": bundle.get("epoch"),
-                "arm": bundle.get("arm"),
+                "epoch": bundle["epoch"],
+                "arm": bundle["arm"],
                 "species": line["species"],
                 "line": line["label"],
                 "rest_air_A": float(line["rest_air_A"]),
@@ -504,15 +488,14 @@ def _planet_velocity(
     eccentricity=0.0,
     omega_deg=None,
 ):
-    if kp_kms is None or not np.isfinite(float(kp_kms)):
+    if kp_kms is None:
         return None
-    vsys = 0.0 if vsys_kms is None or not np.isfinite(float(vsys_kms)) else float(vsys_kms)
     return planet_radial_velocity_kms(
         np.asarray(phase, dtype=float),
         kp_kms=float(kp_kms),
         eccentricity=float(eccentricity),
         omega_deg=omega_deg,
-    ) + vsys
+    ) + float(vsys_kms)
 
 
 def plot_species_2d_atlas(
@@ -544,7 +527,7 @@ def plot_species_2d_atlas(
         omega_deg=omega_deg,
     )
     atlas_window_kms = float(window_kms)
-    if trail is not None and np.any(np.isfinite(trail)):
+    if trail is not None:
         trail_margin_kms = max(20.0, 0.2 * float(window_kms))
         required = float(np.nanmax(np.abs(trail))) + trail_margin_kms
         atlas_window_kms = max(
@@ -561,10 +544,10 @@ def plot_species_2d_atlas(
         max_interp_gap_kms=max_interp_gap_kms,
     )
     if not products:
-        print(f"No catalogued species lines covered by {bundle.get('epoch')} {bundle.get('arm')}.")
+        print(f"No catalogued species lines covered by {bundle['epoch']} {bundle['arm']}.")
         return None
 
-    ncols = max(1, int(ncols))
+    ncols = int(ncols)
     nrows = int(math.ceil(len(products) / ncols))
     fig, axes = plt.subplots(
         nrows,
@@ -621,7 +604,7 @@ def plot_species_2d_atlas(
     trail_note = "gold: expected planet trail" if trail is not None else "Kp unavailable: no trail overlay"
     window_note = f"observed-frame window +/-{atlas_window_kms:.0f} km/s"
     fig.suptitle(
-        f"Species-combined 2D residual atlas: {bundle.get('epoch')} {bundle.get('arm')}\n"
+        f"Species-combined 2D residual atlas: {bundle['epoch']} {bundle['arm']}\n"
         f"{trail_note}; {window_note}\n"
         "Each panel uses its own robust residual scale",
         fontsize=13,
@@ -785,8 +768,8 @@ def species_velocity_coverage_rows(
     ):
         rows.append(
             {
-                "epoch": bundle.get("epoch"),
-                "arm": bundle.get("arm"),
+                "epoch": bundle["epoch"],
+                "arm": bundle["arm"],
                 "species": result["species"],
                 "n_lines": len(result["lines"]),
                 "n_exposures": result["n_exposures"],
@@ -828,7 +811,7 @@ def plot_species_frame_stacks(
     if not results:
         return None
     velocity_grid = results[0]["velocity"]
-    ncols = max(1, int(ncols))
+    ncols = int(ncols)
     nrows = int(math.ceil(len(results) / ncols))
     fig, axes = plt.subplots(
         nrows,
@@ -902,7 +885,7 @@ def plot_species_frame_stacks(
             ax.set_xlabel("Velocity relative to vacuum rest wavelength [km/s]")
     frame = "planet frame" if results[0]["frame"] == "planet" else "line rest frame"
     fig.suptitle(
-        f"Species-combined {frame} stacks: {bundle.get('epoch')} {bundle.get('arm')}\n"
+        f"Species-combined {frame} stacks: {bundle['epoch']} {bundle['arm']}\n"
         "direct relativistic sampling; gray=exposure coverage, orange=relative weight",
         fontsize=13,
     )
@@ -1031,7 +1014,7 @@ def plot_residual_quality_summary(
     fraction_axis.set_ylim(-0.03, 1.03)
     ratio_axis.set_title("Wavelength-wise noise ratio and coverage")
 
-    fig.suptitle(f"Residual quality summary: {bundle.get('epoch')} {bundle.get('arm')}", fontsize=13)
+    fig.suptitle(f"Residual quality summary: {bundle['epoch']} {bundle['arm']}", fontsize=13)
     return fig, axes
 
 
@@ -1041,25 +1024,13 @@ def plot_pre_post_sysrem_comparison(
     sigma_threshold=0.5,
     max_wavelength_points=1400,
 ):
-    """Compare optional pre-SYSREM arrays with the final prepared residual cube."""
-
-    pre_data = bundle.get("pre_sysrem_data")
-    pre_sigma = bundle.get("pre_sysrem_sigma")
-    if pre_data is None or pre_sigma is None:
-        print(f"No pre-SYSREM arrays for {bundle.get('epoch')} {bundle.get('arm')}; comparison skipped.")
-        return None
+    """Compare supplied pre-SYSREM arrays with the final prepared residual cube."""
 
     wave = np.asarray(bundle["wavelength"], dtype=float)
     post_data = np.asarray(bundle["data"], dtype=float)
     post_sigma = np.asarray(bundle["sigma"], dtype=float)
-    pre_data = np.asarray(pre_data, dtype=float)
-    pre_sigma = np.asarray(pre_sigma, dtype=float)
-    if pre_data.shape != post_data.shape or pre_sigma.shape != post_sigma.shape:
-        print(
-            f"Pre/post shapes differ for {bundle.get('epoch')} {bundle.get('arm')}: "
-            f"pre={pre_data.shape}/{pre_sigma.shape}, post={post_data.shape}/{post_sigma.shape}; comparison skipped."
-        )
-        return None
+    pre_data = np.asarray(bundle["pre_sysrem_data"], dtype=float)
+    pre_sigma = np.asarray(bundle["pre_sysrem_sigma"], dtype=float)
 
     pre_valid = _finite_good(pre_data, pre_sigma, sigma_threshold)
     post_valid = _finite_good(post_data, post_sigma, sigma_threshold)
@@ -1076,7 +1047,6 @@ def plot_pre_post_sysrem_comparison(
     row_post = _masked_rms(post_data, post_valid, axis=1)
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 8.0), constrained_layout=True)
-    image = None
     for ax, matrix, title in (
         (axes[0, 0], pre_data, "Pre-SYSREM residuals"),
         (axes[0, 1], post_data, "Final residuals"),
@@ -1104,9 +1074,8 @@ def plot_pre_post_sysrem_comparison(
     axes[1, 1].set_ylabel("Residual RMS")
     axes[1, 1].set_title("Exposure-wise RMS suppression")
     axes[1, 1].legend(loc="best")
-    if image is not None:
-        fig.colorbar(image, ax=axes[:2, :].ravel().tolist(), pad=0.012, fraction=0.025, label="Residual flux")
-    fig.suptitle(f"Pre/post-SYSREM comparison: {bundle.get('epoch')} {bundle.get('arm')}", fontsize=13)
+    fig.colorbar(image, ax=axes[:2, :].ravel().tolist(), pad=0.012, fraction=0.025, label="Residual flux")
+    fig.suptitle(f"Pre/post-SYSREM comparison: {bundle['epoch']} {bundle['arm']}", fontsize=13)
     return fig, axes
 
 

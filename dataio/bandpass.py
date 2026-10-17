@@ -27,12 +27,7 @@ def load_tess_bandpass(
     """
     bandpass_path = Path(path) if path is not None else config.TESS_BANDPASS_PATH
 
-    if not bandpass_path.exists():
-        if not download_if_missing:
-            raise FileNotFoundError(
-                f"Bandpass file not found: {bandpass_path}. "
-                "Provide bandpass_path or allow download."
-            )
+    if download_if_missing and not bandpass_path.exists():
         _download_tess_bandpass(bandpass_path)
 
     wavelength_nm: list[float] = []
@@ -40,15 +35,12 @@ def load_tess_bandpass(
 
     for raw_line in bandpass_path.read_text().splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#") or "," not in line:
+        if not line or line.startswith("#"):
             continue
 
         left, right = line.split(",", 1)
-        try:
-            lam_nm = float(left.strip())
-            rsp = float(right.strip())
-        except ValueError:
-            continue
+        lam_nm = float(left.strip())
+        rsp = float(right.strip())
 
         wavelength_nm.append(lam_nm)
         response.append(rsp)
@@ -63,8 +55,6 @@ def load_tess_bandpass(
     wavelength_m = wavelength_nm_arr[mask] * 1.0e-9
     response_clean = response_arr[mask]
 
-    if wavelength_m.size < 2:
-        raise ValueError(f"Bandpass file {bandpass_path} does not contain enough valid points.")
 
     order = np.argsort(wavelength_m)
     wavelength_m = wavelength_m[order]

@@ -141,40 +141,15 @@ def collapsed_emission_dir(
 
 def load_frozen_sysrem_arrays(
     data_dir: Path,
-) -> dict[str, np.ndarray] | None:
-    """Load the frozen chunked SYSREM operator saved with a source cube."""
-    path = data_dir / "U_sysrem.npz"
-    if not path.exists():
-        return None
-    with np.load(path) as raw:
-        if "projection_sigma" not in raw.files:
-            if "V_chunk_diag" in raw.files:
-                raise ValueError(
-                    f"{path} uses the retired V_chunk_diag approximation. "
-                    "Regenerate the source cube to retain per-pixel SYSREM "
-                    "projection uncertainties."
-                )
-            raise ValueError(
-                f"{path} is missing projection_sigma; regenerate the source cube."
-            )
+) -> dict[str, np.ndarray]:
+    """Read the source cube's frozen SYSREM operator."""
+    with np.load(data_dir / "U_sysrem.npz") as raw:
         U = np.asarray(raw["U_sysrem"], dtype=float)
         labels = np.asarray(raw["chunk_labels"], dtype=np.int32)
         counts = np.asarray(raw["basis_counts"], dtype=np.int32)
         projection_sigma = np.asarray(raw["projection_sigma"], dtype=float)
     if U.ndim == 2:
         U = U[:, :, None]
-    expected_sigma_shape = (U.shape[0], labels.size)
-    if projection_sigma.shape != expected_sigma_shape:
-        raise ValueError(
-            f"{path} projection_sigma has shape {projection_sigma.shape}; "
-            f"expected {expected_sigma_shape}."
-        )
-    if np.any(~np.isfinite(projection_sigma)) or np.any(
-        projection_sigma <= 0.0
-    ):
-        raise ValueError(
-            f"{path} projection_sigma must contain finite positive values."
-        )
     return {
         "sysrem_U": U,
         "sysrem_chunk_labels": labels,
@@ -183,72 +158,12 @@ def load_frozen_sysrem_arrays(
     }
 
 
-def _validate_timeseries_arrays(
-    wavelength: np.ndarray,
-    data: np.ndarray,
-    sigma: np.ndarray,
-    phase: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    wavelength = np.asarray(wavelength, dtype=float)
-    data = np.asarray(data, dtype=float)
-    sigma = np.asarray(sigma, dtype=float)
-    phase = np.asarray(phase, dtype=float)
-
-    if not np.all(np.isfinite(data)):
-        raise ValueError("data contains non-finite values; regenerate the prepared cube.")
-    if not np.all(np.isfinite(sigma)) or np.any(sigma <= 0.0):
-        raise ValueError(
-            "sigma must contain only finite positive values; regenerate the prepared cube."
-        )
-
-    order = np.argsort(wavelength)
-    wavelength = wavelength[order]
-    data = data[:, order]
-    sigma = sigma[:, order]
-    return wavelength, data, sigma, phase
-
-
-def collapse_selected_emission_exposures(
-    wavelength: np.ndarray,
-    data: np.ndarray,
-    sigma: np.ndarray,
-    phase: np.ndarray,
-    *,
-    kp_kms: float,
-    eccentricity: float = 0.0,
-    omega_deg: float | None = None,
-    bin_size: int = 1,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Shift selected residual spectra to the planet frame and coadd them."""
-    wavelength, data, sigma, phase = _validate_timeseries_arrays(
-        wavelength,
-        data,
-        sigma,
-        phase,
-    )
-
-    operator = build_emission_collapse_operator(
-        wavelength,
-        sigma,
-        phase,
-        kp_kms=kp_kms,
-        eccentricity=eccentricity,
-        omega_deg=omega_deg,
-        bin_size=bin_size,
-    )
-    return apply_emission_collapse_operator(data, operator)
-
-
 def apply_emission_collapse_operator(
     data: np.ndarray,
     operator: dict[str, np.ndarray],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Apply one validated planet-frame shift/coadd/bin operator to data."""
+    """Apply the planet-frame shift/coadd/bin operator to data."""
     data = np.asarray(data, dtype=float)
-    if data.ndim != 2:
-        raise ValueError(f"data must be 2D; got shape {data.shape}.")
-    if not np.all(np.isfinite(data)):
-        raise ValueError("data must contain only finite values.")
 
     left_indices = np.asarray(operator["shift_left_indices"], dtype=np.int32)
     fractions = np.asarray(operator["shift_fractions"], dtype=float)
@@ -258,42 +173,6 @@ def apply_emission_collapse_operator(
     output_wavelength = np.asarray(operator["output_wavelength"], dtype=float)
     output_uncertainty = np.asarray(operator["output_uncertainty"], dtype=float)
 
-    if left_indices.shape != fractions.shape or left_indices.shape != coadd_weights.shape:
-        raise ValueError(
-            "shift_left_indices, shift_fractions, and coadd_weights must have "
-            f"the same shape; got {left_indices.shape}, {fractions.shape}, and "
-            f"{coadd_weights.shape}."
-        )
-    if left_indices.shape[0] != data.shape[0]:
-        raise ValueError(
-            "Collapse operator exposure count does not match data: "
-            f"{left_indices.shape[0]} versus {data.shape[0]}."
-        )
-    if np.any(left_indices < 0) or np.any(left_indices + 1 >= data.shape[1]):
-        raise ValueError("Collapse operator contains out-of-range source indices.")
-    if np.any(~np.isfinite(fractions)) or np.any(
-        (fractions < 0.0) | (fractions > 1.0)
-    ):
-        raise ValueError("Collapse operator fractions must be finite and within [0, 1].")
-    if np.any(~np.isfinite(coadd_weights)) or np.any(coadd_weights < 0.0):
-        raise ValueError("Collapse operator coadd weights must be finite and nonnegative.")
-    if not np.allclose(
-        np.sum(coadd_weights, axis=0),
-        1.0,
-        rtol=1.0e-10,
-        atol=1.0e-12,
-    ):
-        raise ValueError("Collapse operator coadd weights must sum to one.")
-    if bin_indices.ndim != 1 or bin_weights.shape != bin_indices.shape:
-        raise ValueError("bin_indices and bin_weights must be matching 1D arrays.")
-    if bin_indices.size != left_indices.shape[1]:
-        raise ValueError(
-            "Every shifted wavelength must have one bin assignment; got "
-            f"{left_indices.shape[1]} shifted wavelengths and "
-            f"{bin_indices.size} bin assignments."
-        )
-    if np.any(bin_indices < 0) or np.any(bin_indices >= output_wavelength.size):
-        raise ValueError("Collapse operator contains out-of-range bin indices.")
 
     exposure_indices = np.arange(data.shape[0])[:, None]
     left_data = data[exposure_indices, left_indices]
@@ -325,28 +204,7 @@ def build_emission_collapse_operator(
     sigma = np.asarray(sigma, dtype=float)
     phase = np.asarray(phase, dtype=float)
 
-    if wavelength.ndim != 1 or wavelength.size < 2:
-        raise ValueError("wavelength must be a 1D array with at least two pixels.")
-    if np.any(~np.isfinite(wavelength)) or np.any(np.diff(wavelength) <= 0.0):
-        raise ValueError("wavelength must be finite and strictly increasing.")
-    if sigma.ndim != 2 or sigma.shape != (phase.size, wavelength.size):
-        raise ValueError(
-            "sigma must have shape (phase.size, wavelength.size); got "
-            f"{sigma.shape}, expected {(phase.size, wavelength.size)}."
-        )
-    if phase.size == 0 or np.any(~np.isfinite(phase)):
-        raise ValueError("phase must contain at least one finite exposure phase.")
-    if np.any(~np.isfinite(sigma)) or np.any(sigma <= 0.0):
-        raise ValueError("sigma must contain only finite positive values.")
-    if not np.isfinite(kp_kms):
-        raise ValueError("kp_kms must be finite.")
-    if not np.isfinite(velocity_offset_kms):
-        raise ValueError("velocity_offset_kms must be finite.")
-    if int(bin_size) != bin_size or int(bin_size) < 1:
-        raise ValueError("bin_size must be a positive integer.")
     bin_size = int(bin_size)
-    if not np.isfinite(max_native_gap_factor) or max_native_gap_factor <= 0.0:
-        raise ValueError("max_native_gap_factor must be finite and positive.")
 
     spacing = np.diff(wavelength)
     typical_spacing = float(np.median(spacing))
@@ -360,8 +218,6 @@ def build_emission_collapse_operator(
     )
     velocities = velocities + float(velocity_offset_kms)
     beta = velocities / SPEED_OF_LIGHT_KMS
-    if np.any(np.abs(beta) >= 1.0):
-        raise ValueError("Planet-frame velocity must remain below the speed of light.")
     doppler_factor = np.sqrt((1.0 + beta) / (1.0 - beta))
     shift_query_full = doppler_factor[:, None] * wavelength[None, :]
     boundary_tolerance = (
@@ -434,11 +290,6 @@ def build_emission_collapse_operator(
     )
     valid_shift = within_bounds & gap_safe & fraction_safe
     common_coverage = np.all(valid_shift, axis=0)
-    if not np.any(common_coverage):
-        raise ValueError(
-            "No wavelengths retain in-bounds, gap-safe coverage from every "
-            "selected exposure after the planet-frame shift."
-        )
 
     covered_source_indices = np.flatnonzero(common_coverage).astype(np.int32)
     covered_wavelength = wavelength[common_coverage]
@@ -453,11 +304,6 @@ def build_emission_collapse_operator(
     left_sigma = sigma[exposure_indices, shift_left_indices]
     right_sigma = sigma[exposure_indices, shift_left_indices + 1]
     shifted_sigma = left_sigma + shift_fractions * (right_sigma - left_sigma)
-    if np.any(~np.isfinite(shifted_sigma)) or np.any(shifted_sigma <= 0.0):
-        raise ValueError(
-            "Planet-frame interpolation produced non-finite or nonpositive "
-            "uncertainties."
-        )
     inverse_variance = 1.0 / shifted_sigma**2
     weight_sum = np.sum(inverse_variance, axis=0)
     if np.any(~np.isfinite(weight_sum)) or np.any(weight_sum <= 0.0):
@@ -541,34 +387,13 @@ def build_emission_collapse_operator(
 def _load_prepared_timeseries(
     data_dir: Path,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    expected = {
-        "wavelength": data_dir / "wavelength.npy",
-        "data": data_dir / "data.npy",
-        "sigma": data_dir / "sigma.npy",
-        "phase": data_dir / "phase.npy",
-    }
-    missing = [path.name for path in expected.values() if not path.exists()]
-    if missing:
-        raise FileNotFoundError(
-            f"{data_dir} is missing prepared emission time-series files: "
-            + ", ".join(missing)
-        )
-
-    metadata_path = data_dir / "timeseries_prep.json"
-    metadata: dict[str, Any] = {}
-    if metadata_path.exists():
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise ValueError(f"Could not parse {metadata_path}: {exc}") from exc
-    arrays = (
-        np.load(expected["wavelength"]),
-        np.load(expected["data"]),
-        np.load(expected["sigma"]),
-        np.load(expected["phase"]),
-    )
-    wavelength, data, sigma, phase = _validate_timeseries_arrays(*arrays)
-    return wavelength, data, sigma, phase, metadata
+    metadata = json.loads((data_dir / "timeseries_prep.json").read_text(encoding="utf-8"))
+    wavelength = np.asarray(np.load(data_dir / "wavelength.npy"), dtype=float)
+    data = np.asarray(np.load(data_dir / "data.npy"), dtype=float)
+    sigma = np.asarray(np.load(data_dir / "sigma.npy"), dtype=float)
+    phase = np.asarray(np.load(data_dir / "phase.npy"), dtype=float)
+    order = np.argsort(wavelength)
+    return wavelength[order], data[:, order], sigma[:, order], phase, metadata
 
 
 def _write_metadata(output_dir: Path, metadata: dict[str, Any]) -> None:
@@ -624,11 +449,7 @@ def collapse_epoch_arm(
     else:
         output_dir = Path(output_dir)
     wavelength, data, sigma, phase, source_metadata = _load_prepared_timeseries(data_dir)
-    frozen_sysrem = load_frozen_sysrem_arrays(data_dir)
-    if source_metadata.get("run_sysrem") is True and frozen_sysrem is None:
-        raise FileNotFoundError(
-            f"{data_dir} declares run_sysrem=true but U_sysrem.npz is missing."
-        )
+    frozen_sysrem = load_frozen_sysrem_arrays(data_dir) if source_metadata["run_sysrem"] else None
     mask = emission_selection_mask(phase, canonical, params)
     selected_indices = np.flatnonzero(mask)
     phase_01 = np.mod(phase, 1.0)

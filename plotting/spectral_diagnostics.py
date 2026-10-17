@@ -70,7 +70,7 @@ def plot_bundle_profiles(bundle: Mapping[str, Any]):
     axes[1].set_ylabel("Median sigma")
     axes[2].plot(phase, finite_fraction, marker="o", lw=1)
     axes[2].set_ylabel("Finite fraction")
-    axes[2].set_xlabel("Orbital phase" + (" (mod 1)" if bundle.get("mode") == "emission" else ""))
+    axes[2].set_xlabel("Orbital phase" + (" (mod 1)" if bundle["mode"] == "emission" else ""))
     for axis in axes:
         axis.grid(alpha=0.2)
     figure.suptitle(f"{bundle['epoch']} {bundle['arm']} exposure profiles")
@@ -91,8 +91,7 @@ def plot_observed_spectrum(bundle: Mapping[str, Any], *, max_bins: int = 900):
     )
     figure, axes = plt.subplots(2, 1, figsize=(13, 7), sharex=True)
     axes[0].plot(binned_wave, binned_mean, color="black", lw=0.9)
-    if binned_error is not None:
-        axes[0].fill_between(binned_wave, binned_mean - binned_error, binned_mean + binned_error, color="0.7", alpha=0.4)
+    axes[0].fill_between(binned_wave, binned_mean - binned_error, binned_mean + binned_error, color="0.7", alpha=0.4)
     axes[0].axhline(0.0, color="0.5", ls="--", lw=0.8)
     axes[0].set_ylabel("Weighted residual")
     binned_wave_cov, binned_coverage, _ = binned_series(wavelength, coverage, max_bins=max_bins)
@@ -129,11 +128,9 @@ def plot_column_quality(bundle: Mapping[str, Any], *, max_bins: int = 900):
 
 
 def plot_collapsed_product(bundle: Mapping[str, Any], *, max_bins: int = 900):
-    """Plot the persisted one-dimensional collapsed product, if available."""
+    """Plot the persisted one-dimensional collapsed product."""
 
-    collapsed = bundle.get("collapsed")
-    if collapsed is None:
-        return None
+    collapsed = bundle["collapsed"]
     wave, spectrum, uncertainty = binned_series(
         collapsed["wavelength"],
         collapsed["spectrum"],
@@ -142,8 +139,7 @@ def plot_collapsed_product(bundle: Mapping[str, Any], *, max_bins: int = 900):
     )
     figure, axis = plt.subplots(figsize=(13, 4.5))
     axis.plot(wave, spectrum, color="black", lw=0.9)
-    if uncertainty is not None:
-        axis.fill_between(wave, spectrum - uncertainty, spectrum + uncertainty, color="0.7", alpha=0.4)
+    axis.fill_between(wave, spectrum - uncertainty, spectrum + uncertainty, color="0.7", alpha=0.4)
     axis.axhline(0.0, color="0.5", ls="--", lw=0.8)
     axis.set_xlabel("Vacuum wavelength [Angstrom]")
     axis.set_ylabel("Collapsed spectrum")
@@ -155,9 +151,7 @@ def plot_collapsed_product(bundle: Mapping[str, Any], *, max_bins: int = 900):
 def plot_stacked_spectra(stacked: Mapping[str, Any]):
     """Plot weighted spectra from multiple epoch/arm rows."""
 
-    rows = list(stacked.get("rows", []))
-    if not rows:
-        return None
+    rows = list(stacked["rows"])
     figure, axes = plt.subplots(len(rows), 1, figsize=(13, max(3.0, 2.6 * len(rows))), squeeze=False)
     for axis, row in zip(axes[:, 0], rows):
         wave, spectrum, uncertainty = binned_series(
@@ -167,8 +161,7 @@ def plot_stacked_spectra(stacked: Mapping[str, Any]):
             max_bins=900,
         )
         axis.plot(wave, spectrum, color="black", lw=0.8)
-        if uncertainty is not None:
-            axis.fill_between(wave, spectrum - uncertainty, spectrum + uncertainty, color="0.8", alpha=0.4)
+        axis.fill_between(wave, spectrum - uncertainty, spectrum + uncertainty, color="0.8", alpha=0.4)
         axis.axhline(0.0, color="0.5", ls="--", lw=0.7)
         axis.set_ylabel(str(row["label"]))
     axes[-1, 0].set_xlabel("Vacuum wavelength [Angstrom]")

@@ -130,39 +130,15 @@ def _ensure_parent_on_sys_path(path: Path) -> None:
         sys.path.insert(0, parent)
 
 
-def _load_module_or_raise(module_name: str, *, install_hint: str) -> Any:
-    try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(f"Required dependency '{module_name}' is not available. {install_hint}") from exc
-
-
 def _load_mlexo_runtime(config: TessTransitFitConfig) -> _MlexoRuntime:
     mlexo_root = _coerce_optional_path(config.mlexo_root) or _default_mlexo_root()
-    if not mlexo_root.exists():
-        raise FileNotFoundError(
-            f"Local mlexo checkout not found: {mlexo_root}. "
-            "Pass TessTransitFitConfig(mlexo_root=...) if it lives elsewhere."
-        )
 
     _ensure_parent_on_sys_path(mlexo_root)
 
-    mx = _load_module_or_raise(
-        "mlx.core",
-        install_hint="Install MLX in the active environment before running the fit.",
-    )
-    lc_transforms = _load_module_or_raise(
-        "mlexo.light_curves.transforms",
-        install_hint="Ensure the local mlexo checkout is importable.",
-    )
-    limb_dark = _load_module_or_raise(
-        "mlexo.light_curves.limb_dark",
-        install_hint="Ensure the local mlexo checkout is importable.",
-    )
-    keplerian = _load_module_or_raise(
-        "mlexo.orbits.keplerian",
-        install_hint="Ensure the local mlexo checkout is importable.",
-    )
+    mx = importlib.import_module('mlx.core')
+    lc_transforms = importlib.import_module('mlexo.light_curves.transforms')
+    limb_dark = importlib.import_module('mlexo.light_curves.limb_dark')
+    keplerian = importlib.import_module('mlexo.orbits.keplerian')
 
     return _MlexoRuntime(
         mx=mx,
@@ -182,10 +158,7 @@ def download_tess_lightcurves(config: TessTransitFitConfig) -> Any:
     author products.
     """
 
-    lk = _load_module_or_raise(
-        "lightkurve",
-        install_hint="Install lightkurve before downloading TESS light curves.",
-    )
+    lk = importlib.import_module('lightkurve')
 
     search_kwargs: dict[str, Any] = {
         "mission": config.mission,
@@ -196,18 +169,11 @@ def download_tess_lightcurves(config: TessTransitFitConfig) -> Any:
         search_kwargs["sector"] = list(config.sectors)
 
     search = lk.search_lightcurve(config.target, **search_kwargs)
-    if len(search) == 0:
-        raise RuntimeError(
-            f"No TESS light curves found for target={config.target!r} "
-            f"mission={config.mission!r} author={config.author!r}."
-        )
 
     collection = search.download_all(
         quality_bitmask=config.quality_bitmask,
         flux_column=config.flux_column,
     )
-    if collection is None or len(collection) == 0:
-        raise RuntimeError(f"Failed to download TESS light curves for {config.target!r}.")
     return collection
 
 
@@ -282,9 +248,6 @@ def build_joint_tess_dataset(
         yerr_parts.append(np.ascontiguousarray(flux_err[window_mask], dtype=np.float64))
         sector_idx_parts.append(np.full(np.count_nonzero(window_mask), len(sector_labels), dtype=np.int32))
         sector_labels.append(str(sector_label))
-
-    if not x_parts:
-        raise RuntimeError("No TESS cadences survived the preprocessing window.")
 
     x = np.concatenate(x_parts)
     y = np.concatenate(y_parts)
@@ -398,7 +361,7 @@ def _sector_gp_marginal_nll(
 
     try:
         chol, alpha = _gp_cholesky_solve(cov, resid_mx, runtime)
-    except Exception:
+    except (ValueError, RuntimeError, np.linalg.LinAlgError):
         return float(np.inf)
 
     quad = mx.sum(resid_mx * alpha)
@@ -703,10 +666,7 @@ def _log_probability(
     if not np.all(np.isfinite(theta_arr)) or not _in_bounds(theta_arr, bounds):
         return float("-inf")
 
-    try:
-        nlp = _negative_log_posterior(theta_arr, dataset, runtime, config)
-    except Exception:
-        return float("-inf")
+    nlp = _negative_log_posterior(theta_arr, dataset, runtime, config)
     if not np.isfinite(nlp):
         return float("-inf")
     return -float(nlp)
@@ -748,40 +708,34 @@ def _run_emcee_sampler(
     config: TessTransitFitConfig,
     bounds: np.ndarray,
 ) -> tuple[Any, bool, int]:
-    emcee = _load_module_or_raise(
-        "emcee",
-        install_hint="Install emcee before running the transit sampler.",
-    )
+    emcee = importlib.import_module('emcee')
 
     ndim = initial_walkers.shape[1]
     n_walkers = initial_walkers.shape[0]
     worker_count = min(int(config.emcee_n_processes), int(n_walkers))
 
     if config.emcee_use_pool and worker_count > 1:
-        try:
-            ctx = get_context(config.emcee_start_method)
-            with ctx.Pool(processes=worker_count) as pool:
-                sampler = emcee.EnsembleSampler(
-                    n_walkers,
-                    ndim,
-                    _log_probability,
-                    args=(dataset, runtime, config, bounds),
-                    pool=pool,
-                )
-                state = sampler.run_mcmc(
-                    initial_walkers,
-                    config.emcee_burnin_steps,
-                    progress=True,
-                )
-                sampler.reset()
-                sampler.run_mcmc(
-                    state,
-                    config.emcee_production_steps,
-                    progress=True,
-                )
-                return sampler, True, worker_count
-        except Exception:
-            pass
+        ctx = get_context(config.emcee_start_method)
+        with ctx.Pool(processes=worker_count) as pool:
+            sampler = emcee.EnsembleSampler(
+                n_walkers,
+                ndim,
+                _log_probability,
+                args=(dataset, runtime, config, bounds),
+                pool=pool,
+            )
+            state = sampler.run_mcmc(
+                initial_walkers,
+                config.emcee_burnin_steps,
+                progress=True,
+            )
+            sampler.reset()
+            sampler.run_mcmc(
+                state,
+                config.emcee_production_steps,
+                progress=True,
+            )
+            return sampler, True, worker_count
 
     sampler = emcee.EnsembleSampler(
         n_walkers,
@@ -803,10 +757,7 @@ def fit_tess_transit_with_mlexo(
     """Run the raw-TESS to mlexo transit fit and return dataset plus best-fit state."""
 
     runtime = _load_mlexo_runtime(config)
-    scipy_optimize = _load_module_or_raise(
-        "scipy.optimize",
-        install_hint="Install scipy before running the transit optimizer.",
-    )
+    scipy_optimize = importlib.import_module('scipy.optimize')
 
     collection = lc_collection if lc_collection is not None else download_tess_lightcurves(config)
     dataset = build_joint_tess_dataset(
@@ -875,9 +826,6 @@ def fit_tess_transit_with_mlexo(
     finite_mask = np.isfinite(posterior_log_prob)
     posterior_theta = posterior_theta[finite_mask]
     posterior_log_prob = posterior_log_prob[finite_mask]
-    if posterior_theta.size == 0:
-        raise RuntimeError("emcee produced no finite posterior samples.")
-
     best_idx = int(np.argmax(posterior_log_prob))
     theta_best = posterior_theta[best_idx]
 
@@ -1001,14 +949,9 @@ def write_tess_bandpass_tbl(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     observable = str(constraint["observable"])
-    mode = str(constraint["mode"]).lower().strip()
     value = float(constraint["value"])
     sigma = float(constraint["sigma"])
 
-    if mode != "transmission":
-        raise ValueError("write_tess_bandpass_tbl currently supports transmission constraints only.")
-    if observable not in {"radius_ratio", "transit_depth"}:
-        raise ValueError("Transmission TESS .tbl export expects 'radius_ratio' or 'transit_depth'.")
 
     transit_depth_fraction = value if observable == "transit_depth" else value**2
     if observable == "transit_depth":

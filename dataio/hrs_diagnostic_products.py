@@ -18,7 +18,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT_ROOT = PROJECT_ROOT / "input" / "hrs"
 PRODUCTS = ("timeseries", "collapse_source")
 ARMS = ("blue", "red")
-REQUIRED_ARRAYS = ("wavelength.npy", "data.npy", "sigma.npy", "phase.npy")
 OPTIONAL_ARRAYS = (
     "jd",
     "airmass",
@@ -36,19 +35,10 @@ def planet_slug(planet: str) -> str:
     return "".join(character for character in str(planet).lower() if character.isalnum())
 
 
-def bundle_is_complete(path: str | Path) -> bool:
-    """Return whether a directory contains the minimum prepared-bundle contract."""
-
-    directory = Path(path)
-    return (directory / "timeseries_prep.json").is_file() and all(
-        (directory / name).is_file() for name in REQUIRED_ARRAYS
-    )
-
-
 def discover_prepared_inventory(
     input_root: str | Path = DEFAULT_INPUT_ROOT,
 ) -> dict[tuple[str, str], dict[str, Any]]:
-    """Discover complete target/mode bundles from preparation metadata.
+    """Discover target/mode bundles from preparation metadata.
 
     The result keeps the inventory shape used by the calibration and diagnostic
     runners: keys are ``(mode, planet_slug)`` and entries contain ``datasets``,
@@ -83,8 +73,6 @@ def discover_prepared_inventory(
             name: root / mode / slug / epoch / arm / name
             for name in PRODUCTS
         }
-        if not all(bundle_is_complete(path) for path in paths.values()):
-            continue
         key = (mode, slug)
         inventory[key]["planet_display"] = display_planet
         inventory[key]["ephemerides"].add(metadata.get("ephemeris"))
@@ -100,17 +88,11 @@ def discover_prepared_inventory(
                 epoch,
                 mode=key[0],
             )
-            if set(arms) != set(active_arms):
-                continue
-            complete_epochs[epoch] = dict(arms)
+            complete_epochs[epoch] = {arm: arms[arm] for arm in active_arms}
             datasets.extend((epoch, arm) for arm in active_arms)
         if not complete_epochs:
             continue
         ephemerides = entry["ephemerides"] - {None}
-        if len(ephemerides) != 1:
-            raise ValueError(
-                f"{key}: expected one saved ephemeris, found {sorted(ephemerides)}."
-            )
         complete[key] = {
             "epochs": complete_epochs,
             "datasets": tuple(datasets),
@@ -123,11 +105,6 @@ def discover_prepared_inventory(
 def _configured_planet_from_slug(slug: str) -> str:
     requested = planet_slug(slug)
     matches = [name for name in config.PLANETS if planet_slug(name) == requested]
-    if len(matches) != 1:
-        raise KeyError(
-            f"Could not uniquely resolve raw planet directory {slug!r}; "
-            f"configured matches={matches}."
-        )
     return matches[0]
 
 
@@ -155,10 +132,6 @@ def discover_raw_calibration_inventory(
             prepared_entry = prepared.get(key)
             if prepared_entry is None:
                 display_planet = _configured_planet_from_slug(planet_dir.name)
-                if "Recommended" not in config.PLANETS[display_planet]:
-                    raise KeyError(
-                        f"{key}: raw-only target has no Recommended ephemeris profile."
-                    )
                 ephemeris = "Recommended"
             else:
                 display_planet = prepared_entry["planet_display"]
@@ -190,18 +163,14 @@ def resolve_product_specs(
     arms: Iterable[str] | None = None,
     input_root: str | Path = DEFAULT_INPUT_ROOT,
 ) -> list[dict[str, Any]]:
-    """Resolve existing prepared product directories for one target and mode."""
+    """Resolve prepared product paths for one target and mode."""
 
-    if mode not in {"transmission", "emission"}:
-        raise ValueError("mode must be 'transmission' or 'emission'.")
-    if product not in PRODUCTS:
-        raise ValueError(f"product must be one of {PRODUCTS}.")
     root = Path(input_root)
     slug = planet_slug(planet)
     target_root = root / mode / slug
     selected_epochs = tuple(str(epoch) for epoch in epochs) if epochs else tuple(
         path.name for path in sorted(target_root.iterdir()) if path.is_dir()
-    ) if target_root.is_dir() else ()
+    )
     requested_arms = tuple(str(arm) for arm in arms) if arms else None
     specs: list[dict[str, Any]] = []
     for epoch in selected_epochs:
@@ -210,8 +179,6 @@ def resolve_product_specs(
         )
         for arm in epoch_arms:
             path = target_root / epoch / arm / product
-            if not path.is_dir():
-                continue
             specs.append(
                 {
                     "planet": planet,
@@ -239,15 +206,8 @@ def load_product_bundle(spec: dict[str, Any]) -> dict[str, Any]:
     """Load one prepared bundle without changing any saved product."""
 
     path = Path(spec["path"])
-    missing = [name for name in REQUIRED_ARRAYS if not (path / name).is_file()]
-    if missing:
-        raise FileNotFoundError(f"{path}: missing required arrays {missing}.")
     metadata_path = path / "timeseries_prep.json"
-    metadata = (
-        json.loads(metadata_path.read_text(encoding="utf-8"))
-        if metadata_path.is_file()
-        else {}
-    )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     bundle: dict[str, Any] = {
         **spec,
         "path": path,
@@ -275,13 +235,13 @@ def load_product_bundle(spec: dict[str, Any]) -> dict[str, Any]:
             name: np.asarray(np.load(array_path), dtype=float)
             for name, array_path in collapsed_names.items()
         }
-        if all(array_path.is_file() for array_path in collapsed_names.values())
+        if collapsed_root.is_dir()
         else None
     )
     sysrem_path = path / "U_sysrem.npz"
     bundle["sysrem"] = (
         {name: np.asarray(value) for name, value in np.load(sysrem_path).items()}
-        if sysrem_path.is_file()
+        if metadata["run_sysrem"]
         else None
     )
     return bundle
@@ -324,13 +284,8 @@ def verify_bundle_edge_trim(
     saved = metadata.get("arm_edge_trim") or {}
     expected_left = float(manifest_row["left_trim_A"])
     expected_right = float(manifest_row["right_trim_A"])
-    try:
-        saved_left = float(saved["left_trim_A"])
-        saved_right = float(saved["right_trim_A"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{bundle['path']}: missing saved arm_edge_trim provenance."
-        ) from exc
+    saved_left = float(saved["left_trim_A"])
+    saved_right = float(saved["right_trim_A"])
     if not np.isclose(saved_left, expected_left, rtol=0.0, atol=absolute_tolerance_A):
         raise ValueError(
             f"{bundle['path']}: saved left trim {saved_left} A does not match "

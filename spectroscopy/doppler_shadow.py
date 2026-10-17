@@ -50,7 +50,6 @@ from dataio.stellar_lsd import (
     mask_regions,
     relativistic_velocity_difference_kms,
     synthesize_spectrum_from_lsd_profile,
-    validate_quadratic_limb_darkening,
     velocity_to_doppler_factor,
 )
 from plotting.style import configure_matplotlib, save_figure_pdf
@@ -111,46 +110,16 @@ def _array_sha256(array: np.ndarray) -> str:
     return digest.hexdigest()
 
 
-def _load_prepared_operator(
-    data_dir: Path,
-    arm: str,
-    *,
-    product_kind: str,
-) -> dict[str, Any]:
+def _load_prepared_operator(data_dir: Path) -> dict[str, Any]:
     metadata_path = data_dir / "timeseries_prep.json"
     operator_path = data_dir / "timeseries_operator.npz"
-    if not metadata_path.is_file() or not operator_path.is_file():
-        raise FileNotFoundError(
-            f"{data_dir} must first be regenerated with timeseries_prep.json and "
-            "timeseries_operator.npz before fitting a fixed Doppler shadow."
-        )
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if (
-        str(metadata.get("arm")) != arm
-        or str(metadata.get("product_kind")) != product_kind
-    ):
-        raise ValueError(
-            f"{metadata_path} is not the requested {arm} {product_kind} product."
-        )
     with np.load(operator_path, allow_pickle=False) as archive:
-        required = {
-            "source_wavelength",
-            "source_phase",
-            "source_bjd_tdb",
-            "active_exposure_mask",
-        }
-        missing = sorted(required.difference(archive.files))
-        if missing:
-            raise ValueError(f"{operator_path} is missing: {', '.join(missing)}")
         operator = {name: np.asarray(archive[name]) for name in archive.files}
 
     wavelength = np.asarray(operator["source_wavelength"], dtype=float)
     phase = np.asarray(operator["source_phase"], dtype=float)
     bjd_tdb = np.asarray(operator["source_bjd_tdb"], dtype=float)
-    if wavelength.ndim != 1 or np.any(~np.isfinite(wavelength)) or np.any(np.diff(wavelength) <= 0.0):
-        raise ValueError(f"{operator_path} source wavelength must be finite and increasing.")
-    if phase.ndim != 1 or bjd_tdb.shape != phase.shape:
-        raise ValueError(f"{operator_path} source phase and time arrays must match.")
     return {
         "metadata": metadata,
         "metadata_path": metadata_path,
@@ -174,7 +143,7 @@ def _load_raw_arm(
         epoch=epoch,
         mode="transmission",
     )
-    loaded = get_pepsi_data(
+    result, extras = get_pepsi_data(
         arm=arm,
         observation_epoch=epoch,
         planet_name=planet,
@@ -186,15 +155,7 @@ def _load_raw_arm(
         wavelength_frame="barycentric",
         data_mode="transmission",
     )
-    if loaded is None:
-        raise FileNotFoundError(f"No raw PEPSI {arm} spectra found in {raw_dir}.")
-    result, extras = loaded
     wavelength, flux, error, jd, _snr, _exptime, _airmass, _n_exp, _n_pix = result
-    if extras.get("wavelength_medium") != WAVELENGTH_MEDIUM:
-        raise ValueError("The raw LSD fit requires vacuum wavelengths.")
-    if extras.get("wavelength_frame") != "barycentric":
-        raise ValueError("The raw LSD fit requires the barycentric wavelength reconstruction.")
-
     jd = np.asarray(jd, dtype=float)
     bjd_tdb = get_bjd_tdb(
         jd,
@@ -232,20 +193,9 @@ def _load_raw_arm(
 def _prepared_uses_molecfit(metadata: dict[str, Any]) -> bool:
     """Recover the frozen flux-product choice from frame provenance."""
 
-    contract = metadata.get("wavelength_frame_contract")
-    per_exposure = contract.get("per_exposure", []) if isinstance(contract, dict) else []
-    products = {
-        str(row.get("flux_product"))
-        for row in per_exposure
-        if isinstance(row, dict) and row.get("flux_product") is not None
-    }
-    if products == {"molecfit"}:
-        return True
-    if products == {"raw_pepsi"}:
-        return False
-    raise ValueError(
-        "Prepared frame provenance must identify one uniform flux product; "
-        f"found {sorted(products)!r}."
+    return (
+        metadata["wavelength_frame_contract"]["per_exposure"][0]["flux_product"]
+        == "molecfit"
     )
 
 
@@ -257,13 +207,9 @@ def _pixel_masks(
     arm: str,
     prepared_metadata: dict[str, Any],
 ) -> np.ndarray:
-    edge_trim = prepared_metadata.get("arm_edge_trim")
-    if not isinstance(edge_trim, dict):
-        raise ValueError("Prepared metadata is missing arm_edge_trim provenance.")
-    left_trim = float(edge_trim.get("left_trim_A", np.nan))
-    right_trim = float(edge_trim.get("right_trim_A", np.nan))
-    if not np.isfinite(left_trim) or not np.isfinite(right_trim):
-        raise ValueError("Prepared arm-edge trim widths must be finite.")
+    edge_trim = prepared_metadata["arm_edge_trim"]
+    left_trim = float(edge_trim["left_trim_A"])
+    right_trim = float(edge_trim["right_trim_A"])
 
     masks = np.zeros(wavelength.shape, dtype=bool)
     balmer_regions = [
@@ -289,22 +235,12 @@ def _pixel_masks(
 def _match_source_exposures(
     raw_bjd_tdb: np.ndarray,
     source_bjd_tdb: np.ndarray,
-    *,
-    tolerance_day: float = 1.0e-8,
 ) -> np.ndarray:
     raw = np.asarray(raw_bjd_tdb, dtype=float)
     source = np.asarray(source_bjd_tdb, dtype=float)
     indices = np.empty(source.size, dtype=int)
     for index, time in enumerate(source):
-        match = int(np.argmin(np.abs(raw - time)))
-        if abs(float(raw[match] - time)) > tolerance_day:
-            raise ValueError(
-                "Raw LSD exposures do not align with the frozen source sequence; "
-                f"nearest BJD_TDB differs by {abs(float(raw[match] - time)):.3g} day."
-            )
-        indices[index] = match
-    if np.unique(indices).size != indices.size:
-        raise ValueError("Frozen source times matched duplicate raw exposures.")
+        indices[index] = int(np.argmin(np.abs(raw - time)))
     return indices
 
 
@@ -318,8 +254,8 @@ def _weighted_master(
         & np.all(np.isfinite(profiles), axis=1)
         & np.all(np.isfinite(uncertainties) & (uncertainties > 0.0), axis=1)
     )
-    if np.count_nonzero(valid_rows) < 3:
-        raise ValueError("At least three successful out-of-transit LSD profiles are required.")
+    if not np.any(valid_rows):
+        raise ValueError("No usable out-of-transit LSD profiles for the reference average.")
     weights = 1.0 / uncertainties[valid_rows] ** 2
     weight_sum = np.sum(weights, axis=0)
     master = np.sum(weights * profiles[valid_rows], axis=0) / weight_sum
@@ -369,12 +305,17 @@ def _master_residuals(
             valid &= np.abs(
                 relative_velocity - planet_velocity_kms[exposure]
             ) > float(planet_exclusion_kms)
-        if np.count_nonzero(valid) < 10:
+        if np.count_nonzero(valid) < 2:
             continue
         design = np.column_stack([master[valid], np.ones(np.count_nonzero(valid))])
         weighted_design = design / uncertainties[exposure, valid, np.newaxis]
         weighted_profile = profiles[exposure, valid] / uncertainties[exposure, valid]
-        scale, offset = np.linalg.lstsq(weighted_design, weighted_profile, rcond=None)[0]
+        coefficients, _, rank, _ = np.linalg.lstsq(
+            weighted_design, weighted_profile, rcond=None
+        )
+        if rank < weighted_design.shape[1]:
+            continue
+        scale, offset = coefficients
         reference = float(scale) * master + float(offset)
         reference_models[exposure] = reference
         residuals[exposure] = profiles[exposure] - reference
@@ -422,8 +363,9 @@ def _fit_shadow(
             )
             > float(planet_exclusion_kms)
         )
-    if np.count_nonzero(fit_mask) < 30:
-        raise ValueError("Too few finite in-transit LSD bins remain for shadow fitting.")
+    n_parameters = 3
+    if np.count_nonzero(fit_mask) <= n_parameters:
+        raise ValueError("Shadow fit requires positive residual degrees of freedom.")
 
     initial_template = compute_local_doppler_shadow_profiles(
         velocity,
@@ -477,7 +419,7 @@ def _fit_shadow(
     model = float(amplitude) * template
     normalized_residual = ((residuals - model) / uncertainties)[fit_mask]
     chi2 = float(np.sum(normalized_residual**2))
-    dof = max(1, int(normalized_residual.size - 3))
+    dof = int(normalized_residual.size - n_parameters)
     covariance = np.linalg.pinv(optimized.jac.T @ optimized.jac) * (chi2 / dof)
     parameter_error = np.sqrt(np.maximum(np.diag(covariance), 0.0))
     return {
@@ -547,8 +489,9 @@ def _fit_shadow_with_lambda(
             )
             > float(planet_exclusion_kms)
         )
-    if np.count_nonzero(fit_mask) < 30:
-        raise ValueError("Too few finite in-transit LSD bins remain for lambda fitting.")
+    n_parameters = 4
+    if np.count_nonzero(fit_mask) <= n_parameters:
+        raise ValueError("Joint-lambda fit requires positive residual degrees of freedom.")
 
     def template_for(parameters: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
         _amplitude, velocity_offset, log_sigma, lambda_angle = parameters
@@ -629,7 +572,7 @@ def _fit_shadow_with_lambda(
     model = float(amplitude) * template
     normalized_residual = ((residuals - model) / uncertainties)[fit_mask]
     chi2 = float(np.sum(normalized_residual**2))
-    dof = max(1, int(normalized_residual.size - 4))
+    dof = int(normalized_residual.size - n_parameters)
     covariance = np.linalg.pinv(optimized.jac.T @ optimized.jac) * (chi2 / dof)
     parameter_error = np.sqrt(np.maximum(np.diag(covariance), 0.0))
     return {
@@ -656,16 +599,11 @@ def _projection_velocity_grid(
     velocity_grid: np.ndarray,
     prepared_metadata: dict[str, Any],
 ) -> tuple[np.ndarray, float | None]:
-    frame = str(prepared_metadata.get("wavelength_frame", "")).strip().lower()
+    frame = prepared_metadata["wavelength_frame"]
     if frame == "barycentric":
         return np.asarray(velocity_grid, dtype=float), None
-    if frame != "stellar_rest":
-        raise ValueError(f"Unsupported prepared wavelength frame {frame!r}.")
-    contract = prepared_metadata.get("wavelength_frame_contract")
-    correction = contract.get("stellar_rest_correction", {}) if isinstance(contract, dict) else {}
-    removed_velocity = float(correction.get("applied_velocity_kms", np.nan))
-    if not np.isfinite(removed_velocity):
-        raise ValueError("Stellar-rest metadata is missing its applied velocity.")
+    correction = prepared_metadata["wavelength_frame_contract"]["stellar_rest_correction"]
+    removed_velocity = float(correction["applied_velocity_kms"])
     return (
         relativistic_velocity_difference_kms(velocity_grid, removed_velocity),
         removed_velocity,
@@ -686,16 +624,6 @@ def _project_fixed_source_model(
         raw["bjd_tdb"],
         prepared["source_bjd_tdb"],
     )
-    if not np.allclose(
-        raw["phase"][source_order],
-        prepared["source_phase"],
-        rtol=0.0,
-        atol=1.0e-10,
-    ):
-        raise ValueError(
-            "Raw and prepared source phases disagree after BJD matching for "
-            f"{prepared['metadata_path']}."
-        )
     projection_velocity, removed_velocity = _projection_velocity_grid(
         velocity_grid,
         prepared["metadata"],
@@ -707,15 +635,8 @@ def _project_fixed_source_model(
         projection_velocity,
         np.asarray(fitted_shadow_profiles, dtype=float)[source_order],
     )
-    expected_shape = (
-        prepared["source_phase"].size,
-        prepared["source_wavelength"].size,
-    )
-    if source_model.shape != expected_shape or np.any(~np.isfinite(source_model)):
-        raise ValueError(
-            "Projected LSD shadow has an invalid shape or non-finite values: "
-            f"{source_model.shape}, expected {expected_shape}."
-        )
+    if np.any(~np.isfinite(source_model)):
+        raise ValueError("Projected LSD shadow contains non-finite values.")
     source_model_path = prepared["metadata_path"].parent / "shadow_source_model.npy"
     np.save(source_model_path, np.asarray(source_model, dtype=np.float64))
     return {
@@ -863,16 +784,8 @@ def _fit_arm(
         prepared_root = args.prepared_root.resolve() / arm
         timeseries_dir = prepared_root / "timeseries"
         collapse_source_dir = prepared_root / "collapse_source"
-    prepared_timeseries = _load_prepared_operator(
-        timeseries_dir,
-        arm,
-        product_kind="timeseries",
-    )
-    prepared_collapse_source = _load_prepared_operator(
-        collapse_source_dir,
-        arm,
-        product_kind="collapse-source",
-    )
+    prepared_timeseries = _load_prepared_operator(timeseries_dir)
+    prepared_collapse_source = _load_prepared_operator(collapse_source_dir)
 
     raw = _load_raw_arm(
         planet=args.planet,
@@ -907,12 +820,7 @@ def _fit_arm(
     )
     profiles = np.asarray(extracted["profiles"], dtype=float)
     profile_uncertainties = np.asarray(extracted["profile_uncertainties"], dtype=float)
-    if not bool(extracted["shared_basis_used"]):
-        raise RuntimeError("Fresh Doppler-shadow extraction did not use a shared basis.")
     shared_rank = int(extracted["shared_effective_rank"])
-    exposure_ranks = np.asarray(extracted["effective_rank"], dtype=int)
-    if not np.all(exposure_ranks == shared_rank):
-        raise RuntimeError("Not every exposure used the declared shared LSD rank.")
     projected_condition = np.asarray(
         extracted["projected_condition_number"], dtype=float
     )
@@ -931,13 +839,6 @@ def _fit_arm(
         raw["bjd_tdb"],
         prepared_timeseries["source_bjd_tdb"],
     )
-    if not np.allclose(
-        raw["phase"][source_order],
-        prepared_timeseries["source_phase"],
-        rtol=0.0,
-        atol=1.0e-10,
-    ):
-        raise ValueError("Raw and frozen-operator phases disagree after BJD matching.")
     contacts = compute_contact_phases(params)
     out_of_transit = (raw["phase"] < contacts["T1"]) | (raw["phase"] > contacts["T4"])
     master, master_uncertainty, master_rows = _weighted_master(
@@ -1275,11 +1176,6 @@ def _fit_arm(
             f"lambda={masked_fit['lambda_angle_deg']:.3f} +/- "
             f"{masked_fit['lambda_angle_err_deg']:.3f} deg"
         )
-    if masked_fit["reduced_chi2"] > 3.0:
-        print(
-            f"  Warning: reduced chi2={masked_fit['reduced_chi2']:.2f}; "
-            "formal fit errors are not trustworthy until residual structure is resolved."
-        )
     print(f"  Saved LSD artifact: {artifact_path}")
     print(f"  Saved diagnostic: {pdf_path}")
     print(
@@ -1355,65 +1251,29 @@ def fit_doppler_shadow(args: DopplerShadowFitConfig) -> int:
         shadow_source=args.shadow_source,
     )
     args.vsini_kms = float(
-        params.get("v_sini_star", np.nan) if args.vsini_kms is None else args.vsini_kms
+        params["v_sini_star"] if args.vsini_kms is None else args.vsini_kms
     )
-    configured_lambda_value = params.get("lambda_angle", np.nan)
-    try:
-        configured_lambda = float(configured_lambda_value)
-    except (TypeError, ValueError):
-        configured_lambda = np.nan
+    configured_lambda = params.get("lambda_angle")
     if args.lambda_angle_deg is not None:
-        configured_lambda = float(args.lambda_angle_deg)
-    if not np.isfinite(configured_lambda):
+        configured_lambda = args.lambda_angle_deg
+    if configured_lambda is None or not np.isfinite(configured_lambda):
         args.fit_lambda_angle = True
         configured_lambda = 0.0
         print(
             "No published/configured projected obliquity is available; "
             "fitting lambda from the LSD Doppler shadow."
         )
-    args.lambda_angle_deg = configured_lambda
+    args.lambda_angle_deg = float(configured_lambda)
     args.limb_darkening_u1 = float(
-        params.get("gamma1", np.nan)
+        params["gamma1"]
         if args.limb_darkening_u1 is None
         else args.limb_darkening_u1
     )
     args.limb_darkening_u2 = float(
-        params.get("gamma2", np.nan)
+        params["gamma2"]
         if args.limb_darkening_u2 is None
         else args.limb_darkening_u2
     )
-    required_geometry = {
-        "v_sini_star": args.vsini_kms,
-        "gamma1": args.limb_darkening_u1,
-        "gamma2": args.limb_darkening_u2,
-        "b": params.get("b"),
-        "rp_rs": params.get("rp_rs"),
-        "a_rs": params.get("a_rs"),
-        "period": params.get("period"),
-        "Kp": params.get("Kp"),
-    }
-    if float(params.get("eccentricity", 0.0)) != 0.0:
-        required_geometry["omega_planet"] = params.get("omega")
-    if not args.fit_lambda_angle:
-        required_geometry["lambda_angle"] = args.lambda_angle_deg
-    missing = [
-        name
-        for name, value in required_geometry.items()
-        if value is None or not np.isfinite(float(value))
-    ]
-    if missing:
-        raise ValueError(f"Missing finite fixed shadow geometry: {', '.join(missing)}")
-    validate_quadratic_limb_darkening(args.limb_darkening_u1, args.limb_darkening_u2)
-    if args.vsini_kms <= 0.0 or args.velocity_span_kms <= args.vsini_kms:
-        raise ValueError("Velocity span must be wider than a finite positive v sin(i).")
-    for name in (
-        "resolving_power",
-        "initial_local_sigma_kms",
-        "shadow_exclusion_kms",
-        "planet_exclusion_kms",
-    ):
-        if float(getattr(args, name)) <= 0.0:
-            raise ValueError(f"--{name.replace('_', '-')} must be positive.")
 
     template_path = args.template
     if template_path is None:

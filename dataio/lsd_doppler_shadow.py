@@ -57,18 +57,6 @@ def compute_doppler_shadow_track(
     """Return the RM velocity track and relative occulted-light weight."""
 
     phase = np.asarray(phase, dtype=float)
-    values = np.asarray(
-        [vsini, lambda_angle, b, rp_rs, a_rs, period, gamma1, gamma2, eccentricity],
-        dtype=float,
-    )
-    if phase.ndim != 1 or np.any(~np.isfinite(phase)) or np.any(~np.isfinite(values)):
-        raise ValueError("Doppler-shadow phases and geometry must be finite.")
-    if vsini <= 0.0 or rp_rs <= 0.0 or a_rs <= 0.0 or period <= 0.0:
-        raise ValueError("vsini, rp_rs, a_rs, and period must be positive.")
-    if float(eccentricity) != 0.0 and (
-        omega_deg is None or not np.isfinite(float(omega_deg))
-    ):
-        raise ValueError("An eccentric Doppler-shadow track requires finite omega_deg.")
 
     x_planet, y_planet = compute_planet_positions(
         phase,
@@ -153,12 +141,6 @@ def compute_local_doppler_shadow_profiles(
     velocity_grid = np.asarray(velocity_grid, dtype=float)
     track_velocity_kms = np.asarray(track_velocity_kms, dtype=float)
     occulted_weight = np.asarray(occulted_weight, dtype=float)
-    if velocity_grid.ndim != 1 or not np.all(np.diff(velocity_grid) > 0.0):
-        raise ValueError("velocity_grid must be a strictly increasing 1D array.")
-    if track_velocity_kms.ndim != 1 or occulted_weight.shape != track_velocity_kms.shape:
-        raise ValueError("Track velocity and occulted weight must be matching 1D arrays.")
-    if not np.isfinite(local_sigma_kms) or local_sigma_kms <= 0.0:
-        raise ValueError("local_sigma_kms must be finite and positive.")
     center = track_velocity_kms + float(velocity_offset_kms)
     gaussian = np.exp(
         -0.5

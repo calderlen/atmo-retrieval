@@ -48,26 +48,23 @@ def phase_coverage_rows(bundles):
     rows = []
     for bundle in bundles:
         phase = _phase_mod1(bundle)
-        finite = phase[np.isfinite(phase)]
-        if finite.size == 0:
-            continue
-        lo = float(np.nanmin(finite))
-        hi = float(np.nanmax(finite))
+        lo = float(np.min(phase))
+        hi = float(np.max(phase))
         if lo <= 0.5 <= hi:
             eclipse_side = "crosses 0.5"
         elif hi < 0.5:
             eclipse_side = "pre-eclipse"
         else:
             eclipse_side = "post-eclipse"
-        visibility = 0.5 * (1.0 - np.cos(2.0 * np.pi * finite))
+        visibility = 0.5 * (1.0 - np.cos(2.0 * np.pi * phase))
         rows.append(
             {
-                "epoch": bundle.get("epoch"),
-                "arm": bundle.get("arm"),
-                "n_exp": int(finite.size),
+                "epoch": bundle["epoch"],
+                "arm": bundle["arm"],
+                "n_exp": int(phase.size),
                 "phase_min": lo,
                 "phase_max": hi,
-                "phase_mean": float(np.nanmean(finite)),
+                "phase_mean": float(np.mean(phase)),
                 "eclipse_side": eclipse_side,
                 "mean_dayside_visibility_proxy": float(np.nanmean(visibility)),
             }
@@ -81,11 +78,7 @@ def plot_dayside_phase_coverage(bundles):
     records = []
     for bundle in bundles:
         phase = _phase_mod1(bundle)
-        phase = phase[np.isfinite(phase)]
-        if phase.size:
-            records.append((bundle, np.sort(phase)))
-    if not records:
-        return None
+        records.append((bundle, np.sort(phase)))
 
     fig, ax = plt.subplots(
         figsize=(7.2, 7.2),
@@ -95,8 +88,8 @@ def plot_dayside_phase_coverage(bundles):
     colors = {"blue": "tab:blue", "red": "tab:red"}
     labeled_arms = set()
     for bundle, phase in records:
-        arm = str(bundle.get("arm"))
-        color = colors.get(arm, "0.25")
+        arm = str(bundle["arm"])
+        color = colors[arm]
         label = f"{arm} arm" if arm not in labeled_arms else None
         ax.scatter(
             2.0 * np.pi * phase,
@@ -160,17 +153,15 @@ def arm_phase_alignment_rows(bundles):
 
     grouped = {}
     for bundle in bundles:
-        grouped.setdefault(str(bundle.get("epoch")), {})[str(bundle.get("arm"))] = _phase_mod1(bundle)
+        grouped.setdefault(str(bundle["epoch"]), {})[str(bundle["arm"])] = _phase_mod1(bundle)
 
     rows = []
     for epoch in sorted(grouped):
         arms = grouped[epoch]
         if "blue" not in arms or "red" not in arms:
             continue
-        blue = np.sort(arms["blue"][np.isfinite(arms["blue"])])
-        red = np.sort(arms["red"][np.isfinite(arms["red"])])
-        if blue.size == 0 or red.size == 0:
-            continue
+        blue = np.sort(arms["blue"])
+        red = np.sort(arms["red"])
         intersection = max(0.0, min(float(blue[-1]), float(red[-1])) - max(float(blue[0]), float(red[0])))
         union = max(float(blue[-1]), float(red[-1])) - min(float(blue[0]), float(red[0]))
         nearest_blue = np.min(np.abs(blue[:, None] - red[None, :]), axis=1)
@@ -197,7 +188,7 @@ def plot_arm_phase_alignment(bundles):
 
     grouped = {}
     for bundle in bundles:
-        grouped.setdefault(str(bundle.get("epoch")), {})[str(bundle.get("arm"))] = np.sort(_phase_mod1(bundle))
+        grouped.setdefault(str(bundle["epoch"]), {})[str(bundle["arm"])] = np.sort(_phase_mod1(bundle))
     epochs = [epoch for epoch in sorted(grouped) if "blue" in grouped[epoch] and "red" in grouped[epoch]]
     if not epochs:
         return None
@@ -211,14 +202,11 @@ def plot_arm_phase_alignment(bundles):
     for index, epoch in enumerate(epochs):
         for arm in ("blue", "red"):
             phase = grouped[epoch][arm]
-            finite = phase[np.isfinite(phase)]
-            if finite.size == 0:
-                continue
             y = index + offsets[arm]
-            ax.plot([finite[0], finite[-1]], [y, y], color=colors[arm], lw=1.25, alpha=0.8)
+            ax.plot([phase[0], phase[-1]], [y, y], color=colors[arm], lw=1.25, alpha=0.8)
             ax.scatter(
-                finite,
-                np.full(finite.size, y),
+                phase,
+                np.full(phase.size, y),
                 s=14,
                 color=colors[arm],
                 marker="o" if arm == "blue" else "s",
@@ -284,7 +272,7 @@ def plot_epoch_species_coherence(
             omega_deg=omega_deg,
         )
         phase = _phase_mod1(bundle)
-        phase_mean = float(np.nanmean(phase)) if np.any(np.isfinite(phase)) else np.nan
+        phase_mean = float(np.mean(phase))
         for result in results:
             by_species[result["species"]].append(
                 {
@@ -296,11 +284,11 @@ def plot_epoch_species_coherence(
                     ),
                 }
             )
-    available = [(name, by_species[name]) for name in species if by_species.get(name)]
+    available = [(name, by_species[name]) for name in species if by_species[name]]
     if not available:
         return None
 
-    ncols = max(1, int(ncols))
+    ncols = int(ncols)
     nrows = int(math.ceil(len(available) / ncols))
     max_bundle_rows = max(len(records) for _, records in available)
     fig, axes = plt.subplots(
@@ -312,7 +300,7 @@ def plot_epoch_species_coherence(
     )
     images = []
     for ax, (species_name, records) in zip(axes.ravel(), available):
-        records = sorted(records, key=lambda item: (item["phase_mean"], item["bundle"].get("epoch"), item["bundle"].get("arm")))
+        records = sorted(records, key=lambda item: (item["phase_mean"], item["bundle"]["epoch"], item["bundle"]["arm"]))
         matrix = np.stack([item["standardized"] for item in records], axis=0)
         velocity = records[0]["result"]["velocity"]
         finite = np.abs(matrix[np.isfinite(matrix)])
@@ -331,7 +319,7 @@ def plot_epoch_species_coherence(
         ax.set_yticks(np.arange(len(records)))
         ax.set_yticklabels(
             [
-                f"{item['bundle'].get('epoch')} {item['bundle'].get('arm')}  phi={item['phase_mean']:.3f}"
+                f"{item['bundle']['epoch']} {item['bundle']['arm']}  phi={item['phase_mean']:.3f}"
                 f"  cov0={item['result']['center_coverage_fraction']:.0%}"
                 for item in records
             ],
@@ -341,15 +329,14 @@ def plot_epoch_species_coherence(
         ax.set_xlabel("Velocity relative to vacuum rest wavelength [km/s]")
     for ax in axes.ravel()[len(available) :]:
         ax.set_axis_off()
-    if images:
-        fig.colorbar(
-            images[-1],
-            ax=[ax for ax in axes.ravel() if ax.axison],
-            pad=0.012,
-            fraction=0.018,
-            label="Profile / off-line MAD scale (display only)",
-        )
-    frame = "planet frame" if kp_kms is not None and np.isfinite(float(kp_kms)) else "line rest frame"
+    fig.colorbar(
+        images[-1],
+        ax=[ax for ax in axes.ravel() if ax.axison],
+        pad=0.012,
+        fraction=0.018,
+        label="Profile / off-line MAD scale (display only)",
+    )
+    frame = "planet frame" if kp_kms is not None else "line rest frame"
     fig.suptitle(
         f"Species repeatability across prepared bundles ({frame}); rows are independently standardized",
         fontsize=13,
@@ -434,15 +421,15 @@ def plot_eclipse_side_species_comparison(
 
     comparable = []
     for species_name in species:
-        pre = _combine_profiles(side_results["pre"].get(species_name, []))
-        post = _combine_profiles(side_results["post"].get(species_name, []))
+        pre = _combine_profiles(side_results["pre"][species_name])
+        post = _combine_profiles(side_results["post"][species_name])
         if pre is not None and post is not None:
             comparable.append((species_name, pre, post))
     if not comparable:
         print("No species has sufficient coverage on both sides of secondary eclipse.")
         return None
 
-    ncols = max(1, int(ncols))
+    ncols = int(ncols)
     nrows = int(math.ceil(len(comparable) / ncols))
     fig, axes = plt.subplots(
         nrows,
@@ -483,7 +470,7 @@ def plot_eclipse_side_species_comparison(
     for ax in axes[-1, :]:
         if ax.axison:
             ax.set_xlabel("Velocity relative to vacuum rest wavelength [km/s]")
-    frame = "planet frame" if kp_kms is not None and np.isfinite(float(kp_kms)) else "line rest frame"
+    frame = "planet frame" if kp_kms is not None else "line rest frame"
     fig.suptitle(
         f"Pre/post-secondary-eclipse species comparison ({frame}; diagnostic, not a detection test)",
         fontsize=13,
@@ -497,28 +484,18 @@ def plot_sysrem_component_diagnostics(bundles):
     records = []
     chunk_names = []
     for bundle in bundles:
-        z = bundle.get("sysrem")
-        if z is None or "basis_counts" not in z.files:
-            continue
-        names = (
-            [str(value) for value in np.asarray(z["chunk_names"]).tolist()]
-            if "chunk_names" in z.files
-            else [f"chunk_{index}" for index in range(np.asarray(z["basis_counts"]).size)]
-        )
+        z = bundle["sysrem"]
+        names = [str(value) for value in np.asarray(z["chunk_names"]).tolist()]
         for name in names:
             if name not in chunk_names:
                 chunk_names.append(name)
         records.append((bundle, z, names))
-    if not records:
-        return None
-
-    labels = [f"{bundle.get('epoch')} {bundle.get('arm')}" for bundle, _, _ in records]
+    labels = [f"{bundle['epoch']} {bundle['arm']}" for bundle, _, _ in records]
     counts = np.full((len(records), len(chunk_names)), np.nan)
     for row, (_, z, names) in enumerate(records):
         basis_counts = np.asarray(z["basis_counts"], dtype=float).ravel()
         for index, name in enumerate(names):
-            if index < basis_counts.size:
-                counts[row, chunk_names.index(name)] = basis_counts[index]
+            counts[row, chunk_names.index(name)] = basis_counts[index]
 
     fig, axes = plt.subplots(1, 3, figsize=(16.5, max(5.0, 0.38 * len(records) + 2.1)), constrained_layout=True)
     masked_counts = np.ma.masked_invalid(counts)
@@ -535,25 +512,16 @@ def plot_sysrem_component_diagnostics(bundles):
     fig.colorbar(image, ax=axes[0], pad=0.012, fraction=0.045, label="Accepted components")
 
     epoch_colors = {}
-    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["0.2"])
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     for bundle, z, names in records:
-        epoch = str(bundle.get("epoch"))
+        epoch = str(bundle["epoch"])
         if epoch not in epoch_colors:
             epoch_colors[epoch] = color_cycle[len(epoch_colors) % len(color_cycle)]
-        before = np.asarray(z["sysrem_stddev_before"], dtype=float) if "sysrem_stddev_before" in z.files else None
-        after = np.asarray(z["sysrem_stddev_after"], dtype=float) if "sysrem_stddev_after" in z.files else None
-        accepted = np.asarray(z["sysrem_component_accepted"], dtype=bool) if "sysrem_component_accepted" in z.files else None
-        if before is None or after is None:
-            continue
-        before = np.atleast_2d(before)
-        after = np.atleast_2d(after)
-        if accepted is None:
-            accepted = np.isfinite(after)
-        accepted = np.atleast_2d(accepted)
-        target_ax = axes[1] if bundle.get("arm") == "blue" else axes[2]
+        before = np.asarray(z["sysrem_stddev_before"], dtype=float)
+        after = np.asarray(z["sysrem_stddev_after"], dtype=float)
+        accepted = np.asarray(z["sysrem_component_accepted"], dtype=bool)
+        target_ax = axes[1] if bundle["arm"] == "blue" else axes[2]
         for chunk_index, name in enumerate(names):
-            if chunk_index >= before.shape[1] or chunk_index >= after.shape[1]:
-                continue
             keep = accepted[:, chunk_index] & np.isfinite(after[:, chunk_index])
             component = np.flatnonzero(keep) + 1
             if component.size == 0:
@@ -577,8 +545,7 @@ def plot_sysrem_component_diagnostics(bundles):
         ax.set_xlabel("Accepted component number")
         ax.set_ylabel("Residual scatter / initial scatter")
         ax.set_title(f"{arm.title()}-arm scatter reduction")
-        if ax.lines:
-            ax.legend(loc="best", fontsize=6.5)
+        ax.legend(loc="best", fontsize=6.5)
     fig.suptitle("Persisted SYSREM component diagnostics", fontsize=13)
     return fig, axes
 
@@ -666,7 +633,7 @@ def plot_time_domain_coherence(bundle, *, sigma_threshold=0.5, max_wavelength_po
     axes[2].set_xlabel("Midpoint orbital phase (mod 1)")
     axes[2].set_ylabel("Adjacent-exposure correlation")
     axes[2].set_title("Lag-one spectral coherence (phase gaps excluded)")
-    fig.suptitle(f"Time-domain residual coherence: {bundle.get('epoch')} {bundle.get('arm')}", fontsize=13)
+    fig.suptitle(f"Time-domain residual coherence: {bundle['epoch']} {bundle['arm']}", fontsize=13)
     return fig, axes
 
 

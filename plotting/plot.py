@@ -42,9 +42,6 @@ def _augment_corner_samples(sample_dict: dict | None) -> dict | None:
             continue
 
         arr = np.asarray(values, dtype=float)
-        if arr.size == 0 or np.any(~np.isfinite(arr)) or np.any(arr <= 0.0):
-            continue
-
         augmented[_replace_basename(name, f"log10_{base}")] = np.log10(arr)
 
     return augmented
@@ -84,17 +81,11 @@ def _bin_observed_spectrum(
     errors: np.ndarray,
     max_bins: int = 300,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    wavelength = np.asarray(wavelength, dtype=float).reshape(-1)
-    values = np.asarray(values, dtype=float).reshape(-1)
-    errors = np.asarray(errors, dtype=float).reshape(-1)
+    wavelength = np.asarray(wavelength, dtype=float)
+    values = np.asarray(values, dtype=float)
+    errors = np.asarray(errors, dtype=float)
 
-    if not (wavelength.size == values.size == errors.size):
-        raise ValueError(
-            "wavelength, values, and errors must have the same flattened length "
-            f"(got {wavelength.size}, {values.size}, {errors.size})."
-        )
-
-    valid = np.isfinite(wavelength) & np.isfinite(values) & np.isfinite(errors)
+    valid = np.isfinite(values) & np.isfinite(errors)
     if not np.any(valid):
         return np.array([]), np.array([]), np.array([])
 
@@ -136,26 +127,16 @@ def _bin_observed_spectrum(
     binned_errors = []
 
     for indices in index_bins:
-        if indices.size == 0:
-            continue
-
         wave_bin = wavelength[indices]
         value_bin = values[indices]
         error_bin = errors[indices]
         positive_error = error_bin > 0.0
-
-        if np.any(positive_error):
-            weights = 1.0 / np.square(error_bin[positive_error])
-            binned_wavelength.append(float(np.average(wave_bin[positive_error], weights=weights)))
-            binned_values.append(float(np.average(value_bin[positive_error], weights=weights)))
-            binned_errors.append(float(np.sqrt(1.0 / np.sum(weights))))
-        else:
-            binned_wavelength.append(float(np.mean(wave_bin)))
-            binned_values.append(float(np.mean(value_bin)))
-            if value_bin.size > 1:
-                binned_errors.append(float(np.std(value_bin) / np.sqrt(value_bin.size)))
-            else:
-                binned_errors.append(np.nan)
+        if not np.any(positive_error):
+            continue
+        weights = 1.0 / np.square(error_bin[positive_error])
+        binned_wavelength.append(float(np.average(wave_bin[positive_error], weights=weights)))
+        binned_values.append(float(np.average(value_bin[positive_error], weights=weights)))
+        binned_errors.append(float(np.sqrt(1.0 / np.sum(weights))))
 
     return (
         np.asarray(binned_wavelength),
@@ -177,11 +158,6 @@ def plot_transmission_spectrum(
     rp_hmc_np = np.asarray(rp_hmc)
     if rp_hmc_np.ndim == 1:
         rp_hmc_np = rp_hmc_np[None, :]
-    if rp_hmc_np.ndim != 2:
-        raise ValueError(
-            "rp_hmc must contain posterior predictive spectra with shape "
-            f"(draw, wavelength); got {rp_hmc_np.shape}."
-        )
     q16, median, q84 = np.nanpercentile(rp_hmc_np, [16.0, 50.0, 84.0], axis=0)
     rp_svi_np = None if rp_svi is None else np.asarray(rp_svi)
 
@@ -214,7 +190,7 @@ def plot_transmission_spectrum(
     else:
         bin_residual = np.array([])
 
-    has_pre_sysrem = rp_pre_sysrem is not None and rp_pre_sysrem_err is not None
+    has_pre_sysrem = rp_pre_sysrem is not None
     if has_pre_sysrem:
         pre_sorted = np.asarray(rp_pre_sysrem, dtype=float)[sort_idx]
         pre_err_sorted = np.asarray(rp_pre_sysrem_err, dtype=float)[sort_idx]
@@ -365,11 +341,6 @@ def plot_emission_spectrum(
     fp_hmc_np = np.asarray(fp_hmc)
     if fp_hmc_np.ndim == 1:
         fp_hmc_np = fp_hmc_np[None, :]
-    if fp_hmc_np.ndim != 2:
-        raise ValueError(
-            "fp_hmc must contain posterior predictive spectra with shape "
-            f"(draw, wavelength); got {fp_hmc_np.shape}."
-        )
     q16, median, q84 = np.nanpercentile(fp_hmc_np, [16.0, 50.0, 84.0], axis=0)
     fp_svi_np = None if fp_svi is None else np.asarray(fp_svi)
 
@@ -436,10 +407,7 @@ def plot_temperature_profile(
         arr = np.asarray(values)
         if arr.ndim > 0:
             sample_sizes.append(arr.shape[0])
-    if not sample_sizes:
-        raise ValueError("posterior_samples does not contain any sample arrays.")
-
-    n_samples = min(sample_sizes)
+    n_samples = sample_sizes[0]
     draw_count = min(Ncurve, n_samples)
     draw_indices = np.random.choice(n_samples, draw_count, replace=False)
 
@@ -486,41 +454,30 @@ def plot_temperature_profile(
 def _corner_data(
     sample_dict: dict,
     variables: list[str] | None,
-) -> tuple[np.ndarray | None, list[str] | None]:
+) -> tuple[np.ndarray, list[str]]:
     if variables is None:
         variables = list(sample_dict.keys())
 
     cols = []
     labels = []
-    available = []
     for var in variables:
-        if var in sample_dict:
-            available.append(var)
-    for var in available:
         arr = np.asarray(sample_dict[var])
         arr = arr.reshape(arr.shape[0], -1)
         for j in range(arr.shape[1]):
             cols.append(arr[:, j])
             base_label = _corner_label(var)
             labels.append(base_label if arr.shape[1] == 1 else f"{base_label}[{j}]")
-    if not cols:
-        return None, None
     return np.column_stack(cols), labels
 
 
 def _is_corner_friendly(arr: np.ndarray, max_components: int = 6) -> bool:
     if arr.ndim == 0:
         return False
-    if arr.shape[0] < 2:
-        return False
     n_components = 1 if arr.ndim == 1 else int(np.prod(arr.shape[1:]))
     return n_components <= max_components
 
 
 def _default_corner_variables(sample_dict: dict) -> list[str]:
-    if not sample_dict:
-        return []
-
     priority = [
         "Kp", "v_sys",
         "Rp", "Mp", "Rstar",
@@ -528,8 +485,6 @@ def _default_corner_variables(sample_dict: dict) -> list[str]:
         "T_deep", "log_P_trans", "delta_P",
         "log_metallicity", "C_O_ratio",
     ]
-    skip_names: set[str] = set()
-
     corner_ready = {}
     for name, values in sample_dict.items():
         arr = np.asarray(values)
@@ -553,7 +508,7 @@ def _default_corner_variables(sample_dict: dict) -> list[str]:
             log_name = _replace_basename(name, f"log10_{base}")
             if log_name in corner_ready:
                 continue
-        if name in selected or base in skip_names or base.endswith("_kms"):
+        if name in selected or base.endswith("_kms"):
             continue
         selected.append(name)
 
@@ -570,14 +525,14 @@ def _filter_corner_datasets(
     for i, label in enumerate(labels):
         for data, _color, _extra_kwargs in datasets:
             col = np.asarray(data[:, i], dtype=float)
-            if col.size < 2 or np.any(~np.isfinite(col)) or np.min(col) == np.max(col):
+            if np.min(col) == np.max(col):
                 keep[i] = False
                 dropped.append(label)
                 break
 
     if dropped:
         print(
-            "Skipping corner column(s) with non-finite values or no dynamic range: "
+            "Skipping constant corner column(s): "
             + ", ".join(dropped)
         )
 
@@ -602,26 +557,18 @@ def plot_corner(
 
     if hmc_samples is not None:
         hmc_data, labels_hmc = _corner_data(hmc_samples, variables)
-        if hmc_data is not None:
-            labels = labels_hmc
-            datasets.append((hmc_data, "C0", {}))
+        labels = labels_hmc
+        datasets.append((hmc_data, "C0", {}))
 
     if svi_samples is not None:
         svi_data, labels_svi = _corner_data(svi_samples, variables)
         if labels is None:
             labels = labels_svi
-        if svi_data is not None and labels_svi == labels:
-            datasets.append((svi_data, "C3", {"hist_kwargs": {"linestyle": "--"}}))
-        elif svi_data is not None:
-            print("SVI/HMC corner labels do not match; skipping overlay dataset.")
-
-    if not datasets or labels is None:
-        print("No data for corner plot; skipping.")
-        return
+        datasets.append((svi_data, "C3", {"hist_kwargs": {"linestyle": "--"}}))
 
     datasets, labels = _filter_corner_datasets(datasets, labels)
-    if not datasets or not labels:
-        print("No corner columns with finite dynamic range; skipping.")
+    if not datasets:
+        print("No varying corner parameters; skipping.")
         return
 
     fig = None
@@ -630,10 +577,6 @@ def plot_corner(
             data, labels=labels, color=color, bins=40, smooth=1.0,
             fig=fig, show_titles=True, **extra_kwargs,
         )
-
-    if fig is None:
-        print("No corner figure was generated; skipping save.")
-        return
 
     save_path = save_figure_pdf(fig, save_path, dpi=200)
     plt.close(fig)
@@ -649,102 +592,50 @@ def save_retrieval_corner_plots(
     hmc_corner_samples = _augment_corner_samples(hmc_samples)
     svi_corner_samples = _augment_corner_samples(svi_samples)
 
-    if hmc_corner_samples is None and svi_corner_samples is None:
-        print("No posterior samples available for corner plots; skipping.")
-        return
-
     if variables is None:
-        merged_samples = {}
-        if hmc_corner_samples is not None:
-            merged_samples.update(hmc_corner_samples)
+        merged_samples = dict(
+            hmc_corner_samples if hmc_corner_samples is not None else svi_corner_samples
+        )
         if svi_corner_samples is not None:
             for key, value in svi_corner_samples.items():
                 merged_samples.setdefault(key, value)
         variables = _default_corner_variables(merged_samples)
 
-    if not variables:
-        print("No suitable variables for corner plots; skipping.")
-        return
-
     if svi_corner_samples is not None:
-        svi_vars = []
-        for var in variables:
-            if var in svi_corner_samples:
-                svi_vars.append(var)
-        if svi_vars:
-            plot_corner(
-                svi_samples=svi_corner_samples,
-                variables=svi_vars,
-                save_path=os.path.join(output_dir, "corner_plot_svi.pdf"),
-            )
-        else:
-            print("No SVI variables available for corner_plot_svi.pdf; skipping.")
+        svi_vars = [var for var in variables if var in svi_corner_samples]
+        plot_corner(
+            svi_samples=svi_corner_samples,
+            variables=svi_vars,
+            save_path=os.path.join(output_dir, "corner_plot_svi.pdf"),
+        )
 
     if hmc_corner_samples is not None:
-        hmc_vars = []
-        for var in variables:
-            if var in hmc_corner_samples:
-                hmc_vars.append(var)
-        if hmc_vars:
-            plot_corner(
-                hmc_samples=hmc_corner_samples,
-                variables=hmc_vars,
-                save_path=os.path.join(output_dir, "corner_plot_hmc.pdf"),
-            )
-        else:
-            print("No HMC variables available for corner_plot_hmc.pdf; skipping.")
+        hmc_vars = [var for var in variables if var in hmc_corner_samples]
+        plot_corner(
+            hmc_samples=hmc_corner_samples,
+            variables=hmc_vars,
+            save_path=os.path.join(output_dir, "corner_plot_hmc.pdf"),
+        )
 
     if hmc_corner_samples is not None and svi_corner_samples is not None:
-        overlay_vars = []
-        for var in variables:
-            if var in hmc_corner_samples and var in svi_corner_samples:
-                overlay_vars.append(var)
-        if overlay_vars:
-            plot_corner(
-                hmc_samples=hmc_corner_samples,
-                svi_samples=svi_corner_samples,
-                variables=overlay_vars,
-                save_path=os.path.join(output_dir, "corner_plot_overlay.pdf"),
-            )
-        else:
-            print("No overlapping HMC/SVI variables for corner_plot_overlay.pdf; skipping.")
-
-
-def create_transmission_plots(
-    losses: np.ndarray,
-    wav_obs: np.ndarray,
-    rp_mean: np.ndarray,
-    rp_std: np.ndarray,
-    predictions: dict,
-    svi_mu: np.ndarray | None,
-    posterior_sample: dict,
-    svi_samples: dict | None,
-    opa_mols: dict,
-    art: object,
-    output_dir: str,
-) -> None:
-    print("Generating diagnostic plots...")
-
-    plot_svi_loss(losses, os.path.join(output_dir, "svi_loss.pdf"))
-
-    plot_transmission_spectrum(
-        wav_obs, rp_mean, rp_std, predictions["rp"], svi_mu,
-        os.path.join(output_dir, "transmission_spectrum.pdf")
-    )
-
-    plot_temperature_profile(
-        posterior_sample, art, os.path.join(output_dir, "temperature_profile.pdf")
-    )
-
-    save_retrieval_corner_plots(
-        output_dir=output_dir,
-        hmc_samples=posterior_sample,
-        svi_samples=svi_samples,
-    )
+        overlay_vars = [
+            var for var in variables
+            if var in hmc_corner_samples and var in svi_corner_samples
+        ]
+        plot_corner(
+            hmc_samples=hmc_corner_samples,
+            svi_samples=svi_corner_samples,
+            variables=overlay_vars,
+            save_path=os.path.join(output_dir, "corner_plot_overlay.pdf"),
+        )
 
 
 # ==============================================================================
 # PHASE-RESOLVED ANALYSIS PLOTS
+# ==============================================================================
+
+# ==============================================================================
+# CONTRIBUTION FUNCTION PLOTS
 # ==============================================================================
 
 def plot_phase_trace(
@@ -946,15 +837,10 @@ def plot_ccf_pair(
         plt.show()
 
 
-# ==============================================================================
-# CONTRIBUTION FUNCTION PLOTS
-# ==============================================================================
-
 def _normalize_contribution(raw_contribution: np.ndarray) -> np.ndarray:
-    contribution = np.nan_to_num(raw_contribution, nan=0.0, posinf=0.0, neginf=0.0)
-    contribution = np.clip(contribution, 0.0, None)
+    contribution = np.asarray(raw_contribution, dtype=float)
     contribution_sum = np.sum(contribution, axis=0, keepdims=True)
-    contribution_sum = np.where(contribution_sum > 0.0, contribution_sum, 1.0)
+    contribution_sum = np.where(contribution_sum != 0.0, contribution_sum, 1.0)
     return contribution / contribution_sum
 
 
@@ -984,33 +870,22 @@ def compute_contribution_function(
         cf: Contribution function, shape (n_layers, n_wavelength)
     """
     mode = str(mode).lower().strip()
-    if mode not in {"transmission", "emission"}:
-        raise ValueError(f"Unsupported contribution-function mode: {mode!r}")
-
     dtau = np.asarray(dtau, dtype=float)
     Tarr = np.asarray(Tarr, dtype=float)
     pressure = np.asarray(pressure, dtype=float)
     dParr = np.asarray(dParr, dtype=float)
     nu_grid = np.asarray(nu_grid, dtype=float)
 
-    if dtau.ndim != 2:
-        raise ValueError(f"dtau must be 2D, got shape {dtau.shape}.")
-    if dtau.shape != (pressure.size, nu_grid.size):
-        raise ValueError(
-            "dtau shape must match (n_pressure, n_wavenumber); "
-            f"got {dtau.shape}, pressure={pressure.size}, nu_grid={nu_grid.size}."
-        )
-
     tau_cumsum = np.cumsum(dtau, axis=0)
-    escape = np.exp(-np.clip(tau_cumsum, 0.0, 700.0))
+    escape = np.exp(-np.minimum(tau_cumsum, 700.0))
 
     if mode == "transmission":
         return _normalize_contribution(dtau * escape)
 
-    pressure_weight = pressure[:, None] / np.clip(dParr[:, None], 1.0e-300, None)
-    temperature = np.clip(Tarr[:, None], 1.0e-300, None)
-    nu = np.clip(nu_grid[None, :], 1.0e-300, None)
-    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+    pressure_weight = pressure[:, None] / dParr[:, None]
+    temperature = Tarr[:, None]
+    nu = nu_grid[None, :]
+    with np.errstate(over="ignore"):
         source_weight = np.power(nu, 3) / np.expm1(_HC_OVER_K_CM * nu / temperature)
     return _normalize_contribution(escape * dtau * pressure_weight * source_weight)
 

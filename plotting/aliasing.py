@@ -226,38 +226,37 @@ def generate_aliasing_report(
     }
     
     # Generate text report
-    if output_path or True:  # Always print to console
-        lines = []
-        lines.append("=" * 70)
-        lines.append("SPECIES ALIASING DIAGNOSTIC REPORT")
-        lines.append("=" * 70)
+    lines = []
+    lines.append("=" * 70)
+    lines.append("SPECIES ALIASING DIAGNOSTIC REPORT")
+    lines.append("=" * 70)
+    lines.append("")
+    lines.append(f"Number of species analyzed: {len(species_names)}")
+    lines.append(f"Correlation threshold: {threshold}")
+    lines.append(f"Velocity range: {velocity_range[0]} to {velocity_range[1]} km/s")
+    lines.append("")
+
+    if aliased_pairs:
+        lines.append("WARNING: Potential aliasing detected!")
+        lines.append("-" * 70)
+        for sp_a, sp_b, corr, vel in aliased_pairs:
+            lines.append(f"  {sp_a} <-> {sp_b}: r = {corr:.3f} at v = {vel:.1f} km/s")
         lines.append("")
-        lines.append(f"Number of species analyzed: {len(species_names)}")
-        lines.append(f"Correlation threshold: {threshold}")
-        lines.append(f"Velocity range: {velocity_range[0]} to {velocity_range[1]} km/s")
-        lines.append("")
-        
-        if aliased_pairs:
-            lines.append("WARNING: Potential aliasing detected!")
-            lines.append("-" * 70)
-            for sp_a, sp_b, corr, vel in aliased_pairs:
-                lines.append(f"  {sp_a} <-> {sp_b}: r = {corr:.3f} at v = {vel:.1f} km/s")
-            lines.append("")
-            lines.append("These species pairs have significant template overlap.")
-            lines.append("Detections of the weaker species may be affected by the stronger one.")
-        else:
-            lines.append("No significant aliasing detected (all correlations < threshold).")
-        
-        lines.append("")
-        lines.append("=" * 70)
-        
-        report_text = "\n".join(lines)
-        print(report_text)
-        
-        if output_path:
-            with open(output_path, "w") as f:
-                f.write(report_text)
-            print(f"\nReport saved to: {output_path}")
+        lines.append("These species pairs have significant template overlap.")
+        lines.append("Detections of the weaker species may be affected by the stronger one.")
+    else:
+        lines.append("No significant aliasing detected (all correlations < threshold).")
+
+    lines.append("")
+    lines.append("=" * 70)
+
+    report_text = "\n".join(lines)
+    print(report_text)
+
+    if output_path:
+        with open(output_path, "w") as f:
+            f.write(report_text)
+        print(f"\nReport saved to: {output_path}")
     
     return result
 

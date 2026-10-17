@@ -53,8 +53,6 @@ def _selected_cases(args: argparse.Namespace) -> list[dict]:
         )
         if datasets:
             selected.append({**entry, "mode": mode, "slug": slug, "datasets": datasets})
-    if not selected:
-        raise SystemExit("No matching raw edge-trim calibration datasets were found.")
     return selected
 
 
@@ -68,8 +66,6 @@ def _print_cases(cases: list[dict]) -> None:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if not args.list and not args.all and args.planet is None:
-        raise SystemExit("Pass --planet, --all, or --list.")
     cases = _selected_cases(args)
     if args.list or args.dry_run:
         _print_cases(cases)

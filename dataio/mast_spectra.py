@@ -196,14 +196,10 @@ def load_alias_registry(path: str | Path = DEFAULT_ALIAS_REGISTRY) -> dict[str, 
 
     path = Path(path)
     payload = json.loads(path.read_text())
-    if payload.get("schema_version") != 1 or not isinstance(payload.get("targets"), dict):
-        raise ValueError(f"Invalid MAST target alias registry: {path}")
 
     registry: dict[str, tuple[str, ...]] = {}
     for name, entry in payload["targets"].items():
-        aliases = entry.get("archive_target_names", []) if isinstance(entry, dict) else []
-        if not isinstance(aliases, list) or not all(isinstance(item, str) for item in aliases):
-            raise ValueError(f"Invalid archive_target_names entry for {name!r} in {path}")
+        aliases = entry["archive_target_names"]
         registry[target_slug(name)] = tuple(dict.fromkeys(alias.strip() for alias in aliases if alias.strip()))
     return registry
 
@@ -406,10 +402,6 @@ def build_uri_records(data_uris: Iterable[str]) -> list[ProductRecord]:
         uri = str(raw_uri).strip()
         if not uri or uri.startswith("#"):
             continue
-        if not uri.lower().startswith("mast:"):
-            raise ValueError(
-                f"Exact product {uri!r} is not a MAST data URI. Expected a value beginning with 'mast:'."
-            )
         if uri in seen:
             continue
         seen.add(uri)
@@ -462,10 +454,6 @@ def select_products(
     """Select a bounded download set using an explicit scientific product profile."""
 
     product_profile = str(product_profile).lower()
-    if product_profile not in PRODUCT_PROFILES:
-        raise ValueError(
-            f"Unknown product profile {product_profile!r}; choose from {PRODUCT_PROFILES}"
-        )
 
     explicit_subgroups = product_subgroups is not None
     requested_subgroups = {
@@ -607,13 +595,7 @@ def query_mast(config: MastQueryConfig, observations_client: Any | None = None) 
     """Query object/cone and exact target labels, then union observations by ``obsid``."""
 
     if observations_client is None:
-        try:
-            from astroquery.mast import Observations as observations_client
-        except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError(
-                "MAST fetching requires astroquery. Install the repository environment "
-                "or run `pip install astroquery`."
-            ) from exc
+        from astroquery.mast import Observations as observations_client
 
     base_criteria: dict[str, Any] = {
         "obs_collection": list(config.collections),
@@ -651,11 +633,6 @@ def query_mast(config: MastQueryConfig, observations_client: Any | None = None) 
                     observations_client.query_criteria(**criteria),
                 )
             )
-        if not query_results:
-            raise ValueError(
-                "MAST discovery requires --target, --archive-target-name, or --obs-id; "
-                "proposal-wide discovery is intentionally unsupported."
-            )
 
     observations = _merge_observation_queries(query_results)
     if len(observations) == 0:
@@ -679,15 +656,8 @@ def _find_column(
 ) -> str | None:
     lookup = _column_lookup(names)
     if explicit is not None:
-        matched = lookup.get(_canonical_name(explicit))
-        if matched is None:
-            raise ValueError(f"Requested column {explicit!r} not found; available columns: {list(names)}")
-        return matched
-    for alias in aliases:
-        matched = lookup.get(_canonical_name(alias))
-        if matched is not None:
-            return matched
-    return None
+        return lookup[_canonical_name(explicit)]
+    return next((lookup[_canonical_name(alias)] for alias in aliases if _canonical_name(alias) in lookup), None)
 
 
 def _column_array(data: Any, column: str) -> np.ndarray:
@@ -721,31 +691,21 @@ def _wavelength_to_angstrom(values: np.ndarray, unit: str | None) -> np.ndarray:
         "meter": 1.0e10,
         "meters": 1.0e10,
     }
-    if normalized not in factors:
-        raise ValueError(
-            f"Wavelength unit {unit!r} is missing or unsupported; pass --wavelength-unit."
-        )
     return np.asarray(values, dtype=float) * factors[normalized]
 
 
 def _depth_scale(unit: str | None) -> float:
-    normalized = _normalize_unit_text(unit)
-    if normalized in {"1", "fraction", "dimensionless", "unitless"}:
-        return 1.0
-    if normalized in {"%", "percent", "percentage"}:
-        return 1.0e-2
-    if normalized in {"ppm", "partspermillion"}:
-        return 1.0e-6
-    if normalized in {"ppt", "partsperthousand", "permille"}:
-        return 1.0e-3
-    raise ValueError(f"Depth unit {unit!r} is missing or unsupported; pass --value-unit.")
+    scales = {
+        "1": 1.0, "fraction": 1.0, "dimensionless": 1.0, "unitless": 1.0,
+        "%": 1.0e-2, "percent": 1.0e-2, "percentage": 1.0e-2,
+        "ppm": 1.0e-6, "partspermillion": 1.0e-6,
+        "ppt": 1.0e-3, "partsperthousand": 1.0e-3, "permille": 1.0e-3,
+    }
+    return scales[_normalize_unit_text(unit)]
 
 
 def _units_for_fits_column(hdu: fits.BinTableHDU, column: str) -> str:
-    try:
-        return str(hdu.columns[column].unit or "")
-    except (KeyError, TypeError):
-        return ""
+    return str(hdu.columns[column].unit or "")
 
 
 def _units_for_table_column(table: Table, column: str) -> str:
@@ -761,12 +721,7 @@ def _find_value_column(
         if explicit_kind is None:
             canonical = _canonical_name(column)
             kinds = _TRANSMISSION_VALUE_KINDS if mode == "transmission" else _EMISSION_VALUE_KINDS
-            explicit_kind = kinds.get(canonical)
-        if explicit_kind is None:
-            raise ValueError(
-                "An explicit --value-column with an unfamiliar name also requires "
-                "--value-kind depth, radius_ratio, or flux_ratio."
-            )
+            explicit_kind = kinds[canonical]
         return column, explicit_kind
 
     kinds = _TRANSMISSION_VALUE_KINDS if mode == "transmission" else _EMISSION_VALUE_KINDS
@@ -848,11 +803,6 @@ def _extract_from_tabular(
         if len(uncertainty_arrays) == 1
         else np.nanmax(np.vstack(uncertainty_arrays), axis=0)
     )
-    if wavelengths.size != values.size or uncertainty.size != values.size:
-        raise ValueError(
-            f"Column sizes do not match in {source_location}: wavelength={wavelengths.size}, "
-            f"value={values.size}, uncertainty={uncertainty.size}."
-        )
 
     scale = _depth_scale(value_unit)
     if value_kind == "radius_ratio":
@@ -870,10 +820,6 @@ def _extract_from_tabular(
     else:
         bandwidth_unit = unit_getter(bandwidth_column) or overrides.wavelength_unit or wavelength_unit
         bandwidth = _wavelength_to_angstrom(_column_array(data, bandwidth_column), bandwidth_unit)
-        if bandwidth.size != wavelengths.size:
-            raise ValueError(
-                f"Bandwidth size does not match wavelength size in {source_location}."
-            )
 
     mask = (
         np.isfinite(wavelengths)
@@ -910,37 +856,26 @@ def extract_direct_depth_spectrum(
 
     path = Path(path)
     mode = str(mode).lower().strip()
-    if mode not in {"transmission", "emission"}:
-        raise ValueError("mode must be 'transmission' or 'emission'")
     overrides = overrides or ColumnOverrides()
 
     if _filename_extension(path.name) in {".fits", ".fit", ".fits.gz"}:
-        extraction_errors: list[str] = []
         with fits.open(path, memmap=False) as hdul:
             for index, hdu in enumerate(hdul):
                 if not isinstance(hdu, (fits.BinTableHDU, fits.TableHDU)) or hdu.data is None:
                     continue
                 names = list(hdu.columns.names or [])
-                try:
-                    extracted = _extract_from_tabular(
-                        data=hdu.data,
-                        names=names,
-                        unit_getter=lambda name, current_hdu=hdu: _units_for_fits_column(
-                            current_hdu, name
-                        ),
-                        source_location=f"{path.name}[{index}:{hdu.name}]",
-                        mode=mode,
-                        overrides=overrides,
-                    )
-                except ValueError as exc:
-                    extraction_errors.append(f"{hdu.name}: {exc}")
-                    continue
+                extracted = _extract_from_tabular(
+                    data=hdu.data,
+                    names=names,
+                    unit_getter=lambda name, current_hdu=hdu: _units_for_fits_column(
+                        current_hdu, name
+                    ),
+                    source_location=f"{path.name}[{index}:{hdu.name}]",
+                    mode=mode,
+                    overrides=overrides,
+                )
                 if extracted is not None:
                     return extracted
-        if extraction_errors and (
-            overrides.wavelength_column is not None or overrides.value_column is not None
-        ):
-            raise ValueError("; ".join(extraction_errors))
         return None
 
     table = Table.read(path)
@@ -964,11 +899,7 @@ def inspect_downloaded_product(
 
     path = Path(path)
     details: dict[str, Any] = {"file_extension": _filename_extension(path.name)}
-    try:
-        extracted = extract_direct_depth_spectrum(path, mode=mode, overrides=overrides)
-    except (OSError, ValueError, TypeError) as exc:
-        details["normalization_error"] = str(exc)
-        extracted = None
+    extracted = extract_direct_depth_spectrum(path, mode=mode, overrides=overrides)
     if extracted is not None:
         details.update(
             {
@@ -988,21 +919,17 @@ def inspect_downloaded_product(
 
     extension = _filename_extension(path.name)
     if extension in {".fits", ".fit", ".fits.gz"}:
-        try:
-            with fits.open(path, memmap=False) as hdul:
-                table_columns: list[str] = []
-                for hdu in hdul:
-                    if isinstance(hdu, (fits.BinTableHDU, fits.TableHDU)):
-                        table_columns.extend(hdu.columns.names or [])
-                details["table_columns"] = sorted(set(table_columns))
-                canonical = {_canonical_name(name) for name in table_columns}
-                has_wavelength = any(alias in canonical for alias in _WAVELENGTH_ALIASES)
-                has_flux = any(alias in canonical for alias in _FLUX_ALIASES)
-                if has_wavelength and has_flux:
-                    return "calibrated_flux_spectrum", details, None
-        except OSError as exc:
-            details["inspection_error"] = str(exc)
-            return "unreadable_product", details, None
+        with fits.open(path, memmap=False) as hdul:
+            table_columns: list[str] = []
+            for hdu in hdul:
+                if isinstance(hdu, (fits.BinTableHDU, fits.TableHDU)):
+                    table_columns.extend(hdu.columns.names or [])
+            details["table_columns"] = sorted(set(table_columns))
+            canonical = {_canonical_name(name) for name in table_columns}
+            has_wavelength = any(alias in canonical for alias in _WAVELENGTH_ALIASES)
+            has_flux = any(alias in canonical for alias in _FLUX_ALIASES)
+            if has_wavelength and has_flux:
+                return "calibrated_flux_spectrum", details, None
 
     return "reduction_required", details, None
 
@@ -1225,30 +1152,21 @@ def download_selected_products(
             temporary = local_path.with_name(f".{local_path.name}.part")
             if temporary.exists():
                 temporary.unlink()
-            try:
-                status, message, _url = observations_client.download_file(
-                    record.data_uri,
-                    local_path=str(temporary),
-                    cache=False,
-                )
-            except Exception as exc:
-                record.download_status = "ERROR"
-                record.download_message = str(exc)
+            status, message, _url = observations_client.download_file(
+                record.data_uri,
+                local_path=str(temporary),
+                cache=False,
+            )
+            record.download_status = str(status)
+            record.download_message = None if message is None else str(message)
+            if str(status).upper() == "COMPLETE":
+                os.replace(temporary, local_path)
+            else:
                 if temporary.exists():
                     temporary.unlink()
                 if manifest_callback is not None:
                     manifest_callback()
                 continue
-            record.download_status = str(status)
-            record.download_message = None if message is None else str(message)
-            if str(status).upper() == "COMPLETE" and temporary.exists():
-                os.replace(temporary, local_path)
-            elif temporary.exists():
-                temporary.unlink()
-        if not local_path.exists():
-            if manifest_callback is not None:
-                manifest_callback()
-            continue
 
         record.sha256 = _sha256(local_path)
         classification, details, extracted = inspect_downloaded_product(
@@ -1265,30 +1183,25 @@ def download_selected_products(
             product_relative = local_path.relative_to(output_root / "products")
             normalized_path = normalized_root / product_relative.parent / f"{stem}.tbl"
             normalized_existed = normalized_path.exists()
-            try:
-                if not normalized_existed or overwrite:
-                    write_joint_spectrum_tbl(
-                        extracted,
-                        normalized_path,
-                        target=target,
-                        mode=mode,
-                        instrument=record.instrument,
-                        data_uri=record.data_uri,
-                        overwrite=overwrite,
-                    )
-                record.normalized_path = str(normalized_path)
-                record.normalization_status = (
-                    "normalized (cached)" if normalized_existed and not overwrite else "normalized"
+            if not normalized_existed or overwrite:
+                write_joint_spectrum_tbl(
+                    extracted,
+                    normalized_path,
+                    target=target,
+                    mode=mode,
+                    instrument=record.instrument,
+                    data_uri=record.data_uri,
+                    overwrite=overwrite,
                 )
-                record.recommended_cli_flag = (
-                    "--joint-spectrum-tbl"
-                    if extracted.wavelength_angstrom.size >= 5
-                    else "--bandpass-tbl"
-                )
-            except (OSError, ValueError, TypeError) as exc:
-                record.normalization_status = "normalization error"
-                record.content_details = dict(record.content_details or {})
-                record.content_details["normalization_error"] = str(exc)
+            record.normalized_path = str(normalized_path)
+            record.normalization_status = (
+                "normalized (cached)" if normalized_existed and not overwrite else "normalized"
+            )
+            record.recommended_cli_flag = (
+                "--joint-spectrum-tbl"
+                if extracted.wavelength_angstrom.size >= 5
+                else "--bandpass-tbl"
+            )
         if manifest_callback is not None:
             manifest_callback()
 
@@ -1467,11 +1380,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from astroquery.mast import Observations
 
     if args.include_proprietary:
-        token = os.getenv(args.token_env)
-        if not token:
-            raise RuntimeError(
-                f"--include-proprietary requires a token in the {args.token_env} environment variable."
-            )
+        token = os.environ[args.token_env]
         Observations.login(token=token, store_token=False)
 
     if data_uris:

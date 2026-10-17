@@ -157,14 +157,12 @@ def _run_single_memory_profile_for_range(
             pressure_btm=pressure_btm,
             nlayer=nl,
         )
-    elif mode == "emission":
+    else:
         art = ArtEmisPure(
             pressure_top=pressure_top,
             pressure_btm=pressure_btm,
             nlayer=nl,
         )
-    else:
-        raise ValueError(f"Unsupported mode: {mode!r}")
     art.change_temperature_range(config.T_LOW, config.T_HIGH)
     _print_snapshot("After RT setup", tracker)
 
@@ -289,16 +287,6 @@ def run_memory_profile(
         print(f"JAX devices: {jax.devices()}")
 
     if config.OBSERVING_MODE == "full":
-        if (wav_min_override is None) ^ (wav_max_override is None):
-            raise ValueError(
-                "wav_min_override and wav_max_override must be provided together."
-            )
-        if wav_min_override is not None or wav_max_override is not None:
-            raise ValueError(
-                "Full-arm memory profiling uses separate red/blue grids and does not "
-                "accept a single wav_min_override/wav_max_override pair."
-            )
-
         component_results: dict[str, ProfileResult] = {}
         for arm in ("red", "blue"):
             arm_wav_min, arm_wav_max = config_utils.get_wavelength_range(mode=arm)

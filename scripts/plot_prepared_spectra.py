@@ -103,26 +103,21 @@ def _line_rows_and_figures(bundle: dict[str, Any], output_dir: Path, max_lines: 
     wavelength = wave_1d(bundle["wavelength"])
     params = config_utils.get_params(
         bundle["planet"],
-        bundle.get("metadata", {}).get("ephemeris") or "Recommended",
+        bundle["metadata"]["ephemeris"],
     )
-    kp = float(params.get("Kp", np.nan))
-    velocity = None
-    if np.isfinite(kp) and kp > 0:
-        eccentricity = float(params.get("eccentricity", 0.0) or 0.0)
-        omega = params.get("omega")
-        omega = float(omega) if omega is not None and np.isfinite(float(omega)) else None
-        velocity = planet_radial_velocity_kms(
-            np.asarray(bundle["phase"], dtype=float),
-            kp_kms=kp,
-            eccentricity=eccentricity,
-            omega_deg=omega,
-        )
+    eccentricity = float(params["eccentricity"])
+    velocity = planet_radial_velocity_kms(
+        np.asarray(bundle["phase"], dtype=float),
+        kp_kms=float(params["Kp"]),
+        eccentricity=eccentricity,
+        omega_deg=None if eccentricity == 0.0 else float(params["omega"]),
+    )
     rows: list[dict[str, Any]] = []
     figures: list[str] = []
     selected = [
         (label, rest) for label, rest in VACUUM_DIAGNOSTIC_LINES
         if float(np.nanmin(wavelength)) <= rest <= float(np.nanmax(wavelength))
-    ][: max(0, max_lines)]
+    ][:max_lines]
     for index, (label, rest) in enumerate(selected, start=1):
         result = stack_line_window(
             bundle,
@@ -171,8 +166,6 @@ def render_case(
         arms=arms,
         input_root=input_root,
     )
-    if not specs:
-        raise FileNotFoundError(f"No {planet} {mode} {product} bundles found under {input_root}.")
     bundles = load_product_records(specs)
     slug = specs[0]["planet_slug"]
     run_dir = output_root / mode / slug / product / _stamp()
@@ -247,8 +240,6 @@ def main() -> None:
                     max_lines=args.max_lines,
                 )
         return
-    if args.mode is None:
-        raise SystemExit("--mode is required with --planet.")
     for product in products:
         render_case(
             planet=args.planet,

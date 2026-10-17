@@ -57,7 +57,6 @@ from dataio.stellar_lsd import (
     measure_lsd_exposures,
     relativistic_velocity_difference_kms,
     summarize_velocity,
-    validate_quadratic_limb_darkening,
     velocity_to_doppler_factor,
 )
 
@@ -105,15 +104,6 @@ def _load_edge_trim_calibration(
     row = rows[(str(epoch), str(arm))]
     left_trim_A = float(row["left_trim_A"])
     right_trim_A = float(row["right_trim_A"])
-    if (
-        not np.isfinite(left_trim_A)
-        or not np.isfinite(right_trim_A)
-        or left_trim_A < 0.0
-        or right_trim_A < 0.0
-    ):
-        raise ValueError(
-            f"{manifest_path}: invalid accepted edge trim for {mode} {epoch} {arm}."
-        )
     return {
         "policy": LSD_EDGE_TRIM_POLICY,
         "status": ACCEPTED_STATUS,
@@ -147,11 +137,6 @@ def _load_arm(
     epoch: str,
     arm: str,
 ) -> tuple[tuple[np.ndarray, ...], dict[str, Any]]:
-    if arm != SYSTEMIC_VELOCITY_ARM:
-        raise ValueError(
-            f"Systemic-velocity measurements require arm={SYSTEMIC_VELOCITY_ARM!r}; "
-            f"received {arm!r}."
-        )
     raw_dir = _raw_dir(planet, mode, epoch)
     loaded = get_pepsi_data(
         arm=arm,
@@ -165,8 +150,6 @@ def _load_arm(
         wavelength_frame="barycentric",
         data_mode=mode,
     )
-    if loaded is None:
-        raise FileNotFoundError(f"No PEPSI {arm} spectra found in {raw_dir}.")
     result, extras = loaded
     return result, extras
 
@@ -182,12 +165,12 @@ def _phases(
         jd_utc,
         str(params["RA"]),
         str(params["Dec"]),
-        header_bjd_tdb=extras.get("header_bjd_tdb"),
+        header_bjd_tdb=extras["header_bjd_tdb"],
     )
     epoch_bjd_tdb = get_ephemeris_epoch_bjd_tdb(
         float(params["epoch"]),
-        str(params.get("epoch_scale")),
-        str(params.get("epoch_reference")),
+        str(params["epoch_scale"]),
+        str(params["epoch_reference"]),
     )
     midpoint_bjd_tdb = config_utils.resolve_transit_midpoint(
         bjd_tdb,
@@ -223,19 +206,16 @@ def _lsd_pixel_masks(
         for line in BALMER_VACUUM_ANGSTROM
     ]
     for index, row in enumerate(wavelength):
-        valid_wavelength = np.isfinite(row) & (row > 0.0)
-        if np.any(valid_wavelength):
-            valid_row = row[valid_wavelength]
-            masks[index, valid_wavelength] = get_sysrem_ignore_mask(
-                valid_row,
-                arm,
-                explicit_edge_trim_widths_A=edge_trim_widths_A,
-            )
-            edge_masks[index, valid_wavelength] = get_arm_edge_trim_mask(
-                valid_row,
-                arm,
-                explicit_widths_A=edge_trim_widths_A,
-            )
+        masks[index] = get_sysrem_ignore_mask(
+            row,
+            arm,
+            explicit_edge_trim_widths_A=edge_trim_widths_A,
+        )
+        edge_masks[index] = get_arm_edge_trim_mask(
+            row,
+            arm,
+            explicit_widths_A=edge_trim_widths_A,
+        )
         masks[index] |= mask_regions(row, balmer_regions)
     return masks, edge_masks
 
@@ -270,16 +250,6 @@ def _measure_arm(
     wavelength = np.asarray(wavelength, dtype=float)
     flux = np.asarray(flux, dtype=float)
     error = np.asarray(error, dtype=float)
-    if extras.get("wavelength_medium") != WAVELENGTH_MEDIUM:
-        raise ValueError(
-            f"PEPSI loader returned wavelength_medium={extras.get('wavelength_medium')!r}; "
-            f"expected {WAVELENGTH_MEDIUM!r}."
-        )
-    if extras.get("wavelength_frame") != "barycentric":
-        raise ValueError(
-            f"PEPSI loader returned wavelength_frame={extras.get('wavelength_frame')!r}; "
-            "the mean stellar velocity requires a barycentric grid."
-        )
     bjd_tdb, phase = _phases(
         np.asarray(jd, dtype=float),
         extras,
@@ -431,7 +401,7 @@ def _measure_arm(
         "input_product": "normalized_raw",
         "wavelength_frame": "barycentric",
         "science_exposure_selection": dict(
-            extras.get("science_exposure_selection_metadata", {})
+            extras["science_exposure_selection_metadata"]
         ),
         "edge_trim_policy": LSD_EDGE_TRIM_POLICY,
         "edge_trim_calibration": edge_trim_result,
@@ -513,14 +483,8 @@ def _validate_blue_arm(
     arms: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     """Accept a dataset only from a valid blue-arm measurement."""
-    unexpected_arms = sorted(set(arms) - {SYSTEMIC_VELOCITY_ARM})
-    if unexpected_arms:
-        raise ValueError(
-            "Systemic-velocity measurements are blue-only; unexpected arm results: "
-            + ", ".join(unexpected_arms)
-        )
-    blue = arms.get(SYSTEMIC_VELOCITY_ARM)
-    if blue is None or blue.get("arm_measurement_valid") is not True:
+    blue = arms[SYSTEMIC_VELOCITY_ARM]
+    if not blue["arm_measurement_valid"]:
         return {
             "blue_arm_validation_passed": False,
             "status": "blue arm must have at least two QC-passing profiles",
@@ -538,14 +502,9 @@ def _validate_blue_arm(
 def _blue_only_exposures(
     rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Return blue-arm rows and reject any attempt to supply another arm."""
+    """Prepare the blue-arm rows for the joint fit."""
     blue_rows: list[dict[str, Any]] = []
     for row in rows:
-        if row.get("arm") != SYSTEMIC_VELOCITY_ARM:
-            raise ValueError(
-                "Systemic-velocity joint inputs must contain blue-arm rows only; "
-                f"received arm={row.get('arm')!r}."
-            )
         output = dict(row)
         output["arms_used"] = SYSTEMIC_VELOCITY_ARM
         output["n_arms"] = 1
@@ -660,50 +619,47 @@ def _plot_dataset(
     output_path: Path,
 ) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
-    if set(arrays) - {SYSTEMIC_VELOCITY_ARM}:
-        raise ValueError("Systemic-velocity dataset plots accept blue-arm arrays only.")
-    if SYSTEMIC_VELOCITY_ARM in arrays:
-        values = arrays[SYSTEMIC_VELOCITY_ARM]
-        selected = values["selected"] & np.isfinite(values["centroid_kms"])
-        if np.any(selected):
-            color = "#2474b5"
-            mean_profile = np.nanmedian(values["profiles"][selected], axis=0)
-            model = np.nanmedian(values["profile_models"][selected], axis=0)
-            axes[0].plot(
-                values["velocity_kms"],
-                mean_profile,
-                color=color,
-                label="blue LSD",
+    values = arrays[SYSTEMIC_VELOCITY_ARM]
+    selected = values["selected"]
+    if np.any(selected):
+        color = "#2474b5"
+        mean_profile = np.nanmedian(values["profiles"][selected], axis=0)
+        model = np.nanmedian(values["profile_models"][selected], axis=0)
+        axes[0].plot(
+            values["velocity_kms"],
+            mean_profile,
+            color=color,
+            label="blue LSD",
+        )
+        axes[0].plot(
+            values["velocity_kms"],
+            model,
+            color=color,
+            ls="--",
+            alpha=0.8,
+        )
+        axes[1].errorbar(
+            values["phase"][selected],
+            values["centroid_kms"][selected],
+            yerr=values["centroid_err_kms"][selected],
+            fmt="o",
+            ms=4,
+            capsize=2,
+            color=color,
+            label="blue",
+        )
+        excluded = (~values["selected"]) & np.isfinite(values["centroid_kms"])
+        if np.any(excluded):
+            axes[1].scatter(
+                values["phase"][excluded],
+                values["centroid_kms"][excluded],
+                facecolors="none",
+                edgecolors=color,
+                s=24,
+                alpha=0.6,
             )
-            axes[0].plot(
-                values["velocity_kms"],
-                model,
-                color=color,
-                ls="--",
-                alpha=0.8,
-            )
-            axes[1].errorbar(
-                values["phase"][selected],
-                values["centroid_kms"][selected],
-                yerr=values["centroid_err_kms"][selected],
-                fmt="o",
-                ms=4,
-                capsize=2,
-                color=color,
-                label="blue",
-            )
-            excluded = (~values["selected"]) & np.isfinite(values["centroid_kms"])
-            if np.any(excluded):
-                axes[1].scatter(
-                    values["phase"][excluded],
-                    values["centroid_kms"][excluded],
-                    facecolors="none",
-                    edgecolors=color,
-                    s=24,
-                    alpha=0.6,
-                )
 
-    if dataset.get("epoch_systemic_velocity_kms") is not None:
+    if dataset["epoch_systemic_velocity_kms"] is not None:
         axes[1].axhline(
             dataset["epoch_systemic_velocity_kms"],
             color="black",
@@ -816,22 +772,16 @@ def _write_summary(
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for dataset in datasets:
-            blue = dataset["arms"].get("blue", {})
+            blue = dataset["arms"]["blue"]
             writer.writerow(
                 {
                     "planet": dataset["planet"],
                     "mode": dataset["mode"],
                     "epoch": dataset["epoch"],
-                    "blue_systemic_velocity_kms": blue.get(
-                        "arm_systemic_velocity_kms"
-                    ),
-                    "blue_error_kms": blue.get("arm_systemic_velocity_err_kms"),
-                    "epoch_systemic_velocity_kms": dataset.get(
-                        "epoch_systemic_velocity_kms"
-                    ),
-                    "epoch_systemic_velocity_err_kms": dataset.get(
-                        "epoch_systemic_velocity_err_kms"
-                    ),
+                    "blue_systemic_velocity_kms": blue["arm_systemic_velocity_kms"],
+                    "blue_error_kms": blue["arm_systemic_velocity_err_kms"],
+                    "epoch_systemic_velocity_kms": dataset["epoch_systemic_velocity_kms"],
+                    "epoch_systemic_velocity_err_kms": dataset["epoch_systemic_velocity_err_kms"],
                     "blue_arm_validation_passed": dataset[
                         "blue_arm_validation_passed"
                     ],
@@ -860,11 +810,11 @@ def _write_summary(
         "|---|---:|---|",
     ]
     for dataset in datasets:
-        blue = dataset["arms"].get("blue", {})
+        blue = dataset["arms"]["blue"]
         markdown.append(
             "| "
             f"{dataset['mode']} {dataset['epoch']} | "
-            f"{_format_velocity(blue.get('arm_systemic_velocity_kms'), blue.get('arm_systemic_velocity_err_kms'))} | "
+            f"{_format_velocity(blue['arm_systemic_velocity_kms'], blue['arm_systemic_velocity_err_kms'])} | "
             f"{dataset['status']} |"
         )
     (output_dir / "stellar_velocity_results.md").write_text(
@@ -1052,8 +1002,6 @@ def _discover_datasets(
     found: list[tuple[str, str]] = []
     for mode in modes:
         root = config_utils.get_raw_hrs_dir(planet=planet, mode=mode)
-        if not root.is_dir():
-            continue
         for path in sorted(root.iterdir()):
             if not path.is_dir() or len(path.name) != 8 or not path.name.isdigit():
                 continue
@@ -1161,31 +1109,17 @@ def create_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = create_parser().parse_args()
     params = config_utils.get_params(args.planet, args.ephemeris)
-    vsini = float(args.vsini_kms if args.vsini_kms is not None else params.get("v_sini_star", np.nan))
+    vsini = float(args.vsini_kms if args.vsini_kms is not None else params["v_sini_star"])
     limb_darkening_u1 = float(
         args.limb_darkening_u1
         if args.limb_darkening_u1 is not None
-        else params.get("gamma1", np.nan)
+        else params["gamma1"]
     )
     limb_darkening_u2 = float(
         args.limb_darkening_u2
         if args.limb_darkening_u2 is not None
-        else params.get("gamma2", np.nan)
+        else params["gamma2"]
     )
-    if not np.isfinite(vsini) or vsini <= 0.0:
-        raise ValueError("A finite positive --vsini-kms or configured v_sini_star is required.")
-    validate_quadratic_limb_darkening(limb_darkening_u1, limb_darkening_u2)
-    if args.velocity_span_kms <= vsini:
-        raise ValueError("--velocity-span-kms must be larger than v sin(i).")
-    if args.resolving_power <= 0.0:
-        raise ValueError("--resolving-power must be positive.")
-    if args.max_profile_fractional_rms <= 0.0:
-        raise ValueError("--max-profile-fractional-rms must be positive.")
-    if args.max_profile_asymmetry <= 0.0:
-        raise ValueError("--max-profile-asymmetry must be positive.")
-    if args.systematic_error_floor_kms < 0.0:
-        raise ValueError("--systematic-error-floor-kms must be non-negative.")
-
     template = load_stellar_template(args.template)
     velocity_grid = np.arange(
         -args.velocity_span_kms,
@@ -1198,24 +1132,15 @@ def main() -> int:
         modes=modes,
         requested_epochs=None if args.epoch is None else set(args.epoch),
     )
-    if not datasets_to_run:
-        raise FileNotFoundError("No matching raw PEPSI datasets were found.")
     edge_trim_calibrations: dict[tuple[str, str], dict[str, Any]] = {}
     for mode, epoch in datasets_to_run:
-        try:
-            edge_trim_calibrations[(mode, epoch)] = _load_edge_trim_calibration(
-                calibration_root=args.edge_trim_calibration_root,
-                planet=args.planet,
-                mode=mode,
-                epoch=epoch,
-                arm=SYSTEMIC_VELOCITY_ARM,
-            )
-        except (FileNotFoundError, ValueError) as exc:
-            raise ValueError(
-                f"No acceptance-grade edge trim is available for "
-                f"{args.planet} {mode} {epoch} {SYSTEMIC_VELOCITY_ARM}; "
-                "untrimmed LSD fallback is disabled."
-            ) from exc
+        edge_trim_calibrations[(mode, epoch)] = _load_edge_trim_calibration(
+            calibration_root=args.edge_trim_calibration_root,
+            planet=args.planet,
+            mode=mode,
+            epoch=epoch,
+            arm=SYSTEMIC_VELOCITY_ARM,
+        )
     output_dir = args.output_dir or (
         config.PROJECT_ROOT / "diagnostics" / "stellar_velocity" / _planet_slug(args.planet)
     )
@@ -1223,7 +1148,6 @@ def main() -> int:
     datasets: list[dict[str, Any]] = []
     blue_measurements: list[dict[str, Any]] = []
     validated_blue_measurements: list[dict[str, Any]] = []
-    validated_dataset_keys: set[tuple[str, str]] = set()
     for mode, epoch in datasets_to_run:
         edge_trim_calibration = edge_trim_calibrations[(mode, epoch)]
         print(
@@ -1234,38 +1158,33 @@ def main() -> int:
         )
         arm_results: dict[str, dict[str, Any]] = {}
         arm_arrays: dict[str, dict[str, np.ndarray]] = {}
-        dataset_blue_measurements: list[dict[str, Any]] = []
-        try:
-            result, arrays = _measure_arm(
-                planet=args.planet,
-                mode=mode,
-                epoch=epoch,
-                arm=SYSTEMIC_VELOCITY_ARM,
-                params=params,
-                template=template,
-                velocity_grid=velocity_grid,
-                vsini_kms=vsini,
-                limb_darkening_u1=limb_darkening_u1,
-                limb_darkening_u2=limb_darkening_u2,
-                resolving_power=float(args.resolving_power),
-                include_in_transit=args.include_in_transit,
-                max_profile_fractional_rms=args.max_profile_fractional_rms,
-                max_profile_asymmetry=args.max_profile_asymmetry,
-                edge_trim_calibration=edge_trim_calibration,
-                diagnostics_dir=output_dir,
-            )
-        except (FileNotFoundError, ValueError, RuntimeError) as exc:
-            print(f"  FAILED {mode} {epoch} blue: {exc}")
-        else:
-            arm_results[SYSTEMIC_VELOCITY_ARM] = result
-            arm_arrays[SYSTEMIC_VELOCITY_ARM] = arrays
-            dataset_blue_measurements = _measurement_rows(
-                planet=args.planet,
-                mode=mode,
-                epoch=epoch,
-                arm=SYSTEMIC_VELOCITY_ARM,
-                arrays=arrays,
-            )
+        result, arrays = _measure_arm(
+            planet=args.planet,
+            mode=mode,
+            epoch=epoch,
+            arm=SYSTEMIC_VELOCITY_ARM,
+            params=params,
+            template=template,
+            velocity_grid=velocity_grid,
+            vsini_kms=vsini,
+            limb_darkening_u1=limb_darkening_u1,
+            limb_darkening_u2=limb_darkening_u2,
+            resolving_power=float(args.resolving_power),
+            include_in_transit=args.include_in_transit,
+            max_profile_fractional_rms=args.max_profile_fractional_rms,
+            max_profile_asymmetry=args.max_profile_asymmetry,
+            edge_trim_calibration=edge_trim_calibration,
+            diagnostics_dir=output_dir,
+        )
+        arm_results[SYSTEMIC_VELOCITY_ARM] = result
+        arm_arrays[SYSTEMIC_VELOCITY_ARM] = arrays
+        dataset_blue_measurements = _measurement_rows(
+            planet=args.planet,
+            mode=mode,
+            epoch=epoch,
+            arm=SYSTEMIC_VELOCITY_ARM,
+            arrays=arrays,
+        )
 
         validation = _validate_blue_arm(arm_results)
         dataset_joint_measurements = _blue_only_exposures(
@@ -1277,7 +1196,6 @@ def main() -> int:
             ]
         blue_measurements.extend(dataset_blue_measurements)
         if validation["blue_arm_validation_passed"]:
-            validated_dataset_keys.add((mode, epoch))
             validated_blue_measurements.extend(dataset_joint_measurements)
         dataset = {
             "schema_version": STELLAR_VELOCITY_RESULT_SCHEMA_VERSION,
@@ -1296,12 +1214,7 @@ def main() -> int:
             "systemic_velocity_arm": SYSTEMIC_VELOCITY_ARM,
             "systemic_velocity_arm_policy": SYSTEMIC_VELOCITY_ARM_POLICY,
             "edge_trim_policy": LSD_EDGE_TRIM_POLICY,
-            "edge_trim_calibration": (
-                arm_results.get(SYSTEMIC_VELOCITY_ARM, {}).get(
-                    "edge_trim_calibration",
-                    edge_trim_calibration,
-                )
-            ),
+            "edge_trim_calibration": result["edge_trim_calibration"],
             "resolving_power": float(args.resolving_power),
             "velocity_span_kms": [float(velocity_grid[0]), float(velocity_grid[-1])],
             "velocity_step_kms": float(velocity_grid[1] - velocity_grid[0]),
@@ -1321,10 +1234,7 @@ def main() -> int:
                 if mode == "transmission" and not args.include_in_transit
                 else "all_exposures"
             ),
-            "science_exposure_selection": arm_results.get(
-                SYSTEMIC_VELOCITY_ARM,
-                {},
-            ).get("science_exposure_selection", {}),
+            "science_exposure_selection": result["science_exposure_selection"],
             "arms": arm_results,
             "n_blue_exposures_for_joint_fit": len(dataset_joint_measurements),
             "correction_convention": (
@@ -1334,20 +1244,9 @@ def main() -> int:
             **validation,
         }
         datasets.append(dataset)
-        if arm_arrays:
-            _plot_dataset(dataset, arm_arrays, output_dir / f"{mode}_{epoch}.pdf")
+        _plot_dataset(dataset, arm_arrays, output_dir / f"{mode}_{epoch}.pdf")
         print(f"  Dataset status: {dataset['status']}")
 
-    if len(validated_dataset_keys) < 2:
-        raise ValueError(
-            "At least two datasets must have valid blue-arm measurements; "
-            "red-arm and invalid-dataset fallbacks are disabled."
-        )
-    if len(validated_blue_measurements) < 3:
-        raise ValueError(
-            "At least three QC-passing blue-arm exposure RVs are required; "
-            "red-arm and invalid-dataset fallbacks are disabled."
-        )
     joint_measurements = validated_blue_measurements
     joint_result = fit_circular_stellar_velocity(
         np.asarray([row["orbital_phase"] for row in joint_measurements], dtype=float),

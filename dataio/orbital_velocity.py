@@ -5,23 +5,6 @@ from __future__ import annotations
 import numpy as np
 
 
-def _validate_eccentric_geometry(
-    eccentricity: float,
-    omega_deg: float | None,
-) -> tuple[float, float]:
-    eccentricity = float(eccentricity)
-    if not np.isfinite(eccentricity) or not 0.0 <= eccentricity < 1.0:
-        raise ValueError("eccentricity must be finite with 0 <= e < 1.")
-    if eccentricity == 0.0:
-        return eccentricity, 0.0 if omega_deg is None else float(omega_deg)
-    if omega_deg is None or not np.isfinite(float(omega_deg)):
-        raise ValueError(
-            "A non-circular planet velocity requires a finite planetary "
-            "argument of periastron omega_deg."
-        )
-    return eccentricity, float(omega_deg)
-
-
 def _eccentric_anomaly_from_true_anomaly(
     true_anomaly: np.ndarray | float,
     eccentricity: float,
@@ -63,12 +46,8 @@ def planet_orbital_state_from_transit_phase(
     """
 
     phase = np.asarray(phase, dtype=float)
-    if phase.ndim != 1 or np.any(~np.isfinite(phase)):
-        raise ValueError("phase must be a finite one-dimensional array.")
-    eccentricity, omega_deg = _validate_eccentric_geometry(
-        eccentricity,
-        omega_deg,
-    )
+    eccentricity = float(eccentricity)
+    omega_deg = 0.0 if eccentricity == 0.0 and omega_deg is None else float(omega_deg)
     omega = np.radians(omega_deg)
     transit_true_anomaly = 0.5 * np.pi - omega
     transit_eccentric_anomaly = _eccentric_anomaly_from_true_anomaly(
@@ -110,8 +89,6 @@ def planet_radial_velocity_kms(
     """
 
     kp_kms = float(kp_kms)
-    if not np.isfinite(kp_kms) or kp_kms <= 0.0:
-        raise ValueError("kp_kms must be finite and positive.")
     state = planet_orbital_state_from_transit_phase(
         phase,
         eccentricity=eccentricity,

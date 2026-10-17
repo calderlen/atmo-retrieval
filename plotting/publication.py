@@ -55,38 +55,30 @@ def _json_safe(value: Any) -> Any:
         return _json_safe(value.item())
     if isinstance(value, float) and not np.isfinite(value):
         return None
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
+    return value
 
 
 def _git_snapshot(repository_root: Path) -> dict[str, Any]:
-    snapshot: dict[str, Any] = {"commit": None, "dirty": None}
-    try:
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repository_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=repository_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return snapshot
-    snapshot["commit"] = commit or None
-    snapshot["dirty"] = bool(status.strip())
-    return snapshot
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return {"commit": commit, "dirty": bool(status.strip())}
 
 
 def _safe_identifier(value: str) -> str:
     cleaned = "".join(character if character.isalnum() else "_" for character in str(value))
-    return cleaned.strip("_").lower() or "figure"
+    return cleaned.strip("_").lower()
 
 
 @dataclass
@@ -112,8 +104,6 @@ class PublicationBundle:
         self.data_root.mkdir(parents=True, exist_ok=True)
 
     def figure_path(self, figure_id: str, tier: str) -> Path:
-        if tier not in {"paper", "supplement", "qc"}:
-            raise ValueError(f"Unsupported publication tier: {tier!r}")
         return self.figure_root / tier / f"{_safe_identifier(figure_id)}.pdf"
 
     def data_path(self, figure_id: str) -> Path:
@@ -171,15 +161,6 @@ class PublicationBundle:
         warnings: Iterable[str] = (),
     ) -> None:
         path = Path(path)
-        if not path.exists():
-            self.record_failure(
-                figure_id=figure_id,
-                tier=tier,
-                required=required,
-                error=f"Expected figure was not written: {path}",
-                metadata=metadata,
-            )
-            return
         self.entries.append(
             {
                 "figure_id": figure_id,
@@ -255,8 +236,6 @@ class PublicationBundle:
 def deterministic_draw_indices(sample_count: int, maximum: int) -> np.ndarray:
     sample_count = int(sample_count)
     maximum = int(maximum)
-    if sample_count <= 0 or maximum <= 0:
-        return np.asarray([], dtype=int)
     count = min(sample_count, maximum)
     return np.unique(np.linspace(0, sample_count - 1, count).round().astype(int))
 
@@ -269,8 +248,6 @@ def _phase_edges(phase: np.ndarray) -> np.ndarray:
     edges[1:-1] = 0.5 * (phase[:-1] + phase[1:])
     edges[0] = phase[0] - 0.5 * (phase[1] - phase[0])
     edges[-1] = phase[-1] + 0.5 * (phase[-1] - phase[-2])
-    if np.any(np.diff(edges) <= 0.0):
-        return np.arange(phase.size + 1, dtype=float) - 0.5
     return edges
 
 
@@ -301,14 +278,6 @@ def plot_likelihood_space_triptych(
     data = np.asarray(data, dtype=float)
     model = np.asarray(model, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
-    if data.ndim != 2 or data.shape != model.shape or data.shape != sigma.shape:
-        raise ValueError(
-            "Likelihood triptych requires matching exposure x wavelength arrays; "
-            f"got data={data.shape}, model={model.shape}, sigma={sigma.shape}."
-        )
-    if wavelength.shape != (data.shape[1],) or phase.shape != (data.shape[0],):
-        raise ValueError("Wavelength/phase coordinates do not match the likelihood arrays.")
-
     order = np.argsort(phase)
     wavelength_order = np.argsort(wavelength)
     wavelength = wavelength[wavelength_order]
@@ -385,8 +354,6 @@ def prepare_planet_frame_operator(
     wavelength = np.asarray(wavelength_A, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
     phase = np.asarray(phase, dtype=float)
-    if sigma.ndim != 2 or sigma.shape != (phase.size, wavelength.size):
-        raise ValueError("Planet-frame operator coordinates do not match sigma.")
     order = np.argsort(wavelength)
     operator = build_emission_collapse_operator(
         wavelength[order],
@@ -438,11 +405,10 @@ def _inverse_variance_bins(
     total = sum(segment.stop - segment.start for segment in segments)
     for segment in segments:
         indices = np.arange(segment.start, segment.stop)
-        segment_bins = max(1, round(max_bins * indices.size / max(total, 1)))
+        segment_bins = max(1, round(max_bins * indices.size / total))
         for group in np.array_split(indices, min(segment_bins, indices.size)):
             valid = (
-                np.isfinite(wavelength[group])
-                & np.isfinite(values[group])
+                np.isfinite(values[group])
                 & np.isfinite(errors[group])
                 & (errors[group] > 0.0)
             )
@@ -469,16 +435,6 @@ def plot_planet_frame_posterior_predictive(
     observed = np.asarray(observed, dtype=float)
     observed_error = np.asarray(observed_error, dtype=float)
     draws = np.asarray(model_draws, dtype=float)
-    if draws.ndim != 2 or draws.shape[1] != wavelength.size:
-        raise ValueError(
-            "model_draws must be posterior_draw x wavelength; got "
-            f"{draws.shape} for {wavelength.size} wavelengths."
-        )
-    if draws.shape[0] < 4:
-        raise ValueError("At least four successful posterior model draws are required.")
-    if observed.shape != wavelength.shape or observed_error.shape != wavelength.shape:
-        raise ValueError("Observed planet-frame arrays do not match wavelength.")
-
     q025, q16, q50, q84, q975 = np.nanpercentile(
         draws,
         [2.5, 16.0, 50.0, 84.0, 97.5],
@@ -584,10 +540,6 @@ def plot_temperature_pressure_posterior(
 ) -> tuple[plt.Figure, dict[str, np.ndarray]]:
     pressure = np.asarray(pressure_bar, dtype=float)
     draws = np.asarray(temperature_draws_K, dtype=float)
-    if draws.ndim != 2 or draws.shape[1] != pressure.size:
-        raise ValueError("Temperature draws must have shape draw x pressure.")
-    if draws.shape[0] < 4:
-        raise ValueError("At least four temperature-profile draws are required.")
     q025, q16, q50, q84, q975 = np.nanpercentile(
         draws,
         [2.5, 16.0, 50.0, 84.0, 97.5],
@@ -626,12 +578,8 @@ def plot_bandpass_posterior_predictive(
     """Plot one scalar bandpass constraint against its predictive posterior."""
     draws = np.asarray(model_draws, dtype=float).reshape(-1)
     draws = draws[np.isfinite(draws)]
-    if draws.size < 4:
-        raise ValueError("At least four finite bandpass model draws are required.")
     observed = float(observed)
     observed_error = float(observed_error)
-    if not np.isfinite(observed) or not np.isfinite(observed_error) or observed_error <= 0.0:
-        raise ValueError("Bandpass observation and uncertainty must be finite and positive.")
 
     q025, q16, q50, q84, q975 = np.percentile(
         draws,
@@ -709,18 +657,16 @@ def plot_kp_vsys_posterior(
     density, x_edges, y_edges = np.histogram2d(vsys, kp, bins=48)
     positive = np.sort(density[density > 0.0].ravel())[::-1]
     levels: list[float] = []
-    if positive.size:
-        cumulative = np.cumsum(positive) / np.sum(positive)
-        for probability in (0.95, 0.68):
-            levels.append(float(positive[min(np.searchsorted(cumulative, probability), positive.size - 1)]))
+    cumulative = np.cumsum(positive) / np.sum(positive)
+    for probability in (0.95, 0.68):
+        levels.append(float(positive[min(np.searchsorted(cumulative, probability), positive.size - 1)]))
     levels = sorted(set(levels))
     x_center = 0.5 * (x_edges[:-1] + x_edges[1:])
     y_center = 0.5 * (y_edges[:-1] + y_edges[1:])
 
     fig, axis = plt.subplots(figsize=(3.6, 3.35), constrained_layout=True)
     image = axis.pcolormesh(x_edges, y_edges, density.T, cmap="Blues", shading="auto", rasterized=True)
-    if levels:
-        axis.contour(x_center, y_center, density.T, levels=levels, colors="0.15", linewidths=0.8)
+    axis.contour(x_center, y_center, density.T, levels=levels, colors="0.15", linewidths=0.8)
     median_vsys = float(np.median(vsys))
     median_kp = float(np.median(kp))
     axis.plot(median_vsys, median_kp, marker="+", color="tab:red", ms=8, mew=1.2)
@@ -754,9 +700,6 @@ def plot_abundance_constraints(
         elif array.ndim > 1 and int(np.prod(array.shape[1:])) <= 6:
             flat = array.reshape(array.shape[0], -1)
             rows.extend((f"{key}[{index}]", flat[:, index]) for index in range(flat.shape[1]))
-    if not rows:
-        return None
-
     labels: list[str] = []
     quantiles: list[np.ndarray] = []
     raw: dict[str, np.ndarray] = {}

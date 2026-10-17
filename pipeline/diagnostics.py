@@ -59,26 +59,16 @@ class DiagnosticContext:
     model_inputs: dict[str, object]
 
 
-def _deepcopy_or_value(value: Any) -> Any:
-    try:
-        return deepcopy(value)
-    except Exception:
-        return value
-
-
 @contextmanager
 def temporary_runtime_config(overrides: dict[str, Any]):
-    previous = {}
-    for name in overrides:
-        if hasattr(config, name):
-            previous[name] = _deepcopy_or_value(getattr(config, name))
+    previous = {name: getattr(config, name) for name in overrides}
     try:
         for name, value in overrides.items():
-            config_utils.set_runtime_config(name, _deepcopy_or_value(value))
+            setattr(config, name, deepcopy(value))
         yield
     finally:
         for name, value in previous.items():
-            config_utils.set_runtime_config(name, _deepcopy_or_value(value))
+            setattr(config, name, value)
 
 
 def _filter_species_map(
@@ -174,9 +164,6 @@ def build_diagnostic_context(
     fastchem_parameter_file: str | Path | None = None,
     phoenix_cache_dir: str | Path | None = None,
 ) -> DiagnosticContext:
-    if data_format != "timeseries":
-        raise ValueError("Diagnostics currently only support data_format='timeseries'.")
-
     overrides = _build_runtime_overrides(
         planet=planet,
         ephemeris=ephemeris,
@@ -268,8 +255,6 @@ def build_diagnostic_context(
                 default_stellar_limb_darkening_u2=model_params["gamma2"],
                 default_phoenix_cache_dir=phoenix_cache_dir,
             )
-            if component.name in spectroscopic_components:
-                raise ValueError(f"Duplicate diagnostic component name: {component.name}")
             loaded_components.append(component)
             spectroscopic_components[component.name] = component
 
@@ -323,14 +308,7 @@ def _get_spectroscopic_component(
     context: DiagnosticContext,
     component_name: str,
 ) -> _retrieval.SpectroscopicComponentBundle:
-    try:
-        return context.spectroscopic_components[str(component_name)]
-    except KeyError as exc:
-        available = ", ".join(context.spectroscopic_component_names)
-        raise KeyError(
-            f"Unknown spectroscopic component {component_name!r}. "
-            f"Available components: {available}"
-        ) from exc
+    return context.spectroscopic_components[str(component_name)]
 
 
 def default_named_params_for_context(context: DiagnosticContext) -> dict[str, float]:
@@ -456,12 +434,10 @@ def load_saved_run_config(run_dir: str | Path) -> dict[str, Any]:
 
 
 def _parse_bool_token(value: str) -> bool:
-    normalized = str(value).strip().lower()
-    if normalized in {"1", "true", "yes", "enabled"}:
-        return True
-    if normalized in {"0", "false", "no", "disabled"}:
-        return False
-    raise ValueError(f"Could not parse boolean value from {value!r}.")
+    return {
+        "1": True, "true": True, "yes": True, "enabled": True,
+        "0": False, "false": False, "no": False, "disabled": False,
+    }[str(value).strip().lower()]
 
 
 def _infer_chemistry_model_from_run_dir(run_dir: str | Path) -> str:
@@ -491,9 +467,7 @@ def build_diag_config_from_run_dir(
     run_dir = Path(run_dir)
     saved = load_saved_run_config(run_dir)
 
-    resolved_epoch = epoch or saved.get("Epoch")
-    if resolved_epoch is None:
-        raise ValueError("epoch must be provided for saved runs that do not log it in run_config.log.")
+    resolved_epoch = epoch or saved["Epoch"]
 
     resolved_chemistry_model = (
         chemistry_model
@@ -507,8 +481,7 @@ def build_diag_config_from_run_dir(
     fastchem_parameter_file = saved.get("FastChem parameter file")
     if not fastchem_parameter_file and str(resolved_chemistry_model) == "fastchem_hybrid_grid":
         default_fastchem_path = Path("input/fastchem/parameters.dat")
-        if default_fastchem_path.exists():
-            fastchem_parameter_file = str(default_fastchem_path)
+        fastchem_parameter_file = str(default_fastchem_path)
 
     config_payload = {
         "planet": str(saved["Planet"]),
@@ -542,8 +515,8 @@ def linear_edges_from_centers(centers: np.ndarray) -> np.ndarray:
     """Return cell edges for a one-dimensional linear center grid."""
 
     values = np.asarray(centers, dtype=float)
-    if values.ndim != 1 or values.size < 2:
-        raise ValueError("centers must be a one-dimensional array with at least two values.")
+    if values.size < 2:
+        raise ValueError("centers must contain at least two values.")
     edges = np.empty(values.size + 1, dtype=float)
     edges[1:-1] = 0.5 * (values[:-1] + values[1:])
     edges[0] = values[0] - 0.5 * (values[1] - values[0])
@@ -564,8 +537,6 @@ def normalized_contribution_function(dtau: np.ndarray) -> np.ndarray:
     """Compute the normalized vertical contribution from layer optical depths."""
 
     optical_depth = np.asarray(dtau, dtype=float)
-    if optical_depth.ndim != 2:
-        raise ValueError("dtau must have shape (layer, wavelength).")
     contribution = optical_depth * np.exp(-np.cumsum(optical_depth, axis=0))
     total = np.sum(contribution, axis=0, keepdims=True)
     return np.divide(
@@ -741,8 +712,6 @@ def plot_temperature_profiles(
         for value in posterior.values()
         if np.asarray(value).ndim > 0
     ]
-    if not sample_sizes:
-        raise ValueError("Posterior contains no sampled arrays.")
     count = min(int(draw_count), min(sample_sizes))
     indices = np.random.default_rng(seed).choice(min(sample_sizes), count, replace=False)
     figure, axis = plt.subplots(figsize=(6, 7))
@@ -839,14 +808,10 @@ def planet_rest_frame_products(
 ) -> dict[str, Any]:
     """Shift observed and model timeseries using posterior-median orbital velocities."""
 
-    if "Kp" not in posterior:
-        raise KeyError("Posterior does not contain Kp.")
     if "v_sys" in posterior:
         v_sys = float(np.median(posterior["v_sys"]))
-    elif "Vsys_kms" in posterior:
-        v_sys = float(np.median(posterior["Vsys_kms"]))
     else:
-        raise KeyError("Posterior does not contain v_sys or Vsys_kms.")
+        v_sys = float(np.median(posterior["Vsys_kms"]))
     kp = float(np.median(posterior["Kp"]))
     velocity = np.asarray(planet_rv_kms(np.asarray(phase), kp, v_sys))
     observed = coadd_in_planet_rest_frame(wavelength, data, sigma, velocity)
@@ -912,9 +877,8 @@ def default_kp_vsys_grids(
     return kp_grid, v_sys_grid
 
 
+
 def _normal_logpdf(value: float, mean: float, std: float) -> float:
-    if std <= 0.0:
-        raise ValueError(f"std must be positive, got {std}.")
     z = (value - mean) / std
     return float(-0.5 * z * z - math.log(std) - 0.5 * math.log(2.0 * math.pi))
 
@@ -1153,6 +1117,7 @@ def plot_kp_vsys_surface(
     ax.legend(loc="best")
     plt.colorbar(im, ax=ax, label=surface_label)
     return ax
+
 
 
 def plot_processed_timeseries_comparison(

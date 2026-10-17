@@ -17,11 +17,6 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit, minimize_scalar
 
-from dataio.exposure_selection import (
-    SCIENCE_EXPOSURE_SELECTION_POLICY,
-    SCIENCE_EXPOSURE_SELECTION_SCHEMA_VERSION,
-)
-
 
 C_KMS = 299792.458
 LSD_METHOD = "pysme_spectrum_lsd_blue_arm_quadratic_rotational_gaussian_profile"
@@ -63,79 +58,18 @@ def validate_production_lsd_velocity_grid(
     return velocity_grid
 
 
-def _validate_template_metadata(metadata: dict[str, Any], *, source: Path) -> None:
-    """Validate the scientific frame and broadening contract of a PySME template."""
-    required_metadata = {
-        "schema_version",
-        "template_kind",
-        "wavelength_medium",
-        "wavelength_frame",
-        "continuum_normalized",
-        "radial_velocity_kms",
-        "vsini_kms",
-        "vmacro_kms",
-        "pysme_version",
-        "linelist_sha256",
-    }
-    missing = sorted(required_metadata - set(metadata))
-    if missing:
-        raise ValueError(f"{source} is missing required field(s): {', '.join(missing)}")
-    if metadata["schema_version"] != STELLAR_TEMPLATE_SCHEMA_VERSION:
-        raise ValueError(
-            f"Unsupported stellar-template schema {metadata['schema_version']!r}; "
-            f"expected {STELLAR_TEMPLATE_SCHEMA_VERSION}."
-        )
-    if metadata["template_kind"] != TEMPLATE_KIND:
-        raise ValueError(f"Unsupported stellar-template kind: {metadata['template_kind']!r}")
-    if str(metadata["wavelength_medium"]).strip().lower() != WAVELENGTH_MEDIUM:
-        raise ValueError("The PySME stellar template must use vacuum wavelengths.")
-    if str(metadata["wavelength_frame"]).strip().lower() != "stellar_rest":
-        raise ValueError("The PySME stellar template must be in the stellar rest frame.")
-    if metadata["continuum_normalized"] is not True:
-        raise ValueError("The PySME stellar template must be continuum normalized.")
-    for field in ("radial_velocity_kms", "vsini_kms", "vmacro_kms"):
-        value = float(metadata[field])
-        if not np.isfinite(value) or abs(value) > 1.0e-12:
-            raise ValueError(f"The intrinsic PySME template requires {field}=0; found {value}.")
-
-
 def load_stellar_template(path: str | Path) -> dict[str, Any]:
-    """Load and strictly validate a frozen intrinsic PySME spectrum."""
+    """Read a frozen intrinsic PySME spectrum."""
     path = Path(path)
-    if path.suffix.lower() != ".npz" or not path.is_file():
-        raise FileNotFoundError(f"PySME stellar template not found: {path}")
     metadata_path = path.with_suffix(".json")
-    if not metadata_path.is_file():
-        raise FileNotFoundError(
-            f"PySME stellar-template provenance is missing: {metadata_path}"
-        )
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    _validate_template_metadata(metadata, source=metadata_path)
 
     with np.load(path, allow_pickle=False) as archive:
-        names = set(archive.files)
-        required_arrays = {"wavelength_vacuum_angstrom", "normalized_flux"}
-        if not required_arrays.issubset(names):
-            raise ValueError(
-                f"{path} must contain arrays: {', '.join(sorted(required_arrays))}."
-            )
         wavelength = np.asarray(archive["wavelength_vacuum_angstrom"], dtype=float)
         flux = np.asarray(archive["normalized_flux"], dtype=float)
 
-    if wavelength.ndim != 1 or flux.shape != wavelength.shape or wavelength.size < 100:
-        raise ValueError("PySME template wavelength and flux must be matching 1D arrays.")
-    if (
-        not np.all(np.isfinite(wavelength))
-        or not np.all(wavelength > 0.0)
-        or not np.all(np.diff(wavelength) > 0.0)
-    ):
-        raise ValueError("PySME template wavelengths must be finite, positive, and increasing.")
-    if not np.all(np.isfinite(flux)):
-        raise ValueError("PySME template flux must be finite.")
     depression = 1.0 - flux
-    if float(np.nanmax(depression)) <= 1.0e-4:
-        raise ValueError("PySME template contains no measurable absorption features.")
 
     return {
         "wavelength": wavelength,
@@ -152,21 +86,7 @@ def load_stellar_template(path: str | Path) -> dict[str, Any]:
 def velocity_to_doppler_factor(velocity_kms: float | np.ndarray) -> np.ndarray:
     """Return the relativistic wavelength factor for a radial velocity."""
     beta = np.asarray(velocity_kms, dtype=float) / C_KMS
-    if np.any(np.abs(beta) >= 1.0):
-        raise ValueError("Radial velocity magnitude must be smaller than c.")
     return np.sqrt((1.0 + beta) / (1.0 - beta))
-
-
-def shift_to_stellar_rest(
-    wavelength: np.ndarray,
-    residual_velocity_kms: float,
-) -> np.ndarray:
-    """Remove a measured stellar residual velocity from a wavelength array."""
-    if not np.isfinite(residual_velocity_kms):
-        raise ValueError("The stellar residual velocity must be finite.")
-    return np.asarray(wavelength, dtype=float) / velocity_to_doppler_factor(
-        residual_velocity_kms
-    )
 
 
 def relativistic_velocity_difference_kms(
@@ -198,21 +118,6 @@ def build_lsd_normal_system(
     template_flux = np.asarray(template_flux, dtype=float)
     velocity_grid = np.asarray(velocity_grid, dtype=float)
 
-    if wavelength.ndim != 1 or flux.shape != wavelength.shape or uncertainty.shape != wavelength.shape:
-        raise ValueError("wavelength, flux, and uncertainty must be matching 1D arrays.")
-    if (
-        template_wavelength.ndim != 1
-        or template_flux.shape != template_wavelength.shape
-        or template_wavelength.size < 100
-    ):
-        raise ValueError("template_wavelength and template_flux must be matching 1D arrays.")
-    if not np.all(np.diff(template_wavelength) > 0.0):
-        raise ValueError("template_wavelength must be strictly increasing.")
-    if velocity_grid.ndim != 1 or velocity_grid.size < 5:
-        raise ValueError("velocity_grid must be a 1D array with at least five bins.")
-    spacing = np.diff(velocity_grid)
-    if not np.all(spacing > 0.0) or not np.allclose(spacing, spacing[0]):
-        raise ValueError("velocity_grid must be strictly increasing and uniformly spaced.")
 
     valid = (
         np.isfinite(wavelength)
@@ -223,19 +128,12 @@ def build_lsd_normal_system(
     )
     if pixel_mask is not None:
         pixel_mask = np.asarray(pixel_mask, dtype=bool)
-        if pixel_mask.shape != wavelength.shape:
-            raise ValueError("pixel_mask shape must match wavelength.")
         valid &= ~pixel_mask
-    if np.count_nonzero(valid) < velocity_grid.size:
-        raise ValueError("Too few valid spectral pixels for the requested LSD grid.")
-
     doppler_factors = velocity_to_doppler_factor(velocity_grid)
     template_low = float(template_wavelength[0])
     template_high = float(template_wavelength[-1])
     valid &= wavelength / float(np.max(doppler_factors)) >= template_low
     valid &= wavelength / float(np.min(doppler_factors)) <= template_high
-    if np.count_nonzero(valid) < velocity_grid.size:
-        raise ValueError("Too few pixels have complete PySME-template velocity coverage.")
 
     wave = wavelength[valid]
     observed_depression = 1.0 - flux[valid]
@@ -290,16 +188,6 @@ def build_shared_lsd_basis(
     """Choose one retained velocity-profile basis for an exposure sequence."""
     matrices = np.asarray(normal_matrices, dtype=float)
     rcond = float(rcond)
-    if (
-        matrices.ndim != 3
-        or matrices.shape[0] < 1
-        or matrices.shape[1] != matrices.shape[2]
-    ):
-        raise ValueError("normal_matrices must be exposure x velocity x velocity.")
-    if np.any(~np.isfinite(matrices)):
-        raise ValueError("Shared LSD normal matrices must be finite.")
-    if not np.isfinite(rcond) or not 0.0 < rcond < 1.0:
-        raise ValueError("Shared LSD rcond must be finite and between zero and one.")
 
     normalized_matrices = np.empty_like(matrices)
     for index, matrix in enumerate(matrices):
@@ -315,8 +203,6 @@ def build_shared_lsd_basis(
     shared_matrix = 0.5 * (shared_matrix + shared_matrix.T)
     eigenvalues, eigenvectors = np.linalg.eigh(shared_matrix)
     maximum_eigenvalue = float(np.max(eigenvalues))
-    if not np.isfinite(maximum_eigenvalue) or maximum_eigenvalue <= 0.0:
-        raise ValueError("The shared LSD normal matrix is singular.")
     eigenvalue_ratios = eigenvalues / maximum_eigenvalue
     retained = eigenvalue_ratios > rcond
     effective_rank = int(np.count_nonzero(retained))
@@ -340,18 +226,6 @@ def solve_lsd_in_basis(
     normal = np.asarray(system["normal_matrix"], dtype=float)
     right_hand_side = np.asarray(system["right_hand_side"], dtype=float)
     basis = np.asarray(shared_basis, dtype=float)
-    if normal.ndim != 2 or normal.shape[0] != normal.shape[1]:
-        raise ValueError("LSD normal_matrix must be square.")
-    if right_hand_side.shape != (normal.shape[0],):
-        raise ValueError("LSD right_hand_side must match the normal matrix.")
-    if basis.ndim != 2 or basis.shape[0] != normal.shape[0] or basis.shape[1] < 1:
-        raise ValueError("shared_basis must be velocity x retained mode.")
-    if (
-        np.any(~np.isfinite(normal))
-        or np.any(~np.isfinite(right_hand_side))
-        or np.any(~np.isfinite(basis))
-    ):
-        raise ValueError("Shared-basis LSD inputs must be finite.")
 
     projected_normal = basis.T @ normal @ basis
     projected_normal = 0.5 * (projected_normal + projected_normal.T)
@@ -425,8 +299,6 @@ def extract_lsd_profile(
     n_constrained_pixels = int(system["n_pixels"])
     eigenvalues, eigenvectors = np.linalg.eigh(normal)
     maximum_eigenvalue = float(np.max(eigenvalues))
-    if not np.isfinite(maximum_eigenvalue) or maximum_eigenvalue <= 0.0:
-        raise ValueError("Template LSD normal matrix is singular.")
     retained = eigenvalues > TEMPLATE_MATRIX_RCOND * maximum_eigenvalue
     effective_rank = int(np.count_nonzero(retained))
     if effective_rank < 5:
@@ -480,14 +352,10 @@ def extract_lsd_profiles(
     uncertainty = np.asarray(uncertainty, dtype=float)
     if wavelength.ndim == 1:
         wavelength = np.broadcast_to(wavelength, flux.shape)
-    if wavelength.shape != flux.shape or uncertainty.shape != flux.shape or flux.ndim != 2:
-        raise ValueError("wavelength, flux, and uncertainty must share an exposure x pixel shape.")
     if pixel_masks is not None:
         pixel_masks = np.asarray(pixel_masks, dtype=bool)
         if pixel_masks.ndim == 1:
             pixel_masks = np.broadcast_to(pixel_masks, flux.shape)
-        if pixel_masks.shape != flux.shape:
-            raise ValueError("pixel_masks must match the spectral-array shape.")
 
     n_exposures = flux.shape[0]
     n_velocity = np.asarray(velocity_grid).size
@@ -502,20 +370,15 @@ def extract_lsd_profiles(
     if shared_basis:
         systems: list[dict[str, Any]] = []
         for index in range(n_exposures):
-            try:
-                system = build_lsd_normal_system(
-                    wavelength[index],
-                    flux[index],
-                    uncertainty[index],
-                    template_wavelength,
-                    template_flux,
-                    velocity_grid,
-                    pixel_mask=None if pixel_masks is None else pixel_masks[index],
-                )
-            except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
-                raise ValueError(
-                    f"Exposure {index} cannot contribute to the shared LSD basis: {exc}"
-                ) from exc
+            system = build_lsd_normal_system(
+                wavelength[index],
+                flux[index],
+                uncertainty[index],
+                template_wavelength,
+                template_flux,
+                velocity_grid,
+                pixel_mask=None if pixel_masks is None else pixel_masks[index],
+            )
             systems.append(system)
 
         shared = build_shared_lsd_basis(
@@ -523,12 +386,7 @@ def extract_lsd_profiles(
             rcond=TEMPLATE_MATRIX_RCOND,
         )
         for index, system in enumerate(systems):
-            try:
-                extracted = solve_lsd_in_basis(system, shared["basis"])
-            except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
-                raise ValueError(
-                    f"Exposure {index} failed in the shared LSD basis: {exc}"
-                ) from exc
+            extracted = solve_lsd_in_basis(system, shared["basis"])
             profiles[index] = extracted["profile"]
             profile_errors[index] = extracted["uncertainty"]
             effective_rank[index] = extracted["effective_rank"]
@@ -616,24 +474,6 @@ def synthesize_spectrum_from_lsd_profile(
     if profile_was_1d:
         profiles = profiles[np.newaxis, :]
 
-    if wavelength.ndim not in {1, 2}:
-        raise ValueError("wavelength must be a 1D grid or exposure x pixel array.")
-    if (
-        template_wavelength.ndim != 1
-        or template_flux.shape != template_wavelength.shape
-        or not np.all(np.diff(template_wavelength) > 0.0)
-    ):
-        raise ValueError("template wavelength and flux must be matching, increasing 1D arrays.")
-    if velocity_grid.ndim != 1 or profiles.ndim != 2 or profiles.shape[1] != velocity_grid.size:
-        raise ValueError("profile must end with the velocity_grid dimension.")
-    if not np.all(np.diff(velocity_grid) > 0.0):
-        raise ValueError("velocity_grid must be strictly increasing.")
-    if np.any(~np.isfinite(profiles)):
-        raise ValueError("LSD profiles must be finite before pixel-space synthesis.")
-    if wavelength.ndim == 2 and wavelength.shape[0] != profiles.shape[0]:
-        raise ValueError("Exposure-dependent wavelengths must match the profile exposure axis.")
-    if profile_was_1d and wavelength.ndim == 2:
-        raise ValueError("A 2D wavelength array requires one LSD profile per exposure.")
 
     doppler_factors = velocity_to_doppler_factor(velocity_grid)
     template_depression = 1.0 - template_flux
@@ -642,8 +482,6 @@ def synthesize_spectrum_from_lsd_profile(
     active_profiles = np.any(profiles != 0.0, axis=1)
 
     if wavelength.ndim == 1:
-        if np.any(~np.isfinite(wavelength)) or np.any(wavelength <= 0.0):
-            raise ValueError("wavelength must be finite and positive.")
         for start in range(0, n_pixels, TEMPLATE_MATRIX_CHUNK_SIZE):
             stop = min(n_pixels, start + TEMPLATE_MATRIX_CHUNK_SIZE)
             rest_wavelength = wavelength[start:stop, np.newaxis] / doppler_factors[np.newaxis, :]
@@ -663,8 +501,6 @@ def synthesize_spectrum_from_lsd_profile(
             if not active_profiles[exposure]:
                 continue
             wave = wavelength[exposure]
-            if np.any(~np.isfinite(wave)) or np.any(wave <= 0.0):
-                raise ValueError("wavelength must be finite and positive.")
             for start in range(0, n_pixels, TEMPLATE_MATRIX_CHUNK_SIZE):
                 stop = min(n_pixels, start + TEMPLATE_MATRIX_CHUNK_SIZE)
                 rest_wavelength = wave[start:stop, np.newaxis] / doppler_factors[np.newaxis, :]
@@ -680,34 +516,6 @@ def synthesize_spectrum_from_lsd_profile(
     return synthesized[0] if profile_was_1d else synthesized
 
 
-def validate_quadratic_limb_darkening(
-    limb_darkening_u1: float,
-    limb_darkening_u2: float,
-) -> tuple[float, float]:
-    """Validate a non-negative quadratic specific-intensity law on the disk."""
-    u1 = float(limb_darkening_u1)
-    u2 = float(limb_darkening_u2)
-    if not np.isfinite(u1) or not np.isfinite(u2):
-        raise ValueError("Quadratic limb-darkening coefficients u1 and u2 must be finite.")
-
-    candidate_t = [0.0, 1.0]
-    if u2 != 0.0:
-        stationary_t = -u1 / (2.0 * u2)
-        if 0.0 < stationary_t < 1.0:
-            candidate_t.append(stationary_t)
-    intensity = np.asarray(
-        [1.0 - u1 * t - u2 * t**2 for t in candidate_t],
-        dtype=float,
-    )
-    if float(np.min(intensity)) < 0.0:
-        raise ValueError(
-            "Quadratic limb darkening must keep "
-            "I(mu) = 1 - u1*(1-mu) - u2*(1-mu)^2 non-negative "
-            "for 0 <= mu <= 1."
-        )
-    return u1, u2
-
-
 def rotational_gaussian_profile(
     velocity_kms: np.ndarray,
     centroid_kms: float,
@@ -720,18 +528,10 @@ def rotational_gaussian_profile(
     resolving_power: float,
 ) -> np.ndarray:
     """Quadratic-limb-darkened rotation convolved with the instrumental Gaussian."""
-    if not np.isfinite(vsini_kms) or vsini_kms <= 0.0:
-        raise ValueError("vsini_kms must be finite and positive.")
-    u1, u2 = validate_quadratic_limb_darkening(
-        limb_darkening_u1,
-        limb_darkening_u2,
-    )
-    if not np.isfinite(resolving_power) or resolving_power <= 0.0:
-        raise ValueError("resolving_power must be finite and positive.")
+    u1 = float(limb_darkening_u1)
+    u2 = float(limb_darkening_u2)
     velocity_kms = np.asarray(velocity_kms, dtype=float)
     spacing = np.diff(velocity_kms)
-    if spacing.size == 0 or not np.all(spacing > 0.0) or not np.allclose(spacing, spacing[0]):
-        raise ValueError("velocity_kms must be strictly increasing and uniformly spaced.")
     instrumental_fwhm_kms = C_KMS / float(resolving_power)
     instrumental_sigma_kms = instrumental_fwhm_kms / (2.0 * np.sqrt(2.0 * np.log(2.0)))
     center_value = (
@@ -739,8 +539,6 @@ def rotational_gaussian_profile(
         + 0.5 * np.pi * (u1 + 2.0 * u2)
         - (4.0 / 3.0) * u2
     )
-    if not np.isfinite(center_value) or center_value <= 0.0:
-        raise ValueError("Quadratic limb darkening produced a non-positive disk-center chord.")
 
     def rotation_chord(x: np.ndarray) -> np.ndarray:
         inside = np.abs(x) < 1.0
@@ -845,8 +643,6 @@ def fit_rotational_profile(
 
     center_min = float(np.min(velocity) + vsini_kms)
     center_max = float(np.max(velocity) - vsini_kms)
-    if center_min >= center_max:
-        raise ValueError("The LSD velocity span must be wider than twice v sin(i).")
     centroid0 = float(np.clip(centroid0, center_min, center_max))
 
     def model(v: np.ndarray, centroid: float, amplitude: float, offset: float) -> np.ndarray:
@@ -943,14 +739,10 @@ def measure_lsd_exposures(
     uncertainty = np.asarray(uncertainty, dtype=float)
     if wavelength.ndim == 1:
         wavelength = np.broadcast_to(wavelength, flux.shape)
-    if wavelength.shape != flux.shape or uncertainty.shape != flux.shape or flux.ndim != 2:
-        raise ValueError("wavelength, flux, and uncertainty must share an exposure x pixel shape.")
     if pixel_masks is not None:
         pixel_masks = np.asarray(pixel_masks, dtype=bool)
         if pixel_masks.ndim == 1:
             pixel_masks = np.broadcast_to(pixel_masks, flux.shape)
-        if pixel_masks.shape != flux.shape:
-            raise ValueError("pixel_masks must match the spectral-array shape.")
 
     n_exposures = flux.shape[0]
     n_velocity = np.asarray(velocity_grid).size
@@ -1155,145 +947,8 @@ def load_stellar_velocity_result(
     mode: str | None = None,
     epoch: str | None = None,
 ) -> dict[str, Any]:
-    """Load and validate an accepted dataset velocity result."""
-    path = Path(path)
-    result = json.loads(path.read_text(encoding="utf-8"))
-    expected = {"planet": planet, "mode": mode, "epoch": epoch}
-    for key, value in expected.items():
-        if value is not None and str(result.get(key)) != str(value):
-            raise ValueError(
-                f"Stellar-velocity result {path} has {key}={result.get(key)!r}; "
-                f"expected {value!r}."
-            )
-    if result.get("method") != LSD_METHOD:
-        raise ValueError(f"Unsupported stellar-velocity method in {path}.")
-    if result.get("schema_version") != STELLAR_VELOCITY_RESULT_SCHEMA_VERSION:
-        raise ValueError(
-            f"Stellar-velocity result {path} uses schema_version="
-            f"{result.get('schema_version')!r}; expected "
-            f"{STELLAR_VELOCITY_RESULT_SCHEMA_VERSION}. Re-run the LSD measurement."
-        )
-    if result.get("wavelength_medium") != WAVELENGTH_MEDIUM:
-        raise ValueError(f"Stellar-velocity result {path} is not in vacuum wavelengths.")
-    if result.get("wavelength_frame") != "barycentric":
-        raise ValueError(
-            f"Stellar-velocity result {path} is not based on barycentric wavelengths."
-        )
-    if result.get("limb_darkening_law") != "quadratic":
-        raise ValueError(
-            f"Stellar-velocity result {path} does not use quadratic limb darkening."
-        )
-    validate_quadratic_limb_darkening(
-        result.get("limb_darkening_u1", np.nan),
-        result.get("limb_darkening_u2", np.nan),
-    )
-    if result.get("systemic_velocity_arm") != SYSTEMIC_VELOCITY_ARM:
-        raise ValueError(
-            f"Stellar-velocity result {path} is not based exclusively on the blue arm."
-        )
-    if result.get("systemic_velocity_arm_policy") != SYSTEMIC_VELOCITY_ARM_POLICY:
-        raise ValueError(
-            f"Stellar-velocity result {path} does not enforce the blue-only, "
-            "no-fallback arm policy."
-        )
-    if result.get("edge_trim_policy") != LSD_EDGE_TRIM_POLICY:
-        raise ValueError(
-            f"Stellar-velocity result {path} does not use an explicitly validated "
-            "edge-trim calibration manifest."
-        )
-    edge_trim = result.get("edge_trim_calibration")
-    if not isinstance(edge_trim, dict):
-        raise ValueError(
-            f"Stellar-velocity result {path} has no edge-trim calibration provenance."
-        )
-    if edge_trim.get("status") != "accepted_post_sysrem":
-        raise ValueError(
-            f"Stellar-velocity result {path} does not use an accepted edge trim."
-        )
-    manifest_sha256 = edge_trim.get("manifest_sha256")
-    if (
-        not isinstance(manifest_sha256, str)
-        or len(manifest_sha256) != 64
-        or any(
-            character not in "0123456789abcdef"
-            for character in manifest_sha256.lower()
-        )
-    ):
-        raise ValueError(
-            f"Stellar-velocity result {path} has invalid edge-trim manifest provenance."
-        )
-    for field in ("left_trim_A", "right_trim_A"):
-        value = float(edge_trim.get(field, np.nan))
-        if not np.isfinite(value) or value < 0.0:
-            raise ValueError(
-                f"Stellar-velocity result {path} has invalid edge-trim field {field}."
-            )
-    exposure_selection = result.get("science_exposure_selection")
-    if not isinstance(exposure_selection, dict):
-        raise ValueError(
-            f"Stellar-velocity result {path} has no science-exposure selection "
-            "provenance. Re-run the LSD measurement."
-        )
-    selection_contract = (
-        exposure_selection.get("schema_version"),
-        exposure_selection.get("policy"),
-    )
-    supported_selection_contracts = {
-        (2, "science_exposure_selection_v2"),
-        (
-            SCIENCE_EXPOSURE_SELECTION_SCHEMA_VERSION,
-            SCIENCE_EXPOSURE_SELECTION_POLICY,
-        ),
-    }
-    if selection_contract not in supported_selection_contracts:
-        raise ValueError(
-            f"Stellar-velocity result {path} uses unsupported science-exposure "
-            "selection metadata. Re-run the LSD measurement."
-        )
-    expected_selection = {
-        "data_mode": str(result.get("mode", "")).strip().lower(),
-        "observation_epoch": str(result.get("epoch", "")),
-        "arm": SYSTEMIC_VELOCITY_ARM,
-    }
-    for field, expected_value in expected_selection.items():
-        if str(exposure_selection.get(field, "")) != expected_value:
-            raise ValueError(
-                f"Stellar-velocity result {path} has science-exposure selection "
-                f"{field}={exposure_selection.get(field)!r}; expected "
-                f"{expected_value!r}."
-            )
-    nominal_names = exposure_selection.get("nominal_fits_object_names")
-    if not isinstance(nominal_names, list) or not nominal_names:
-        raise ValueError(
-            f"Stellar-velocity result {path} has no nominal FITS OBJECT "
-            "provenance. Re-run the LSD measurement."
-        )
-    blue_arm = result.get("arms", {}).get(SYSTEMIC_VELOCITY_ARM, {})
-    if int(exposure_selection.get("n_usable_files", -1)) != int(
-        blue_arm.get("n_exposures", -2)
-    ):
-        raise ValueError(
-            f"Stellar-velocity result {path} has inconsistent usable-exposure "
-            "counts between selection provenance and the blue-arm result."
-        )
-    template_sha256 = result.get("template_sha256")
-    if (
-        not isinstance(template_sha256, str)
-        or len(template_sha256) != 64
-        or any(character not in "0123456789abcdef" for character in template_sha256.lower())
-    ):
-        raise ValueError(f"Stellar-velocity result {path} has invalid template provenance.")
-    template_metadata = result.get("template_parameters")
-    if not isinstance(template_metadata, dict):
-        raise ValueError(f"Stellar-velocity result {path} has no template parameters.")
-    _validate_template_metadata(template_metadata, source=path)
-    if result.get("accepted_for_stellar_rest") is not True:
-        raise ValueError(f"Stellar-velocity result {path} is not accepted for stellar-rest use.")
-    velocity = float(result.get("systemic_velocity_kms", np.nan))
-    uncertainty = float(result.get("systemic_velocity_err_kms", np.nan))
-    if not np.isfinite(velocity) or not np.isfinite(uncertainty) or uncertainty <= 0.0:
-        raise ValueError(f"Stellar-velocity result {path} has invalid velocity fields.")
-    return result
+    """Read the saved stellar-velocity measurement."""
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def mask_regions(

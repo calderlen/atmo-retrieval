@@ -4,42 +4,13 @@ import hashlib
 import re
 from time import time
 from typing import Callable
-import os
 import numpy as np
 import jax.numpy as jnp
 import pathlib
 
 import requests
 
-# RADIS uses numba cache=True in some environments where caching is unsupported.
-os.environ.setdefault("NUMBA_DISABLE_CACHE", "1")
-
-
-def _patch_numba_enable_caching():
-    try:
-        from numba.core.dispatcher import Dispatcher
-        from numba.core.caching import NullCache
-    except Exception:
-        return
-
-    orig_enable_caching = getattr(Dispatcher, "enable_caching", None)
-    if orig_enable_caching is None or getattr(orig_enable_caching, "_locator_patched", False):
-        return
-
-    def _enable_caching(self):
-        try:
-            return orig_enable_caching(self)
-        except RuntimeError as exc:
-            if "no locator available" not in str(exc):
-                raise
-            self._cache = NullCache()
-            return None
-
-    _enable_caching._locator_patched = True
-    Dispatcher.enable_caching = _enable_caching
-
-
-_patch_numba_enable_caching()
+import _numba_compat  # Configure caching before ExoJAX imports RADIS.
 
 from exojax.database.contdb import CdbCIA
 from exojax.opacity.opacont import OpaCIA
@@ -53,25 +24,12 @@ from radis.api.hitempapi import login_to_hitran
 
 # Opacity cache directory (relative to project root)
 from config import DB_KURUCZ, DB_VALD, OPA_CACHE_DIR, USE_KURUCZ, USE_VALD
-try:
-    from .atomic_sources import (
-        load_kurucz_atomic,
-        load_vald_atomic,
-        create_atomic_snapshot,
-        resolve_vald_file,
-        parse_species,
-        ATOMIC_MASSES as ATOMIC_MASSES_DB,
-    )
-    _ATOMIC_BACKEND_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - depends on external exojax install
-    load_kurucz_atomic = None
-    load_vald_atomic = None
-    create_atomic_snapshot = None
-    resolve_vald_file = None
-    parse_species = None
-    ATOMIC_MASSES_DB = {}
-    _ATOMIC_BACKEND_IMPORT_ERROR = exc
-OPA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+from .atomic_sources import (
+    load_kurucz_atomic,
+    load_vald_atomic,
+    create_atomic_snapshot,
+    resolve_vald_file,
+)
 
 
 def premodit_cache_signature(
@@ -112,89 +70,8 @@ def premodit_cache_path(
     )
     return OPA_CACHE_DIR / f"opa_{name}_{signature}.zarr"
 
-# Atomic mass lookup (most common isotopes)
-ATOMIC_MASSES = {
-    "H": 1.008,   # 1H
-    "He": 4.0026, # 4He
-    "Al": 26.98,   # 27Al
-    "B": 10.81,    # 11B
-    "Ba": 137.33,  # 138Ba
-    "Be": 9.01,    # 9Be
-    "C": 12.01,    # 12C
-    "Ca": 40.08,   # 40Ca
-    "Cl": 35.45,   # 35Cl
-    "Co": 58.93,   # 59Co
-    "Cr": 52.00,   # 52Cr
-    "Cs": 132.91,  # 133Cs
-    "Cu": 63.55,   # 63Cu
-    "Fe": 55.85,   # 56Fe
-    "F": 19.00,    # 19F
-    "Ga": 69.72,   # 69Ga
-    "Ge": 72.63,   # 74Ge
-    "Hf": 178.49,  # 180Hf
-    "In": 114.82,  # 115In
-    "Ir": 192.22,  # 193Ir
-    "K": 39.10,    # 39K
-    "Li": 6.94,    # 7Li
-    "Mg": 24.31,   # 24Mg
-    "Mn": 54.94,   # 55Mn
-    "Mo": 95.95,   # 98Mo
-    "N": 14.01,    # 14N
-    "Na": 22.99,   # 23Na
-    "Nb": 92.91,   # 93Nb
-    "Ni": 58.69,   # 58Ni
-    "O": 16.00,    # 16O
-    "Os": 190.23,  # 192Os
-    "P": 30.97,    # 31P
-    "Pb": 207.2,   # 208Pb
-    "Pd": 106.42,  # 106Pd
-    "Rb": 85.47,   # 85Rb
-    "Rh": 102.91,  # 103Rh
-    "Ru": 101.07,  # 102Ru
-    "S": 32.06,    # 32S
-    "Sc": 44.96,   # 45Sc
-    "Si": 28.09,   # 28Si
-    "Sn": 118.71,  # 120Sn
-    "Sr": 87.62,   # 88Sr
-    "Ti": 47.87,   # 48Ti
-    "Tl": 204.38,  # 205Tl
-    "V": 50.94,    # 51V
-    "W": 183.84,   # 184W
-    "Y": 88.91,    # 89Y
-    "Zn": 65.38,   # 64Zn
-    "Zr": 91.22,   # 90Zr
-}
-
-def _patch_path_contains():
-    if not hasattr(pathlib.Path, "__contains__"):
-        def _contains(self, item):
-            return str(item) in str(self)
-        pathlib.Path.__contains__ = _contains
-
-
-def _patch_radis_dbmanager():
-    orig_init = getattr(radis_dbmanager.DatabaseManager, "__init__", None)
-    if orig_init is None or getattr(orig_init, "_path_patched", False):
-        return
-
-    def _init(self, name, molecule, local_databases, *args, **kwargs):
-        base_dir = pathlib.Path(local_databases).expanduser().resolve()
-        base_dir.mkdir(parents=True, exist_ok=True)
-        return orig_init(self, name, molecule, str(base_dir), *args, **kwargs)
-
-    _init._path_patched = True
-    radis_dbmanager.DatabaseManager.__init__ = _init
-
-
-_patch_path_contains()
-_patch_radis_dbmanager()
-
 
 def _patch_radis_download():
-    orig = getattr(radis_dbmanager.DatabaseManager, "download_and_parse", None)
-    if orig is None or getattr(orig, "_no_head_patched", False):
-        return
-
     def download_and_parse(self, urlnames, local_files, N_files_total=None):
         if N_files_total is None:
             all_local_files, _ = self.get_filenames()
@@ -232,13 +109,6 @@ def _patch_radis_download():
                 urlname, headers=headers, stream=True, allow_redirects=True
             )
             response.raise_for_status()
-
-            content_type = response.headers.get("content-type", "").lower()
-            if "text/html" in content_type:
-                raise requests.HTTPError(
-                    f"Received HTML instead of a data file for {urlname}. "
-                    "HITRAN login is likely required. Set HITRAN_USERNAME and HITRAN_PASSWORD."
-                )
 
             temp_file_name = urlname.split("/")[-1]
             temp_file_name = re.sub(r'[<>:\"/\\\\|?*&=]', "_", temp_file_name)
@@ -294,7 +164,6 @@ def _patch_radis_download():
             ):
                 download_and_parse_one_file(urlname, local_file, Ndownload)
 
-    download_and_parse._no_head_patched = True
     radis_dbmanager.DatabaseManager.download_and_parse = download_and_parse
 
 
@@ -308,24 +177,10 @@ def setup_cia_opacities(cia_paths: dict[str, str], nu_grid: np.ndarray) -> dict[
     for name, path in cia_paths.items():
         cdb = CdbCIA(str(path), nurange=nu_grid)
         if np.asarray(cdb.nucia).size == 0:
-            print(f"  Warning: CIA {name} has no overlap with nu_grid; skipping.")
             continue
         opa_cias[name] = OpaCIA(cdb, nu_grid=nu_grid)
 
-    if not opa_cias:
-        print("  Warning: No CIA sources overlap nu_grid; continuing without CIA.")
     return opa_cias
-
-
-def _opa_grid_matches(opa: OpaPremodit, nu_grid: np.ndarray) -> bool:
-    """Check whether a cached opacity matches the current wavenumber grid."""
-    opa_grid = np.asarray(opa.nu_grid)
-    nu_grid = np.asarray(nu_grid)
-    if opa_grid.shape != nu_grid.shape:
-        return False
-    if opa_grid.size == 0:
-        return False
-    return np.isclose(opa_grid[0], nu_grid[0]) and np.isclose(opa_grid[-1], nu_grid[-1])
 
 
 def _resolve_cutwing(cutwing: float | None) -> float:
@@ -333,36 +188,6 @@ def _resolve_cutwing(cutwing: float | None) -> float:
     if cutwing is None:
         return 0.5
     return float(cutwing)
-
-
-def _opa_settings_match(
-    opa: OpaPremodit,
-    diffmode: int,
-    cutwing: float,
-    T_low: float | None = None,
-    T_high: float | None = None,
-) -> bool:
-    """Check whether cached opacity settings match runtime parameters."""
-    aux = getattr(opa, "aux", {}) or {}
-    dm = aux.get("diffmode")
-    if dm is None or int(dm) != int(diffmode):
-        return False
-    cw = aux.get("cutwing")
-    if cw is None or not np.isclose(float(cw), float(cutwing)):
-        return False
-    # PreModit auto_trange is recorded on the opa object as Tmin / Tmax. A mismatch
-    # means the cached LBD was built for a different robust range (different dE,
-    # Tref, Twt) and must be rebuilt or the polynomial coefficients will be wrong
-    # for the runtime temperature range.
-    if T_low is not None:
-        tmin = getattr(opa, "Tmin", None)
-        if tmin is None or not np.isclose(float(tmin), float(T_low)):
-            return False
-    if T_high is not None:
-        tmax = getattr(opa, "Tmax", None)
-        if tmax is None or not np.isclose(float(tmax), float(T_high)):
-            return False
-    return True
 
 
 def build_premodit_from_snapshot(
@@ -374,7 +199,6 @@ def build_premodit_from_snapshot(
     T_low: float,
     T_high: float,
     cutwing: float | None = None,
-    aux_extra: dict[str, object] | None = None,
 ) -> OpaPremodit:
     """Create preMODIT opacity from database snapshot and save it."""
     cutwing_val = _resolve_cutwing(cutwing)
@@ -395,20 +219,7 @@ def build_premodit_from_snapshot(
         T_high,
         cutwing_val,
     )
-    try:
-        saveopa(
-            opa,
-            str(opa_path),
-            format="zarr",
-            aux={
-                "molmass": molmass,
-                "cutwing": float(cutwing_val),
-                "diffmode": int(diffmode),
-                **(aux_extra or {}),
-            },
-        )
-    except Exception as exc:
-        print(f"    warning: failed to cache opacity for {mol}: {exc}; continuing with in-memory opacity")
+    saveopa(opa, str(opa_path), format="zarr", aux={"molmass": molmass})
     return opa
 
 
@@ -424,9 +235,8 @@ def load_or_build_opacity(
     cutwing: float | None = None,
     load_only: bool = False,
 ) -> tuple[OpaPremodit | None, float | None]:
-    """Load saved opacity or build from database snapshot."""
+    """Load a saved opacity when opa_load is enabled, otherwise build it."""
     path = str(pathlib.Path(path).expanduser().resolve())
-    pathlib.Path(path).mkdir(parents=True, exist_ok=True)
     cutwing_val = _resolve_cutwing(cutwing)
     if opa_load:
         opa_path = premodit_cache_path(
@@ -437,15 +247,8 @@ def load_or_build_opacity(
             T_high,
             cutwing_val,
         )
-        try:
-            opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
-            if not _opa_grid_matches(opa, nu_grid):
-                raise ValueError("Cached opacity grid mismatch.")
-            if not _opa_settings_match(opa, diffmode, cutwing_val, T_low, T_high):
-                raise ValueError("Cached opacity settings mismatch.")
-            return opa, opa.aux["molmass"]
-        except Exception as exc:
-            print(f"    cache miss for {mol}: {exc}; rebuilding opacity")
+        opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
+        return opa, float(opa.aux["molmass"])
     elif load_only:
         print(f"  Warning: OPA_LOAD disabled; skipping {mol} (load-only).")
         return None, None
@@ -500,7 +303,7 @@ def load_molecular_opacities(
             cutwing=cutwing,
             load_only=load_only,
         )
-        if opa is None or molmass is None:
+        if opa is None:
             continue
         opa_mols[mol] = opa
         molmass_list.append(molmass)
@@ -523,7 +326,7 @@ def load_molecular_opacities(
             cutwing=cutwing,
             load_only=load_only,
         )
-        if opa is None or molmass is None:
+        if opa is None:
             continue
         opa_mols[mol] = opa
         molmass_list.append(molmass)
@@ -554,10 +357,8 @@ def load_atomic_opacities(
     Kurucz line lists are auto-downloaded from kurucz.harvard.edu.
     VALD requires manual download from vald.astro.uu.se.
 
-    Source priority:
-        1. Cached .zarr opacity (if opa_load=True)
-        2. Kurucz gfall (if use_kurucz=True, auto-download enabled)
-        3. VALD3 extract file (if use_vald=True and file available)
+    With opa_load=True, read the saved .zarr opacity directly. Otherwise build
+    from Kurucz when enabled, or from the configured VALD extract.
 
     Args:
         use_kurucz: Enable Kurucz database (default: from config.USE_KURUCZ)
@@ -569,14 +370,6 @@ def load_atomic_opacities(
     if not atomic_species:
         return opa_atoms, jnp.array(atommass_list)
 
-    if _ATOMIC_BACKEND_IMPORT_ERROR is not None:
-        print(
-            "  Warning: atomic opacity backend is unavailable; skipping atomic opacities. "
-            f"Import failed with: {_ATOMIC_BACKEND_IMPORT_ERROR.__class__.__name__}: "
-            f"{_ATOMIC_BACKEND_IMPORT_ERROR}"
-        )
-        return opa_atoms, jnp.array(atommass_list)
-
     # Get defaults from config if not specified
     if use_kurucz is None:
         use_kurucz = USE_KURUCZ
@@ -584,7 +377,6 @@ def load_atomic_opacities(
         use_vald = USE_VALD
 
     if not use_kurucz and not use_vald:
-        print("  Warning: Both USE_KURUCZ and USE_VALD are False, skipping atomic opacities")
         return opa_atoms, jnp.array(atommass_list)
 
     cutwing_val = _resolve_cutwing(cutwing)
@@ -594,13 +386,12 @@ def load_atomic_opacities(
     if db_vald is None:
         db_vald = DB_VALD
     db_kurucz = pathlib.Path(db_kurucz) if use_kurucz else None
-    db_vald = pathlib.Path(db_vald) if use_vald and db_vald is not None else None
-    vald_file = resolve_vald_file(db_vald) if db_vald is not None else None
+    db_vald = pathlib.Path(db_vald) if use_vald else None
 
     sources_str = "/".join(filter(None, ["Kurucz" if use_kurucz else None, "VALD" if use_vald else None]))
     print(f"Loading atomic line databases ({sources_str})...")
 
-    for atom, atom_meta in atomic_species.items():
+    for atom in atomic_species:
         cache_name = f"atom_{atom.replace(' ', '_')}"
 
         if opa_load:
@@ -612,48 +403,26 @@ def load_atomic_opacities(
                 T_high,
                 cutwing_val,
             )
-            try:
-                opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
-                if not _opa_grid_matches(opa, nu_grid):
-                    raise ValueError("Cached opacity grid mismatch.")
-                if not _opa_settings_match(opa, diffmode, cutwing_val, T_low, T_high):
-                    raise ValueError("Cached opacity settings mismatch.")
-                if opa.aux.get("snapshot_precision") != "float64":
-                    raise ValueError("Cached atomic snapshot precision mismatch.")
-                molmass = opa.aux.get("molmass", None)
-                if molmass is None:
-                    raise KeyError("Missing molmass in cached opacity.")
-                opa_atoms[atom] = opa
-                atommass_list.append(molmass)
-                print(f"  * {atom} (cached)")
-                if on_species_loaded is not None:
-                    on_species_loaded(f"atom:{atom}")
-                continue
-            except Exception as exc:
-                print(f"  * {atom} cache miss: {exc}; rebuilding opacity")
+            opa = OpaPremodit.from_saved_opa(str(opa_path), strict=False)
+            molmass = float(opa.aux["molmass"])
+            opa_atoms[atom] = opa
+            atommass_list.append(molmass)
+            print(f"  * {atom} (cached)")
+            if on_species_loaded is not None:
+                on_species_loaded(f"atom:{atom}")
+            continue
         elif load_only:
             print(f"  Warning: OPA_LOAD disabled; skipping {atom} (load-only).")
             continue
 
-        if use_kurucz and db_kurucz is not None:
+        if use_kurucz:
             adb, mask = load_kurucz_atomic(atom, nu_grid, db_kurucz, auto_download=auto_download)
             snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
             source = "Kurucz"
-        elif use_vald and vald_file is not None:
-            adb, mask = load_vald_atomic(atom, nu_grid, vald_file)
+        else:
+            adb, mask = load_vald_atomic(atom, nu_grid, resolve_vald_file(db_vald))
             snapshot, molmass = create_atomic_snapshot(adb, mask=mask)
             source = "VALD"
-        else:
-            raise ValueError(f"No atomic database source available for {atom}.")
-
-        # Fix missing molmass
-        if molmass is None or (isinstance(molmass, float) and np.isnan(molmass)):
-            element, _ = parse_species(atom)
-            molmass = ATOMIC_MASSES_DB.get(element, molmass)
-
-        if molmass is None:
-            raise ValueError(f"Could not determine atomic mass for {atom}.")
-
         print(f"  * {atom} ({source})")
         opa = build_premodit_from_snapshot(
             snapshot,
@@ -664,14 +433,10 @@ def load_atomic_opacities(
             T_low,
             T_high,
             cutwing=cutwing_val,
-            aux_extra={"snapshot_precision": "float64"},
         )
         opa_atoms[atom] = opa
         atommass_list.append(molmass)
         if on_species_loaded is not None:
             on_species_loaded(f"atom:{atom}")
-
-    if not opa_atoms:
-        print("  No atomic opacities loaded (data not available or download required)")
 
     return opa_atoms, jnp.array(atommass_list)

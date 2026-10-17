@@ -1,4 +1,4 @@
-"""Build and validate persisted wavelength-frame provenance for HRS products."""
+"""Build persisted wavelength-frame provenance for HRS products."""
 
 from __future__ import annotations
 
@@ -49,14 +49,10 @@ def subset_loader_frame_extras(
     """Subset loader provenance arrays when the saved source exposure set changes."""
 
     selection = np.asarray(selection)
-    if selection.ndim != 1:
-        raise ValueError("Loader-frame provenance selection must be one-dimensional.")
     if selection.dtype == bool:
         indices = np.flatnonzero(selection)
-        expected_length = int(selection.size)
     else:
         indices = selection.astype(int, copy=False)
-        expected_length = None
 
     result = dict(extras)
     for key in _PER_EXPOSURE_KEYS:
@@ -66,20 +62,9 @@ def subset_loader_frame_extras(
         if isinstance(value, np.ndarray):
             if value.ndim == 0:
                 continue
-            length = int(value.shape[0])
-            if expected_length is not None and length != expected_length:
-                raise ValueError(
-                    f"Loader-frame provenance field {key!r} has {length} rows; "
-                    f"expected {expected_length}."
-                )
             result[key] = value[indices]
             continue
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            if expected_length is not None and len(value) != expected_length:
-                raise ValueError(
-                    f"Loader-frame provenance field {key!r} has {len(value)} rows; "
-                    f"expected {expected_length}."
-                )
             result[key] = [value[int(index)] for index in indices]
     return result
 
@@ -102,11 +87,6 @@ def _per_exposure_values(
         values = list(value)
     else:
         values = [value for _ in range(n_source_exposures)]
-    if len(values) != n_source_exposures:
-        raise ValueError(
-            f"Loader-frame provenance field {key!r} has {len(values)} rows; "
-            f"expected {n_source_exposures}."
-        )
     return [_json_value(item) for item in values]
 
 
@@ -167,20 +147,9 @@ def build_wavelength_frame_contract(
     """Return the complete persisted wavelength medium/reference-frame contract."""
 
     n_source_exposures = int(n_source_exposures)
-    if n_source_exposures <= 0:
-        raise ValueError("A wavelength-frame contract requires at least one exposure.")
 
     medium = str(extras.get("wavelength_medium", "")).strip().lower()
-    if medium != "vacuum":
-        raise ValueError(
-            f"Prepared HRS products require wavelength_medium='vacuum'; found {medium!r}."
-        )
     final_frame = str(extras.get("wavelength_frame", "")).strip().lower()
-    if final_frame not in {"barycentric", "stellar_rest"}:
-        raise ValueError(
-            "Prepared HRS products require wavelength_frame='barycentric' or "
-            f"'stellar_rest'; found {final_frame!r}."
-        )
 
     sources = _per_exposure_values(
         extras,

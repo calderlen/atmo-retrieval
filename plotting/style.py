@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import subprocess
+
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
@@ -46,11 +48,9 @@ def configure_matplotlib() -> None:
     different typeface.  This does not change the PDF-only saved-file policy.
     """
     matplotlib.rcParams.update(COMPUTER_MODERN_BRIGHT_RCPARAMS)
-    try:
+    if find_spec("matplotlib_inline") is not None:
         from matplotlib_inline.backend_inline import InlineBackend
-    except ImportError:
-        pass
-    else:
+
         InlineBackend.instance().figure_formats = {"png"}
 
 

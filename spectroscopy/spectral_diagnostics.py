@@ -24,11 +24,9 @@ def wave_1d(wavelength: np.ndarray) -> np.ndarray:
     wave = np.asarray(wavelength, dtype=float)
     if wave.ndim == 1:
         return wave
-    if wave.ndim == 2:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            return np.nanmedian(wave, axis=0)
-    raise ValueError(f"Expected a 1D or 2D wavelength grid, found shape {wave.shape}.")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmedian(wave, axis=0)
 
 
 def robust_limit(
@@ -61,8 +59,6 @@ def phase_order(bundle: Mapping[str, Any]) -> np.ndarray:
 def finite_good(
     values: np.ndarray,
     sigma: np.ndarray | None = None,
-    *,
-    sigma_threshold: float = 0.5,
 ) -> np.ndarray:
     """Return the standard finite and positive-uncertainty diagnostic mask."""
 
@@ -70,7 +66,6 @@ def finite_good(
     if sigma is not None:
         uncertainty = np.asarray(sigma, dtype=float)
         mask &= np.isfinite(uncertainty) & (uncertainty > 0)
-        mask &= uncertainty < float(sigma_threshold)
     return mask
 
 
@@ -126,7 +121,7 @@ def gap_aware_bin_indices(
         if not indices.size:
             continue
         n_groups = min(indices.size, max(1, int(np.ceil(max_bins * indices.size / wave.size))))
-        groups.extend(group for group in np.array_split(indices, n_groups) if group.size)
+        groups.extend(np.array_split(indices, n_groups))
     return tuple(groups)
 
 
@@ -169,14 +164,12 @@ def binned_series(
 def observed_spectrum(
     data: np.ndarray,
     sigma: np.ndarray,
-    *,
-    sigma_threshold: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute an inverse-variance weighted spectrum across exposures."""
 
     values = np.asarray(data, dtype=float)
     uncertainty = np.asarray(sigma, dtype=float)
-    good = finite_good(values, uncertainty, sigma_threshold=sigma_threshold)
+    good = finite_good(values, uncertainty)
     weight = np.where(good, 1.0 / np.square(uncertainty), 0.0)
     denominator = np.sum(weight, axis=0)
     mean = np.divide(
@@ -272,11 +265,7 @@ def stack_line_window(
     sigma = np.asarray(bundle["sigma"], dtype=float)
     if wavelength.ndim == 1:
         wavelength = np.broadcast_to(wavelength, data.shape)
-    if wavelength.shape != data.shape:
-        raise ValueError("Wavelength and data arrays must have matching exposure rows.")
     trail = np.zeros(data.shape[0]) if velocity_kms is None else np.asarray(velocity_kms, dtype=float)
-    if trail.shape != (data.shape[0],):
-        raise ValueError("velocity_kms must have one value per exposure.")
     velocity_grid = np.arange(-half_width_kms, half_width_kms + 0.5 * step_kms, step_kms)
     rest_wave = float(rest_vacuum_A) * _relativistic_doppler_factor(velocity_grid)
     sampled_data = np.full((data.shape[0], velocity_grid.size), np.nan)
@@ -312,13 +301,9 @@ def build_stacked_spectrum_bundle(
     """Build one weighted observed-spectrum row per epoch or epoch/arm."""
 
     grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    label_format = {"epoch": "{epoch}", "epoch_arm": "{epoch} {arm}"}[group_by]
     for record in records:
-        if group_by == "epoch":
-            key = str(record["epoch"])
-        elif group_by == "epoch_arm":
-            key = f"{record['epoch']} {record['arm']}"
-        else:
-            raise ValueError("group_by must be 'epoch' or 'epoch_arm'.")
+        key = label_format.format_map(record)
         grouped[key].append(record)
     rows: list[dict[str, Any]] = []
     for label, candidates in grouped.items():
@@ -350,8 +335,6 @@ def contrast_summary(stacked: Mapping[str, Any]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
         peers = [candidate for peer_index, candidate in enumerate(rows) if peer_index != index]
-        if not peers:
-            continue
         same_grid = [
             peer for peer in peers
             if np.array_equal(peer["wavelength"], row["wavelength"], equal_nan=True)
@@ -387,11 +370,7 @@ def coadd_in_planet_rest_frame(
     source_wave = np.asarray(wavelength, dtype=float)
     if source_wave.ndim == 1:
         source_wave = np.broadcast_to(source_wave, values.shape)
-    if source_wave.shape != values.shape or uncertainty.shape != values.shape:
-        raise ValueError("wavelength, data, and sigma must have matching shapes.")
     velocity = np.asarray(velocity_kms, dtype=float)
-    if velocity.shape != (values.shape[0],):
-        raise ValueError("velocity_kms must have one value per exposure.")
     common_wave = wave_1d(source_wave) if rest_wavelength is None else np.asarray(rest_wavelength, dtype=float)
     shifted = np.full((values.shape[0], common_wave.size), np.nan)
     shifted_sigma = np.full_like(shifted, np.nan)
@@ -415,8 +394,6 @@ def nan_box_smooth(values: np.ndarray, width: int = 7) -> np.ndarray:
     """Box-smooth finite values while ignoring missing samples."""
 
     array = np.asarray(values, dtype=float)
-    if array.ndim != 1:
-        raise ValueError("values must be one-dimensional.")
     width = min(int(width), array.size)
     if width <= 1:
         return array.copy()

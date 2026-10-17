@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -21,11 +22,7 @@ from pipeline.retrieval_plan import (
     configure_runtime,
     intent_manifest,
     model_param_overrides,
-    preflight_timeseries,
-    print_plan,
-    require_ready_timeseries,
     shared_prior_modes,
-    validate_epochs,
 )
 
 
@@ -72,11 +69,8 @@ def main() -> int:
         print("  likelihood: logL = logL_transmission + logL_emission across all components.")
         return 0
 
-    transmission_epochs = validate_epochs(
-        args.transmission_epoch,
-        "--transmission-epoch",
-    )
-    emission_epochs = validate_epochs(args.emission_epoch, "--emission-epoch")
+    transmission_epochs = tuple(epoch.strip() for epoch in args.transmission_epoch)
+    emission_epochs = tuple(epoch.strip() for epoch in args.emission_epoch)
     case_name = "joint_terminator_dayside"
     configure_runtime(
         args,
@@ -85,17 +79,6 @@ def main() -> int:
         output_category="joint",
     )
 
-    transmission_preflight = preflight_timeseries(
-        mode="transmission",
-        epochs=transmission_epochs,
-        args=args,
-    )
-    emission_preflight = preflight_timeseries(
-        mode="emission",
-        epochs=emission_epochs,
-        args=args,
-    )
-    preflight = transmission_preflight + emission_preflight
     manifest = intent_manifest(
         runner="joint",
         case=case_name,
@@ -120,10 +103,9 @@ def main() -> int:
             "likelihood": "sum of every transmission and emission component logL",
         },
     )
-    print_plan(manifest, preflight)
+    print(json.dumps(manifest, indent=2, sort_keys=True))
     if args.dry_run:
         return 0
-    require_ready_timeseries(preflight, args)
 
     joint_spectra = auxiliary_timeseries_specs(
         mode="transmission",

@@ -45,61 +45,35 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _load_sidecar(path: Path) -> dict[str, np.ndarray]:
-    required = {
-        "wavelength_A",
-        "observed",
-        "observed_error",
-        "model_draws",
-    }
-    if not path.is_file():
-        raise FileNotFoundError(f"Saved spectrum sidecar not found: {path}")
     with np.load(path) as saved:
-        missing = sorted(required - set(saved.files))
-        if missing:
-            raise ValueError(f"{path} is missing required arrays: {', '.join(missing)}")
         products = {name: np.asarray(saved[name]) for name in saved.files}
 
     wavelength = np.asarray(products["wavelength_A"], dtype=float)
     observed = np.asarray(products["observed"], dtype=float)
     error = np.asarray(products["observed_error"], dtype=float)
     draws = np.asarray(products["model_draws"], dtype=float)
-    if wavelength.ndim != 1 or wavelength.size < 2:
-        raise ValueError("wavelength_A must be a one-dimensional array with at least two pixels.")
-    if observed.shape != wavelength.shape or error.shape != wavelength.shape:
-        raise ValueError("Observed spectrum and uncertainty must match wavelength_A.")
-    if draws.ndim != 2 or draws.shape[1] != wavelength.size or draws.shape[0] < 4:
-        raise ValueError(
-            "model_draws must have shape (at least 4 posterior draws, wavelength)."
-        )
-    if not np.all(np.diff(wavelength) > 0.0):
-        raise ValueError("wavelength_A must be strictly increasing.")
-    valid = np.isfinite(wavelength) & np.isfinite(observed) & np.isfinite(error) & (error > 0.0)
-    valid &= np.all(np.isfinite(draws), axis=0)
-    if np.count_nonzero(valid) < 2:
-        raise ValueError("No common finite observed/model pixels with positive uncertainty.")
 
     products["wavelength_A"] = wavelength
     products["observed"] = observed
     products["observed_error"] = error
     products["model_draws"] = draws
-    products["common_valid"] = valid
     return products
 
 
 def _run_title(run_dir: Path, component: str) -> str:
     values: dict[str, str] = {}
     config_path = run_dir / "run_config.log"
-    if config_path.is_file():
-        for line in config_path.read_text(encoding="utf-8").splitlines():
-            if ":" not in line:
-                continue
-            key, value = (part.strip() for part in line.split(":", 1))
-            if key in {"Planet", "Epoch", "Collapsed emission selection"}:
-                values[key] = value
-    fields = [values.get("Planet"), values.get("Epoch"), values.get("Collapsed emission selection")]
-    fields = [None if field is None else field.replace("_", "-") for field in fields]
-    prefix = " ".join(field for field in fields if field)
-    return f"{prefix} - {component}" if prefix else f"{run_dir.name} - {component}"
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        if ":" not in line:
+            continue
+        key, value = (part.strip() for part in line.split(":", 1))
+        if key in {"Planet", "Epoch", "Collapsed emission selection"}:
+            values[key] = value
+    fields = [values["Planet"], values["Epoch"]]
+    if "Collapsed emission selection" in values:
+        fields.append(values["Collapsed emission selection"])
+    prefix = " ".join(field.replace("_", "-") for field in fields)
+    return f"{prefix} - {component}"
 
 
 def _bin_groups(wavelength: np.ndarray, *, max_bins: int) -> list[np.ndarray]:
@@ -108,7 +82,7 @@ def _bin_groups(wavelength: np.ndarray, *, max_bins: int) -> list[np.ndarray]:
     groups: list[np.ndarray] = []
     for segment in segments:
         indices = np.arange(segment.start, segment.stop)
-        count = max(1, round(max_bins * indices.size / max(total, 1)))
+        count = max(1, round(max_bins * indices.size / total))
         groups.extend(np.array_split(indices, min(count, indices.size)))
     return [group for group in groups if group.size]
 
@@ -126,10 +100,8 @@ def _bin_products(
     bin_draws: list[np.ndarray] = []
     for group in groups:
         valid = (
-            np.isfinite(wavelength[group])
-            & np.isfinite(observed[group])
+            np.isfinite(observed[group])
             & np.isfinite(error[group])
-            & (error[group] > 0.0)
             & np.all(np.isfinite(draws[:, group]), axis=0)
         )
         if not np.any(valid):
@@ -159,7 +131,7 @@ def _rank_model_windows(
     separation_A: float,
 ) -> list[dict[str, float]]:
     power = np.where(
-        np.isfinite(model) & np.isfinite(error) & (error > 0.0),
+        np.isfinite(model) & np.isfinite(error),
         np.square(model / error),
         0.0,
     )
@@ -177,8 +149,6 @@ def _rank_model_windows(
                     side="right",
                 )
             )
-            if stop <= local_start:
-                continue
             local_stop = min(stop, segment.stop - segment.start)
             end = segment.start + local_stop
             if wavelength[end - 1] - wavelength[start] < 0.9 * width_A:
@@ -202,8 +172,6 @@ def _rank_model_windows(
             selected.append(candidate)
         if len(selected) == count:
             break
-    if len(selected) < count:
-        raise ValueError(f"Only {len(selected)} non-overlapping model-power windows were found.")
     return sorted(selected, key=lambda row: row["lo_A"])
 
 
@@ -441,7 +409,7 @@ def _velocity_scan(
     draws: np.ndarray,
     velocities: np.ndarray,
 ) -> dict[str, np.ndarray]:
-    base_valid = np.isfinite(observed) & np.isfinite(error) & (error > 0.0)
+    base_valid = np.isfinite(observed) & np.isfinite(error)
     weight = np.zeros(error.shape, dtype=float)
     weight[base_valid] = 1.0 / np.square(error[base_valid])
     alpha = np.full((draws.shape[0], velocities.size), np.nan)
@@ -544,7 +512,7 @@ def _likelihood_products(
     error: np.ndarray,
     draws: np.ndarray,
 ) -> dict[str, np.ndarray | float | int]:
-    valid = np.isfinite(observed) & np.isfinite(error) & (error > 0.0)
+    valid = np.isfinite(observed) & np.isfinite(error)
     valid &= np.all(np.isfinite(draws), axis=0)
     data = observed[valid]
     sigma = error[valid]
@@ -672,12 +640,6 @@ def _plot_likelihood_improvement(
 
 def main() -> None:
     args = _build_parser().parse_args()
-    if args.num_windows < 1:
-        raise SystemExit("--num-windows must be positive.")
-    if args.window_width_A <= 0.0 or args.window_separation_A < 0.0:
-        raise SystemExit("Window width must be positive and separation must be nonnegative.")
-    if args.velocity_step_kms <= 0.0 or args.velocity_max_kms <= args.velocity_min_kms:
-        raise SystemExit("Velocity bounds and step do not define a positive grid.")
 
     configure_matplotlib()
     run_dir = args.run_dir.resolve()

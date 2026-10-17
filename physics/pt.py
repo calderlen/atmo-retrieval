@@ -2,16 +2,6 @@ import jax.numpy as jnp
 import numpyro
 import numpyro.distributions as dist
 
-import config as numerics_config
-
-
-def isothermal_profile(art: object, T0: float) -> jnp.ndarray:
-    return T0 * jnp.ones_like(art.pressure)
-
-def numpyro_isothermal(art: object, T_low: float, T_high: float) -> jnp.ndarray:
-    T0 = numpyro.sample("T0", dist.Uniform(T_low, T_high))
-    return isothermal_profile(art, T0)
-
 
 def gradient_profile(art: object, T_bottom: float, T_top: float) -> jnp.ndarray:
     log_p = jnp.log10(art.pressure)
@@ -36,7 +26,7 @@ def guillot_profile(
     gamma: float,
 ) -> jnp.ndarray:
     P_cgs = pressure_bar * 1.0e6
-    tau = kappa_ir_cgs * P_cgs / jnp.clip(g_cgs, numerics_config.F32_GRAVITY_FLOOR, None)
+    tau = kappa_ir_cgs * P_cgs / g_cgs
 
     sqrt3 = jnp.sqrt(3.0)
     exp_term = jnp.exp(-sqrt3 * gamma * tau)
@@ -47,7 +37,7 @@ def guillot_profile(
     )
 
     T4 = (3.0 / 4.0) * (Tint**4) * (2.0 / 3.0 + tau) + (3.0 / 4.0) * (Tirr**4) * bracket
-    return jnp.power(jnp.clip(T4, 0.0, None), 0.25)
+    return jnp.power(T4, 0.25)
 
 
 def madhu_seager_profile(
@@ -106,28 +96,15 @@ def numpyro_free_temperature(
     return free_temperature_profile(art, n_layers, T_low, T_high)[0]
 
 
-def _validate_pressure_bar(pressure_bar: jnp.ndarray) -> jnp.ndarray:
-    p = jnp.asarray(pressure_bar)
-    if p.ndim != 1:
-        raise ValueError("pressure_bar must be 1D")
-    if jnp.any(~jnp.isfinite(p)) or jnp.any(p <= 0.0):
-        raise ValueError("pressure_bar must be finite and > 0 everywhere")
-    return p
-
-
 def pspline_knots_profile_on_grid(
     pressure_bar: jnp.ndarray,
     T_knots: jnp.ndarray,
     *,
     pressure_eval_bar: jnp.ndarray,
 ) -> jnp.ndarray:
-    p_ref = _validate_pressure_bar(pressure_bar)
-    p_eval = _validate_pressure_bar(pressure_eval_bar)
+    p_ref = jnp.asarray(pressure_bar)
+    p_eval = jnp.asarray(pressure_eval_bar)
     T_knots = jnp.asarray(T_knots)
-    if T_knots.ndim != 1:
-        raise ValueError("T_knots must be 1D")
-    if T_knots.size < 3:
-        raise ValueError("need at least 3 knots to define second differences")
 
     logp_min = jnp.log10(jnp.min(p_ref))
     logp_max = jnp.log10(jnp.max(p_ref))
@@ -147,7 +124,7 @@ def numpyro_pspline_knots_on_art_grid(
     inv_gamma_b: float = 5.0e-5,
 ) -> jnp.ndarray:
 
-    p_bar = _validate_pressure_bar(art.pressure)
+    p_bar = jnp.asarray(art.pressure)
     n_knots = int(p_bar.size)
 
     # Knot temperatures
@@ -174,12 +151,12 @@ def numpyro_pspline_knots_on_art_grid(
 
 def _gp_kernel_rbf(x: jnp.ndarray, amp: jnp.ndarray, ell: jnp.ndarray) -> jnp.ndarray:
     dx = x[:, None] - x[None, :]
-    return (amp**2) * jnp.exp(-0.5 * (dx / jnp.clip(ell, numerics_config.F32_LENGTHSCALE_FLOOR, None)) ** 2)
+    return (amp**2) * jnp.exp(-0.5 * (dx / ell) ** 2)
 
 
 def _gp_kernel_matern32(x: jnp.ndarray, amp: jnp.ndarray, ell: jnp.ndarray) -> jnp.ndarray:
     dx = jnp.abs(x[:, None] - x[None, :])
-    r = jnp.sqrt(3.0) * dx / jnp.clip(ell, numerics_config.F32_LENGTHSCALE_FLOOR, None)
+    r = jnp.sqrt(3.0) * dx / ell
     return (amp**2) * (1.0 + r) * jnp.exp(-r)
 
 
@@ -203,7 +180,7 @@ def numpyro_gp_temperature(
     # Optional: center/scale x for numerics (still interpretable because ell is in dex pre-scaling).
     # Keep a copy of original-dex coordinate for ell interpretation:
     x_dex = x
-    x = (x - jnp.mean(x)) / (jnp.std(x) + numerics_config.F32_STDDEV_FLOOR)
+    x = (x - jnp.mean(x)) / (jnp.std(x))
 
     # Mean function
     if mean_kind == "isothermal":
@@ -221,7 +198,7 @@ def numpyro_gp_temperature(
     ell_dex = numpyro.sample("gp_ell_dex", dist.LogNormal(jnp.log(ell_loc), ell_scale))
     # Convert dex-lengthscale to standardized-x lengthscale:
     # x_std = (x_dex - mean)/std, so Δx_std = Δx_dex / std_dex
-    std_dex = jnp.std(x_dex) + numerics_config.F32_STDDEV_FLOOR
+    std_dex = jnp.std(x_dex)
     ell = ell_dex / std_dex
 
     # Kernel matrix

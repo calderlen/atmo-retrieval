@@ -76,12 +76,9 @@ def plot_transit_fit(result):
 
 
 def plot_posterior_corner(result):
-    """Plot the seven global sampled parameters when corner is installed."""
+    """Plot the seven global sampled parameters."""
 
-    try:
-        import corner
-    except ModuleNotFoundError:
-        return None
+    import corner
     samples = np.asarray(result.best_fit["posterior_theta"], dtype=float)
     labels = (
         r"$\log P$",

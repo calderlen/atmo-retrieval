@@ -8,36 +8,7 @@ from pathlib import Path
 import re
 from typing import NamedTuple, Protocol
 
-# RADIS/numba can attempt file-based caching in environments where the locator
-# is unavailable; disable it before exojax/molinfo triggers those imports.
-os.environ.setdefault("NUMBA_DISABLE_CACHE", "1")
-
-
-def _patch_numba_enable_caching() -> None:
-    try:
-        from numba.core.dispatcher import Dispatcher
-        from numba.core.caching import NullCache
-    except Exception:
-        return
-
-    orig_enable_caching = getattr(Dispatcher, "enable_caching", None)
-    if orig_enable_caching is None or getattr(orig_enable_caching, "_locator_patched", False):
-        return
-
-    def _enable_caching(self):
-        try:
-            return orig_enable_caching(self)
-        except RuntimeError as exc:
-            if "no locator available" not in str(exc):
-                raise
-            self._cache = NullCache()
-            return None
-
-    _enable_caching._locator_patched = True
-    Dispatcher.enable_caching = _enable_caching
-
-
-_patch_numba_enable_caching()
+import _numba_compat  # Configure caching before ExoJAX imports RADIS.
 
 import jax.numpy as jnp
 import numpy as np
@@ -66,10 +37,6 @@ def gas_particle_density(
     """Ideal-gas particle number density in cm^-3 for pressure in bar."""
     pressure = np.asarray(pressure_bar, dtype=np.float64)
     temperature = np.asarray(temperature_k, dtype=np.float64)
-    if np.any(~np.isfinite(pressure)) or np.any(pressure <= 0.0):
-        raise ValueError("FastChem pressure values must be finite and positive.")
-    if np.any(~np.isfinite(temperature)) or np.any(temperature <= 0.0):
-        raise ValueError("FastChem temperature values must be finite and positive.")
     return pressure * 1.0e6 / (K_B_CGS * temperature)
 
 
@@ -108,19 +75,12 @@ def _load_solar_element_abundances() -> dict[str, float]:
             if not line or line.startswith("#"):
                 continue
             parts = line.split()
-            if len(parts) < 2:
-                continue
             symbol = parts[0]
             if symbol == "e-":
                 continue
-            try:
-                log_eps = float(parts[1])
-            except ValueError:
-                continue
+            log_eps = float(parts[1])
             abundances[symbol] = float(10.0 ** (log_eps - 12.0))
 
-    if "H" not in abundances:
-        raise ValueError(f"Hydrogen abundance missing from '{_SOLAR_ABUNDANCE_FILE}'.")
     abundances["H"] = 1.0
     return abundances
 
@@ -520,21 +480,6 @@ class FreeVMR:
             continuum_vmr_profiles={},
         )
 
-# TODO: extend the current equilibrium / hybrid baseline with quenching,
-# disequilibrium chemistry, and photochemistry when the free-VMR model is not sufficient
-# TODO: partial ionization (Saha)
-# TODO: H- continuum affecting line-to-continuum ratio
-# TODO: vertical transport parameterized by K_zz and then like tchem and t_dyn or more simply the pestimate of quench level
-# TODO: use CO as a proxy/tracer for the overall metallicity M/H of the atmosphere
-# TODO: The continuum problem. Public low resolution spectra? R ~ 10^2 - 10^3??
-#class QuenchedChemistry(CompositionSolver):
-#    pass
-#class Photochemistry:
-#    pass
-
-#class DisequilibriumChemistry:
-#    pass
-
 class ParametricMetallicityCOChemistry(CompositionSolver):
 #    """Simple equilibrium-like chemistry with [M/H] and C/O as free parameters."""
 
@@ -747,8 +692,7 @@ class FastChemEquilibriumChemistry(CompositionSolver):
         overall_flag: int,
     ) -> None:
         """Reject an incomplete or physically inconsistent FastChem run."""
-        expected_points = np.asarray(temperature_k).size
-        success_flag = getattr(pyfastchem, "FASTCHEM_SUCCESS", 0)
+        success_flag = pyfastchem.FASTCHEM_SUCCESS
         if overall_flag != success_flag:
             raise RuntimeError(
                 "FastChem grid calculation failed with status "
@@ -756,14 +700,9 @@ class FastChemEquilibriumChemistry(CompositionSolver):
             )
 
         point_flags = np.asarray(
-            getattr(output_data, "fastchem_flag", []),
+            output_data.fastchem_flag,
             dtype=np.int64,
         )
-        if point_flags.shape != (expected_points,):
-            raise RuntimeError(
-                "FastChem returned an unexpected status shape: "
-                f"{point_flags.shape}; expected ({expected_points},)."
-            )
         if np.any(point_flags != success_flag):
             bad = int(np.flatnonzero(point_flags != success_flag)[0])
             raise RuntimeError(
@@ -773,13 +712,8 @@ class FastChemEquilibriumChemistry(CompositionSolver):
             )
 
         element_conserved = np.asarray(
-            getattr(output_data, "element_conserved", []),
+            output_data.element_conserved,
         )
-        if element_conserved.ndim < 1 or element_conserved.shape[0] != expected_points:
-            raise RuntimeError(
-                "FastChem returned an unexpected element-conservation shape: "
-                f"{element_conserved.shape}; expected first dimension {expected_points}."
-            )
         if not np.all(element_conserved == 1):
             bad = int(np.flatnonzero(element_conserved.reshape(-1) != 1)[0])
             raise RuntimeError(
@@ -788,27 +722,11 @@ class FastChemEquilibriumChemistry(CompositionSolver):
             )
 
         number_densities = np.asarray(output_data.number_densities, dtype=np.float64)
-        if number_densities.ndim != 2 or number_densities.shape[0] != expected_points:
-            raise RuntimeError(
-                "FastChem returned an unexpected number-density shape: "
-                f"{number_densities.shape}; expected ({expected_points}, n_species)."
-            )
         if np.any(~np.isfinite(number_densities)) or np.any(number_densities < 0.0):
             raise RuntimeError("FastChem returned non-finite or negative gas number densities.")
 
-        element_density = np.asarray(
-            output_data.total_element_density,
-            dtype=np.float64,
-        )
-        if (
-            element_density.shape != (expected_points,)
-            or np.any(~np.isfinite(element_density))
-            or np.any(element_density < 0.0)
-        ):
-            raise RuntimeError("FastChem returned invalid total element densities.")
-
         mmw = np.asarray(output_data.mean_molecular_weight, dtype=np.float64)
-        if mmw.shape != (expected_points,) or np.any(~np.isfinite(mmw)) or np.any(mmw <= 0.0):
+        if np.any(~np.isfinite(mmw)) or np.any(mmw <= 0.0):
             raise RuntimeError(
                 "FastChem returned an invalid mean-molecular-weight profile "
                 f"with shape {mmw.shape}."
@@ -1198,10 +1116,6 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        if n_metallicity < 2:
-            raise ValueError("n_metallicity must be >= 2.")
-        if n_co_ratio < 2:
-            raise ValueError("n_co_ratio must be >= 2.")
 
         self.continuum_species = tuple(continuum_species)
         self._canonical_continuum_species = tuple(dict.fromkeys(_canonical_continuum_species_name(species) for species in self.continuum_species))
@@ -1225,19 +1139,15 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         # Hybrid VMR grids are also stored as log10(VMR).
         self._hybrid_vmr_grids: dict[str, jnp.ndarray] | None = None
         self._hybrid_mmw_grid: jnp.ndarray | None = None
-        self._hybrid_species_built: list[str] | None = None
 
         self._free_solver = ConstantVMR(
             log_vmr_min=self.log_vmr_min,
             log_vmr_max=self.log_vmr_max,
             h2_he_ratio=self.h2_he_ratio,
         )
-        if not self.requires_hybrid_parameters():
-            logger.warning(
-                "FastChemHybridChemistry requires hidden 'H'/'H I' and 'e-' "
-                "continuum drivers for the H- continuum. It will fall back to "
-                "ConstantVMR behavior."
-            )
+
+
+
 
     def _canonical_species_name(self, species: str) -> str:
         return _canonical_continuum_species_name(species)
@@ -1246,10 +1156,7 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         return self._canonical_species_name(species) in self._canonical_continuum_species
 
     def hidden_continuum_species(self) -> tuple[str, ...]:
-        return tuple(
-            species for species in self._canonical_continuum_species
-            if species in _FASTCHEM_SPECIES_MAP
-        )
+        return self._canonical_continuum_species
 
     def opacity_driver_species(self) -> tuple[str, ...]:
         drivers = []
@@ -1291,22 +1198,10 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         fc: pyfastchem.FastChem,
         species_names: list[str],
     ) -> dict[str, int]:
-        fc_species_idx: dict[str, int] = {}
-        for name in species_names:
-            fc_symbol = _FASTCHEM_SPECIES_MAP.get(name)
-            if fc_symbol is None:
-                logger.warning("No FastChem mapping for species '%s', skipping.", name)
-                continue
-            idx = fc.getGasSpeciesIndex(fc_symbol)
-            if idx == pyfastchem.FASTCHEM_UNKNOWN_SPECIES:
-                logger.warning(
-                    "FastChem does not know species '%s' (symbol '%s'), skipping.",
-                    name,
-                    fc_symbol,
-                )
-                continue
-            fc_species_idx[name] = idx
-        return fc_species_idx
+        return {
+            name: fc.getGasSpeciesIndex(_FASTCHEM_SPECIES_MAP[name])
+            for name in species_names
+        }
 
     def _set_fastchem_abundances(
         self,
@@ -1320,7 +1215,7 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
     ) -> None:
         n_elements = fc.getElementNumber()
         metallicity_factor = 10.0 ** float(log_metallicity)
-        co_ratio_safe = max(float(co_ratio), 1.0e-8)
+        co_ratio = float(co_ratio)
 
         abundances = solar_abundances.copy()
         for ie in range(n_elements):
@@ -1330,8 +1225,8 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         solar_c = solar_abundances[idx_c] * metallicity_factor
         solar_o = solar_abundances[idx_o] * metallicity_factor
         total_co = solar_c + solar_o
-        abundances[idx_c] = total_co * (co_ratio_safe / (1.0 + co_ratio_safe))
-        abundances[idx_o] = total_co * (1.0 / (1.0 + co_ratio_safe))
+        abundances[idx_c] = total_co * (co_ratio / (1.0 + co_ratio))
+        abundances[idx_o] = total_co * (1.0 / (1.0 + co_ratio))
         fc.setElementAbundances(abundances.tolist())
 
     def _build_hybrid_grid(
@@ -1339,9 +1234,6 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         pressure_bar: np.ndarray,
         species_names: list[str],
     ) -> None:
-        if self.fastchem_parameter_file is None:
-            raise ValueError("fastchem_parameter_file is required for FastChemHybridChemistry.")
-
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         species_names = sorted(set(species_names))
         cache_key = self._hybrid_cache_key(pressure_bar, species_names)
@@ -1358,30 +1250,12 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         if cache_file.exists():
             logger.info("Loading FastChem hybrid grid from cache: %s", cache_file)
             data = np.load(cache_file, allow_pickle=False)
-            if data["schema"].item() != FASTCHEM_GRID_SCHEMA:
-                raise RuntimeError(
-                    f"Unexpected FastChem hybrid cache schema in '{cache_file}'."
-                )
             self._hybrid_vmr_grids = {}
             for name in species_names:
                 key = f"log_vmr_{name}"
-                if key not in data:
-                    raise RuntimeError(
-                        f"FastChem hybrid cache '{cache_file}' is missing '{key}'."
-                    )
-                _validate_cached_log_vmr(data[key], key)
                 self._hybrid_vmr_grids[name] = jnp.array(data[key])
-            if "mmw_grid" not in data:
-                raise RuntimeError(
-                    f"FastChem hybrid cache '{cache_file}' is missing 'mmw_grid'."
-                )
             mmw_grid = np.asarray(data["mmw_grid"], dtype=np.float64)
-            if np.any(~np.isfinite(mmw_grid)) or np.any(mmw_grid <= 0.0):
-                raise RuntimeError(
-                    f"FastChem hybrid cache '{cache_file}' has an invalid MMW grid."
-                )
             self._hybrid_mmw_grid = jnp.array(mmw_grid)
-            self._hybrid_species_built = list(species_names)
             return
 
         logger.info(
@@ -1400,12 +1274,6 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         solar_abundances = np.array([fc.getElementAbundance(i) for i in range(n_elements)])
 
         fc_species_idx = self._resolve_fastchem_species_indices(fc, species_names)
-        missing_species = sorted(set(species_names) - set(fc_species_idx))
-        if missing_species:
-            raise RuntimeError(
-                "FastChem hybrid grid is missing required species mappings: "
-                + ", ".join(missing_species)
-            )
 
         grid_shape = (self.n_metallicity, self.n_co_ratio, self.n_temp, self.n_pressure)
         vmr_grids_np: dict[str, np.ndarray] = {
@@ -1446,7 +1314,6 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
 
         self._hybrid_vmr_grids = {name: jnp.array(g) for name, g in vmr_grids_np.items()}
         self._hybrid_mmw_grid = jnp.array(mmw_grid_np)
-        self._hybrid_species_built = list(species_names)
 
         save_dict = {
             "schema": np.asarray(FASTCHEM_GRID_SCHEMA),
@@ -1474,28 +1341,23 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         t_grid = jnp.array(self._T_grid)
         log_p_grid = jnp.array(self._log_P_grid)
 
-        mh_val = jnp.clip(log_metallicity, mh_grid[0], mh_grid[-1])
-        co_val = jnp.clip(co_ratio, co_grid[0], co_grid[-1])
-        t_val = jnp.clip(Tarr, t_grid[0], t_grid[-1])
-        log_p_val = jnp.clip(log_P, log_p_grid[0], log_p_grid[-1])
-
-        f_mh = jnp.interp(mh_val, mh_grid, jnp.arange(mh_grid.size))
+        f_mh = jnp.interp(log_metallicity, mh_grid, jnp.arange(mh_grid.size))
         i_mh = jnp.clip(jnp.floor(f_mh).astype(int), 0, mh_grid.size - 2)
         w_mh = f_mh - i_mh
 
-        f_co = jnp.interp(co_val, co_grid, jnp.arange(co_grid.size))
+        f_co = jnp.interp(co_ratio, co_grid, jnp.arange(co_grid.size))
         i_co = jnp.clip(jnp.floor(f_co).astype(int), 0, co_grid.size - 2)
         w_co = f_co - i_co
 
-        f_t = jnp.interp(t_val, t_grid, jnp.arange(t_grid.size))
+        f_t = jnp.interp(Tarr, t_grid, jnp.arange(t_grid.size))
         i_t = jnp.clip(jnp.floor(f_t).astype(int), 0, t_grid.size - 2)
         w_t = f_t - i_t
 
-        f_p = jnp.interp(log_p_val, log_p_grid, jnp.arange(log_p_grid.size))
+        f_p = jnp.interp(log_P, log_p_grid, jnp.arange(log_p_grid.size))
         i_p = jnp.clip(jnp.floor(f_p).astype(int), 0, log_p_grid.size - 2)
         w_p = f_p - i_p
 
-        result = jnp.zeros_like(t_val)
+        result = jnp.zeros_like(Tarr)
         for d_mh in (0, 1):
             w0 = w_mh if d_mh else (1.0 - w_mh)
             idx_mh = i_mh + d_mh
@@ -1537,7 +1399,7 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         atom_names: list[str],
         atom_masses: list[float],
         art: object,
-        Tarr: jnp.ndarray | None = None,
+        Tarr: jnp.ndarray,
     ) -> CompositionState:
         free_mol = [
             (n, m) for n, m in zip(mol_names, mol_masses)
@@ -1562,13 +1424,6 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
             Tarr=Tarr,
         )
 
-        if not self.requires_hybrid_parameters():
-            return base
-
-        if Tarr is None:
-            T_mid = (self.t_min + self.t_max) / 2.0
-            Tarr = jnp.full(art.pressure.shape, T_mid)
-
         log_metallicity = numpyro.sample(
             "log_metallicity",
             dist.Uniform(self.metallicity_range[0], self.metallicity_range[1]),
@@ -1582,44 +1437,32 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         n_layers = art.pressure.size
 
         mol_profile_map = {
-            name: jnp.full(n_layers, numerics_config.TRACE_SPECIES_FLOOR)
-            for name in mol_names
+            name: jnp.full(n_layers, base.vmr_mols[i])
+            for i, name in enumerate(free_mol_names)
         }
         atom_profile_map = {
-            name: jnp.full(n_layers, numerics_config.TRACE_SPECIES_FLOOR)
-            for name in atom_names
+            name: jnp.full(n_layers, base.vmr_atoms[i])
+            for i, name in enumerate(free_atom_names)
         }
-        for i, name in enumerate(free_mol_names):
-            mol_profile_map[name] = jnp.full(n_layers, base.vmr_mols[i])
-        for i, name in enumerate(free_atom_names):
-            atom_profile_map[name] = jnp.full(n_layers, base.vmr_atoms[i])
-
-        continuum_profile_map = {
-            species: jnp.full(n_layers, numerics_config.TRACE_SPECIES_FLOOR)
-            for species in self.hidden_continuum_species()
-        }
-        needed = list(continuum_profile_map)
+        continuum_profile_map = {}
+        needed = list(self.hidden_continuum_species())
         if needed:
             if self._hybrid_vmr_grids is None or any(s not in self._hybrid_vmr_grids for s in needed):
                 self._build_hybrid_grid(np.asarray(art.pressure), needed)
 
-            overrides = {}
             for species in needed:
-                if species in self._hybrid_vmr_grids:
-                    overrides[species] = self._interp_4d_log_vmr(
-                        self._hybrid_vmr_grids[species],
-                        log_metallicity,
-                        co_ratio,
-                        Tarr,
-                        log_P,
-                    )
-
-            for species, vmr_prof in overrides.items():
+                vmr_prof = self._interp_4d_log_vmr(
+                    self._hybrid_vmr_grids[species],
+                    log_metallicity,
+                    co_ratio,
+                    Tarr,
+                    log_P,
+                )
                 continuum_profile_map[species] = vmr_prof
-                for name in mol_profile_map:
+                for name in mol_names:
                     if self._canonical_species_name(name) == species:
                         mol_profile_map[name] = vmr_prof
-                for name in atom_profile_map:
+                for name in atom_names:
                     if self._canonical_species_name(name) == species:
                         atom_profile_map[name] = vmr_prof
 
@@ -1656,8 +1499,7 @@ class FastChemHybridChemistry(FastChemEquilibriumChemistry):
         for vmr_prof, mass in zip(vmr_atoms_profiles, atom_masses):
             mmw_profile = mmw_profile + mass * vmr_prof
         for species, vmr_prof in continuum_profile_map.items():
-            if species in _CONTINUUM_SPECIES_MASSES:
-                mmw_profile = mmw_profile + _CONTINUUM_SPECIES_MASSES[species] * vmr_prof
+            mmw_profile = mmw_profile + _CONTINUUM_SPECIES_MASSES[species] * vmr_prof
 
         if len(vmr_mols_profiles) > 0:
             mmr_mols = jnp.array([
@@ -1714,8 +1556,6 @@ class FastChemMetallicityEquilibriumChemistry(FastChemHybridChemistry):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        if not np.isfinite(fixed_co_ratio) or fixed_co_ratio <= 0.0:
-            raise ValueError("fixed_co_ratio must be finite and positive.")
         self.fixed_co_ratio = float(fixed_co_ratio)
 
     def sample(
@@ -1725,12 +1565,8 @@ class FastChemMetallicityEquilibriumChemistry(FastChemHybridChemistry):
         atom_names: list[str],
         atom_masses: list[float],
         art: object,
-        Tarr: jnp.ndarray | None = None,
+        Tarr: jnp.ndarray,
     ) -> CompositionState:
-        if Tarr is None:
-            T_mid = (self.t_min + self.t_max) / 2.0
-            Tarr = jnp.full(art.pressure.shape, T_mid)
-
         log_metallicity = numpyro.sample(
             "log_metallicity",
             dist.Uniform(self.metallicity_range[0], self.metallicity_range[1]),

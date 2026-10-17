@@ -16,7 +16,7 @@ from pipeline.retrieval import (
     _load_sysrem_inputs,
     _normalize_phase,
     _subset_sysrem_inputs,
-    _validate_sysrem_inputs,
+    _build_sysrem_inputs,
     load_timeseries_data,
     run_retrieval,
 )
@@ -34,19 +34,6 @@ def run_phase_binned_retrieval(
         phase_bins = list(config.PHASE_BINS.keys())
     if base_output_dir is None:
         base_output_dir = config.DEFAULT_PHASE_BINNED_OUTPUT_DIR
-    if mode != "transmission":
-        raise ValueError("Phase-binned retrieval is only supported for transmission mode.")
-
-    if data_format == "spectrum":
-        raise ValueError("Phase-binned retrieval requires time-series data.")
-
-    if config.OBSERVING_MODE == "full":
-        raise NotImplementedError(
-            "Phase-binned retrieval is not yet supported with OBSERVING_MODE='full'. "
-            "Run a single arm at a time (--wavelength-range red or blue) to use "
-            "--phase-bin / --all-phase-bins."
-        )
-
     resolved_data_dir = config_utils.get_timeseries_data_dir(
         epoch=epoch,
         mode=mode,
@@ -64,9 +51,8 @@ def run_phase_binned_retrieval(
 
     sysrem_inputs = None
     if apply_sysrem:
-        sysrem_inputs = _validate_sysrem_inputs(
+        sysrem_inputs = _build_sysrem_inputs(
             _load_sysrem_inputs(resolved_data_dir),
-            n_exp=data.shape[0],
         )
         print(
             f"Loaded SYSREM auxiliaries for phase-binned retrieval: "

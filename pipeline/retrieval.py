@@ -29,11 +29,6 @@ from dataio.load import (
     load_observed_spectrum,
     parse_nasa_archive_tbl,
 )
-from dataio.collapse_transmission_timeseries_to_1d import get_sysrem_deep_mask
-from dataio.lsd_doppler_shadow import (
-    FIXED_LSD_SHADOW_METHOD,
-    FIXED_LSD_SHADOW_SCHEMA_VERSION,
-)
 from physics.chemistry import (
     ConstantVMR,
     FastChemHybridChemistry,
@@ -48,6 +43,7 @@ from opacities import (
     setup_cia_opacities,
 )
 from physics.model import (
+    _default_region_name_for_mode,
     BandpassObservationInputs,
     ChunkedSysremInputs,
     CollapsedEmissionInputs,
@@ -113,8 +109,6 @@ from plotting.transmission_diagnostics import (
 
 DEFAULT_ROTATION_VSINI_MAX_KMS = 100.0
 STELLAR_ROTATION_VSINI_MARGIN = 1.10
-COLLAPSED_EMISSION_OPERATOR_SCHEMA_VERSION = 4
-COLLAPSED_TRANSMISSION_OPERATOR_SCHEMA_VERSION = 4
 
 
 def _rotation_operator_vsini_max(
@@ -134,125 +128,7 @@ def _rotation_operator_vsini_max(
 
 
 def _load_timeseries_metadata(data_dir: Path) -> dict[str, Any]:
-    path = data_dir / "timeseries_prep.json"
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"Could not parse {path}: {exc}") from exc
-
-
-def _validate_collapsed_operator_arrays(
-    *,
-    arrays: dict[str, np.ndarray],
-    metadata: dict[str, Any],
-    operator_path: Path,
-    expected_schema_version: int,
-    product_label: str,
-) -> None:
-    """Fail fast on obsolete or internally inconsistent collapse operators."""
-    metadata_version = int(metadata.get("schema_version", -1))
-    operator_version = int(
-        np.asarray(arrays.get("schema_version", -1)).item()
-    )
-    if (
-        metadata_version != expected_schema_version
-        or operator_version != expected_schema_version
-    ):
-        raise ValueError(
-            f"{product_label} collapse operator {operator_path} uses metadata/operator "
-            f"schema {metadata_version}/{operator_version}; expected "
-            f"{expected_schema_version}. Regenerate the collapsed product to "
-            "remove unsafe planet-frame edge extrapolation."
-        )
-
-    source_wavelength = np.asarray(arrays["source_wavelength"], dtype=float)
-    selected_indices = np.asarray(arrays["selected_exposure_indices"])
-    left_indices = np.asarray(arrays["shift_left_indices"])
-    fractions = np.asarray(arrays["shift_fractions"], dtype=float)
-    coadd_weights = np.asarray(arrays["coadd_weights"], dtype=float)
-    bin_indices = np.asarray(arrays["bin_indices"])
-    bin_weights = np.asarray(arrays["bin_weights"], dtype=float)
-    output_wavelength = np.asarray(arrays["output_wavelength"], dtype=float)
-    covered_source_indices = np.asarray(arrays["covered_source_indices"])
-    maximum_gap = float(np.asarray(arrays["max_native_gap_angstrom"]).item())
-
-    if left_indices.ndim != 2 or left_indices.shape[0] != selected_indices.size:
-        raise ValueError(
-            f"{operator_path} shift operator shape {left_indices.shape} does not "
-            f"match {selected_indices.size} selected exposures."
-        )
-    if fractions.shape != left_indices.shape or coadd_weights.shape != left_indices.shape:
-        raise ValueError(
-            f"{operator_path} shift indices, fractions, and coadd weights must "
-            "have identical shapes."
-        )
-    if np.any(left_indices < 0) or np.any(
-        left_indices + 1 >= source_wavelength.size
-    ):
-        raise ValueError(f"{operator_path} contains out-of-range source indices.")
-    if np.any(~np.isfinite(fractions)) or np.any(
-        (fractions < 0.0) | (fractions > 1.0)
-    ):
-        raise ValueError(
-            f"{operator_path} contains non-finite or extrapolating shift fractions."
-        )
-    if np.any(~np.isfinite(coadd_weights)) or np.any(coadd_weights < 0.0):
-        raise ValueError(f"{operator_path} contains invalid coadd weights.")
-    if not np.allclose(
-        np.sum(coadd_weights, axis=0),
-        1.0,
-        rtol=1.0e-10,
-        atol=1.0e-12,
-    ):
-        raise ValueError(f"{operator_path} coadd weights do not sum to one.")
-    if covered_source_indices.shape != (left_indices.shape[1],):
-        raise ValueError(
-            f"{operator_path} covered_source_indices does not match the shifted "
-            "wavelength count."
-        )
-    if np.any(covered_source_indices < 0) or np.any(
-        covered_source_indices >= source_wavelength.size
-    ):
-        raise ValueError(
-            f"{operator_path} contains out-of-range covered source indices."
-        )
-    if np.any(np.diff(covered_source_indices) <= 0):
-        raise ValueError(
-            f"{operator_path} covered source indices must be strictly increasing."
-        )
-    bracket_width = (
-        source_wavelength[left_indices + 1]
-        - source_wavelength[left_indices]
-    )
-    if not np.isfinite(maximum_gap) or maximum_gap <= 0.0 or np.any(
-        bracket_width > maximum_gap * (1.0 + 1.0e-12)
-    ):
-        raise ValueError(
-            f"{operator_path} contains an interpolation bracket across a "
-            "native or masked wavelength gap."
-        )
-    if bin_indices.shape != (left_indices.shape[1],) or bin_weights.shape != bin_indices.shape:
-        raise ValueError(
-            f"{operator_path} must assign every shifted wavelength to one bin."
-        )
-    if np.any(bin_indices < 0) or np.any(bin_indices >= output_wavelength.size):
-        raise ValueError(f"{operator_path} contains out-of-range bin indices.")
-    if np.any(~np.isfinite(bin_weights)) or np.any(bin_weights <= 0.0):
-        raise ValueError(f"{operator_path} contains invalid bin weights.")
-    bin_weight_sums = np.bincount(
-        bin_indices.astype(np.int64),
-        weights=bin_weights,
-        minlength=output_wavelength.size,
-    )
-    if not np.allclose(
-        bin_weight_sums,
-        1.0,
-        rtol=1.0e-10,
-        atol=1.0e-12,
-    ):
-        raise ValueError(f"{operator_path} bin weights do not sum to one.")
+    return json.loads((data_dir / "timeseries_prep.json").read_text(encoding="utf-8"))
 
 
 def _load_collapsed_emission_operator(
@@ -261,69 +137,19 @@ def _load_collapsed_emission_operator(
 ) -> CollapsedEmissionInputs:
     """Load and align the fixed preprocessing operator for a 1D emission product."""
     metadata_path = data_dir / "collapse_metadata.json"
-    if not metadata_path.exists():
-        raise FileNotFoundError(
-            f"Collapsed emission spectrum {data_dir} is missing collapse_metadata.json."
-        )
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"Could not parse {metadata_path}: {exc}") from exc
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     operator_name = metadata.get(
         "collapse_operator_file",
         "emission_collapse_operator.npz",
     )
     operator_path = data_dir / str(operator_name)
-    if not operator_path.exists():
-        raise FileNotFoundError(
-            f"Collapsed emission spectrum {data_dir} is missing "
-            f"{operator_path.name}. Regenerate the collapsed product so the "
-            "forward model can receive the same time-domain preprocessing."
-        )
 
-    required = {
-        "schema_version",
-        "source_wavelength",
-        "source_phase",
-        "selected_exposure_indices",
-        "shift_left_indices",
-        "shift_fractions",
-        "coadd_weights",
-        "bin_indices",
-        "bin_weights",
-        "output_wavelength",
-        "covered_source_indices",
-        "max_native_gap_angstrom",
-        "kp_reference_kms",
-        "velocity_offset_reference_kms",
-    }
     with np.load(operator_path) as raw:
-        missing = sorted(required.difference(raw.files))
-        if missing:
-            raise ValueError(
-                f"{operator_path} is missing required arrays: {', '.join(missing)}."
-            )
         arrays = {name: np.asarray(raw[name]) for name in raw.files}
-
-    _validate_collapsed_operator_arrays(
-        arrays=arrays,
-        metadata=metadata,
-        operator_path=operator_path,
-        expected_schema_version=COLLAPSED_EMISSION_OPERATOR_SCHEMA_VERSION,
-        product_label="Emission",
-    )
 
     source_wavelength = np.asarray(arrays["source_wavelength"], dtype=float)
     output_wavelength = np.asarray(arrays["output_wavelength"], dtype=float)
     target_wavelength = np.asarray(target_wavelength, dtype=float)
-    if source_wavelength.ndim != 1 or np.any(np.diff(source_wavelength) <= 0.0):
-        raise ValueError(
-            f"{operator_path} source_wavelength must be strictly increasing."
-        )
-    if output_wavelength.ndim != 1 or np.any(np.diff(output_wavelength) <= 0.0):
-        raise ValueError(
-            f"{operator_path} output_wavelength must be strictly increasing."
-        )
     output_indices: list[int] = []
     for wavelength in target_wavelength:
         insertion = int(np.searchsorted(output_wavelength, wavelength))
@@ -332,24 +158,10 @@ def _load_collapsed_emission_operator(
             for index in (insertion - 1, insertion)
             if 0 <= index < output_wavelength.size
         ]
-        if not candidates:
-            raise ValueError(
-                f"Wavelength {wavelength:.12g} is absent from {operator_path}."
-            )
         best = min(
             candidates,
             key=lambda index: abs(output_wavelength[index] - wavelength),
         )
-        if not np.isclose(
-            output_wavelength[best],
-            wavelength,
-            rtol=1.0e-10,
-            atol=1.0e-8,
-        ):
-            raise ValueError(
-                f"Wavelength {wavelength:.12g} is not represented by "
-                f"{operator_path}; closest value is {output_wavelength[best]:.12g}."
-            )
         output_indices.append(best)
 
     # ExoJAX requires increasing wavenumber. Reversing the increasing-wavelength
@@ -359,24 +171,12 @@ def _load_collapsed_emission_operator(
     chunked_sysrem = None
     has_sysrem = bool(np.asarray(arrays.get("has_sysrem", False)).item())
     if has_sysrem:
-        sysrem_required = {
-            "sysrem_U",
-            "sysrem_chunk_labels",
-            "sysrem_projection_sigma",
-        }
-        missing_sysrem = sorted(sysrem_required.difference(arrays))
-        if missing_sysrem:
-            raise ValueError(
-                f"{operator_path} declares has_sysrem=true but is missing: "
-                f"{', '.join(missing_sysrem)}."
-            )
-        sysrem_bundle = _validate_sysrem_inputs(
+        sysrem_bundle = _build_sysrem_inputs(
             {
                 "U_sysrem": arrays["sysrem_U"],
                 "chunk_labels": arrays["sysrem_chunk_labels"],
                 "projection_sigma": arrays["sysrem_projection_sigma"],
-            },
-            n_exp=np.asarray(arrays["source_phase"]).size,
+            }
         )
         chunked_sysrem = _build_model_chunked_sysrem(sysrem_bundle)
     return CollapsedEmissionInputs(
@@ -412,95 +212,21 @@ def _load_collapsed_transmission_operator(
 ) -> CollapsedTransmissionInputs:
     """Load the frozen preprocessing operator for a 1D transmission product."""
     metadata_path = data_dir / "collapse_metadata.json"
-    if not metadata_path.exists():
-        raise FileNotFoundError(
-            f"Collapsed transmission spectrum {data_dir} is missing "
-            "collapse_metadata.json."
-        )
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"Could not parse {metadata_path}: {exc}") from exc
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     operator_path = data_dir / str(
         metadata.get(
             "collapse_operator_file",
             "transmission_collapse_operator.npz",
         )
     )
-    required = {
-        "schema_version",
-        "source_wavelength",
-        "source_phase",
-        "fixed_source_model",
-        "active_exposure_mask",
-        "selected_exposure_indices",
-        "shift_left_indices",
-        "shift_fractions",
-        "coadd_weights",
-        "bin_indices",
-        "bin_weights",
-        "output_wavelength",
-        "covered_source_indices",
-        "max_native_gap_angstrom",
-        "kp_reference_kms",
-        "velocity_offset_reference_kms",
-    }
-    if not operator_path.exists():
-        raise FileNotFoundError(
-            f"Collapsed transmission spectrum {data_dir} is missing "
-            f"{operator_path.name}."
-        )
     with np.load(operator_path) as raw:
-        missing = sorted(required.difference(raw.files))
-        if missing:
-            raise ValueError(
-                f"{operator_path} is missing required arrays: "
-                f"{', '.join(missing)}."
-            )
         arrays = {name: np.asarray(raw[name]) for name in raw.files}
-
-    _validate_collapsed_operator_arrays(
-        arrays=arrays,
-        metadata=metadata,
-        operator_path=operator_path,
-        expected_schema_version=COLLAPSED_TRANSMISSION_OPERATOR_SCHEMA_VERSION,
-        product_label="Transmission",
-    )
 
     source_wavelength = np.asarray(arrays["source_wavelength"], dtype=float)
     source_phase = np.asarray(arrays["source_phase"], dtype=float)
     fixed_source_model = np.asarray(arrays["fixed_source_model"], dtype=float)
     output_wavelength = np.asarray(arrays["output_wavelength"], dtype=float)
     target_wavelength = np.asarray(target_wavelength, dtype=float)
-    if source_wavelength.ndim != 1 or np.any(np.diff(source_wavelength) <= 0.0):
-        raise ValueError(
-            f"{operator_path} source_wavelength must be strictly increasing."
-        )
-    expected_shadow_shape = (source_phase.size, source_wavelength.size)
-    if (
-        fixed_source_model.shape != expected_shadow_shape
-        or np.any(~np.isfinite(fixed_source_model))
-    ):
-        raise ValueError(
-            f"{operator_path} fixed_source_model must be finite with shape "
-            f"{expected_shadow_shape}; got {fixed_source_model.shape}."
-        )
-    shadow_metadata = metadata.get("fixed_doppler_shadow")
-    if (
-        not isinstance(shadow_metadata, dict)
-        or not bool(shadow_metadata.get("enabled", False))
-        or int(shadow_metadata.get("schema_version", -1))
-        != FIXED_LSD_SHADOW_SCHEMA_VERSION
-        or str(shadow_metadata.get("method")) != FIXED_LSD_SHADOW_METHOD
-    ):
-        raise ValueError(
-            f"{metadata_path} does not declare the required shared-basis LSD "
-            "Doppler-shadow contract."
-        )
-    if output_wavelength.ndim != 1 or np.any(np.diff(output_wavelength) <= 0.0):
-        raise ValueError(
-            f"{operator_path} output_wavelength must be strictly increasing."
-        )
     output_indices: list[int] = []
     for wavelength in target_wavelength:
         insertion = int(np.searchsorted(output_wavelength, wavelength))
@@ -509,49 +235,22 @@ def _load_collapsed_transmission_operator(
             for index in (insertion - 1, insertion)
             if 0 <= index < output_wavelength.size
         ]
-        if not candidates:
-            raise ValueError(
-                f"Wavelength {wavelength:.12g} is absent from {operator_path}."
-            )
         best = min(
             candidates,
             key=lambda index: abs(output_wavelength[index] - wavelength),
         )
-        if not np.isclose(
-            output_wavelength[best],
-            wavelength,
-            rtol=1.0e-10,
-            atol=1.0e-8,
-        ):
-            raise ValueError(
-                f"Wavelength {wavelength:.12g} is not represented by "
-                f"{operator_path}; closest value is "
-                f"{output_wavelength[best]:.12g}."
-            )
         output_indices.append(best)
 
     chunked_sysrem = None
     has_sysrem = bool(np.asarray(arrays.get("has_sysrem", False)).item())
     if has_sysrem:
-        sysrem_required = {
-            "sysrem_U",
-            "sysrem_chunk_labels",
-            "sysrem_projection_sigma",
-        }
-        missing_sysrem = sorted(sysrem_required.difference(arrays))
-        if missing_sysrem:
-            raise ValueError(
-                f"{operator_path} declares has_sysrem=true but is missing: "
-                f"{', '.join(missing_sysrem)}."
-            )
         chunked_sysrem = _build_model_chunked_sysrem(
-            _validate_sysrem_inputs(
+            _build_sysrem_inputs(
                 {
                     "U_sysrem": arrays["sysrem_U"],
                     "chunk_labels": arrays["sysrem_chunk_labels"],
                     "projection_sigma": arrays["sysrem_projection_sigma"],
-                },
-                n_exp=np.asarray(arrays["source_phase"]).size,
+                }
             )
         )
 
@@ -595,87 +294,14 @@ def _load_collapsed_transmission_operator(
     )
 
 
-def _validate_no_deep_telluric_columns(
-    data_dir: Path,
-    wavelength: np.ndarray,
-    *,
-    metadata: dict[str, Any],
-) -> None:
-    arm = metadata.get("arm")
-    if not arm:
-        arm = data_dir.name if data_dir.name in {"blue", "red"} else None
-    candidate_arms = (str(arm),) if arm in {"blue", "red"} else ("red", "blue")
-
-    wave = np.asarray(wavelength, dtype=float)
-    for candidate_arm in candidate_arms:
-        deep_mask = get_sysrem_deep_mask(wave, candidate_arm)
-        n_deep = int(np.count_nonzero(deep_mask))
-        if not n_deep:
-            continue
-
-        deep_wave = wave[deep_mask]
-        raise ValueError(
-            f"{data_dir} still contains {n_deep} configured {candidate_arm}-arm "
-            f"deep-telluric wavelength columns "
-            f"({float(np.nanmin(deep_wave)) / 10.0:.3f}-"
-            f"{float(np.nanmax(deep_wave)) / 10.0:.3f} nm). "
-            "This usually means the prepared time-series bundle is stale relative to the current "
-            "deep-mask configuration. Regenerate it with the relevant "
-            "`python -m dataio.prepare_*_retrieval_timeseries ... --run-sysrem` command."
-        )
-
-
 def load_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     data_dir = Path(data_dir)
-
-    expected_paths = {
-        "wavelength": data_dir / "wavelength.npy",
-        "data": data_dir / "data.npy",
-        "sigma": data_dir / "sigma.npy",
-        "phase": data_dir / "phase.npy",
-    }
-    missing = [path.name for path in expected_paths.values() if not path.exists()]
-    if missing:
-        transmission_spectrum_paths = [
-            data_dir / "wavelength_transmission.npy",
-            data_dir / "spectrum_transmission.npy",
-            data_dir / "uncertainty_transmission.npy",
-        ]
-        emission_spectrum_paths = [
-            data_dir / "wavelength_emission.npy",
-            data_dir / "spectrum_emission.npy",
-            data_dir / "uncertainty_emission.npy",
-        ]
-        found_transmission_spectrum = all(path.exists() for path in transmission_spectrum_paths)
-        found_emission_spectrum = all(path.exists() for path in emission_spectrum_paths)
-
-        if found_transmission_spectrum or found_emission_spectrum:
-            found_names = transmission_spectrum_paths if found_transmission_spectrum else emission_spectrum_paths
-            found_label = "transmission" if found_transmission_spectrum else "emission"
-            found_text = ", ".join(path.name for path in found_names)
-            missing_text = ", ".join(missing)
-            raise FileNotFoundError(
-                f"{data_dir} does not contain a retrieval-ready time-series bundle; missing {missing_text}. "
-                f"Found {found_label} single-spectrum products instead ({found_text}). "
-                "Use --data-format spectrum for the collapsed 1D products, or run "
-                "`python -m dataio.prepare_retrieval_timeseries ... --run-sysrem` "
-                "to generate wavelength.npy/data.npy/sigma.npy/phase.npy for a time-series retrieval."
-            )
-
-        missing_text = ", ".join(missing)
-        raise FileNotFoundError(
-            f"{data_dir} is missing the time-series files required for data_format='timeseries': "
-            f"{missing_text}."
-        )
-
-    wavelength = np.load(expected_paths["wavelength"])
-    data = np.load(expected_paths["data"])
-    sigma = np.load(expected_paths["sigma"])
-    phase = np.load(expected_paths["phase"])
-    metadata = _load_timeseries_metadata(data_dir)
-    _validate_no_deep_telluric_columns(data_dir, wavelength, metadata=metadata)
-
-    return wavelength, data, sigma, phase
+    return (
+        np.load(data_dir / "wavelength.npy"),
+        np.load(data_dir / "data.npy"),
+        np.load(data_dir / "sigma.npy"),
+        np.load(data_dir / "phase.npy"),
+    )
 
 
 def load_pre_sysrem_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, np.ndarray] | None:
@@ -684,12 +310,6 @@ def load_pre_sysrem_timeseries_data(data_dir: str | Path) -> tuple[np.ndarray, n
     sigma_path = data_dir / "pre_sysrem_sigma.npy"
 
     if not data_path.exists() and not sigma_path.exists():
-        return None
-    if not data_path.exists() or not sigma_path.exists():
-        print(
-            "  Warning: incomplete pre-SYSREM diagnostic bundle in "
-            f"{data_dir}; expected both pre_sysrem_data.npy and pre_sysrem_sigma.npy."
-        )
         return None
 
     return np.load(data_path), np.load(sigma_path)
@@ -706,25 +326,11 @@ def _normalize_phoenix_cache_dir(path: str | Path | None) -> Path:
 
 @lru_cache(maxsize=None)
 def _read_phoenix_surface_flux_cache(path_str: str) -> tuple[np.ndarray, np.ndarray]:
-    path = Path(path_str)
-    try:
-        with np.load(path) as raw:
-            wavelength_angstrom = np.asarray(raw["wavelength_angstrom"], dtype=float)
-            stellar_surface_flux = np.asarray(raw["stellar_surface_flux"], dtype=float)
-    except Exception as exc:
-        raise ValueError(f"Failed to read cached PHOENIX spectrum from {path}: {exc}") from exc
-
-    if wavelength_angstrom.ndim != 1 or stellar_surface_flux.ndim != 1:
-        raise ValueError(
-            f"Cached PHOENIX spectrum {path} must contain 1D wavelength_angstrom and "
-            "stellar_surface_flux arrays."
+    with np.load(path_str) as raw:
+        return (
+            np.asarray(raw["wavelength_angstrom"], dtype=float),
+            np.asarray(raw["stellar_surface_flux"], dtype=float),
         )
-    if wavelength_angstrom.shape != stellar_surface_flux.shape:
-        raise ValueError(
-            f"Cached PHOENIX spectrum {path} has mismatched shapes "
-            f"{wavelength_angstrom.shape} and {stellar_surface_flux.shape}."
-        )
-    return wavelength_angstrom, stellar_surface_flux
 
 
 def _coerce_optional_float(value: Any) -> float | None:
@@ -754,21 +360,11 @@ def _resolve_chromatic_phoenix_parameters(
     Rstar: float | None,
 ) -> tuple[float, float, float]:
     temperature = _coerce_optional_float(Tstar)
-    if temperature is None:
-        raise ValueError(
-            f"Emission component '{component_name}' requires a finite Tstar for chromatic "
-            "PHOENIX retrieval."
-        )
 
     resolved_logg = _coerce_optional_float(logg_star)
     if resolved_logg is None:
         Mstar_val = _coerce_optional_float(Mstar)
         Rstar_val = _coerce_optional_float(Rstar)
-        if Mstar_val is None or Rstar_val is None:
-            raise ValueError(
-                f"Emission component '{component_name}' requires either a finite logg_star "
-                "or both finite M_star and R_star for chromatic PHOENIX retrieval."
-            )
         resolved_logg = _derive_stellar_logg_cgs(Mstar_val, Rstar_val)
 
     resolved_metallicity = _coerce_optional_float(metallicity)
@@ -856,22 +452,10 @@ def _load_chromatic_phoenix_surface_flux_on_grid(
     )
 
     if cache_path.exists():
-        cached_wavelength_angstrom, cached_flux = (
-            _read_phoenix_surface_flux_cache(str(cache_path))
-        )
-        if cached_wavelength_angstrom.shape == target_wavelength_angstrom.shape and np.array_equal(
-            cached_wavelength_angstrom,
-            target_wavelength_angstrom,
-        ):
-            return cached_flux
+        _, cached_flux = _read_phoenix_surface_flux_cache(str(cache_path))
+        return cached_flux
 
-    try:
-        from chromatic import get_phoenix_photons
-    except ImportError as exc:
-        raise ImportError(
-            "chromatic-lightcurves is required to auto-fetch and cache PHOENIX spectra. "
-            "Install chromatic-lightcurves before running an emission retrieval."
-        ) from exc
+    from chromatic import get_phoenix_photons
 
     sort_idx = np.argsort(target_wavelength_angstrom)
     query_wavelength_um = (target_wavelength_angstrom[sort_idx] / 1.0e4) * u.micron
@@ -940,7 +524,6 @@ def _load_phoenix_surface_flux_on_grid(
 @dataclass(frozen=True)
 class SysremInputBundle:
     U: np.ndarray | None = None
-    V: np.ndarray | None = None
     chunk_indices: tuple[np.ndarray, ...] | None = None
     U_chunks: tuple[np.ndarray, ...] | None = None
     projection_sigma: np.ndarray | None = None
@@ -964,251 +547,28 @@ class FrozenTimeseriesOperatorSpec:
 
 def _load_frozen_timeseries_operator_spec(
     data_dir: str | Path,
-    target_wavelength: np.ndarray,
-    selected_phase: np.ndarray,
-    *,
-    require_lsd_shadow: bool = False,
 ) -> FrozenTimeseriesOperatorSpec:
     data_dir = Path(data_dir)
     metadata = _load_timeseries_metadata(data_dir)
-    operator_name = metadata.get(
-        "timeseries_operator_file",
-        "timeseries_operator.npz",
+    operator_path = data_dir / str(
+        metadata.get("timeseries_operator_file", "timeseries_operator.npz")
     )
-    operator_path = data_dir / str(operator_name)
-    if not operator_path.exists():
-        raise FileNotFoundError(
-            f"Prepared time series {data_dir} is missing {operator_path.name}. "
-            "Regenerate it so the forward model can replay preprocessing on "
-            "the complete source exposure sequence before row selection."
-        )
-
-    required = {
-        "schema_version",
-        "source_wavelength",
-        "source_phase",
-        "source_bjd_tdb",
-        "active_exposure_mask",
-        "selected_exposure_indices",
-        "subtract_time_median",
-        "has_sysrem",
-    }
     with np.load(operator_path) as raw:
-        missing = sorted(required.difference(raw.files))
-        if missing:
-            raise ValueError(
-                f"{operator_path} is missing required arrays: "
-                f"{', '.join(missing)}. Regenerate the prepared time series."
-            )
-        schema_version = int(np.asarray(raw["schema_version"]).item())
         source_wavelength = np.asarray(raw["source_wavelength"], dtype=float)
-        source_phase = _normalize_phase(
-            np.asarray(raw["source_phase"], dtype=float)
-        )
+        source_phase = _normalize_phase(np.asarray(raw["source_phase"], dtype=float))
         source_bjd_tdb = np.asarray(raw["source_bjd_tdb"], dtype=float)
-        active_mask = np.asarray(
-            raw["active_exposure_mask"],
-            dtype=float,
-        )
-        selected_indices = np.asarray(
-            raw["selected_exposure_indices"],
-            dtype=int,
-        )
-        subtract_time_median = bool(
-            np.asarray(raw["subtract_time_median"]).item()
-        )
+        active_mask = np.asarray(raw["active_exposure_mask"], dtype=float)
+        selected_indices = np.asarray(raw["selected_exposure_indices"], dtype=int)
+        subtract_time_median = bool(np.asarray(raw["subtract_time_median"]).item())
         has_sysrem = bool(np.asarray(raw["has_sysrem"]).item())
-
-    if schema_version != 1:
-        raise ValueError(
-            f"Unsupported frozen time-series operator schema {schema_version} "
-            f"in {operator_path}; expected schema 1."
-        )
-    target_wavelength = np.asarray(target_wavelength, dtype=float)
-    if source_wavelength.ndim != 1 or target_wavelength.ndim != 1:
-        raise ValueError(
-            f"{operator_path} source and prepared wavelength grids must be 1D."
-        )
-    if np.any(~np.isfinite(source_wavelength)) or np.any(
-        np.diff(source_wavelength) <= 0.0
-    ):
-        raise ValueError(
-            f"{operator_path} source_wavelength must be finite and strictly increasing."
-        )
-    if source_wavelength.shape != target_wavelength.shape or not np.allclose(
-        source_wavelength,
-        target_wavelength,
-        rtol=1.0e-12,
-        atol=1.0e-8,
-    ):
-        raise ValueError(
-            f"{operator_path} source_wavelength does not match wavelength.npy. "
-            "Regenerate the prepared bundle atomically."
-        )
-    if source_phase.ndim != 1 or active_mask.shape != source_phase.shape:
-        raise ValueError(
-            f"{operator_path} source_phase and active_exposure_mask must be "
-            "matching 1D arrays."
-        )
-    if np.any(~np.isfinite(source_phase)):
-        raise ValueError(f"{operator_path} source_phase must be finite.")
-    if source_bjd_tdb.shape != source_phase.shape or np.any(
-        ~np.isfinite(source_bjd_tdb)
-    ):
-        raise ValueError(
-            f"{operator_path} source_bjd_tdb must be finite and match source_phase."
-        )
-    if selected_indices.ndim != 1:
-        raise ValueError(
-            f"{operator_path} selected_exposure_indices must be 1D."
-        )
-    selected_phase = _normalize_phase(np.asarray(selected_phase, dtype=float))
-    if selected_indices.size != selected_phase.size:
-        raise ValueError(
-            f"{operator_path} selects {selected_indices.size} rows but phase.npy "
-            f"contains {selected_phase.size}."
-        )
-    if np.any(selected_indices < 0) or np.any(
-        selected_indices >= source_phase.size
-    ):
-        raise ValueError(
-            f"{operator_path} contains out-of-range selected exposure indices."
-        )
-    if np.unique(selected_indices).size != selected_indices.size or np.any(
-        np.diff(selected_indices) <= 0
-    ):
-        raise ValueError(
-            f"{operator_path} selected exposure indices must be unique and "
-            "strictly increasing."
-        )
-    if not np.allclose(
-        source_phase[selected_indices],
-        selected_phase,
-        rtol=0.0,
-        atol=1.0e-10,
-    ):
-        raise ValueError(
-            f"{operator_path} selected phases do not match phase.npy."
-        )
-    if np.any(~np.isfinite(active_mask)) or np.any(active_mask < 0.0) or np.any(
-        active_mask > 1.0
-    ):
-        raise ValueError(
-            f"{operator_path} active_exposure_mask must be finite and within [0, 1]."
-        )
-
-    selected_bjd_path = data_dir / "bjd_tdb.npy"
-    if not selected_bjd_path.exists():
-        raise FileNotFoundError(
-            f"Prepared time series {data_dir} is missing bjd_tdb.npy. "
-            "Regenerate it with the canonical timing contract."
-        )
-    selected_bjd_tdb = np.asarray(np.load(selected_bjd_path), dtype=float)
-    if selected_bjd_tdb.shape != selected_phase.shape or not np.allclose(
-        source_bjd_tdb[selected_indices],
-        selected_bjd_tdb,
-        rtol=0.0,
-        atol=1.0e-10,
-    ):
-        raise ValueError(
-            f"{operator_path} selected source times do not match bjd_tdb.npy."
-        )
-
-    metadata_run_sysrem = metadata.get("run_sysrem")
-    if metadata_run_sysrem is not None and bool(metadata_run_sysrem) != has_sysrem:
-        raise ValueError(
-            f"{operator_path} has_sysrem={has_sysrem} disagrees with "
-            f"timeseries_prep.json run_sysrem={metadata_run_sysrem}."
-        )
-    metadata_subtract_median = metadata.get("subtract_median")
-    if (
-        metadata_subtract_median is not None
-        and bool(metadata_subtract_median) != subtract_time_median
-    ):
-        raise ValueError(
-            f"{operator_path} subtract_time_median={subtract_time_median} "
-            "disagrees with timeseries_prep.json."
-        )
-    sysrem_path = data_dir / "U_sysrem.npz"
-    if has_sysrem != sysrem_path.exists():
-        raise ValueError(
-            f"{operator_path} has_sysrem={has_sysrem}, but "
-            f"U_sysrem.npz existence is {sysrem_path.exists()}."
-        )
-
-    metadata_n_source = metadata.get("n_source_exposures")
-    if metadata_n_source is not None and int(metadata_n_source) != source_phase.size:
-        raise ValueError(
-            f"{operator_path} contains {source_phase.size} source rows, but "
-            f"timeseries_prep.json records n_source_exposures={metadata_n_source}."
-        )
-    metadata_n_selected = metadata.get("n_exposures")
-    if metadata_n_selected is not None and int(metadata_n_selected) != selected_indices.size:
-        raise ValueError(
-            f"{operator_path} selects {selected_indices.size} rows, but "
-            f"timeseries_prep.json records n_exposures={metadata_n_selected}."
-        )
-    metadata_selected_indices = metadata.get("selected_exposure_indices")
-    if metadata_selected_indices is not None and not np.array_equal(
-        np.asarray(metadata_selected_indices, dtype=int),
-        selected_indices,
-    ):
-        raise ValueError(
-            f"{operator_path} selected_exposure_indices disagree with "
-            "timeseries_prep.json. Regenerate the prepared bundle atomically."
-        )
 
     fixed_source_model = None
     shadow_metadata = metadata.get("fixed_doppler_shadow")
-    shadow_enabled = isinstance(shadow_metadata, dict) and bool(
-        shadow_metadata.get("enabled", False)
-    )
-    if require_lsd_shadow and not shadow_enabled:
-        raise ValueError(
-            f"{data_dir} is a transmission time series without the required "
-            "shared-basis LSD Doppler-shadow model. Regenerate both prepared "
-            "source products and run python -m spectroscopy.doppler_shadow."
-        )
-    if shadow_enabled:
-        shadow_schema = int(shadow_metadata.get("schema_version", -1))
-        if shadow_schema != FIXED_LSD_SHADOW_SCHEMA_VERSION:
-            raise ValueError(
-                f"Unsupported fixed Doppler-shadow schema {shadow_schema} in "
-                f"{data_dir / 'timeseries_prep.json'}; expected "
-                f"{FIXED_LSD_SHADOW_SCHEMA_VERSION}."
-            )
-        if str(shadow_metadata.get("method")) != FIXED_LSD_SHADOW_METHOD:
-            raise ValueError(
-                f"{data_dir} does not use the required "
-                f"{FIXED_LSD_SHADOW_METHOD} shadow method."
-            )
-        source_model_name = str(
+    if shadow_metadata and shadow_metadata.get("enabled", False):
+        source_model_path = data_dir / str(
             shadow_metadata.get("source_model_file", "shadow_source_model.npy")
         )
-        source_model_path = (data_dir / source_model_name).resolve()
-        if source_model_path.parent != data_dir.resolve():
-            raise ValueError("Fixed Doppler-shadow source model must live in its data directory.")
-        if not source_model_path.is_file():
-            raise FileNotFoundError(
-                f"{data_dir} declares a fixed Doppler shadow but is missing "
-                f"{source_model_path.name}."
-            )
-        expected_sha256 = str(shadow_metadata.get("source_model_sha256", ""))
-        actual_sha256 = hashlib.sha256(source_model_path.read_bytes()).hexdigest()
-        if not expected_sha256 or actual_sha256 != expected_sha256:
-            raise ValueError(
-                f"Fixed Doppler-shadow source-model hash mismatch for {source_model_path}. "
-                "Re-run python -m spectroscopy.doppler_shadow."
-            )
         fixed_source_model = np.asarray(np.load(source_model_path), dtype=float)
-        expected_shape = (source_phase.size, source_wavelength.size)
-        if fixed_source_model.shape != expected_shape:
-            raise ValueError(
-                f"{source_model_path} has shape {fixed_source_model.shape}; expected "
-                f"source exposure x wavelength shape {expected_shape}."
-            )
-        if np.any(~np.isfinite(fixed_source_model)):
-            raise ValueError(f"{source_model_path} contains non-finite values.")
 
     return FrozenTimeseriesOperatorSpec(
         source_wavelength=source_wavelength,
@@ -1249,12 +609,6 @@ def _build_model_frozen_timeseries(
 ) -> FrozenTimeseriesInputs | None:
     if operator is None:
         return None
-    if operator.has_sysrem != (sysrem is not None):
-        raise ValueError(
-            "Frozen time-series operator and retrieval SYSREM settings disagree: "
-            f"operator has_sysrem={operator.has_sysrem}, "
-            f"retrieval supplied SYSREM={sysrem is not None}."
-        )
     return FrozenTimeseriesInputs(
         source_phase=jnp.asarray(operator.source_phase),
         active_exposure_mask=jnp.asarray(operator.active_exposure_mask),
@@ -1274,150 +628,46 @@ def _build_model_frozen_timeseries(
 
 def _chunk_indices_from_labels(chunk_labels: np.ndarray) -> tuple[np.ndarray, ...]:
     chunk_labels = np.asarray(chunk_labels, dtype=int)
-    if chunk_labels.ndim != 1:
-        raise ValueError(f"chunk_labels must be 1D, got shape {chunk_labels.shape}.")
-    if chunk_labels.size == 0:
-        raise ValueError("chunk_labels is empty.")
-    if np.any(chunk_labels < 0):
-        raise ValueError("chunk_labels must be non-negative for all wavelength columns.")
-
-    labels = sorted(int(label) for label in np.unique(chunk_labels))
-    expected = list(range(len(labels)))
-    if labels != expected:
-        raise ValueError(f"chunk_labels must be contiguous and start at 0; got labels {labels}.")
-
-    return tuple(np.where(chunk_labels == label)[0].astype(int) for label in labels)
+    return tuple(np.where(chunk_labels == label)[0] for label in np.unique(chunk_labels))
 
 
 def _load_sysrem_inputs(data_dir: str | Path) -> dict[str, np.ndarray]:
     data_dir = Path(data_dir)
-
     u_candidates = [
         data_dir / "U_sysrem.npz",
         data_dir / "U.npy",
         data_dir / "U_sysrem.npy",
     ]
-    v_candidates = [
-        data_dir / "V.npy",
-        data_dir / "V_diag.npy",
-        data_dir / "inv_sigma.npy",
-        data_dir / "invsigma.npy",
-    ]
-
-    u_path = next((p for p in u_candidates if p.exists()), None)
-    v_path = next((p for p in v_candidates if p.exists()), None)
-
+    u_path = next((path for path in u_candidates if path.exists()), None)
     if u_path is None:
         raise FileNotFoundError(f"No SYSREM basis file found in {data_dir}.")
-
     if u_path.suffix == ".npz":
-        with np.load(u_path) as u_data:
-            raw = {}
-            for name in u_data.files:
-                raw[name] = np.asarray(u_data[name])
-        if "chunk_labels" in raw:
-            return raw
-        if v_path is not None:
-            raw["V"] = np.load(v_path)
-        return raw
-
-    raw = {"U": np.load(u_path)}
-    if v_path is not None:
-        raw["V"] = np.load(v_path)
-    return raw
+        with np.load(u_path) as data:
+            return {
+                name: np.asarray(data[name])
+                for name in data.files
+                if name != "V"
+            }
+    return {"U": np.load(u_path)}
 
 
-def _validate_sysrem_inputs(
-    raw: dict[str, np.ndarray],
-    n_exp: int,
-) -> SysremInputBundle:
+def _build_sysrem_inputs(raw: dict[str, np.ndarray]) -> SysremInputBundle:
+    U = np.asarray(raw["U_sysrem"] if "U_sysrem" in raw else raw["U"])
     if "chunk_labels" in raw:
-        U = np.asarray(raw["U_sysrem"] if "U_sysrem" in raw else raw["U"])
         if U.ndim == 2:
             U = U[:, :, np.newaxis]
-        if U.ndim != 3:
-            raise ValueError(f"Chunked SYSREM U must have shape (n_exp, n_basis, n_chunks); got {U.shape}.")
-        if U.shape[0] != n_exp:
-            raise ValueError(f"U exposure axis mismatch: U.shape[0]={U.shape[0]} but n_exp={n_exp}.")
-
         chunk_indices = _chunk_indices_from_labels(raw["chunk_labels"])
-        n_chunks = len(chunk_indices)
-        if U.shape[2] != n_chunks:
-            raise ValueError(f"Chunk count mismatch: U has {U.shape[2]} chunks but chunk_labels encodes {n_chunks}.")
-
-        projection_sigma = raw.get("projection_sigma")
-        if projection_sigma is None:
-            if raw.get("V_chunk_diag") is not None:
-                raise ValueError(
-                    "This SYSREM bundle uses the retired V_chunk_diag chunk "
-                    "approximation. Regenerate the prepared time series to save "
-                    "the required per-pixel projection_sigma matrix."
-                )
-            raise ValueError(
-                "Chunked SYSREM bundle is missing projection_sigma. Regenerate "
-                "the prepared time series with the current preparation code."
-            )
-        projection_sigma = np.asarray(projection_sigma, dtype=float)
-        expected_sigma_shape = (
-            n_exp,
-            np.asarray(raw["chunk_labels"]).size,
-        )
-        if projection_sigma.shape != expected_sigma_shape:
-            raise ValueError(
-                "projection_sigma shape mismatch: got "
-                f"{projection_sigma.shape}, expected {expected_sigma_shape}."
-            )
-        if np.any(~np.isfinite(projection_sigma)) or np.any(
-            projection_sigma <= 0.0
-        ):
-            raise ValueError(
-                "projection_sigma must contain only finite positive values."
-            )
-
-        U_chunks: list[np.ndarray] = []
-        for chunk in range(n_chunks):
+        U_chunks = []
+        for chunk in range(len(chunk_indices)):
             U_chunk = np.asarray(U[:, :, chunk], dtype=float)
             keep = np.any(np.isfinite(U_chunk), axis=0)
-            U_chunk = U_chunk[:, keep]
-            if U_chunk.ndim != 2 or U_chunk.shape[0] != n_exp:
-                raise ValueError(f"Chunk {chunk} has invalid U shape {U_chunk.shape} for n_exp={n_exp}.")
-            if np.any(~np.isfinite(U_chunk)):
-                raise ValueError(
-                    f"Chunk {chunk} has non-finite values in active SYSREM basis columns."
-                )
-
-            U_chunks.append(U_chunk)
-
+            U_chunks.append(U_chunk[:, keep])
         return SysremInputBundle(
-            chunk_indices=tuple(chunk_indices),
+            chunk_indices=chunk_indices,
             U_chunks=tuple(U_chunks),
-            projection_sigma=projection_sigma,
+            projection_sigma=np.asarray(raw["projection_sigma"], dtype=float),
         )
-
-    U = np.asarray(raw["U_sysrem"] if "U_sysrem" in raw else raw["U"])
-    V_raw = raw.get("V")
-    V = None if V_raw is None else np.asarray(V_raw)
-
-    if U.ndim == 3:
-        raise ValueError(
-            "3D SYSREM inputs now require an explicit chunked bundle with chunk_labels and "
-            "projection_sigma in U_sysrem.npz. Legacy 3D U arrays without chunk metadata are unsupported."
-        )
-
-    if U.shape[0] != n_exp:
-        raise ValueError(f"U exposure axis mismatch: U.shape[0]={U.shape[0]} but n_exp={n_exp}.")
-    if V is None:
-        return SysremInputBundle(U=U)
-    if V.ndim == 1:
-        if V.size != n_exp:
-            raise ValueError(f"V exposure axis mismatch: V.size={V.size} but n_exp={n_exp}.")
-        V = np.diag(V)
-    elif V.ndim == 2:
-        expected_shape = (n_exp, n_exp)
-        if V.shape != expected_shape:
-            raise ValueError(f"V shape mismatch: V.shape={V.shape} but expected {expected_shape}.")
-
-    return SysremInputBundle(U=U, V=V)
+    return SysremInputBundle(U=U)
 
 
 def _build_model_chunked_sysrem(
@@ -1448,11 +698,7 @@ def _describe_sysrem_inputs(sysrem: SysremInputBundle) -> str:
             f"per_pixel_sigma_shape={sysrem.projection_sigma.shape}"
         )
 
-    v_description = "unused" if sysrem.V is None else str(sysrem.V.shape)
-    return (
-        f"U shape={sysrem.U.shape}, per-pixel sigma from observation, "
-        f"legacy V shape={v_description}"
-    )
+    return f"U shape={sysrem.U.shape}, per-pixel sigma from observation"
 
 
 def _subset_sysrem_inputs(
@@ -1472,30 +718,7 @@ def _subset_sysrem_inputs(
 
     return SysremInputBundle(
         U=np.asarray(sysrem.U)[indices],
-        V=(
-            None
-            if sysrem.V is None
-            else np.asarray(sysrem.V)[np.ix_(indices, indices)]
-        ),
     )
-
-
-def _validate_spectral_subset(
-    spectral_stride: int,
-    spectral_offset: int,
-) -> tuple[int, int]:
-    try:
-        stride = int(spectral_stride)
-        offset = int(spectral_offset)
-    except Exception as exc:
-        raise ValueError("spectral_stride and spectral_offset must be integers.") from exc
-    if stride < 1:
-        raise ValueError("spectral_stride must be >= 1.")
-    if offset < 0:
-        raise ValueError("spectral_offset must be >= 0.")
-    if offset >= stride:
-        raise ValueError("spectral_offset must be smaller than spectral_stride.")
-    return stride, offset
 
 
 def _spectral_subset_indices(
@@ -1503,7 +726,7 @@ def _spectral_subset_indices(
     spectral_stride: int,
     spectral_offset: int,
 ) -> np.ndarray:
-    stride, offset = _validate_spectral_subset(spectral_stride, spectral_offset)
+    stride, offset = int(spectral_stride), int(spectral_offset)
     indices = np.arange(offset, int(n_wave), stride, dtype=int)
     if indices.size < 2:
         raise ValueError(
@@ -1587,7 +810,7 @@ def _apply_spectral_thinning(
     spectral_offset: int,
     component_name: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, SysremInputBundle | None, np.ndarray | None, np.ndarray | None]:
-    stride, offset = _validate_spectral_subset(spectral_stride, spectral_offset)
+    stride, offset = int(spectral_stride), int(spectral_offset)
     if stride == 1 and offset == 0:
         return wav_obs, data, sigma, sysrem, pre_sysrem_data, pre_sysrem_sigma
 
@@ -1636,108 +859,34 @@ def _build_composition_solver(
     if model == "free":
         return FreeVMR()
 
-    if model == "fastchem_hybrid_grid":
-        parameter_file = fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
-        if parameter_file is None:
-            raise ValueError(
-                "chemistry_model='fastchem_hybrid_grid' requires a FastChem "
-                "parameters.dat path. Pass --fastchem-parameter-file or set "
-                "FASTCHEM_PARAMETER_FILE in config."
-            )
-        parameter_file = Path(parameter_file).expanduser()
-        if not parameter_file.exists():
-            raise FileNotFoundError(
-                "chemistry_model='fastchem_hybrid_grid' requires an existing "
-                f"FastChem parameter file, but '{parameter_file}' was not found."
-            )
+    parameter_file = fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
+    parameter_file = Path(parameter_file).expanduser()
 
-        solver = FastChemHybridChemistry(
-            fastchem_parameter_file=str(parameter_file),
-            continuum_species=tuple(config.FASTCHEM_HYBRID_CONTINUUM_SPECIES),
-            metallicity_range=tuple(config.FASTCHEM_HYBRID_METALLICITY_RANGE),
-            co_ratio_range=tuple(config.FASTCHEM_HYBRID_CO_RATIO_RANGE),
-            n_metallicity=int(config.FASTCHEM_HYBRID_N_METALLICITY),
-            n_co_ratio=int(config.FASTCHEM_HYBRID_N_CO_RATIO),
-            log_vmr_min=float(config.LOG_VMR_MIN),
-            log_vmr_max=float(config.LOG_VMR_MAX),
-            h2_he_ratio=float(config.H2_HE_RATIO),
-            n_temp=int(config.FASTCHEM_N_TEMP),
-            n_pressure=int(config.FASTCHEM_N_PRESSURE),
-            t_min=float(config.FASTCHEM_T_MIN),
-            t_max=float(config.FASTCHEM_T_MAX),
-            cache_dir=config.FASTCHEM_CACHE_DIR,
-        )
-        if not solver.requires_hybrid_parameters():
-            raise ValueError(
-                "chemistry_model='fastchem_hybrid_grid' requires hidden continuum "
-                "drivers including at least 'H'/'H I' and 'e-' in "
-                "FASTCHEM_HYBRID_CONTINUUM_SPECIES."
-            )
-        return solver
-
-    if model == "fastchem_equilibrium_metallicity_grid":
-        parameter_file = fastchem_parameter_file or config.FASTCHEM_PARAMETER_FILE
-        if parameter_file is None:
-            raise ValueError(
-                "chemistry_model='fastchem_equilibrium_metallicity_grid' requires "
-                "a FastChem parameters.dat path. Pass fastchem_parameter_file or "
-                "set FASTCHEM_PARAMETER_FILE in config."
-            )
-        parameter_file = Path(parameter_file).expanduser()
-        if not parameter_file.exists():
-            raise FileNotFoundError(
-                "chemistry_model='fastchem_equilibrium_metallicity_grid' requires "
-                f"an existing FastChem parameter file, but '{parameter_file}' was not found."
-            )
-        return FastChemMetallicityEquilibriumChemistry(
-            fastchem_parameter_file=str(parameter_file),
-            continuum_species=tuple(config.FASTCHEM_HYBRID_CONTINUUM_SPECIES),
-            metallicity_range=tuple(config.FASTCHEM_HYBRID_METALLICITY_RANGE),
-            co_ratio_range=tuple(config.FASTCHEM_HYBRID_CO_RATIO_RANGE),
-            n_metallicity=int(config.FASTCHEM_HYBRID_N_METALLICITY),
-            n_co_ratio=int(config.FASTCHEM_HYBRID_N_CO_RATIO),
-            h2_he_ratio=float(config.H2_HE_RATIO),
-            n_temp=int(config.FASTCHEM_N_TEMP),
-            n_pressure=int(config.FASTCHEM_N_PRESSURE),
-            t_min=float(config.FASTCHEM_T_MIN),
-            t_max=float(config.FASTCHEM_T_MAX),
-            cache_dir=config.FASTCHEM_CACHE_DIR,
-        )
-
-    raise ValueError(
-        f"Unknown chemistry_model: {chemistry_model}. "
-        "Choose from {'constant', 'free', 'fastchem_hybrid_grid', "
-        "'fastchem_equilibrium_metallicity_grid'}."
+    solver_type = {
+        "fastchem_hybrid_grid": FastChemHybridChemistry,
+        "fastchem_equilibrium_metallicity_grid": FastChemMetallicityEquilibriumChemistry,
+    }[model]
+    free_vmr_settings = (
+        {"log_vmr_min": float(config.LOG_VMR_MIN), "log_vmr_max": float(config.LOG_VMR_MAX)}
+        if model == "fastchem_hybrid_grid"
+        else {}
     )
-
-
-def _preflight_spectrum_checks(
-    wav_obs: np.ndarray,
-    data: np.ndarray,
-    sigma: np.ndarray,
-    phase: np.ndarray,
-    inst_nus: np.ndarray,
-) -> None:
-    wav_obs = np.asarray(wav_obs)
-    data = np.asarray(data)
-    sigma = np.asarray(sigma)
-    phase = np.asarray(phase)
-    inst_nus = np.asarray(inst_nus)
-
-    if sigma.shape != data.shape:
-        raise ValueError(f"sigma shape {sigma.shape} does not match data shape {data.shape}")
-
-    if data.ndim == 1:
-        if data.size != wav_obs.size:
-            raise ValueError(f"data length {data.size} != wavelength length {wav_obs.size}")
-        expected_exposures = 1
-    else:
-        if data.shape[1] != wav_obs.size:
-            raise ValueError(f"data spectral axis {data.shape[1]} != wavelength length {wav_obs.size}")
-        expected_exposures = data.shape[0]
-
-    if phase.size != expected_exposures:
-        raise ValueError(f"phase length {phase.size} != number of exposures {expected_exposures}")
+    solver = solver_type(
+        fastchem_parameter_file=str(parameter_file),
+        continuum_species=tuple(config.FASTCHEM_HYBRID_CONTINUUM_SPECIES),
+        metallicity_range=tuple(config.FASTCHEM_HYBRID_METALLICITY_RANGE),
+        co_ratio_range=tuple(config.FASTCHEM_HYBRID_CO_RATIO_RANGE),
+        n_metallicity=int(config.FASTCHEM_HYBRID_N_METALLICITY),
+        n_co_ratio=int(config.FASTCHEM_HYBRID_N_CO_RATIO),
+        h2_he_ratio=float(config.H2_HE_RATIO),
+        n_temp=int(config.FASTCHEM_N_TEMP),
+        n_pressure=int(config.FASTCHEM_N_PRESSURE),
+        t_min=float(config.FASTCHEM_T_MIN),
+        t_max=float(config.FASTCHEM_T_MAX),
+        cache_dir=config.FASTCHEM_CACHE_DIR,
+        **free_vmr_settings,
+    )
+    return solver
 
 
 def _preflight_grid_checks(inst_nus: np.ndarray, nu_grid: np.ndarray) -> None:
@@ -1814,42 +963,6 @@ def _summarize_observed_spectrum(
     return obs_mean, obs_err
 
 
-def _validate_mcmc_device_layout(
-    *,
-    num_chains: int,
-    chain_method: str,
-    require_gpu_per_chain: bool,
-) -> None:
-    chain_method = str(chain_method).strip().lower()
-    local_devices = list(jax.local_devices())
-    gpu_devices = []
-    for device in local_devices:
-        if device.platform == "gpu":
-            gpu_devices.append(device)
-
-    print(f"  JAX default backend: {jax.default_backend()}")
-    print(f"  JAX local devices: {local_devices}")
-
-    if not require_gpu_per_chain:
-        return
-
-    if chain_method != "parallel":
-        raise RuntimeError("MCMC_REQUIRE_GPU_PER_CHAIN requires MCMC_CHAIN_METHOD='parallel'.")
-
-    if jax.default_backend() != "gpu":
-        raise RuntimeError(
-            "This run requires GPU-backed parallel chains, but JAX default backend "
-            f"is {jax.default_backend()!r}."
-        )
-
-    if len(gpu_devices) < num_chains:
-        raise RuntimeError(
-            f"This run requires at least {num_chains} visible GPU devices for "
-            f"{num_chains} MCMC chains, but JAX sees {len(gpu_devices)} GPU device(s). "
-            "Request more GPUs or reduce --mcmc-chains."
-        )
-
-
 def _posterior_site_value(
     params: dict[str, float],
     site_name: str,
@@ -1886,9 +999,7 @@ def _synthesize_timeseries_from_atmospheric_state(
                 default=0.0,
             )
             return float(base_offset) + float(region_offset)
-        if mode in {"species", "none"}:
-            return float(base_offset)
-        raise ValueError(f"Unsupported velocity offset mode: {mode!r}")
+        return float(base_offset)
 
     # Existing posterior artifacts store this sampled site as ``Rp``.  Its
     # explicit runtime meaning is the adopted transmission reference radius
@@ -1982,7 +1093,6 @@ def _synthesize_timeseries_from_atmospheric_state(
         ),
         sigma=jnp.asarray(component.sigma),
         U=None if component.sysrem is None or component.sysrem.U is None else jnp.asarray(component.sysrem.U),
-        V=None if component.sysrem is None or component.sysrem.V is None else jnp.asarray(component.sysrem.V),
         chunked_sysrem=(
             None
             if frozen_timeseries is not None
@@ -2310,10 +1420,7 @@ def _bandpass_publication_model_draws(
                 if albedo_site in subset:
                     albedo = float(np.asarray(subset[albedo_site]).reshape(-1)[0])
                 else:
-                    bounds = observation_config.geometric_albedo_bounds
-                    if bounds is None or bounds[0] != bounds[1]:
-                        raise KeyError(f"Missing sampled geometric albedo site {albedo_site!r}.")
-                    albedo = float(bounds[0])
+                    albedo = float(observation_config.geometric_albedo_bounds[0])
                 semi_major_axis_m = float(observation_config.semi_major_axis_au) * config.AU_M
                 radius_m = radius_cm * 1.0e-2
                 reflected_value = albedo * (radius_m / semi_major_axis_m) ** 2
@@ -2914,13 +2021,6 @@ def _build_spectroscopic_observation_inputs(
             or sysrem.U is None
             else jnp.asarray(sysrem.U)
         ),
-        V=(
-            None
-            if frozen_timeseries is not None
-            or sysrem is None
-            or sysrem.V is None
-            else jnp.asarray(sysrem.V)
-        ),
         chunked_sysrem=(
             None
             if frozen_timeseries is not None
@@ -2996,40 +2096,13 @@ def _coerce_model_params(params: dict) -> dict[str, float | None]:
 
 
 def _normalize_retrieval_mode(mode: str) -> str:
-    normalized = str(mode).lower().strip()
-    if normalized not in {"transmission", "emission"}:
-        raise ValueError(f"Unsupported retrieval mode: {mode}")
-    return normalized
+    return str(mode).lower().strip()
 
 
-def _default_region_name_for_mode(mode: str) -> str:
-    if mode == "transmission":
-        return "terminator"
-    if mode == "emission":
-        return "dayside"
-
-
-def _build_art_for_mode(
-    mode: str,
-    *,
-    reference_pressure_bar: float | None = None,
-) -> object:
+def _build_art_for_mode(mode: str) -> object:
     mode = _normalize_retrieval_mode(mode)
     pressure_top, pressure_btm = config_utils.get_pressure_bounds_for_mode(mode)
     if mode == "transmission":
-        if reference_pressure_bar is None:
-            reference_pressure_bar = config_utils.get_transmission_reference_pressure_bar()
-        if not np.isclose(
-            float(reference_pressure_bar),
-            pressure_btm,
-            rtol=1e-12,
-            atol=0.0,
-        ):
-            raise ValueError(
-                "Transmission reference pressure must equal the RT lower "
-                f"boundary: P_ref={float(reference_pressure_bar):g} bar, "
-                f"P_btm={pressure_btm:g} bar"
-            )
         art = ArtTransPure(
             pressure_top=pressure_top,
             pressure_btm=pressure_btm,
@@ -3081,14 +2154,8 @@ def _resolve_model_wavelength_range(
 ) -> tuple[float, float, float, float]:
     """Resolve observed and padded model bounds from the complete data grid."""
     wavelengths = np.asarray(wav_obs_before_thinning, dtype=float)
-    if wavelengths.ndim != 1 or wavelengths.size == 0:
-        raise ValueError("Model-grid wavelengths must be a non-empty one-dimensional array.")
-    if np.any(~np.isfinite(wavelengths)) or np.any(wavelengths <= 0.0):
-        raise ValueError("Model-grid wavelengths must be finite and positive.")
     observed_min = float(np.min(wavelengths))
     observed_max = float(np.max(wavelengths))
-    if observed_max <= observed_min:
-        raise ValueError("Model-grid wavelengths must span a positive interval.")
     return (
         observed_min,
         observed_max,
@@ -3410,11 +2477,6 @@ def make_joint_spectrum_component_from_tbl(tbl_path: str | Path) -> dict[str, An
     tbl_path = _resolve_lowres_tbl_path(tbl_path)
     metadata, _columns, _data_by_col, _units_by_col = parse_nasa_archive_tbl(tbl_path)
     mode = _infer_tbl_mode(metadata)
-    if mode is None:
-        raise ValueError(
-            f"Could not infer low-res mode from SPEC_TYPE in {tbl_path}. "
-            "Use a NASA .tbl with SPEC_TYPE matching eclipse/transmission."
-        )
 
     return {
         "name": f"lrs_{_sanitize_name_for_id(tbl_path.stem)}",
@@ -3428,19 +2490,8 @@ def make_bandpass_constraints_from_tbl(tbl_path: str | Path) -> list[dict[str, A
     tbl_path = _resolve_bandpass_tbl_path(tbl_path)
     metadata, _columns, data_by_col, units_by_col = parse_nasa_archive_tbl(tbl_path)
     mode = _infer_tbl_mode(metadata)
-    if mode is None:
-        raise ValueError(
-            f"Could not infer low-res mode from SPEC_TYPE in {tbl_path}. "
-            "Use a NASA .tbl with SPEC_TYPE matching eclipse/transmission."
-        )
 
     wav_angstrom, spectrum, sigma, _meta = load_nasa_archive_spectrum(tbl_path, mode=mode)
-    unique_wav = np.unique(np.round(wav_angstrom, 6))
-    if unique_wav.size >= 5:
-        raise ValueError(
-            f"{tbl_path} has {unique_wav.size} unique wavelength bins. "
-            "Pass it via --joint-spectrum-tbl instead of --bandpass-tbl."
-        )
 
     bandwidth_values = np.full_like(wav_angstrom, np.nan, dtype=float)
     if "BANDWIDTH" in data_by_col:
@@ -3520,8 +2571,6 @@ def _build_atmosphere_regions(
         for raw_spec in atmosphere_regions:
             spec = dict(raw_spec)
             name = str(spec.get("name", "")).strip()
-            if "mode" in spec and spec["mode"] is not None:
-                spec["mode"] = _normalize_retrieval_mode(spec["mode"])
             explicit_specs[name] = spec
 
     component_modes: dict[str, str] = {}
@@ -3530,12 +2579,6 @@ def _build_atmosphere_regions(
     for observation_config in observation_configs:
         region_name = str(observation_config.region_name)
         region_mode = _normalize_retrieval_mode(observation_config.mode)
-        if region_name in component_modes and component_modes[region_name] != region_mode:
-            raise ValueError(
-                f"Atmosphere region '{region_name}' is referenced by mixed modes "
-                f"({component_modes[region_name]} and {region_mode}). Split them into "
-                "separate region_name values."
-            )
         component_modes[region_name] = region_mode
         region_mol_names.setdefault(region_name, set()).update(observation_config.opa_mols.keys())
         region_atom_names.setdefault(region_name, set()).update(observation_config.opa_atoms.keys())
@@ -3545,12 +2588,6 @@ def _build_atmosphere_regions(
     for region_name in component_modes:
         region_mode = component_modes[region_name]
         spec = explicit_specs.get(region_name, {})
-        if spec.get("mode") is not None and spec["mode"] != region_mode:
-            raise ValueError(
-                f"Atmosphere region '{region_name}' is configured as mode='{spec['mode']}' "
-                f"but observation components require mode='{region_mode}'."
-            )
-
         chemistry_name = str(spec.get("chemistry_model", default_chemistry_model))
         chemistry_param_file = spec.get(
             "fastchem_parameter_file",
@@ -3631,7 +2668,6 @@ def _load_joint_spectroscopic_component(
     data_format = str(spec.get("data_format", "spectrum")).lower().strip()
     instrument_resolution = float(spec.get("instrument_resolution", config_utils.get_resolution()))
     radial_velocity_mode = str(spec.get("radial_velocity_mode", "orbital" if data_format == "timeseries" else "none"))
-    apply_sysrem_explicit = "apply_sysrem" in spec
     apply_sysrem = bool(spec.get("apply_sysrem", data_format == "timeseries" and config.APPLY_SYSREM_DEFAULT))
     subtract_weighted_global_mean = bool(
         spec.get(
@@ -3662,24 +2698,14 @@ def _load_joint_spectroscopic_component(
         ),
     )
     phoenix_cache_dir = spec.get("phoenix_cache_dir", default_phoenix_cache_dir)
-    sigma_scale = _validate_sigma_scale(spec.get("sigma_scale", default_sigma_scale))
-    spectral_stride, spectral_offset = _validate_spectral_subset(
-        spec.get("spectral_stride", default_spectral_stride),
-        spec.get("spectral_offset", default_spectral_offset),
-    )
+    sigma_scale = float(spec.get("sigma_scale", default_sigma_scale))
+    spectral_stride = int(spec.get("spectral_stride", default_spectral_stride))
+    spectral_offset = int(spec.get("spectral_offset", default_spectral_offset))
     pre_sysrem_data = None
     pre_sysrem_sigma = None
     collapsed_emission = spec.get("collapsed_emission")
     collapsed_transmission = spec.get("collapsed_transmission")
     frozen_timeseries_operator = spec.get("frozen_timeseries_operator")
-    if frozen_timeseries_operator is not None and not isinstance(
-        frozen_timeseries_operator,
-        FrozenTimeseriesOperatorSpec,
-    ):
-        raise TypeError(
-            f"Unsupported frozen time-series operator for component '{name}': "
-            f"{type(frozen_timeseries_operator)!r}"
-        )
     component_data_dir: Path | None = None
 
     if "tbl_path" in spec:
@@ -3710,31 +2736,11 @@ def _load_joint_spectroscopic_component(
             sysrem_spec = spec["sysrem"]
             if isinstance(sysrem_spec, SysremInputBundle):
                 sysrem = sysrem_spec
-            elif isinstance(sysrem_spec, dict):
-                n_sysrem_exp = (
-                    frozen_timeseries_operator.source_phase.size
-                    if frozen_timeseries_operator is not None
-                    else (1 if data.ndim == 1 else data.shape[0])
-                )
-                sysrem = _validate_sysrem_inputs(
-                    sysrem_spec,
-                    n_exp=n_sysrem_exp,
-                )
             else:
-                raise TypeError(f"Unsupported sysrem spec type for component '{name}': {type(sysrem_spec)!r}")
-        elif spec.get("U") is not None or spec.get("V") is not None:
-            if spec.get("U") is None:
-                raise ValueError(
-                    f"Joint spectroscopic component '{name}' cannot provide V "
-                    "without U. Per-pixel projection weights come from sigma."
-                )
+                sysrem = _build_sysrem_inputs(sysrem_spec)
+        elif spec.get("U") is not None:
             raw_sysrem = {"U": np.asarray(spec["U"])}
-            if spec.get("V") is not None:
-                raw_sysrem["V"] = np.asarray(spec["V"])
-            sysrem = _validate_sysrem_inputs(
-                raw_sysrem,
-                n_exp=(1 if data.ndim == 1 else data.shape[0]),
-            )
+            sysrem = _build_sysrem_inputs(raw_sysrem)
         else:
             sysrem = None
     elif "data_dir" in spec:
@@ -3742,34 +2748,14 @@ def _load_joint_spectroscopic_component(
         component_data_dir = data_dir
         if data_format == "timeseries":
             wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
-            frozen_timeseries_operator = (
-                _load_frozen_timeseries_operator_spec(
-                    data_dir,
-                    wav_obs,
-                    phase,
-                    require_lsd_shadow=component_mode == "transmission",
-                )
-            )
-            if (
-                apply_sysrem_explicit
-                and apply_sysrem != frozen_timeseries_operator.has_sysrem
-            ):
-                raise ValueError(
-                    f"Joint spectroscopic component '{name}' requests "
-                    f"apply_sysrem={apply_sysrem}, but its frozen operator "
-                    f"records has_sysrem={frozen_timeseries_operator.has_sysrem}. "
-                    "Use a bundle prepared with the requested preprocessing."
-                )
+            frozen_timeseries_operator = _load_frozen_timeseries_operator_spec(data_dir)
             apply_sysrem = frozen_timeseries_operator.has_sysrem
             pre_sysrem_bundle = load_pre_sysrem_timeseries_data(data_dir)
             if pre_sysrem_bundle is not None:
                 pre_sysrem_data, pre_sysrem_sigma = pre_sysrem_bundle
             phase = _normalize_phase(phase)
             if apply_sysrem:
-                sysrem = _validate_sysrem_inputs(
-                    _load_sysrem_inputs(data_dir),
-                    n_exp=frozen_timeseries_operator.source_phase.size,
-                )
+                sysrem = _build_sysrem_inputs(_load_sysrem_inputs(data_dir))
             else:
                 sysrem = None
         elif data_format == "spectrum":
@@ -3786,12 +2772,6 @@ def _load_joint_spectroscopic_component(
         else:
             wav_obs, data, sigma, phase = load_timeseries_data(data_dir)
             sysrem = None
-
-    if apply_sysrem and sysrem is None:
-        raise ValueError(
-            f"Joint spectroscopic component '{name}' requested SYSREM but no valid "
-            "SYSREM inputs were provided."
-        )
 
     wav_obs_before_thinning = np.asarray(
         spec.get("wav_obs_before_thinning", wav_obs),
@@ -3872,11 +2852,6 @@ def _load_joint_spectroscopic_component(
     if pre_sysrem_data is not None and pre_sysrem_sigma is not None:
         pre_sysrem_data = np.asarray(pre_sysrem_data)
         pre_sysrem_sigma = np.asarray(pre_sysrem_sigma)
-        if pre_sysrem_data.shape != data.shape or pre_sysrem_sigma.shape != sigma.shape:
-            raise ValueError(
-                f"Pre-SYSREM diagnostic arrays for component '{name}' must match "
-                f"data/sigma shape {data.shape}; got {pre_sysrem_data.shape} and {pre_sysrem_sigma.shape}."
-            )
         if sort_idx_for_prepare is not None:
             if pre_sysrem_data.ndim == 2:
                 pre_sysrem_data = pre_sysrem_data[:, sort_idx_for_prepare]
@@ -3891,7 +2866,6 @@ def _load_joint_spectroscopic_component(
         phase = _normalize_phase(phase)
     elif phase.size == 0:
         phase = np.zeros((1,), dtype=float)
-    _preflight_spectrum_checks(wav_obs, data, sigma, phase, inst_nus)
 
     inst_nus_component, nu_grid, sop_rot, sop_inst = _build_component_grid_and_ops(
         wav_obs,
@@ -4112,16 +3086,6 @@ class _StepTimer:
         return False
 
 
-def _validate_sigma_scale(sigma_scale: float) -> float:
-    try:
-        scale = float(sigma_scale)
-    except Exception as exc:
-        raise ValueError("sigma_scale must be a finite positive number.") from exc
-    if not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError("sigma_scale must be a finite positive number.")
-    return scale
-
-
 def _scale_spectroscopic_sigma(
     sigma: np.ndarray,
     sigma_scale: float,
@@ -4138,11 +3102,6 @@ def _subtract_inverse_variance_weighted_constant(
     """Project one wavelength-independent offset out of a 1D spectrum."""
     values = np.asarray(values, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
-    if values.shape != sigma.shape:
-        raise ValueError(
-            f"Cannot subtract weighted constant: values shape {values.shape} "
-            f"does not match sigma shape {sigma.shape}."
-        )
     weights = 1.0 / np.clip(
         sigma,
         config.F32_FLOOR_RECIPSQ,
@@ -4172,7 +3131,6 @@ def run_retrieval(
     sigma: np.ndarray | None = None,
     phase: np.ndarray | None = None,
     U: np.ndarray | None = None,
-    V: np.ndarray | None = None,
     sysrem_inputs: SysremInputBundle | None = None,
     joint_spectra: list[dict[str, Any]] | None = None,
     bandpass_constraints: list[dict[str, Any]] | None = None,
@@ -4203,27 +3161,10 @@ def run_retrieval(
         emission_selection = str(emission_selection).strip().lower().replace("-", "_")
         if emission_selection in {"full", "full_transit"}:
             emission_selection = "full_emission"
-        if emission_selection not in {
-            "full_emission",
-            "pre_eclipse",
-            "post_eclipse",
-        }:
-            raise ValueError(
-                f"Unsupported collapsed emission selection: {emission_selection!r}."
-            )
-        if mode != "emission" or data_format != "spectrum":
-            raise ValueError(
-                "emission_selection requires mode='emission' and data_format='spectrum'."
-            )
-    sigma_scale = _validate_sigma_scale(sigma_scale)
-    spectral_stride, spectral_offset = _validate_spectral_subset(spectral_stride, spectral_offset)
+    sigma_scale = float(sigma_scale)
+    spectral_stride, spectral_offset = int(spectral_stride), int(spectral_offset)
     epochs = _normalize_epoch_values(epoch)
     primary_epoch = epochs[0] if epochs else None
-    if pt_profile is None:
-        raise ValueError("pt_profile must be passed explicitly.")
-    if chemistry_model is None:
-        raise ValueError("chemistry_model must be passed explicitly.")
-
     # Create timestamped output directory
     base_dir = config.DIR_SAVE or config_utils.get_output_dir()
     sanitized_label = sanitize_diagnostic_label(diagnostic_label)
@@ -4284,13 +3225,6 @@ def run_retrieval(
         config.OBSERVING_MODE == "full"
         and all(val is None for val in (wav_obs, data, sigma, phase))
     )
-    if config.OBSERVING_MODE == "full" and not full_arm_mode:
-        raise ValueError(
-            "--wavelength-range full requires loading red and blue from their "
-            "on-disk component directories; direct in-memory primary arrays are "
-            "not supported in full-arm mode."
-        )
-
     primary_component_name = "spectroscopy_red" if full_arm_mode else "spectroscopy"
 
     if full_arm_mode:
@@ -4355,30 +3289,13 @@ def run_retrieval(
             else:
                 print(f"  Using epochs: {', '.join(epochs)}")
         if any(val is not None for val in (wav_obs, data, sigma, phase)):
-            if mode == "emission" and emission_selection is not None:
-                raise ValueError(
-                    "Collapsed 1D emission retrievals must be loaded from their "
-                    "product directory so emission_collapse_operator.npz is "
-                    "available; direct wav_obs/data/sigma arrays are insufficient."
-                )
             phase = _normalize_phase(phase)
             print(f"  Using provided data: {data.shape[0]} exposures x {data.shape[1]} wavelengths")
             print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
             if apply_sysrem:
                 if primary_sysrem is None:
-                    if U is None:
-                        raise ValueError(
-                            "apply_sysrem=True requires either sysrem_inputs or U "
-                            "when providing wav_obs/data/sigma/phase directly; "
-                            "per-pixel weights come from sigma."
-                        )
                     raw_sysrem = {"U": U}
-                    if V is not None:
-                        raw_sysrem["V"] = V
-                    primary_sysrem = _validate_sysrem_inputs(
-                        raw_sysrem,
-                        n_exp=data.shape[0],
-                    )
+                    primary_sysrem = _build_sysrem_inputs(raw_sysrem)
                 print(f"  Using provided SYSREM auxiliaries: {_describe_sysrem_inputs(primary_sysrem)}")
         else:
             if full_arm_mode:
@@ -4440,25 +3357,9 @@ def run_retrieval(
 
             if data_format == "timeseries":
                 wav_obs, data, sigma, phase = load_timeseries_data(resolved_data_dir)
-                primary_frozen_timeseries_operator = (
-                    _load_frozen_timeseries_operator_spec(
-                        resolved_data_dir,
-                        wav_obs,
-                        phase,
-                        require_lsd_shadow=mode == "transmission",
-                    )
+                primary_frozen_timeseries_operator = _load_frozen_timeseries_operator_spec(
+                    resolved_data_dir
                 )
-                if (
-                    apply_sysrem_override is not None
-                    and bool(apply_sysrem_override)
-                    != primary_frozen_timeseries_operator.has_sysrem
-                ):
-                    raise ValueError(
-                        f"The prepared bundle records has_sysrem="
-                        f"{primary_frozen_timeseries_operator.has_sysrem}, but "
-                        f"the run requests apply_sysrem={bool(apply_sysrem_override)}. "
-                        "Use a bundle prepared with the requested preprocessing."
-                    )
                 apply_sysrem = primary_frozen_timeseries_operator.has_sysrem
                 pre_sysrem_bundle = load_pre_sysrem_timeseries_data(resolved_data_dir)
                 if pre_sysrem_bundle is not None:
@@ -4467,12 +3368,7 @@ def run_retrieval(
                 print(f"  Loaded {data.shape[0]} exposures x {data.shape[1]} wavelengths")
                 print(f"  Phase range: {phase.min():.3f} - {phase.max():.3f}")
                 if apply_sysrem:
-                    primary_sysrem = _validate_sysrem_inputs(
-                        _load_sysrem_inputs(resolved_data_dir),
-                        n_exp=(
-                            primary_frozen_timeseries_operator.source_phase.size
-                        ),
-                    )
+                    primary_sysrem = _build_sysrem_inputs(_load_sysrem_inputs(resolved_data_dir))
                     print(f"  Loaded SYSREM auxiliaries: {_describe_sysrem_inputs(primary_sysrem)}")
             elif data_format == "spectrum":
                 wav_obs, spectrum, uncertainty, inst_nus = load_observed_spectrum(
@@ -4484,18 +3380,6 @@ def run_retrieval(
                 sigma = uncertainty[np.newaxis, :]
                 phase = np.array([0.0])
                 print(f"  Loaded single spectrum with {len(wav_obs)} points")
-                if apply_sysrem:
-                    raise ValueError(
-                        "apply_sysrem=True with data_format='spectrum' requires SYSREM "
-                        "auxiliaries tied to time-series exposures, which are unavailable "
-                        "for single-spectrum input. Use data_format='timeseries' or set "
-                        "APPLY_SYSREM_DEFAULT=False."
-                    )
-            else:
-                raise ValueError(
-                    f"Unsupported data_format: {data_format}. "
-                    "Choose from {'timeseries', 'spectrum'}."
-                )
 
         primary_wav_obs_before_thinning = np.asarray(wav_obs, dtype=float).copy()
         (
@@ -4512,15 +3396,6 @@ def run_retrieval(
         if primary_pre_sysrem_data is not None and primary_pre_sysrem_sigma is not None:
             primary_pre_sysrem_data = np.asarray(primary_pre_sysrem_data)
             primary_pre_sysrem_sigma = np.asarray(primary_pre_sysrem_sigma)
-            if (
-                primary_pre_sysrem_data.shape != np.asarray(data).shape
-                or primary_pre_sysrem_sigma.shape != np.asarray(sigma).shape
-            ):
-                raise ValueError(
-                    "Pre-SYSREM diagnostic arrays must match the primary "
-                    f"data/sigma shape {np.asarray(data).shape}; got "
-                    f"{primary_pre_sysrem_data.shape} and {primary_pre_sysrem_sigma.shape}."
-                )
 
         primary_frozen_subset_indices = (
             None
@@ -4603,8 +3478,6 @@ def run_retrieval(
         if sigma_scale != 1.0:
             print(f"  Applied spectroscopic sigma scale: x{sigma_scale:g}")
 
-        _preflight_spectrum_checks(wav_obs, data, sigma, phase, inst_nus)
-
     # Setup instrumental resolution
     print("\n[2/7] Setting up instrumental resolution...")
     with _StepTimer("Step 2/7"):
@@ -4627,8 +3500,6 @@ def run_retrieval(
                 "red and blue components build arm-specific grids in step 6."
             )
         else:
-            if primary_wav_obs_before_thinning is None:
-                raise RuntimeError("Primary model-grid wavelengths were not captured.")
             observed_min, observed_max, model_min, model_max = (
                 _resolve_model_wavelength_range(primary_wav_obs_before_thinning)
             )
@@ -4666,10 +3537,7 @@ def run_retrieval(
     # Setup primary atmospheric RT geometry
     print("\n[4/7] Initializing primary atmospheric RT...")
     with _StepTimer("Step 4/7"):
-        primary_art = _build_art_for_mode(
-            mode,
-            reference_pressure_bar=reference_pressure_bar,
-        )
+        primary_art = _build_art_for_mode(mode)
         pressure_top, pressure_btm = config_utils.get_pressure_bounds_for_mode(mode)
         print(f"  {config.NLAYER} atmospheric layers")
         print(f"  Pressure range: {pressure_top:.1e} - {pressure_btm:.1e} bar")
@@ -4769,11 +3637,6 @@ def run_retrieval(
             if (joint_spectra or bandpass_constraints)
             else None
         )
-        if (
-            primary_wav_obs_before_thinning is None
-            or primary_grid_source_wavelength_range is None
-        ):
-            raise RuntimeError("Primary model-grid wavelength range was not captured.")
 
         if full_arm_mode:
             primary_component_spec = _build_in_memory_timeseries_component_spec(
@@ -4880,8 +3743,6 @@ def run_retrieval(
                     default_spectral_stride=spectral_stride,
                     default_spectral_offset=spectral_offset,
                 )
-                if component.name in observations_payload:
-                    raise ValueError(f"Duplicate joint component name: {component.name}")
                 auxiliary_components.append(component)
                 observation_configs.append(component.observation_config)
                 observations_payload[component.name] = component.observation_inputs
@@ -4900,8 +3761,6 @@ def run_retrieval(
                     default_semi_major_axis_au=model_params["a"],
                     default_phoenix_cache_dir=phoenix_cache_dir,
                 )
-                if component.name in observations_payload:
-                    raise ValueError(f"Duplicate joint component name: {component.name}")
                 scalar_constraints.append(component)
                 observation_configs.append(component.observation_config)
                 observations_payload[component.name] = component.observation_inputs
@@ -5137,11 +3996,8 @@ def run_retrieval(
         print(f"  Chains: {config.MCMC_NUM_CHAINS}")
         print(f"  Chain method: {config.MCMC_CHAIN_METHOD}")
 
-        _validate_mcmc_device_layout(
-            num_chains=config.MCMC_NUM_CHAINS,
-            chain_method=config.MCMC_CHAIN_METHOD,
-            require_gpu_per_chain=config.MCMC_REQUIRE_GPU_PER_CHAIN,
-        )
+        print(f"  JAX default backend: {jax.default_backend()}")
+        print(f"  JAX local devices: {jax.local_devices()}")
 
         kernel = NUTS(
             model_c,
@@ -5543,10 +4399,3 @@ def run_retrieval(
     print(f"Results saved to: {output_dir}/")
     print(f"Total runtime: {perf_counter() - retrieval_start:.2f}s")
     print("="*70)
-
-
-if __name__ == "__main__":
-    raise RuntimeError(
-        "Direct __main__ execution no longer provides a chemistry default. "
-        "Import run_retrieval(...) and pass chemistry_model explicitly."
-    )

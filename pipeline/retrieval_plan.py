@@ -1,14 +1,11 @@
-"""Retrieval-plan cases, preflight checks, and runner utilities."""
+"""Retrieval-plan cases and runner utilities."""
 
 from __future__ import annotations
 
 import argparse
-import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
-
-import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -29,9 +26,6 @@ class RetrievalCase:
 
 def atomic_species_dict(names: Iterable[str]) -> dict[str, dict]:
     names = tuple(names)
-    missing = sorted(set(names).difference(config.ATOMIC_SPECIES))
-    if missing:
-        raise ValueError("Unsupported atomic species: " + ", ".join(missing))
     return {name: dict(config.ATOMIC_SPECIES[name]) for name in names}
 
 
@@ -44,13 +38,11 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ephemeris", default="Duck24")
     parser.add_argument(
         "--arm",
-        choices=("red", "blue", "full"),
         default="red",
         help="PEPSI arm selection; full loads red and blue as separate components.",
     )
     parser.add_argument(
         "--profile",
-        choices=config_utils.list_runtime_profiles(),
         default=config_utils.get_runtime_profile_name(),
     )
     parser.add_argument("--output", type=Path, default=None)
@@ -69,13 +61,11 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sigma-scale", type=float, default=1.0)
     parser.add_argument(
         "--radius-policy",
-        choices=("fixed", "tight"),
         default="fixed",
         help="Fix Rp and Rstar, or sample their catalog normal priors.",
     )
     parser.add_argument(
         "--mass-policy",
-        choices=("normal", "fixed", "upper-limit"),
         default="normal",
         help="Prior form for Mp. The image-specified default is an informative normal prior.",
     )
@@ -103,26 +93,22 @@ def configure_runtime(
     output_category: str | None = None,
 ) -> None:
     config_utils.apply_runtime_profile(args.profile)
-    config_utils.set_runtime_config("PLANET", args.planet)
-    config_utils.set_runtime_config("EPHEMERIS", args.ephemeris)
-    config_utils.set_runtime_config("RETRIEVAL_MODE", mode)
-    config_utils.set_runtime_config("OBSERVING_MODE", args.arm)
+    config.PLANET = args.planet
+    config.EPHEMERIS = args.ephemeris
+    config.RETRIEVAL_MODE = mode
+    config.OBSERVING_MODE = args.arm
     config_utils.get_params()
 
     if args.nlayer is not None:
-        if args.nlayer < 1:
-            raise ValueError("--nlayer must be >= 1.")
-        config_utils.set_runtime_config("NLAYER", args.nlayer)
+        config.NLAYER = args.nlayer
     if args.n_spectral_points is not None:
-        if args.n_spectral_points < 1:
-            raise ValueError("--n-spectral-points must be >= 1.")
-        config_utils.set_runtime_config("N_SPECTRAL_POINTS", args.n_spectral_points)
+        config.N_SPECTRAL_POINTS = args.n_spectral_points
 
     if args.quick:
-        config_utils.set_runtime_config("SVI_NUM_STEPS", config.QUICK_SVI_STEPS)
-        config_utils.set_runtime_config("MCMC_NUM_WARMUP", config.QUICK_MCMC_WARMUP)
-        config_utils.set_runtime_config("MCMC_NUM_SAMPLES", config.QUICK_MCMC_SAMPLES)
-        config_utils.set_runtime_config("MCMC_NUM_CHAINS", config.QUICK_MCMC_CHAINS)
+        config.SVI_NUM_STEPS = config.QUICK_SVI_STEPS
+        config.MCMC_NUM_WARMUP = config.QUICK_MCMC_WARMUP
+        config.MCMC_NUM_SAMPLES = config.QUICK_MCMC_SAMPLES
+        config.MCMC_NUM_CHAINS = config.QUICK_MCMC_CHAINS
     for argument, config_name in (
         (args.svi_steps, "SVI_NUM_STEPS"),
         (args.mcmc_warmup, "MCMC_NUM_WARMUP"),
@@ -130,9 +116,7 @@ def configure_runtime(
         (args.mcmc_chains, "MCMC_NUM_CHAINS"),
     ):
         if argument is not None:
-            if argument < 1:
-                raise ValueError(f"{config_name} must be >= 1.")
-            config_utils.set_runtime_config(config_name, argument)
+            setattr(config, config_name, argument)
 
     output_base = args.output
     if output_base is None:
@@ -146,7 +130,7 @@ def configure_runtime(
             / case_name
         )
     output_base.mkdir(parents=True, exist_ok=True)
-    config_utils.set_runtime_config("DIR_SAVE", output_base)
+    config.DIR_SAVE = output_base
 
 
 def shared_prior_modes(args: argparse.Namespace) -> dict[str, str]:
@@ -158,91 +142,19 @@ def shared_prior_modes(args: argparse.Namespace) -> dict[str, str]:
 def model_param_overrides(args: argparse.Namespace) -> dict[str, float]:
     overrides: dict[str, float] = {}
     if args.mass_mean is not None:
-        if not np.isfinite(args.mass_mean) or args.mass_mean <= 0.0:
-            raise ValueError("--mass-mean must be finite and positive.")
         overrides["M_p"] = float(args.mass_mean)
     if args.mass_sigma is not None:
-        if not np.isfinite(args.mass_sigma) or args.mass_sigma <= 0.0:
-            raise ValueError("--mass-sigma must be finite and positive.")
         overrides["M_p_err"] = float(args.mass_sigma)
     return overrides
 
 
 def velocity_bounds(args: argparse.Namespace) -> tuple[float, float]:
     bound = float(args.velocity_bound)
-    if not np.isfinite(bound) or bound <= 0.0:
-        raise ValueError("--velocity-bound must be finite and positive.")
     return (-bound, bound)
 
 
 def arms_for(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(config.FULL_ARM_MEMBERS) if args.arm == "full" else (args.arm,)
-
-
-def timeseries_dirs(
-    *,
-    mode: str,
-    epochs: Iterable[str],
-    args: argparse.Namespace,
-) -> list[Path]:
-    return [
-        config_utils.get_timeseries_data_dir(
-            planet=args.planet,
-            epoch=epoch,
-            arm=arm,
-            mode=mode,
-        )
-        for epoch in epochs
-        for arm in arms_for(args)
-    ]
-
-
-def preflight_timeseries(
-    *,
-    mode: str,
-    epochs: Iterable[str],
-    args: argparse.Namespace,
-) -> list[dict[str, object]]:
-    results: list[dict[str, object]] = []
-    for data_dir in timeseries_dirs(mode=mode, epochs=epochs, args=args):
-        operator_path = data_dir / "timeseries_operator.npz"
-        required = [
-            data_dir / "wavelength.npy",
-            data_dir / "data.npy",
-            data_dir / "sigma.npy",
-            data_dir / "phase.npy",
-            operator_path,
-        ]
-        missing = [path.name for path in required if not path.exists()]
-        has_sysrem = None
-        if operator_path.exists():
-            with np.load(operator_path) as operator:
-                if "has_sysrem" in operator.files:
-                    has_sysrem = bool(np.asarray(operator["has_sysrem"]).item())
-        results.append(
-            {
-                "data_dir": str(data_dir),
-                "missing": missing,
-                "has_sysrem": has_sysrem,
-            }
-        )
-    return results
-
-
-def require_ready_timeseries(preflight: list[dict[str, object]], args: argparse.Namespace) -> None:
-    failures = []
-    for row in preflight:
-        if row["missing"]:
-            failures.append(f"{row['data_dir']}: missing {', '.join(row['missing'])}")
-        elif args.no_sysrem and row["has_sysrem"] is not False:
-            failures.append(
-                f"{row['data_dir']}: --no-sysrem requested but saved has_sysrem="
-                f"{row['has_sysrem']}"
-            )
-    if failures:
-        raise FileNotFoundError(
-            "Prepared time-series preflight failed:\n  - " + "\n  - ".join(failures)
-        )
 
 
 def auxiliary_timeseries_specs(
@@ -324,20 +236,3 @@ def intent_manifest(
     if extra:
         manifest.update(extra)
     return manifest
-
-
-def print_plan(manifest: dict[str, object], preflight: list[dict[str, object]]) -> None:
-    payload = dict(manifest)
-    payload["prepared_data_preflight"] = preflight
-    print(json.dumps(payload, indent=2, sort_keys=True))
-
-
-def validate_epochs(epochs: list[str] | None, flag: str = "--epoch") -> tuple[str, ...]:
-    if not epochs:
-        raise ValueError(f"At least one {flag} value is required.")
-    normalized = tuple(str(epoch).strip() for epoch in epochs if str(epoch).strip())
-    if not normalized:
-        raise ValueError(f"At least one {flag} value is required.")
-    if len(set(normalized)) != len(normalized):
-        raise ValueError(f"Duplicate {flag} values are not allowed.")
-    return normalized
